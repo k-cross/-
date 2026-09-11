@@ -1,0 +1,17 @@
+[package]
+name = "polyphonic"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+todo = "warn"
