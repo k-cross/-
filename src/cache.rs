@@ -242,6 +242,44 @@ impl TierPool {
         self.free_bytes() + burst
     }
 
+    /// Recompute cost per byte of the cheapest state this pool would give up, which is the
+    /// price of putting something new here. Read-only, so it peeks each reclaimable class's
+    /// heap top rather than draining it: a stale or pinned top makes that class abstain, and
+    /// if every class abstains the price falls back to `inflation`, the last price actually
+    /// paid. An estimate, deliberately -- a faithful dry run would cost as much as the
+    /// eviction itself, on every candidate node, on every request.
+    #[must_use]
+    pub fn marginal_price(&self) -> f64 {
+        let mut best: Option<f64> = None;
+        for b in (0..=self.quota.max_band()).rev() {
+            for k in 0..BlobKind::N {
+                if self.quota.band[k] != b || self.by_kind[k] <= self.quota.floor[k] {
+                    continue;
+                }
+                let Some(Reverse(r)) = self.evictable[k].peek() else {
+                    continue;
+                };
+                let Some(e) = self.entries.get(&r.id) else {
+                    continue;
+                };
+                if e.epoch != r.epoch || self.is_serving(e) {
+                    continue;
+                }
+                if self.leaf_first && e.resident_children > 0 {
+                    continue;
+                }
+                let p = e.meta.value_per_byte();
+                if best.is_none_or(|bp| p < bp) {
+                    best = Some(p);
+                }
+            }
+            if best.is_some() {
+                return best.unwrap_or(0.0);
+            }
+        }
+        best.unwrap_or(self.inflation.max(0.0))
+    }
+
     fn is_serving(&self, e: &Entry) -> bool {
         e.meta.kind == BlobKind::ServiceHeap
             && self.clock.saturating_sub(e.last_touch) < SERVING_WINDOW
@@ -496,14 +534,27 @@ pub struct Cost {
     /// What it cost to *decide*, as distinct from what it cost to do. Zero when the
     /// scheduler and the ledger are the same process; a boundary crossing when they are not.
     pub decide_ns: u64,
+    /// The work itself, once its state is resident: a function body, a decode loop, a request
+    /// handler. Without this a warm invocation costs nothing at all and every overhead looks
+    /// infinite beside it.
+    pub exec_ns: u64,
     pub bytes_in: u64,
     pub pending: bool,
 }
 
 impl Cost {
     #[must_use]
+    /// Time spent *waiting on state*, which is the only thing a residency policy can move.
+    /// Execution is deliberately excluded: adding a fixed 200 ms decode to every arm would
+    /// bury the differences under a constant.
     pub fn total_ns(&self) -> u64 {
         self.transfer_ns + self.recompute_ns + self.decide_ns
+    }
+
+    /// End-to-end time for the request. This is the denominator an overhead is a fraction of.
+    #[must_use]
+    pub fn service_ns(&self) -> u64 {
+        self.total_ns() + self.exec_ns
     }
 }
 

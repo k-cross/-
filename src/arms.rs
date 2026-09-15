@@ -144,7 +144,16 @@ pub fn run_on(label: &str, t: Trial, quota: Quota, trace: &[crate::work::Request
             continue;
         }
 
-        let c = h.access(&req.chain);
+        let mut c = h.access(&req.chain);
+        if !c.pending && !req.requires.is_empty() {
+            let dep = h.access_set(&req.requires);
+            c.transfer_ns += dep.transfer_ns;
+            c.recompute_ns += dep.recompute_ns;
+            c.pending |= dep.pending;
+        }
+        if !c.pending {
+            c.exec_ns = req.exec_ns;
+        }
 
         if let Some(up) = req.completes.and_then(|task| started.remove(&task)) {
             if c.pending {

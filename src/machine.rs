@@ -24,6 +24,10 @@ pub enum Placement {
     Sticky,
     /// Run the work where its state already lives.
     Aware,
+    /// Run the work where it is worth the most: state already resident, minus what admitting
+    /// the rest would displace, minus the handoff it avoids -- all in the ledger's own
+    /// currency of recompute nanoseconds. `Aware` scores only the numerator of this.
+    Scored,
 }
 
 /// Where residency knowledge lives, and what it costs to consult.
@@ -61,16 +65,17 @@ pub struct Machine {
     topo: Topology,
     domains: Vec<Hierarchy>,
     placement: Placement,
-    kv_transfer: bool,
     next_unit: usize,
     sticky_unit: usize,
     /// Domains still accepting work. Draining one leaves its state migrated elsewhere and
     /// every content hash that pointed at it stale.
     active: Vec<usize>,
     pub migrated_bytes: u64,
-    /// Domain each in-flight task's upstream stage ran in, so the downstream stage can be
-    /// co-placed with it -- or charged for the handoff when it is not.
-    upstream: HashMap<u64, usize>,
+    /// Domain each in-flight task's upstream stage ran in and the bytes it will hand over, so
+    /// the downstream stage can be co-placed with it -- or charged for the handoff when it is
+    /// not. An agent's tool result and a function's prompt bundle differ by an order of
+    /// magnitude, so the payload travels with the task rather than being assumed.
+    upstream: HashMap<u64, (usize, u64)>,
     pub handoff_ns: u64,
     pub split_tasks: u64,
     pub joined_tasks: u64,
@@ -96,6 +101,13 @@ pub struct Machine {
     pub control_rpcs: u64,
     /// Decisions where the scheduler's view of the chosen node disagreed with the truth.
     pub stale_decisions: u64,
+    /// How many placements each term of the score actually changed. A term that never moves
+    /// a decision is not a policy, it is a comment.
+    pub moved_by_displacement: u64,
+    pub moved_by_flow: u64,
+    pub held_by_affinity: u64,
+    pub flow_requests: u64,
+    pub flow_coplaced: u64,
 }
 
 impl Machine {
@@ -124,7 +136,6 @@ impl Machine {
             topo,
             domains,
             placement,
-            kv_transfer: false,
             next_unit: 0,
             sticky_unit: 0,
             active: (0..n_domains).collect(),
@@ -147,6 +158,11 @@ impl Machine {
             decide_ns: 0,
             control_rpcs: 0,
             stale_decisions: 0,
+            moved_by_displacement: 0,
+            moved_by_flow: 0,
+            held_by_affinity: 0,
+            flow_requests: 0,
+            flow_coplaced: 0,
         }
     }
 
@@ -198,18 +214,6 @@ impl Machine {
                 0
             }
         }
-    }
-
-    /// Domain holding the deepest resident prefix of this chain, and how deep.
-    fn deepest(&self, chain: &[(BlobId, BlobMeta)]) -> (usize, usize) {
-        let mut best = (0usize, 0usize);
-        for d in 0..self.domains.len() {
-            let depth = chain.partition_point(|(id, _)| self.believes_resident(d, id));
-            if depth > best.1 {
-                best = (d, depth);
-            }
-        }
-        best
     }
 
     /// Domain a chain belongs to by content, independent of what is currently resident:
@@ -272,7 +276,7 @@ impl Machine {
                 d
             }
             Placement::Sticky => affinity,
-            Placement::Aware => {
+            Placement::Aware | Placement::Scored => {
                 if value > 0 {
                     best
                 } else {
@@ -299,10 +303,116 @@ impl Machine {
         chain_bytes + dep_bytes
     }
 
-    /// Bytes domain `d` really holds for this chain, regardless of what the scheduler thinks.
-    fn truly_resident(&self, d: usize, chain: &[(BlobId, BlobMeta)]) -> u64 {
-        let depth = chain.partition_point(|(id, _)| self.domains[d].dram.contains(id));
-        chain[..depth].iter().map(|(_, m)| m.bytes).sum()
+    /// Recompute nanoseconds this request would avoid by running on `d`, and the bytes it
+    /// would have to admit there. The first is what residency is worth; the second is what
+    /// claiming it costs someone else.
+    fn gain_and_need(&self, d: usize, req: &Request) -> (f64, u64) {
+        let depth = req
+            .chain
+            .partition_point(|(id, _)| self.believes_resident(d, id));
+        let mut gain = 0.0;
+        let mut need = 0;
+        for (i, (_, m)) in req.chain.iter().enumerate() {
+            if i < depth {
+                gain += m.recompute_ns as f64;
+            } else {
+                need += m.bytes;
+            }
+        }
+        for (id, m) in &req.requires {
+            if self.believes_resident(d, id) {
+                gain += m.recompute_ns as f64;
+            } else {
+                need += m.bytes;
+            }
+        }
+        (gain, need)
+    }
+
+    /// What placing this request on `d` is worth, net.
+    ///
+    /// Every previous placement policy scored only what it stood to gain, which is why each
+    /// one eventually concentrated load onto whichever node already held the most bytes and
+    /// made things worse. Admitting bytes a node does not have room for evicts something, and
+    /// that eviction is a debt the next request pays. Pricing it is the whole difference.
+    fn placement_terms(&self, d: usize, req: &Request, flow: Option<(usize, u64)>) -> Terms {
+        let (gain, need) = self.gain_and_need(d, req);
+        let h = &self.domains[d];
+        let short = need.saturating_sub(h.dram.free_bytes());
+        let displaced = short as f64 * h.dram.marginal_price();
+        let handoff = match flow {
+            Some((src, payload)) if src != d => {
+                self.topo.fetch_ns(self.unit_in(d), src, payload) as f64
+            }
+            _ => 0.0,
+        };
+        Terms {
+            domain: d,
+            gain,
+            displaced,
+            handoff,
+        }
+    }
+
+    /// Argmax of the score, plus what each term changed. Reported rather than assumed: a term
+    /// worth four orders of magnitude less than another one cannot move an argmax, and saying
+    /// so is more useful than shipping it and believing otherwise.
+    fn best_scored(&mut self, req: &Request, flow: Option<(usize, u64)>, affinity: usize) -> usize {
+        let terms: Vec<Terms> = self
+            .active
+            .iter()
+            .map(|&d| self.placement_terms(d, req, flow))
+            .collect();
+        let pick = |f: &dyn Fn(&Terms) -> f64| -> usize {
+            terms
+                .iter()
+                .max_by(|a, b| f(a).total_cmp(&f(b)))
+                .map_or(0, |t| t.domain)
+        };
+        let raw = pick(&Terms::gain_only);
+        let net = pick(&Terms::net);
+        let score = |d: usize| {
+            terms
+                .iter()
+                .find(|t| t.domain == d)
+                .map_or(f64::MIN, Terms::full)
+        };
+        let top = pick(&Terms::full);
+        // Never move without a reason. With nothing resident anywhere every score is zero,
+        // and an argmax over ties would send every cold request to the same node; falling
+        // back to content affinity spreads them the way a hash does.
+        let full = if score(top) > score(affinity) {
+            top
+        } else {
+            affinity
+        };
+        self.moved_by_displacement += u64::from(net != raw);
+        self.moved_by_flow += u64::from(top != net);
+        self.held_by_affinity += u64::from(full != top);
+        if let Some((src, _)) = flow {
+            self.flow_requests += 1;
+            if full == src {
+                self.flow_coplaced += 1;
+            }
+        }
+        full
+    }
+
+    /// Bytes domain `d` really holds for this request, regardless of what the scheduler
+    /// thinks. Must span exactly what `resident_value` scores, dependencies included, or a
+    /// decision correctly made on weight residency is reported as stale.
+    fn truly_resident(&self, d: usize, req: &Request) -> u64 {
+        let depth = req
+            .chain
+            .partition_point(|(id, _)| self.domains[d].dram.contains(id));
+        let chain_bytes: u64 = req.chain[..depth].iter().map(|(_, m)| m.bytes).sum();
+        let dep_bytes: u64 = req
+            .requires
+            .iter()
+            .filter(|(id, _)| self.domains[d].dram.contains(id))
+            .map(|(_, m)| m.bytes)
+            .sum();
+        chain_bytes + dep_bytes
     }
 
     pub fn serve_request(&mut self, req: &Request) -> Cost {
@@ -311,65 +421,90 @@ impl Machine {
         if self.placement != Placement::Blind {
             self.sticky_unit = self.affinity_unit(&req.chain);
         }
-        let best = self
-            .active
-            .iter()
-            .copied()
-            .max_by_key(|&d| self.resident_value(d, req))
-            .unwrap_or(0);
+        let flow_pair = req
+            .completes
+            .filter(|_| self.flow_aware)
+            .and_then(|t| self.upstream.get(&t).copied());
+        let scored = self.placement == Placement::Scored;
+        let affinity = self.topo.units[self.sticky_unit].home as usize;
+        let best = if scored {
+            self.best_scored(req, flow_pair, affinity)
+        } else {
+            self.active
+                .iter()
+                .copied()
+                .max_by_key(|&d| self.resident_value(d, req))
+                .unwrap_or(0)
+        };
         let value = self.resident_value(best, req);
 
         // A task's downstream stage belongs where its upstream ran: neither workload's own
         // identity hashes to the other's domain, so only a scheduler that sees the flow can
         // put them together. This overrides the placement policy for every policy, which is
         // what makes it separable from residency routing.
-        let flow_home = req
-            .completes
-            .filter(|_| self.flow_aware)
-            .and_then(|t| self.upstream.get(&t).copied());
-        let affinity = self.topo.units[self.sticky_unit].home as usize;
-        let target = match flow_home {
-            Some(d) => d,
-            None => self.policy_target(affinity, best, value),
+        // Under `Scored` the score is the whole decision: the flow's pull is already inside
+        // it, priced against what co-placing would evict, and gating on `resident_value` as
+        // well would discard the scored choice using a metric the score never consulted.
+        let target = if scored {
+            best
+        } else {
+            match flow_pair {
+                Some((d, _)) => d,
+                None => self.policy_target(affinity, best, value),
+            }
         };
         let unit = self.unit_in(target);
         let home = self.topo.units[unit].home as usize;
-        if value > 0 && self.truly_resident(target, &req.chain) == 0 {
+        // Only meaningful for a policy that acted on residency: a hash placement did not
+        // consult a view, so it cannot have been misled by one.
+        if self.placement == Placement::Aware
+            && self.resident_value(target, req) > 0
+            && self.truly_resident(target, req) == 0
+        {
             self.stale_decisions += 1;
         }
-        let serving = if self.kv_transfer && value > 0 {
-            best
-        } else {
-            home
-        };
+        // A prefix cache is node-local process state, not shared memory: a replica on one
+        // node cannot read another's KV blocks. Work runs against its own node's ledger, so
+        // landing in the wrong place means recomputing, not fetching remotely.
+        let serving = home;
 
-        let bytes: u64 = req.chain.iter().map(|(_, m)| m.bytes).sum();
-        let link_ns = self.topo.fetch_ns(unit, serving, bytes);
+        // Only bytes that actually cross a link are charged one. State in the running node's
+        // own memory is mapped, not copied: charging a local fetch made every invocation look
+        // cold and drove the warm rate to zero.
+        let link_ns = if serving == home {
+            0
+        } else {
+            let bytes: u64 = req.chain.iter().map(|(_, m)| m.bytes).sum();
+            self.bytes_crossed += bytes;
+            self.topo.fetch_ns(unit, serving, bytes)
+        };
         self.interconnect_ns += link_ns;
 
         self.last_handoff = 0;
         if let Some(hint) = &req.hint {
-            self.upstream.insert(hint.task, home);
+            self.upstream.insert(hint.task, (home, hint.payload_bytes));
         }
-        if let Some(src) = req.completes.and_then(|t| self.upstream.remove(&t)) {
+        if let Some((src, payload)) = req.completes.and_then(|t| self.upstream.remove(&t)) {
             if src == home {
                 self.joined_tasks += 1;
             } else {
                 self.split_tasks += 1;
-                let hop = self
-                    .topo
-                    .fetch_ns(unit, src, crate::work::FLOW_PAYLOAD_BYTES);
+                let hop = self.topo.fetch_ns(unit, src, payload);
                 self.handoff_ns += hop;
                 self.last_handoff = hop;
             }
         }
 
+        let ran_with = self.truly_resident(serving, req);
         let mut cost = self.domains[serving].access(&req.chain);
         cost.decide_ns = decide_ns;
         // Counted after the fact: a refused request never ran, so charging it a placement
         // outcome would inflate every rate by the refusal rate.
+        // Measured at the node that ran the work, against the truth. Scoring `best` instead
+        // reported what the scheduler looked at rather than what the request found, and under
+        // a stale view reported belief rather than residency.
         if !cost.pending {
-            if value == 0 {
+            if ran_with == 0 {
                 self.cold += 1;
             } else if serving == home {
                 self.local += 1;
@@ -377,61 +512,20 @@ impl Machine {
                 self.remote += 1;
             }
         }
-        if !req.requires.is_empty() {
+        // A refused request consumes nothing. Admitting its dependencies anyway would evict
+        // live state to make room for work that never runs, which is the opposite of what
+        // refusal is for.
+        if !cost.pending && !req.requires.is_empty() {
             let dep = self.domains[serving].access_set(&req.requires);
             cost.transfer_ns += dep.transfer_ns;
             cost.recompute_ns += dep.recompute_ns;
             cost.pending |= dep.pending;
         }
         cost.transfer_ns += link_ns + self.last_handoff;
-        cost
-    }
-
-    pub fn serve(&mut self, chain: &[(BlobId, BlobMeta)]) -> Cost {
-        let decide_ns = self.decide(chain.len());
-        self.decide_ns += decide_ns;
-        if self.placement != Placement::Blind {
-            self.sticky_unit = self.affinity_unit(chain);
+        // Charged only on a request that actually runs: a refusal does no work.
+        if !cost.pending {
+            cost.exec_ns = req.exec_ns;
         }
-        let (held, depth) = self.deepest(chain);
-        // With nothing resident anywhere the placement policy picks freely; with state on the
-        // floor, `held` is where the work wants to run.
-        // Content affinity, not load balance: spreading cold chains by bytes scatters a
-        // tenant's sessions and destroys the locality this policy exists to capture.
-        let affinity = self.topo.units[self.sticky_unit].home as usize;
-        let target = self.policy_target(affinity, held, depth as u64);
-        let unit = self.unit_in(target);
-        let home = self.topo.units[unit].home as usize;
-        if depth > 0 && self.truly_resident(target, chain) == 0 {
-            self.stale_decisions += 1;
-        }
-
-        // A prefix cache is node-local process state, not shared memory: a replica on one
-        // domain cannot read another's KV blocks even over a coherent link. Work therefore
-        // runs against its *own* domain's ledger, and landing in the wrong place means
-        // recomputing, not fetching remotely. Enable `kv_transfer` to model an explicit
-        // cross-domain KV move instead.
-        let serving = if self.kv_transfer && depth > 0 {
-            held
-        } else {
-            home
-        };
-        let bytes: u64 = chain.iter().map(|(_, m)| m.bytes).sum();
-        let link_ns = self.topo.fetch_ns(unit, serving, bytes);
-
-        if depth == 0 {
-            self.cold += 1;
-        } else if serving == home {
-            self.local += 1;
-        } else {
-            self.remote += 1;
-            self.bytes_crossed += bytes;
-        }
-        self.interconnect_ns += link_ns;
-
-        let mut cost = self.domains[serving].access(chain);
-        cost.transfer_ns += link_ns;
-        cost.decide_ns = decide_ns;
         cost
     }
 
@@ -448,21 +542,28 @@ impl Machine {
         let lo = used.iter().copied().min().unwrap_or(0).max(1) as f64;
         hi / lo
     }
+}
 
-    /// Allow a chain to be served from a remote domain over a coherent link, modelling an
-    /// explicit cross-domain KV transfer rather than a local recompute.
-    pub fn set_kv_transfer(&mut self, on: bool) {
-        self.kv_transfer = on;
+/// The three terms of a placement score, in recompute nanoseconds: what running here saves,
+/// what claiming the room costs whatever gets evicted, and what not co-placing costs in
+/// handoff. Kept apart so each one's contribution can be counted rather than assumed.
+#[derive(Clone, Copy, Debug)]
+struct Terms {
+    domain: usize,
+    gain: f64,
+    displaced: f64,
+    handoff: f64,
+}
+
+impl Terms {
+    fn gain_only(&self) -> f64 {
+        self.gain
     }
-
-    #[must_use]
-    pub fn local_fraction(&self) -> f64 {
-        let n = self.local + self.remote;
-        if n == 0 {
-            0.0
-        } else {
-            self.local as f64 / n as f64
-        }
+    fn net(&self) -> f64 {
+        self.gain - self.displaced
+    }
+    fn full(&self) -> f64 {
+        self.gain - self.displaced - self.handoff
     }
 }
 

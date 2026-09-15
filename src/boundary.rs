@@ -87,7 +87,10 @@ impl Cost {
             .iter()
             .map(|p| (p.0 as f64 - mx) * (p.1 as f64 - my))
             .sum::<f64>();
-        let slope = cov / var;
+        // Noise can fit a negative slope on a rung whose cost barely depends on size. Copying
+        // bytes never makes a crossing cheaper, and letting it through would price a large
+        // payload below zero once the fit is added to a link cost.
+        let slope = (cov / var).max(0.0);
         Self {
             fixed_ns: my - slope * mx,
             ns_per_byte: slope,

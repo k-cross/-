@@ -75,9 +75,6 @@ enum Cmd {
         /// migrates to the survivors, so the bytes remain but every hash to it is stale.
         #[arg(long, default_value_t = 0.0)]
         drain_at: f64,
-        /// Make inference depend on its model's weight shards, shared across tenants
-        #[arg(long)]
-        share_weights: bool,
     },
 
     /// Residency-aware placement across a cluster, with the control plane's own cost charged
@@ -260,13 +257,8 @@ fn best_split(t: Trial, hard: bool, step: f64) -> (Report, [f64; BlobKind::N]) {
     best.expect("sweep produced no candidate splits")
 }
 
-const PHASE_NAME: [&str; 4] = [
-    "inference-heavy",
-    "faas-burst",
-    "training-window",
-    "mixed-steady",
-];
-const CLASS_NAME: [&str; BlobKind::N] = ["inference", "faas", "training", "service"];
+const PHASE_NAME: [&str; 4] = ["agent-heavy", "faas-burst", "service-steady", "mixed"];
+const CLASS_NAME: [&str; BlobKind::N] = ["inference-kv", "faas", "weights", "service"];
 
 fn ms(ns: u64) -> f64 {
     ns as f64 / 1e6
@@ -354,7 +346,6 @@ fn placement(
     seed: u64,
     bands: [u8; BlobKind::N],
     drain_at: f64,
-    share_weights: bool,
 ) {
     use polyphonic::machine::{Machine, Placement};
     use polyphonic::topo::Topology;
@@ -367,12 +358,6 @@ fn placement(
          cross-domain link constants are MODELLED (coherent, ~2x per-byte, 120 ns hop)",
         gib(per_socket)
     );
-    if share_weights {
-        println!(
-            "inference depends on shared model weight shards ({} tenants over 4 models)",
-            24
-        );
-    }
     if drain_at > 0.0 {
         println!(
             "domain 0 drained at {:.0}% through the trace; its state migrates\n",
@@ -407,13 +392,7 @@ fn placement(
         } else {
             u64::MAX
         };
-        let wl = polyphonic::work::Workload::new(seed, ops, 1.0);
-        let wl = if share_weights {
-            wl.with_shared_weights()
-        } else {
-            wl
-        };
-        for (i, req) in wl.enumerate() {
+        for (i, req) in polyphonic::work::Workload::new(seed, ops, 1.0).enumerate() {
             if i as u64 == drain_op {
                 m.drain(0);
             }
@@ -428,6 +407,7 @@ fn placement(
             Placement::Blind => "blind",
             Placement::Sticky => "sticky",
             Placement::Aware => "aware",
+            Placement::Scored => "scored",
         };
         println!(
             "{label:<10} {:>11.3}ms {:>13.1}s {:>10.2}s {:>11.1}% {:>9.1}% {:>13.2}",
@@ -833,7 +813,6 @@ fn main() {
             seed,
             bands,
             drain_at,
-            share_weights,
         } => {
             placement(
                 sockets,
@@ -844,7 +823,6 @@ fn main() {
                 seed,
                 bands_of(&bands),
                 drain_at,
-                share_weights,
             );
         }
         Cmd::Flows {
@@ -969,34 +947,104 @@ fn boundary(repeat: usize) {
     }
 }
 
-type ClassRow<'a> = (
-    &'a str,
-    [u64; BlobKind::N],
-    [u64; BlobKind::N],
-    [u64; BlobKind::N],
-);
+#[derive(Default, Clone)]
+struct ClassTally {
+    stall: [u64; BlobKind::N],
+    service: [u64; BlobKind::N],
+    decide: [u64; BlobKind::N],
+    ops: [u64; BlobKind::N],
+    warm: [u64; BlobKind::N],
+    /// Service time of warm requests only. A warm invocation is the regime where an overhead
+    /// measured in tens of microseconds stops being a rounding error.
+    warm_ns: [u64; BlobKind::N],
+}
+
+type ClassRow<'a> = (&'a str, ClassTally);
 type ClassRows<'a> = [ClassRow<'a>];
 
+/// Service time is the denominator that matters: an overhead is only ever a fraction of the
+/// work it decorates, and a warm invocation has almost no work.
 fn class_table(rows: &ClassRows<'_>) {
-    println!("\n  per class: mean stall (ms) / share of it spent deciding");
-    print!("  {:<20}", "arm");
+    println!("\n  per class: mean service time (ms) / share spent deciding / warm rate");
+    print!("  {:<18}", "arm");
     for name in CLASS_NAME {
-        print!("{name:>22}");
+        print!("{name:>26}");
     }
     println!();
-    for (label, by, ops_k, dec) in rows {
-        print!("  {label:<20}");
+    for (label, t) in rows {
+        print!("  {label:<18}");
         for k in BlobKind::ALL {
             let i = k.idx();
             print!(
-                "{:>15.3} {:>5.1}%",
-                mean_ms(by[i], ops_k[i]),
-                100.0 * dec[i] as f64 / by[i].max(1) as f64
+                "{:>14.3} {:>5.2}% {:>4.0}%",
+                mean_ms(t.service[i], t.ops[i]),
+                100.0 * t.decide[i] as f64 / t.service[i].max(1) as f64,
+                100.0 * t.warm[i] as f64 / t.ops[i].max(1) as f64,
             );
         }
         println!();
     }
     println!();
+}
+
+use polyphonic::machine::{Control, Placement};
+
+type Arm = (&'static str, Placement, bool, Control);
+
+fn distributed_arms(gossip_period: u64) -> Vec<Arm> {
+    vec![
+        ("hash only", Placement::Sticky, false, Control::Unified),
+        ("residency only", Placement::Aware, false, Control::Unified),
+        ("flow only", Placement::Sticky, true, Control::Unified),
+        ("both, unified", Placement::Aware, true, Control::Unified),
+        ("both, rpc query", Placement::Aware, true, Control::Query),
+        (
+            "both, gossiped",
+            Placement::Aware,
+            true,
+            Control::Gossip {
+                period: gossip_period,
+            },
+        ),
+        ("scored", Placement::Scored, true, Control::Unified),
+        (
+            "scored, no flows",
+            Placement::Scored,
+            false,
+            Control::Unified,
+        ),
+    ]
+}
+
+fn score_terms(mach: &polyphonic::machine::Machine, served: u64) {
+    let pct = |n: u64| 100.0 * n as f64 / served.max(1) as f64;
+    println!(
+        "{:<22} moved by displacement {:.1}%, by flow {:.1}%, held at affinity {:.1}%; \
+         {:.1}% of {} flows co-placed",
+        "",
+        pct(mach.moved_by_displacement),
+        pct(mach.moved_by_flow),
+        pct(mach.held_by_affinity),
+        100.0 * mach.flow_coplaced as f64 / mach.flow_requests.max(1) as f64,
+        mach.flow_requests,
+    );
+}
+
+fn cluster_header(
+    nodes: usize,
+    units_per_node: usize,
+    per_node: u64,
+    crossing: &str,
+    cost: polyphonic::boundary::Cost,
+) {
+    println!(
+        "cluster: {nodes} nodes x {:.1} GiB, {units_per_node} units each\n\
+         control crossing: {crossing} = {:.1} us + {:.3} ns/byte (MEASURED on this host)\n\
+         node link latency and bandwidth are MODELLED\n",
+        gib(per_node),
+        cost.fixed_ns / 1000.0,
+        cost.ns_per_byte,
+    );
 }
 
 fn crossing_of(l: &polyphonic::boundary::Ladder, name: &str) -> Option<polyphonic::boundary::Cost> {
@@ -1030,7 +1078,7 @@ fn distributed(
     gossip_period: u64,
     repeat: usize,
 ) {
-    use polyphonic::machine::{Control, Machine, Placement};
+    use polyphonic::machine::Machine;
     use polyphonic::topo::{Distance, Topology};
 
     let ladder = polyphonic::boundary::measure(repeat);
@@ -1039,77 +1087,64 @@ fn distributed(
         return;
     };
     let per_node = dram / nodes as u64;
-    let split = [0.12, 0.12, 0.12, 0.25];
+    // A class's floor must be at least its smallest indivisible working-set unit. One model is
+    // two 512 MiB shards, so a weights floor below 1 GiB per node cannot hold a whole model and
+    // the ledger thrashes on something no policy can fix.
+    let split = [0.10, 0.12, 0.50, 0.26];
 
-    println!(
-        "cluster: {nodes} nodes x {:.1} GiB, {units_per_node} units each\n\
-         control crossing: {crossing} = {:.1} us + {:.3} ns/byte (MEASURED on this host)\n\
-         node link latency and bandwidth are MODELLED\n",
-        gib(per_node),
-        cost.fixed_ns / 1000.0,
-        cost.ns_per_byte,
-    );
+    cluster_header(nodes, units_per_node, per_node, crossing, cost);
 
     // Residency routing and flow co-placement are separate mechanisms that were previously
     // bundled into one arm. Split so the win can be attributed to one of them.
-    let arms: Vec<(&str, Placement, bool, Control)> = vec![
-        ("hash only", Placement::Sticky, false, Control::Unified),
-        ("residency only", Placement::Aware, false, Control::Unified),
-        ("flow only", Placement::Sticky, true, Control::Unified),
-        ("both, unified", Placement::Aware, true, Control::Unified),
-        ("both, rpc query", Placement::Aware, true, Control::Query),
-        (
-            "both, gossiped",
-            Placement::Aware,
-            true,
-            Control::Gossip {
-                period: gossip_period,
-            },
-        ),
-    ];
+    let mut warm_seen = [(0u64, 0u64); BlobKind::N];
+    let arms = distributed_arms(gossip_period);
 
     for name in distances.split(',') {
-        let Ok(d) = name.trim().parse::<Distance>() else {
+        let Ok(dist) = name.trim().parse::<Distance>() else {
             println!("skipping unknown distance {name}");
             continue;
         };
-        let topo = Topology::cluster(nodes, units_per_node, per_node, d, cost);
+        let topo = Topology::cluster(nodes, units_per_node, per_node, dist, cost);
         println!(
             "== {} : {:.0} us hop, {:.2} ns/byte ==",
-            d.label(),
-            d.one_way_ns() as f64 / 1000.0,
-            d.ns_per_byte()
+            dist.label(),
+            dist.one_way_ns() as f64 / 1000.0,
+            dist.ns_per_byte()
         );
         println!(
             "{:<22} {:>12} {:>12} {:>10} {:>9} {:>10} {:>12}",
-            "arm", "stall/req", "deciding", "of stall", "stale", "cold", "ctl rpc/req"
+            "arm", "stall/req", "deciding", "of stall", "split", "handoff", "node spread"
         );
         let mut base = 0.0;
         let mut per_class: Vec<ClassRow<'_>> = Vec::new();
         for (label, placement, flow, control) in &arms {
-            let mut m = Machine::new(
+            let mut mach = Machine::new(
                 topo.clone(),
                 nvme / nodes as u64,
                 Policy::Gdsf,
                 |cap| Quota::from_split(cap, split, bands, false),
                 *placement,
             );
-            m.set_flow_aware(*flow);
-            m.set_control(*control, cost);
+            mach.set_flow_aware(*flow);
+            mach.set_control(*control, cost);
             let (mut total, mut served) = (0u64, 0u64);
-            let mut by_kind = [0u64; BlobKind::N];
-            let mut ops_kind = [0u64; BlobKind::N];
-            let mut decide_kind = [0u64; BlobKind::N];
+            let mut t = ClassTally::default();
             for req in polyphonic::work::Workload::new(seed, ops, 1.0) {
-                let k = req.chain.first().map_or(0, |(_, m)| m.kind.idx());
-                let c = m.serve_request(&req);
+                let k = req.chain.first().map_or(0, |(_, meta)| meta.kind.idx());
+                let c = mach.serve_request(&req);
                 if c.pending {
                     continue;
                 }
                 total += c.total_ns();
-                by_kind[k] += c.total_ns();
-                decide_kind[k] += c.decide_ns;
-                ops_kind[k] += 1;
+                t.stall[k] += c.total_ns();
+                t.service[k] += c.service_ns();
+                t.decide[k] += c.decide_ns;
+                t.ops[k] += 1;
+                // Warm means the ledger had everything: no fetch, no recompute, just the work.
+                if c.transfer_ns == 0 && c.recompute_ns == 0 {
+                    t.warm[k] += 1;
+                    t.warm_ns[k] += c.service_ns();
+                }
                 served += 1;
             }
             let stall = mean_ms(total, served);
@@ -1117,25 +1152,37 @@ fn distributed(
                 base = stall;
             }
             println!(
-                "{label:<22} {stall:>11.3}ms {:>11.3}ms {:>9.2}% {:>8.1}% {:>9.1}% {:>12.1}",
-                mean_ms(m.decide_ns, served),
-                100.0 * m.decide_ns as f64 / total.max(1) as f64,
-                100.0 * m.stale_decisions as f64 / served.max(1) as f64,
-                100.0 * m.cold as f64 / served.max(1) as f64,
-                m.control_rpcs as f64 / served.max(1) as f64,
+                "{label:<22} {stall:>11.3}ms {:>11.3}ms {:>9.2}% {:>8.1}% {:>9.2}s {:>12.2}",
+                mean_ms(mach.decide_ns, served),
+                100.0 * mach.decide_ns as f64 / total.max(1) as f64,
+                100.0 * mach.split_tasks as f64
+                    / (mach.split_tasks + mach.joined_tasks).max(1) as f64,
+                mach.handoff_ns as f64 / 1e9,
+                mach.domain_spread(),
             );
-            per_class.push((*label, by_kind, ops_kind, decide_kind));
+            if *placement == Placement::Scored {
+                score_terms(&mach, served);
+            }
+            for (seen, (ns, n)) in warm_seen.iter_mut().zip(t.warm_ns.iter().zip(&t.warm)) {
+                seen.0 += ns;
+                seen.1 += n;
+            }
+            per_class.push((*label, t));
         }
 
         class_table(&per_class);
     }
-    crossover(&ladder, cost);
+    crossover(&ladder, cost, &warm_seen);
 }
 
 /// The boundary tax is not a fixed overhead, it is a fraction -- and the fraction depends
 /// entirely on how long the work being scheduled takes. The ladder is measured; this only
 /// divides it by service times spanning a warm `FaaS` invocation to a full prefill.
-fn crossover(ladder: &polyphonic::boundary::Ladder, grpc: polyphonic::boundary::Cost) {
+fn crossover(
+    ladder: &polyphonic::boundary::Ladder,
+    grpc: polyphonic::boundary::Cost,
+    warm: &[(u64, u64); BlobKind::N],
+) {
     use polyphonic::boundary::Boundary;
     const RPCS: f64 = 4.0;
     let Some(ring) = ladder.get(Boundary::Ring) else {
@@ -1150,20 +1197,33 @@ fn crossover(ladder: &polyphonic::boundary::Ladder, grpc: polyphonic::boundary::
         ring.ns(q) as f64 / 1000.0
     );
     println!(
-        "{:<34} {:>12} {:>12}",
+        "{:<40} {:>12} {:>12}",
         "work being scheduled", "over gRPC", "over a ring"
     );
-    for (name, ns) in [
-        ("warm FaaS invocation (10 us)", 10_000.0),
-        ("FaaS snapshot restore (1 ms)", 1_000_000.0),
-        ("agent turn, cached prefix (5 ms)", 5_000_000.0),
-        ("inference request (30 ms)", 30_000_000.0),
-        ("cold start (1 s)", 1_000_000_000.0),
-    ] {
+    let row = |name: &str, ns: f64| {
         println!(
-            "{name:<34} {:>11.1}% {:>11.2}%",
+            "{name:<40} {:>11.1}% {:>11.2}%",
             100.0 * g / (g + ns),
             100.0 * r / (r + ns)
         );
+    };
+    for (k, name) in CLASS_NAME.iter().enumerate() {
+        let (ns, n) = warm[k];
+        if n == 0 {
+            continue;
+        }
+        let mean = ns as f64 / n as f64;
+        row(
+            &format!("warm {name} ({n} seen, {:.0} us)", mean / 1000.0),
+            mean,
+        );
+    }
+    println!();
+    for (name, ns) in [
+        ("hypothetical: 10 us of work", 10_000.0),
+        ("hypothetical: 1 ms of work", 1_000_000.0),
+        ("hypothetical: 100 ms of work", 100_000_000.0),
+    ] {
+        row(name, ns);
     }
 }
