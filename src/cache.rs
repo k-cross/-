@@ -2,17 +2,83 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 
 use crate::blob::{BlobId, BlobKind, BlobMeta};
+use crate::tier::TierSpec;
 
 const FREQ_CAP: u32 = 16;
 
 // A replica with live connections cannot be evicted at any price; only an idle one is a candidate.
 const SERVING_WINDOW: u64 = 600;
-use crate::tier::TierSpec;
+
+const PINNED_SCAN_LIMIT: u32 = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Policy {
     Gdsf,
+    #[allow(dead_code, reason = "baseline policy retained for arm comparison")]
     Lru,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Admission {
+    Admitted,
+    Pending,
+}
+
+/// Per-class guarantees. A class at or below its floor is never reclaimed from.
+/// `hard` additionally forbids growing past the floor, turning it into a partition.
+#[derive(Clone, Copy, Debug)]
+pub struct Quota {
+    /// Priority band per class: 0 is latency-critical, higher is more sacrificial. Operator
+    /// configuration, not a property of the workload kind -- the control plane does not know
+    /// which of a user's workloads matters most.
+    pub band: [u8; BlobKind::N],
+    pub floor: [u64; BlobKind::N],
+    /// Soft ceiling: `floor[k] + slack`. A class may grow past it into free space, but may not
+    /// *preempt* a more-sacrificial band to get there, so it can never consume another
+    /// workload's guaranteed floor.
+    pub limit: [u64; BlobKind::N],
+    pub hard: bool,
+}
+
+impl Quota {
+    #[must_use]
+    pub fn open(capacity: u64, band: [u8; BlobKind::N]) -> Self {
+        Self {
+            band,
+            floor: [0; BlobKind::N],
+            limit: [capacity; BlobKind::N],
+            hard: false,
+        }
+    }
+
+    #[must_use]
+    pub fn max_band(&self) -> u8 {
+        self.band.iter().copied().max().unwrap_or(0)
+    }
+
+    /// `split` may sum to less than 1; the remainder is shared slack every class can grow into.
+    #[must_use]
+    pub fn from_split(
+        capacity: u64,
+        split: [f64; BlobKind::N],
+        band: [u8; BlobKind::N],
+        hard: bool,
+    ) -> Self {
+        let floor = split.map(|f| (capacity as f64 * f) as u64);
+        let reserved: u64 = floor.iter().sum();
+        let slack = capacity.saturating_sub(reserved);
+        let limit = if hard {
+            floor
+        } else {
+            floor.map(|f| f + slack)
+        };
+        Self {
+            band,
+            floor,
+            limit,
+            hard,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -57,33 +123,39 @@ pub struct TierPool {
     spec: TierSpec,
     policy: Policy,
     leaf_first: bool,
+    quota: Quota,
     used: u64,
+    by_kind: [u64; BlobKind::N],
     clock: u64,
     epoch: u64,
     inflation: f64,
     entries: HashMap<BlobId, Entry>,
-    evictable: BinaryHeap<Reverse<Ranked>>,
+    evictable: [BinaryHeap<Reverse<Ranked>>; BlobKind::N],
     pub evicted: [u64; BlobKind::N],
-    pub overcommit: u64,
+    pub refused: [u64; BlobKind::N],
     pub pinned_skips: u64,
+    pub nonleaf_drops: u64,
 }
 
 impl TierPool {
     #[must_use]
-    pub fn new(spec: TierSpec, policy: Policy, leaf_first: bool) -> Self {
+    pub fn new(spec: TierSpec, policy: Policy, leaf_first: bool, quota: Quota) -> Self {
         Self {
             spec,
             policy,
             leaf_first,
+            quota,
             used: 0,
+            by_kind: [0; BlobKind::N],
             clock: 0,
             epoch: 0,
             inflation: 0.0,
             entries: HashMap::new(),
-            evictable: BinaryHeap::new(),
+            evictable: std::array::from_fn(|_| BinaryHeap::new()),
             evicted: [0; BlobKind::N],
-            overcommit: 0,
+            refused: [0; BlobKind::N],
             pinned_skips: 0,
+            nonleaf_drops: 0,
         }
     }
 
@@ -99,11 +171,12 @@ impl TierPool {
 
     #[must_use]
     pub fn resident_bytes(&self, kind: BlobKind) -> u64 {
-        self.entries
-            .values()
-            .filter(|e| e.meta.kind == kind)
-            .map(|e| e.meta.bytes)
-            .sum()
+        self.by_kind[kind.idx()]
+    }
+
+    #[must_use]
+    pub fn over_capacity(&self) -> bool {
+        self.used > self.spec.capacity
     }
 
     fn score(&self, meta: &BlobMeta, freq: u32) -> f64 {
@@ -113,21 +186,26 @@ impl TierPool {
         }
     }
 
+    fn is_serving(&self, e: &Entry) -> bool {
+        e.meta.kind == BlobKind::ServiceHeap
+            && self.clock.saturating_sub(e.last_touch) < SERVING_WINDOW
+    }
+
     fn reheap(&mut self, id: BlobId) {
         let Some(e) = self.entries.get_mut(&id) else {
             return;
         };
-        if e.resident_children > 0 && self.leaf_first {
-            return;
-        }
         self.epoch += 1;
         e.epoch = self.epoch;
-        let ranked = Ranked {
-            priority: e.priority,
-            epoch: e.epoch,
-            id,
-        };
-        self.evictable.push(Reverse(ranked));
+        let (k, ranked) = (
+            e.meta.kind.idx(),
+            Ranked {
+                priority: e.priority,
+                epoch: e.epoch,
+                id,
+            },
+        );
+        self.evictable[k].push(Reverse(ranked));
     }
 
     pub fn touch(&mut self, id: BlobId) {
@@ -136,6 +214,7 @@ impl TierPool {
             return;
         };
         e.freq = e.freq.saturating_add(1);
+        e.last_touch = self.clock;
         let (meta, freq) = (e.meta, e.freq);
         let p = self.score(&meta, freq);
         if let Some(e) = self.entries.get_mut(&id) {
@@ -162,61 +241,158 @@ impl TierPool {
         }
     }
 
-    fn is_serving(&self, e: &Entry) -> bool {
-        e.meta.kind == BlobKind::ServiceHeap
-            && self.clock.saturating_sub(e.last_touch) < SERVING_WINDOW
-    }
-
-    fn pop_victim(&mut self) -> Option<(BlobId, Entry)> {
-        let mut parked = Vec::new();
-        let victim = self.scan_victim(&mut parked);
-        for r in parked {
-            self.evictable.push(Reverse(r));
-        }
-        victim
-    }
-
-    fn scan_victim(&mut self, parked: &mut Vec<Ranked>) -> Option<(BlobId, Entry)> {
-        while let Some(Reverse(r)) = self.evictable.pop() {
-            let Some(e) = self.entries.get(&r.id) else {
-                continue;
-            };
-            if e.epoch != r.epoch {
+    fn clean_top(&mut self, k: usize, parked: &mut Vec<(usize, Ranked)>) -> Option<f64> {
+        let mut skipped = 0;
+        loop {
+            let Reverse(r) = *self.evictable[k].peek()?;
+            let stale = self.entries.get(&r.id).is_none_or(|e| e.epoch != r.epoch);
+            if stale {
+                self.evictable[k].pop();
                 continue;
             }
+            let e = self.entries[&r.id];
+            // A non-leaf is not pinned, just not yet evictable. unlink_parent re-heaps it the
+            // moment its last child goes, so drop it rather than paying to carry it.
             if self.leaf_first && e.resident_children > 0 {
+                self.evictable[k].pop();
+                self.nonleaf_drops += 1;
                 continue;
             }
-            if self.is_serving(e) {
+            if self.is_serving(&e) {
                 self.pinned_skips += 1;
-                parked.push(r);
+                self.evictable[k].pop();
+                parked.push((k, r));
+                skipped += 1;
+                // A serving replica must come back. If the class's cheapest bytes are all
+                // serving, look elsewhere rather than draining a heap we cannot reclaim from.
+                if skipped >= PINNED_SCAN_LIMIT {
+                    return None;
+                }
                 continue;
             }
-            let e = self.entries.remove(&r.id)?;
-            self.used -= e.meta.bytes;
-            self.inflation = r.priority;
-            self.evicted[e.meta.kind.idx()] += 1;
-            self.unlink_parent(e.meta.parent);
-            return Some((r.id, e));
+            return Some(r.priority);
+        }
+    }
+
+    fn cheapest(
+        &mut self,
+        parked: &mut Vec<(usize, Ranked)>,
+        band: u8,
+        above_floor: bool,
+    ) -> Option<usize> {
+        let mut best: Option<(usize, f64)> = None;
+        for k in 0..BlobKind::N {
+            if self.quota.band[k] != band {
+                continue;
+            }
+            if above_floor && self.by_kind[k] <= self.quota.floor[k] {
+                continue;
+            }
+            if let Some(p) = self.clean_top(k, parked)
+                && best.is_none_or(|(_, bp)| p < bp)
+            {
+                best = Some((k, p));
+            }
+        }
+        best.map(|(k, _)| k)
+    }
+
+    /// Reclaim order is lexicographic by band, then by price.
+    ///
+    /// Admitting into band `b` may take freely from any more-sacrificial band (floors there
+    /// do not protect against a higher-priority admission), then from band `b` itself under
+    /// the floor rules -- above floor first, since a floor is a preference and not a barrier.
+    /// Bands below `b` are never touched, so best-effort work cannot displace
+    /// latency-critical state however valuable its bytes look per byte.
+    /// Reclaim takes from classes **above their floor**, most-sacrificial band first, then
+    /// cheapest within the band.
+    ///
+    /// Floors are inviolable, so no class can be pushed below its guarantee by any other
+    /// whatever its priority -- that is the anti-starvation property. Band orders only the
+    /// burstable bytes above those floors, so a best-effort class gives up its slack long
+    /// before a latency-critical one does, but a critical class cannot permanently own slack
+    /// it merely reached first.
+    fn pick_class(&mut self, want: usize, parked: &mut Vec<(usize, Ranked)>) -> Option<usize> {
+        if self.quota.hard {
+            return self.clean_top(want, parked).map(|_| want);
+        }
+        // At or over its soft limit a class may recycle its own bytes and take free space,
+        // but may not preempt anyone else -- otherwise one class pushes every other down to
+        // its floor and holds there.
+        if self.by_kind[want] >= self.quota.limit[want] {
+            return self.clean_top(want, parked).map(|_| want);
+        }
+        // Every class above its floor is a candidate, most-sacrificial band first. Protecting
+        // a critical band's *burstable* bytes as well as its floor is what starves everyone
+        // else: the guarantee is the floor, and nothing above it is owned.
+        for b in (0..=self.quota.max_band()).rev() {
+            if let Some(k) = self.cheapest(parked, b, true) {
+                return Some(k);
+            }
         }
         None
     }
 
-    pub fn admit(&mut self, id: BlobId, meta: BlobMeta, out: &mut Vec<(BlobId, BlobMeta)>) {
+    fn take_victim(&mut self, k: usize) -> Option<(BlobId, Entry)> {
+        let Reverse(r) = self.evictable[k].pop()?;
+        let e = self.entries.remove(&r.id)?;
+        self.used -= e.meta.bytes;
+        self.by_kind[k] -= e.meta.bytes;
+        self.inflation = r.priority;
+        self.evicted[k] += 1;
+        self.unlink_parent(e.meta.parent);
+        Some((r.id, e))
+    }
+
+    pub fn admit(
+        &mut self,
+        id: BlobId,
+        meta: BlobMeta,
+        out: &mut Vec<(BlobId, BlobMeta)>,
+    ) -> Admission {
         if self.entries.contains_key(&id) {
             self.touch(id);
-            return;
+            return Admission::Admitted;
+        }
+        let k = meta.kind.idx();
+        let ceiling = if self.quota.hard {
+            self.quota.floor[k].min(self.spec.capacity)
+        } else {
+            self.spec.capacity
+        };
+        if meta.bytes > ceiling {
+            self.refused[k] += 1;
+            return Admission::Pending;
         }
         self.link_parent(meta.parent);
-        while self.used + meta.bytes > self.spec.capacity {
-            let Some((vid, v)) = self.pop_victim() else {
-                self.overcommit += 1;
-                break;
+        let mut parked = Vec::new();
+        loop {
+            let held = if self.quota.hard {
+                self.by_kind[k]
+            } else {
+                self.used
             };
-            out.push((vid, v.meta));
+            if held + meta.bytes <= ceiling {
+                break;
+            }
+            let Some(c) = self.pick_class(k, &mut parked) else {
+                self.unlink_parent(meta.parent);
+                for (pk, r) in parked {
+                    self.evictable[pk].push(Reverse(r));
+                }
+                self.refused[k] += 1;
+                return Admission::Pending;
+            };
+            if let Some((vid, v)) = self.take_victim(c) {
+                out.push((vid, v.meta));
+            }
+        }
+        for (pk, r) in parked {
+            self.evictable[pk].push(Reverse(r));
         }
         self.clock += 1;
         self.used += meta.bytes;
+        self.by_kind[k] += meta.bytes;
         let priority = self.score(&meta, 1);
         self.epoch += 1;
         self.entries.insert(
@@ -231,11 +407,13 @@ impl TierPool {
             },
         );
         self.reheap(id);
+        Admission::Admitted
     }
 
     pub fn remove(&mut self, id: &BlobId) -> Option<BlobMeta> {
         let e = self.entries.remove(id)?;
         self.used -= e.meta.bytes;
+        self.by_kind[e.meta.kind.idx()] -= e.meta.bytes;
         self.unlink_parent(e.meta.parent);
         Some(e.meta)
     }
@@ -246,6 +424,7 @@ pub struct Cost {
     pub transfer_ns: u64,
     pub recompute_ns: u64,
     pub bytes_in: u64,
+    pub pending: bool,
 }
 
 impl Cost {
@@ -266,23 +445,24 @@ pub struct Hierarchy {
 
 impl Hierarchy {
     #[must_use]
-    pub fn new(dram: TierSpec, nvme: TierSpec, policy: Policy) -> Self {
+    pub fn new(dram: TierSpec, nvme: TierSpec, policy: Policy, quota: Quota) -> Self {
         Self {
-            dram: TierPool::new(dram, policy, true),
-            nvme: TierPool::new(nvme, policy, false),
+            dram: TierPool::new(dram, policy, true, quota),
+            nvme: TierPool::new(nvme, policy, false, Quota::open(nvme.capacity, quota.band)),
             hits: [0; BlobKind::N],
             nvme_hits: [0; BlobKind::N],
             misses: [0; BlobKind::N],
         }
     }
 
-    fn admit_dram(&mut self, id: BlobId, meta: BlobMeta) {
+    fn admit_dram(&mut self, id: BlobId, meta: BlobMeta) -> Admission {
         let mut demoted = Vec::new();
-        self.dram.admit(id, meta, &mut demoted);
+        let a = self.dram.admit(id, meta, &mut demoted);
         for (did, dmeta) in demoted {
             let mut dropped = Vec::new();
-            self.nvme.admit(did, dmeta, &mut dropped);
+            let _ = self.nvme.admit(did, dmeta, &mut dropped);
         }
+        a
     }
 
     pub fn access(&mut self, chain: &[(BlobId, BlobMeta)]) -> Cost {
@@ -295,7 +475,12 @@ impl Hierarchy {
         }
         for &(id, meta) in &chain[hit..] {
             let k = meta.kind.idx();
-            if self.nvme.contains(&id) {
+            let staged = self.nvme.contains(&id);
+            if self.admit_dram(id, meta) == Admission::Pending {
+                cost.pending = true;
+                return cost;
+            }
+            if staged {
                 cost.transfer_ns += self.nvme.spec().fetch_ns(meta.bytes);
                 self.nvme.remove(&id);
                 self.nvme_hits[k] += 1;
@@ -304,7 +489,6 @@ impl Hierarchy {
                 self.misses[k] += 1;
             }
             cost.bytes_in += meta.bytes;
-            self.admit_dram(id, meta);
         }
         cost
     }

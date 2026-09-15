@@ -7,9 +7,9 @@ mod store;
 mod tier;
 mod work;
 
-use arms::{Cache, Report, run};
+use arms::{Report, Trial, mean_ms, run};
 use blob::BlobKind;
-use cache::Policy;
+use cache::{Policy, Quota};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
@@ -40,6 +40,9 @@ enum Cmd {
         /// Phase-shift amplitude: 0 = flat mix, 1 = full swing
         #[arg(long, default_value_t = 1.0)]
         volatility: f64,
+        /// Priority bands as inference,faas,training,service (0 = highest)
+        #[arg(long, default_value = "0,1,2,1", value_parser = parse_bands)]
+        bands: String,
     },
 
     /// Measure this machine's real tier costs: page-fault, spill write, spill read
@@ -66,6 +69,28 @@ enum Cmd {
     },
 }
 
+fn parse_bands(s: &str) -> Result<String, String> {
+    let n = s.split(',').count();
+    if n != BlobKind::N {
+        return Err(format!(
+            "expected {} comma-separated bands, got {n}",
+            BlobKind::N
+        ));
+    }
+    for p in s.split(',') {
+        p.trim().parse::<u8>().map_err(|e| e.to_string())?;
+    }
+    Ok(s.to_string())
+}
+
+fn bands_of(s: &str) -> [u8; BlobKind::N] {
+    let mut out = [0u8; BlobKind::N];
+    for (i, p) in s.split(',').enumerate() {
+        out[i] = p.trim().parse().unwrap_or(0);
+    }
+    out
+}
+
 fn parse_bytes(s: &str) -> Result<u64, String> {
     let t = s.trim();
     let (num, mult) = if let Some(p) = t.strip_suffix("GiB") {
@@ -83,29 +108,72 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
         .map_err(|e| e.to_string())
 }
 
-fn best_static(
-    dram: u64,
-    nvme: u64,
-    policy: Policy,
-    seed: u64,
-    ops: u64,
-    step: f64,
-    vol: f64,
-) -> (Report, [f64; BlobKind::N]) {
+/// Band-lexicographic objective: inference first, then customer-facing, then training.
+/// Training is best-effort, so a configuration is preferred if it improves a higher band
+/// even at the cost of a lower one.
+fn prefer(a: &Report, b: &Report, bands: [u8; BlobKind::N]) -> bool {
+    // Throughput before latency: a config may not buy a faster band by dropping requests.
+    let (ga, gb) = (a.goodput(), b.goodput());
+    if (ga - gb).abs() > 0.02 {
+        return ga > gb;
+    }
+    let max_band = bands.iter().copied().max().unwrap_or(0);
+    for band in 0..=max_band {
+        let stall = |r: &Report| -> f64 {
+            let (mut ns, mut ops) = (0u64, 0u64);
+            for (k, &kb) in bands.iter().enumerate() {
+                if kb == band {
+                    ns += r.kind_ns[k];
+                    ops += r.kind_ops[k];
+                }
+            }
+            mean_ms(ns, ops)
+        };
+        let good = |r: &Report| -> f64 {
+            let (mut s, mut n) = (0u64, 0u64);
+            for (k, &kb) in bands.iter().enumerate() {
+                if kb == band {
+                    s += r.served[k];
+                    n += r.served[k] + r.refused[k];
+                }
+            }
+            if n == 0 { 1.0 } else { s as f64 / n as f64 }
+        };
+        let (ga, gb) = (good(a), good(b));
+        if (ga - gb).abs() > 0.02 {
+            return ga > gb;
+        }
+        let (sa, sb) = (stall(a), stall(b));
+        if sa < sb * 0.98 {
+            return true;
+        }
+        if sb < sa * 0.98 {
+            return false;
+        }
+    }
+    false
+}
+
+fn best_split(t: Trial, hard: bool, step: f64) -> (Report, [f64; BlobKind::N]) {
     let mut best: Option<(Report, [f64; BlobKind::N])> = None;
     let n = (1.0 / step).round() as u64;
     for a in 1..n {
         for b in 1..n - a {
             for c in 1..n - a - b {
-                let split = [a, b, c, n - a - b - c].map(|x| x as f64 / n as f64);
-                let r = run("", Cache::siloed(dram, nvme, split, policy), seed, ops, vol);
-                if best.as_ref().is_none_or(|(x, _)| r.total_ns < x.total_ns) {
-                    best = Some((r, split));
+                // splits sum to less than n; the remainder is shared slack
+                for d in 1..n - a - b - c {
+                    let split = [a, b, c, d].map(|x| x as f64 / n as f64);
+                    let q = Quota::from_split(t.dram, split, t.bands, hard);
+                    let r = run("", t, q);
+                    let better = best.as_ref().is_none_or(|(x, _)| prefer(&r, x, t.bands));
+                    if better {
+                        best = Some((r, split));
+                    }
                 }
             }
         }
     }
-    best.expect("sweep produced no candidate partitions")
+    best.expect("sweep produced no candidate splits")
 }
 
 const PHASE_NAME: [&str; 4] = [
@@ -114,6 +182,7 @@ const PHASE_NAME: [&str; 4] = [
     "training-window",
     "mixed-steady",
 ];
+const CLASS_NAME: [&str; BlobKind::N] = ["inference", "faas", "training", "service"];
 
 fn ms(ns: u64) -> f64 {
     ns as f64 / 1e6
@@ -123,39 +192,14 @@ fn gib(b: u64) -> f64 {
     b as f64 / (1u64 << 30) as f64
 }
 
-fn main() {
-    match Cli::parse().cmd {
-        Cmd::Residency {
-            dram,
-            nvme,
-            ops,
-            seed,
-            step,
-            volatility,
-        } => {
-            residency_report(dram, nvme, ops, seed, step, volatility);
-        }
-        Cmd::Calibrate { path, iters } => calibrate(&path, iters),
-        Cmd::Volatility {
-            dram,
-            nvme,
-            ops,
-            seed,
-            step,
-        } => {
-            volatility_sweep(dram, nvme, ops, seed, step);
-        }
-    }
-}
-
 fn calibrate(path: &str, iters: u32) {
     use crate::blob::BlobId;
     use crate::store::Store;
 
     let sizes: [(&str, usize); 4] = [
-        ("kv-block   512KiB", 512 * 1024),
+        ("kv-block    512KiB", 512 * 1024),
         ("prefill-batch 2MiB", 2 * 1024 * 1024),
-        ("snapshot    32MiB", 32 * 1024 * 1024),
+        ("snapshot     32MiB", 32 * 1024 * 1024),
         ("weight-shard 512MiB", 512 * 1024 * 1024),
     ];
     let mut store = Store::open(std::path::Path::new(path), 8 << 30).expect("open spill file");
@@ -190,33 +234,15 @@ fn calibrate(path: &str, iters: u32) {
     let _ = std::fs::remove_file(path);
 }
 
-fn volatility_sweep(dram: u64, nvme: u64, ops: u64, seed: u64, step: f64) {
-    println!("dram={:.1}GiB ops={ops} seed={seed}\n", gib(dram));
-    println!(
-        "{:>10} {:>16} {:>16} {:>12}",
-        "volatility", "siloed-gdsf (s)", "unified (s)", "advantage"
-    );
-    for i in 0..=5 {
-        let v = f64::from(i) / 5.0;
-        let (gd, _) = best_static(dram, nvme, Policy::Gdsf, seed, ops, step, v);
-        let uni = run("", Cache::unified(dram, nvme, Policy::Gdsf), seed, ops, v);
-        let adv = 100.0 * (gd.total_ns as f64 - uni.total_ns as f64) / gd.total_ns as f64;
-        println!(
-            "{v:>10.1} {:>16.2} {:>16.2} {adv:>11.1}%",
-            gd.total_ns as f64 / 1e9,
-            uni.total_ns as f64 / 1e9
-        );
-    }
-}
-
 fn arm_row(r: &Report) {
+    let served: u64 = r.served.iter().sum();
     println!(
-        "{:<34} {:>11.2} {:>9.0}% {:>9.3} {:>9.3}   {:.2}/{:.2}/{:.2}/{:.2}   {:.1}/{:.1}/{:.1}/{:.1}",
+        "{:<32} {:>11.3} {:>9.3} {:>8.1}% {:>9.0}%   {:.2}/{:.2}/{:.2}/{:.2}   {:.1}/{:.1}/{:.1}/{:.1}",
         r.label,
-        r.total_ns as f64 / 1e9,
-        100.0 * r.transfer_ns as f64 / r.total_ns.max(1) as f64,
-        ms(r.p50_ns),
+        mean_ms(r.total_ns, served),
         ms(r.p99_ns),
+        100.0 * r.goodput(),
+        100.0 * r.transfer_ns as f64 / r.total_ns.max(1) as f64,
         r.hit[0],
         r.hit[1],
         r.hit[2],
@@ -228,93 +254,163 @@ fn arm_row(r: &Report) {
     );
 }
 
-fn residency_report(dram: u64, nvme: u64, ops: u64, seed: u64, step: f64, volatility: f64) {
+fn volatility_sweep(dram: u64, nvme: u64, ops: u64, seed: u64, step: f64) {
+    let bands = [0u8, 1, 2, 1];
+    println!("dram={:.1}GiB ops={ops} seed={seed}\n", gib(dram));
+    println!(
+        "{:>10} {:>18} {:>16} {:>12}",
+        "volatility", "hard-partition (ms)", "soft-floor (ms)", "advantage"
+    );
+    for i in 0..=5 {
+        let v = f64::from(i) / 5.0;
+        let t = Trial {
+            bands,
+            dram,
+            nvme,
+            policy: Policy::Gdsf,
+            seed,
+            ops,
+            vol: v,
+        };
+        let (hard, _) = best_split(t, true, step);
+        let (soft, _) = best_split(t, false, step);
+        let hm = mean_ms(hard.total_ns, hard.served.iter().sum());
+        let sm = mean_ms(soft.total_ns, soft.served.iter().sum());
+        println!(
+            "{v:>10.1} {hm:>18.3} {sm:>16.3} {:>11.1}%",
+            100.0 * (hm - sm) / hm
+        );
+    }
+}
+
+fn residency_report(
+    dram: u64,
+    nvme: u64,
+    ops: u64,
+    seed: u64,
+    step: f64,
+    volatility: f64,
+    bands: [u8; BlobKind::N],
+) {
     println!(
         "dram={:.1}GiB nvme={:.1}GiB ops={ops} seed={seed} volatility={volatility}\n",
         gib(dram),
         gib(nvme)
     );
+    println!("priority bands (operator-configured): {bands:?}\n");
 
-    let (mut lru, ls) = best_static(dram, nvme, Policy::Lru, seed, ops, step, volatility);
-    lru.label = format!(
-        "siloed-lru   [{:.2}/{:.2}/{:.2}/{:.2}]",
-        ls[0], ls[1], ls[2], ls[3]
-    );
-    let (mut gd, gs) = best_static(dram, nvme, Policy::Gdsf, seed, ops, step, volatility);
-    gd.label = format!(
-        "siloed-gdsf  [{:.2}/{:.2}/{:.2}/{:.2}]",
-        gs[0], gs[1], gs[2], gs[3]
-    );
-    let uni = run(
-        "unified-gdsf",
-        Cache::unified(dram, nvme, Policy::Gdsf),
+    let t = Trial {
+        bands,
+        dram,
+        nvme,
+        policy: Policy::Gdsf,
         seed,
         ops,
-        volatility,
+        vol: volatility,
+    };
+    let (mut hard, hs) = best_split(t, true, step);
+    hard.label = format!(
+        "hard-partition [{:.2}/{:.2}/{:.2}/{:.2}]",
+        hs[0], hs[1], hs[2], hs[3]
     );
+    let (mut soft, ss) = best_split(t, false, step);
+    soft.label = format!(
+        "soft-floor     [{:.2}/{:.2}/{:.2}/{:.2}]",
+        ss[0], ss[1], ss[2], ss[3]
+    );
+    let mut open = run("", t, Quota::open(dram, t.bands));
+    open.label = "no-floor       [open]".to_string();
 
     println!(
-        "{:<34} {:>11} {:>10} {:>9} {:>9} {:>20} {:>21}",
-        "arm", "stall (s)", "from tier", "p50 (ms)", "p99 (ms)", "hit kv/sn/wt/svc", "resident GiB"
+        "{:<32} {:>11} {:>9} {:>9} {:>10} {:>20} {:>21}",
+        "arm", "stall/req", "p99 (ms)", "goodput", "from tier", "hit kv/sn/wt/svc", "resident GiB"
     );
-    for r in [&lru, &gd, &uni] {
+    for r in [&hard, &soft, &open] {
         arm_row(r);
     }
-    println!("\nadmission integrity (nonzero overcommit invalidates the row above)");
-    for r in [&lru, &gd, &uni] {
+
+    println!("\nadmission integrity");
+    for r in [&hard, &soft, &open] {
         println!(
-            "{:<34} overcommit={:<10} pinned-skips={}",
-            r.label, r.overcommit, r.pinned_skips
+            "{:<32} over-capacity={:<7} refused={:?} pinned-skips={}",
+            r.label, r.over_capacity, r.refused, r.pinned_skips
         );
+    }
+
+    println!("\nper-class: mean stall per served request (ms) / goodput");
+    println!(
+        "{:<32} {:>16} {:>16} {:>16} {:>16}",
+        "arm", CLASS_NAME[0], CLASS_NAME[1], CLASS_NAME[2], CLASS_NAME[3]
+    );
+    for r in [&hard, &soft, &open] {
+        print!("{:<32}", r.label);
+        for k in 0..BlobKind::N {
+            let cell = format!(
+                "{:.1} / {:.0}%",
+                mean_ms(r.kind_ns[k], r.kind_ops[k]),
+                100.0 * r.class_goodput(k)
+            );
+            print!("{cell:>16}");
+        }
+        println!();
+    }
+
+    println!("\nshare of total stall by class (policy can only move what dominates)");
+    for r in [&hard, &soft, &open] {
+        print!("{:<32}", r.label);
+        for k in 0..BlobKind::N {
+            print!(
+                "{:>15.1}%",
+                100.0 * r.kind_ns[k] as f64 / r.total_ns.max(1) as f64
+            );
+        }
+        println!();
     }
 
     println!("\nstall (s) by phase");
     println!(
-        "{:<34} {:>16} {:>16} {:>16} {:>16}",
+        "{:<32} {:>16} {:>16} {:>16} {:>16}",
         "arm", PHASE_NAME[0], PHASE_NAME[1], PHASE_NAME[2], PHASE_NAME[3]
     );
-    for r in [&lru, &gd, &uni] {
-        print!("{:<34}", r.label);
+    for r in [&hard, &soft, &open] {
+        print!("{:<32}", r.label);
         for p in r.phase_ns {
             print!("{:>16.2}", p as f64 / 1e9);
         }
         println!();
     }
-    print!("{:<34}", "unified advantage");
-    for i in 0..PHASE_NAME.len() {
-        let b = gd.phase_ns[i] as f64;
-        print!(
-            "{:>15.1}%",
-            100.0 * (b - uni.phase_ns[i] as f64) / b.max(1.0)
-        );
-    }
-    println!();
 
-    println!("\nmean stall per request (ms), by workload class");
+    let hm = mean_ms(hard.total_ns, hard.served.iter().sum());
+    let sm = mean_ms(soft.total_ns, soft.served.iter().sum());
     println!(
-        "{:<34} {:>13} {:>13} {:>13} {:>13}",
-        "arm", "inference", "faas", "training", "service"
+        "\nsoft-floor vs hard-partition: {:+.1}% stall/req at {:+.1}pp goodput",
+        100.0 * (hm - sm) / hm,
+        100.0 * (soft.goodput() - hard.goodput())
     );
-    for r in [&gd, &uni] {
-        print!("{:<34}", r.label);
-        for k in 0..BlobKind::N {
-            print!("{:>13.2}", ms(r.kind_ns[k] / r.kind_ops[k].max(1)));
+}
+
+fn main() {
+    match Cli::parse().cmd {
+        Cmd::Residency {
+            dram,
+            nvme,
+            ops,
+            seed,
+            step,
+            volatility,
+            bands,
+        } => {
+            residency_report(dram, nvme, ops, seed, step, volatility, bands_of(&bands));
         }
-        println!();
+        Cmd::Calibrate { path, iters } => calibrate(&path, iters),
+        Cmd::Volatility {
+            dram,
+            nvme,
+            ops,
+            seed,
+            step,
+        } => {
+            volatility_sweep(dram, nvme, ops, seed, step);
+        }
     }
-    print!("{:<34}", "unified advantage");
-    for k in 0..BlobKind::N {
-        let b = (gd.kind_ns[k] / gd.kind_ops[k].max(1)) as f64;
-        let u = (uni.kind_ns[k] / uni.kind_ops[k].max(1)) as f64;
-        print!("{:>12.1}%", 100.0 * (b - u) / b.max(1.0));
-    }
-    println!();
-
-    let win =
-        |base: &Report| 100.0 * (base.total_ns as f64 - uni.total_ns as f64) / base.total_ns as f64;
-    println!(
-        "\nunified vs best-static-lru:  {:+.1}% stall\nunified vs best-static-gdsf: {:+.1}% stall  <- attributable to unification alone",
-        win(&lru),
-        win(&gd)
-    );
 }

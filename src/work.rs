@@ -11,11 +11,11 @@ pub const WEIGHT_NS: u64 = 4_000_000_000;
 const TENANTS: u64 = 24;
 const SESSIONS: usize = 512;
 const FUNCTIONS: u64 = 400;
-const SHARDS: u64 = 40;
-const SERVICES: u64 = 6;
-pub const SERVICE_BYTES: u64 = 512 * 1024 * 1024;
+const SHARDS: u64 = 8;
+const SERVICES: u64 = 3;
+pub const SERVICE_BYTES: u64 = 384 * 1024 * 1024;
 pub const SERVICE_COLD_NS: u64 = 15_000_000_000;
-const REPLICAS: [u64; PHASES] = [4, 1, 2, 4];
+const REPLICAS: [u64; PHASES] = [3, 1, 2, 3];
 const MAX_TURNS: u32 = 24;
 
 #[derive(Clone, Debug)]
@@ -198,7 +198,7 @@ impl Workload {
     }
 
     fn weights(&mut self) -> Vec<(BlobId, BlobMeta)> {
-        let s = self.rng.zipf(SHARDS, 1.1);
+        let s = self.rng.zipf(SHARDS, 2.0);
         let id = BlobId::leaf(format!("shard:{s}").as_bytes());
         vec![(
             id,
