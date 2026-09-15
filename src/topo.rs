@@ -229,3 +229,129 @@ impl Topology {
         Self::new(units, domains, links)
     }
 }
+
+/// How far apart two nodes are. The constants below are **modelled**, not measured -- this
+/// host is a laptop. They are round numbers from published cloud-provider latency floors and
+/// should be replaced with probe data before any result that depends on them is trusted. The
+/// per-crossing *boundary* cost added on top of these is measured (see `crate::boundary`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Distance {
+    /// Same host, different socket. Coherent: reachable by load/store.
+    Socket,
+    /// Same rack, one leaf switch.
+    Rack,
+    /// Same region, different availability zone.
+    Zone,
+    /// Different region.
+    Region,
+}
+
+impl Distance {
+    #[must_use]
+    pub fn one_way_ns(self) -> u64 {
+        match self {
+            Self::Socket => 120,
+            Self::Rack => 30_000,
+            Self::Zone => 400_000,
+            Self::Region => 30_000_000,
+        }
+    }
+
+    /// Inverse bandwidth. A rack link is 25 `GbE`; a zone link is metered lower; a region link
+    /// is lower still and is the one where bulk state movement stops being an option.
+    #[must_use]
+    pub fn ns_per_byte(self) -> f64 {
+        match self {
+            Self::Socket => 1.0 / 14.0,
+            Self::Rack => 0.32,
+            Self::Zone => 0.80,
+            Self::Region => 1.00,
+        }
+    }
+
+    #[must_use]
+    pub fn coherent(self) -> bool {
+        self == Self::Socket
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Socket => "socket",
+            Self::Rack => "rack",
+            Self::Zone => "zone",
+            Self::Region => "region",
+        }
+    }
+
+    #[must_use]
+    pub fn all() -> [Self; 4] {
+        [Self::Socket, Self::Rack, Self::Zone, Self::Region]
+    }
+}
+
+impl std::str::FromStr for Distance {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "socket" => Ok(Self::Socket),
+            "rack" => Ok(Self::Rack),
+            "zone" => Ok(Self::Zone),
+            "region" => Ok(Self::Region),
+            _ => Err(format!(
+                "unknown distance {s}; want socket|rack|zone|region"
+            )),
+        }
+    }
+}
+
+impl Topology {
+    /// A cluster of separate hosts at a given distance. One memory domain per node, because
+    /// a node's DRAM is the unit another node cannot address: crossing is a copy, and the
+    /// copy is charged the measured transport tax on top of the modelled link.
+    #[must_use]
+    pub fn cluster(
+        nodes: usize,
+        units_per_node: usize,
+        dram_per_node: u64,
+        d: Distance,
+        crossing: crate::boundary::Cost,
+    ) -> Self {
+        let mut units = Vec::new();
+        let mut domains = Vec::new();
+        for n in 0..nodes {
+            domains.push(MemoryDomain {
+                id: n as u8,
+                kind: if d.coherent() {
+                    DomainKind::Dram
+                } else {
+                    DomainKind::Remote
+                },
+                capacity: dram_per_node,
+            });
+            for i in 0..units_per_node {
+                units.push(ComputeUnit {
+                    id: (n * units_per_node + i) as u8,
+                    kind: UnitKind::Performance,
+                    cluster: n as u8,
+                    home: n as u8,
+                });
+            }
+        }
+        let mut links = Vec::with_capacity(units.len() * domains.len());
+        for u in &units {
+            for dom in &domains {
+                links.push(if u.home == dom.id {
+                    Link::local(1.0 / 28.0)
+                } else {
+                    Link {
+                        latency_ns: d.one_way_ns() + crossing.fixed_ns as u64,
+                        ns_per_byte: d.ns_per_byte() + crossing.ns_per_byte,
+                        coherent: d.coherent(),
+                    }
+                });
+            }
+        }
+        Self::new(units, domains, links)
+    }
+}

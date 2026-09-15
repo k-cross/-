@@ -599,3 +599,169 @@ uninformatively.
 No VMM, no WASM ABI, no exec rings, no edge agent, no live migration, no multi-region. No
 topology or interconnect graph — placement cost is a two-tier table, not a fabric. The byte store is real but is exercised by `calibrate`
 only; the residency experiments run on the calibrated model rather than moving real bytes.
+
+## Re-aim: what `docs/prototype.md` says we should have been measuring
+
+Three things, and the prototype to this point addressed none of them squarely.
+
+**The cost model had no boundary term at all.** Every number above this section comes from
+`materialise_bytes x ns_per_byte + recompute_ns`. No syscall, no copy, no serialisation,
+anywhere. So every arm silently assumed boundary cost is *zero* -- the most favourable
+possible assumption for Kubernetes, and precisely the tax the README claims to remove.
+`rpcbench` measured a gRPC round trip but its number never entered the ledger.
+
+**The topology was one machine.** `Topology::synthetic` models sockets: coherent links at
+120 ns and 14 GB/s. That is NUMA, not a cluster. The placement conclusion was self-refuting
+-- it said co-placement "would need a ~50x slower link to pay," and a cross-AZ link *is*
+~50x slower. Placement was ruled out on the one topology that excludes the target regime.
+
+**The workload carries four classes, and the wrong fourth.** Training is not in the three,
+and inference is modelled as single-shot chains rather than agent loops.
+
+### The boundary ladder, measured
+
+`polyphonic boundary --repeat 7`, best-of-7 per rung, timer overhead subtracted from the
+per-operation rungs. Apple M-series, unloaded.
+
+| boundary | 64 B | 1024 B | 8192 B | fixed ns | ns/byte | p99 | spread |
+|---|---|---|---|---|---|---|---|
+| native call | 0 | 0 | 0 | 0 | 0.000 | - | 1.0x |
+| shared ring (spin) | 66 | 66 | 192 | 58 | 0.016 | 234 | 2.0x |
+| syscall floor | 97 | 97 | 97 | 97 | 0.000 | - | 2.4x |
+| pipe (same thread) | 434 | 450 | 613 | 430 | 0.022 | - | 1.6x |
+| unix socket RTT | 7149 | 6984 | 7130 | 7068 | 0.006 | 9318 | 1.1x |
+| TCP loopback RTT | 15317 | 15318 | 15671 | 15294 | 0.046 | 18942 | 1.0x |
+| gRPC unary RTT | 49233 | 48276 | 51150 | 48631 | 0.298 | 83942 | 1.1x |
+
+The `spread` column is worst-repetition over best. It runs to 2.4x on the cheap rungs
+because this host migrates threads between performance and efficiency clusters and
+`pin_cluster` is only a QoS hint on macOS. **The ordering is the robust result; no single
+constant here should be quoted to two digits.**
+
+What each step adds, at 1 KiB:
+
+| step | adds | multiplier |
+|---|---|---|
+| cross-core cache line + spin detect | 0.07 us | 66x |
+| ring transition | 0.03 us | 1.5x |
+| kernel buffer copy + second syscall | 0.35 us | 4.6x |
+| **waking a blocked thread** | **6.53 us** | **15.5x** |
+| loopback network stack | 8.33 us | 2.2x |
+| HTTP/2 framing + protobuf | 32.96 us | 3.2x |
+
+Four findings worth designing against:
+
+1. **A single no-op syscall costs about what a whole shared-memory round trip costs**
+   (97 ns vs 66 ns). Any design that spends one syscall per decision has already given up
+   more than the entire budget of the shared-memory alternative. "Fewer syscalls" is not
+   the lever; *zero* is.
+2. **The largest single multiplier in the ladder is waking a thread**, not crossing the
+   kernel and not touching the network: 450 ns -> 6984 ns, 15.5x. The tax to remove is the
+   scheduler. That argues for spin-polled rings or busy-poll completion queues, and against
+   any design whose hot path blocks.
+3. **Two thirds of a gRPC round trip is framing and encoding** -- 33 us of the 48 us sits
+   above raw TCP. This is the self-inflicted part, and it is the majority.
+4. **Marshalling slope is nearly flat except for gRPC** (0.006-0.046 ns/byte for the
+   kernel paths, 0.298 for gRPC -- 6-50x). At control-plane message sizes the fixed cost
+   dominates everything, so *batching decisions matters more than shrinking them*.
+
+The composite: a 48 us gRPC round trip against 0.07 us of shared memory, for the same bytes
+and the same question. That ratio, ~700x, is the size of the prize the README is pointing
+at -- and it is measured, not modelled. What it costs is a burned core per ring, which is a
+real charge the design has to carry rather than wish away.
+
+### What this does not yet show
+
+Nothing above is wired into the arms. The ladder is a cost table; until `Cost` is charged
+on every cross-node decision in a distributed topology, the residency results still assume
+a free boundary and remain quoted under that assumption.
+
+## Distributed: the control plane's own cost, charged
+
+`polyphonic distributed` runs the same workload over a cluster of separate hosts rather than
+sockets on one box, at four distances, and charges each placement decision the **measured**
+boundary cost from the ladder above. Node link latency and bandwidth remain modelled;
+`Distance::{Socket, Rack, Zone, Region}` carries the constants and says so.
+
+Two bugs had to be fixed before any of it meant anything, and both had been inflating the
+earlier placement conclusions:
+
+- `choose_unit` returned the sticky unit for `Placement::Sticky` **regardless of the target
+  the caller had just computed**, so flow co-placement was calculated and then discarded for
+  every arm except `Aware`. Target selection is now the single decision point.
+- `cold`/`local`/`remote` were counted before admission, so a refused request was charged a
+  placement outcome. One configuration reported a 104.7% cold rate, which is what finally
+  gave it away.
+
+### The win is flow co-placement, and it is the only thing that moves
+
+Mean inference stall, by node distance:
+
+| arm | socket | rack | zone | region |
+|---|---|---|---|---|
+| hash only | 5.476 ms | 5.670 ms | 6.100 ms | 11.593 ms |
+| residency only | 5.476 ms | 5.670 ms | 6.100 ms | 11.593 ms |
+| flow only | 5.197 ms | 5.197 ms | 5.197 ms | 5.197 ms |
+| both, unified | 5.197 ms | 5.197 ms | 5.197 ms | 5.197 ms |
+| **flow win** | **5.1%** | **9.1%** | **17.4%** | **123%** |
+
+Three things follow.
+
+**Residency-aware routing contributes exactly nothing** -- `residency only` is bit-identical
+to `hash only` at every distance. This is not a bug; it is the mechanism. **Consistent
+hashing creates the residency it is later compared against.** A hash puts session S on node
+d, so S's KV blocks come to live on d, so residency routing also picks d. The two policies
+agree by construction. This retires the question properly: the earlier "aware loses to
+sticky" results and this "aware ties sticky" result are the same fact seen twice.
+
+**Flow co-placement is the entire win, and it scales with distance exactly as predicted.**
+At socket distance it is worth 5.1%, consistent with the 0.1% measured earlier on the
+end-to-end metric. At region distance it is worth 123%. The earlier conclusion -- that
+co-placement "would need a ~50x slower link to pay" -- was right about the condition and
+wrong to stop there, because a cross-region link *is* that link. **Placement was ruled out
+on the one topology that excluded the regime where it pays.**
+
+**Flow co-placement needs no residency knowledge at all.** The scheduler knows where the
+upstream stage ran because it placed it. So the mechanism that pays is the one that needs
+nothing from remote nodes, and the mechanism that needs remote state is the one worth zero.
+
+### The boundary tax is a fraction, and the denominator is the work
+
+Charging every placement decision a measured gRPC crossing costs **0.17% of total stall**,
+0.9% of inference stall, at 4.2 control RPCs per request. Gossiping a stale view instead
+produces 1.9% stale decisions and costs nothing measurable. On this workload the control
+plane's own cost is irrelevant and being in-process buys almost nothing.
+
+That is entirely an artifact of the denominator. The same measured crossing, against
+different service times:
+
+| work being scheduled | over gRPC | over a shared ring |
+|---|---|---|
+| warm FaaS invocation (10 us) | **95.1%** | 2.95% |
+| FaaS snapshot restore (1 ms) | 16.3% | 0.03% |
+| agent turn, cached prefix (5 ms) | 3.7% | 0.01% |
+| inference request (30 ms) | 0.6% | 0.00% |
+| cold start (1 s) | 0.0% | 0.00% |
+
+Four decisions per request, 1 KiB each, measured crossings. For a warm FaaS invocation
+**95% of the request is the control plane talking to itself.** For an inference request it
+is 0.6%.
+
+So the zero-cost-extension thesis is not wrong, it is *conditional*, and the condition is
+sharp: it pays where the scheduled work is comparable to a boundary crossing. That is warm
+FaaS and it is nothing else in this workload. Which is also the honest criticism of the
+current experiment -- **it has no warm FaaS path**. Mean stall is 30 ms because every class
+is modelled as a materialisation. The regime the ladder says matters most is the one the
+workload does not contain.
+
+### Standing
+
+| claim | status |
+|---|---|
+| eviction priced in recompute-cost per byte | holds |
+| admission that refuses rather than overcommits | holds |
+| flow co-placement across workloads | **holds, and scales with distance: 5.1% socket to 123% region** |
+| residency-aware routing beats consistent hashing | **retired -- hashing creates the residency** |
+| unified control plane beats RPC-queried | unsupported at 30 ms service times (0.9%); untested where it should matter |
+| announce / anticipatory prewarm | 79% relocated, not saved |
+| downstream-aware gate | Tier 1, replicable by a hint API |

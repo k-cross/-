@@ -19,3 +19,10 @@ message CanSatisfyReply {
 service Admission {
   rpc CanSatisfy(CanSatisfyRequest) returns (CanSatisfyReply);
 }
+
+message EchoRequest { bytes payload = 1; }
+message EchoReply { uint64 n = 1; }
+
+service Echo {
+  rpc Call(EchoRequest) returns (EchoReply);
+}

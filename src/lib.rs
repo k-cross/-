@@ -1,5 +1,6 @@
 pub mod arms;
 pub mod blob;
+pub mod boundary;
 pub mod cache;
 pub mod flow;
 pub mod machine;

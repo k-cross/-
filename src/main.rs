@@ -80,6 +80,37 @@ enum Cmd {
         share_weights: bool,
     },
 
+    /// Residency-aware placement across a cluster, with the control plane's own cost charged
+    Distributed {
+        #[arg(long, default_value_t = 4)]
+        nodes: usize,
+        #[arg(long, default_value_t = 3)]
+        units_per_node: usize,
+        /// Total DRAM across all nodes
+        #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
+        dram: u64,
+        #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
+        nvme: u64,
+        #[arg(long, default_value_t = 15_000)]
+        ops: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value = "0,1,2,1", value_parser = parse_bands)]
+        bands: String,
+        /// Node distances to sweep
+        #[arg(long, default_value = "rack,zone,region")]
+        distances: String,
+        /// Transport the control plane crosses on: native|ring|syscall|pipe|unix|tcp|grpc
+        #[arg(long, default_value = "grpc")]
+        crossing: String,
+        /// Requests between gossip refreshes for the stale-view arm
+        #[arg(long, default_value_t = 200)]
+        gossip_period: u64,
+        /// Boundary-ladder repetitions
+        #[arg(long, default_value_t = 3)]
+        repeat: usize,
+    },
+
     /// Discover the host's compute/memory graph and measure its link asymmetry
     Topology {
         /// Streaming buffer per probe; must exceed the largest cache to measure memory
@@ -96,6 +127,14 @@ enum Cmd {
         path: String,
         #[arg(long, default_value_t = 8)]
         iters: u32,
+    },
+
+    /// Measure what it costs to cross a boundary on this host: native call, shared ring,
+    /// syscall, pipe, unix socket, TCP loopback
+    Boundary {
+        /// Repetitions; the best observation of each rung is kept and the spread reported
+        #[arg(long, default_value_t = 5)]
+        repeat: usize,
     },
 
     /// Does the unified advantage scale with volatility, and vanish at zero?
@@ -758,6 +797,32 @@ fn main() {
             residency_report(dram, nvme, ops, seed, step, volatility, bands_of(&bands));
         }
         Cmd::Calibrate { path, iters } => calibrate(&path, iters),
+        Cmd::Boundary { repeat } => boundary(repeat),
+        Cmd::Distributed {
+            nodes,
+            units_per_node,
+            dram,
+            nvme,
+            ops,
+            seed,
+            bands,
+            distances,
+            crossing,
+            gossip_period,
+            repeat,
+        } => distributed(
+            nodes,
+            units_per_node,
+            dram,
+            nvme,
+            ops,
+            seed,
+            bands_of(&bands),
+            &distances,
+            &crossing,
+            gossip_period,
+            repeat,
+        ),
         Cmd::Topology { bytes, iters } => topology(bytes, iters),
         Cmd::Placement {
             sockets,
@@ -801,5 +866,304 @@ fn main() {
         } => {
             volatility_sweep(dram, nvme, ops, seed, step);
         }
+    }
+}
+
+fn boundary(repeat: usize) {
+    use polyphonic::boundary::{Boundary, measure};
+
+    let l = measure(repeat);
+    println!(
+        "boundary ladder (p50 ns per operation, measured on this host)\ntimer overhead {:.1} ns/call -- rungs near it are batch-timed and have no tail\n",
+        l.timer_ns
+    );
+    print!("{:<22}", "boundary");
+    for n in polyphonic::boundary::SIZES {
+        print!("{:>12}", format!("{n} B"));
+    }
+    println!(
+        "{:>12}{:>14}{:>12}{:>10}",
+        "fixed ns", "ns/byte", "p99 ns", "spread"
+    );
+
+    for r in &l.rungs {
+        print!("{:<22}", r.boundary.label());
+        for n in polyphonic::boundary::SIZES {
+            match r.by_size.iter().find(|s| s.0 == n) {
+                Some((_, ns)) => print!("{ns:>12}"),
+                None => print!("{:>12}", "-"),
+            }
+        }
+        println!(
+            "{:>12.0}{:>14.3}{:>12}{:>9.1}x",
+            r.cost.fixed_ns,
+            r.cost.ns_per_byte,
+            if r.p99_ns == 0 {
+                "-".to_string()
+            } else {
+                r.p99_ns.to_string()
+            },
+            r.spread
+        );
+    }
+
+    let mid = polyphonic::boundary::SIZES[1];
+    let at = |b: Boundary| -> Option<u64> {
+        l.rungs
+            .iter()
+            .find(|r| r.boundary == b)
+            .and_then(|r| r.by_size.iter().find(|s| s.0 == mid))
+            .map(|s| s.1)
+    };
+
+    println!("\nwhat each step adds, at {mid} B");
+    let steps = [
+        (
+            Boundary::Native,
+            Boundary::Ring,
+            "cross-core cache line + spin detect",
+        ),
+        (Boundary::Ring, Boundary::Syscall, "ring transition"),
+        (
+            Boundary::Syscall,
+            Boundary::Pipe,
+            "kernel buffer copy + second syscall",
+        ),
+        (
+            Boundary::Pipe,
+            Boundary::UnixSocket,
+            "waking a blocked thread",
+        ),
+        (
+            Boundary::UnixSocket,
+            Boundary::TcpLoopback,
+            "loopback network stack",
+        ),
+        (
+            Boundary::TcpLoopback,
+            Boundary::Grpc,
+            "HTTP/2 framing + protobuf",
+        ),
+    ];
+    for (lo, hi, what) in steps {
+        let (Some(a), Some(b)) = (at(lo), at(hi)) else {
+            continue;
+        };
+        println!(
+            "  {what:<38}{:>10.2} us   {:>6.1}x",
+            b.saturating_sub(a) as f64 / 1000.0,
+            b as f64 / a.max(1) as f64
+        );
+    }
+
+    if let (Some(total), Some(ring)) = (at(Boundary::Grpc), at(Boundary::Ring)) {
+        let wake = at(Boundary::UnixSocket).unwrap_or(0) - at(Boundary::Pipe).unwrap_or(0);
+        let frame = total - at(Boundary::TcpLoopback).unwrap_or(0);
+        println!(
+            "\nof a {:.1} us gRPC round trip: {:.0}% is HTTP/2 + protobuf, {:.0}% is one thread wakeup,\nand {:.2} us is what the same exchange costs through shared memory",
+            total as f64 / 1000.0,
+            100.0 * frame as f64 / total as f64,
+            100.0 * wake as f64 / total as f64,
+            ring as f64 / 1000.0
+        );
+    }
+}
+
+type ClassRow<'a> = (
+    &'a str,
+    [u64; BlobKind::N],
+    [u64; BlobKind::N],
+    [u64; BlobKind::N],
+);
+type ClassRows<'a> = [ClassRow<'a>];
+
+fn class_table(rows: &ClassRows<'_>) {
+    println!("\n  per class: mean stall (ms) / share of it spent deciding");
+    print!("  {:<20}", "arm");
+    for name in CLASS_NAME {
+        print!("{name:>22}");
+    }
+    println!();
+    for (label, by, ops_k, dec) in rows {
+        print!("  {label:<20}");
+        for k in BlobKind::ALL {
+            let i = k.idx();
+            print!(
+                "{:>15.3} {:>5.1}%",
+                mean_ms(by[i], ops_k[i]),
+                100.0 * dec[i] as f64 / by[i].max(1) as f64
+            );
+        }
+        println!();
+    }
+    println!();
+}
+
+fn crossing_of(l: &polyphonic::boundary::Ladder, name: &str) -> Option<polyphonic::boundary::Cost> {
+    use polyphonic::boundary::Boundary;
+    let b = match name {
+        "native" => Boundary::Native,
+        "ring" => Boundary::Ring,
+        "syscall" => Boundary::Syscall,
+        "pipe" => Boundary::Pipe,
+        "unix" => Boundary::UnixSocket,
+        "tcp" => Boundary::TcpLoopback,
+        _ => Boundary::Grpc,
+    };
+    l.get(b).or_else(|| l.get(Boundary::TcpLoopback))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "experiment knobs, all independent"
+)]
+fn distributed(
+    nodes: usize,
+    units_per_node: usize,
+    dram: u64,
+    nvme: u64,
+    ops: u64,
+    seed: u64,
+    bands: [u8; BlobKind::N],
+    distances: &str,
+    crossing: &str,
+    gossip_period: u64,
+    repeat: usize,
+) {
+    use polyphonic::machine::{Control, Machine, Placement};
+    use polyphonic::topo::{Distance, Topology};
+
+    let ladder = polyphonic::boundary::measure(repeat);
+    let Some(cost) = crossing_of(&ladder, crossing) else {
+        println!("no boundary rung available");
+        return;
+    };
+    let per_node = dram / nodes as u64;
+    let split = [0.12, 0.12, 0.12, 0.25];
+
+    println!(
+        "cluster: {nodes} nodes x {:.1} GiB, {units_per_node} units each\n\
+         control crossing: {crossing} = {:.1} us + {:.3} ns/byte (MEASURED on this host)\n\
+         node link latency and bandwidth are MODELLED\n",
+        gib(per_node),
+        cost.fixed_ns / 1000.0,
+        cost.ns_per_byte,
+    );
+
+    // Residency routing and flow co-placement are separate mechanisms that were previously
+    // bundled into one arm. Split so the win can be attributed to one of them.
+    let arms: Vec<(&str, Placement, bool, Control)> = vec![
+        ("hash only", Placement::Sticky, false, Control::Unified),
+        ("residency only", Placement::Aware, false, Control::Unified),
+        ("flow only", Placement::Sticky, true, Control::Unified),
+        ("both, unified", Placement::Aware, true, Control::Unified),
+        ("both, rpc query", Placement::Aware, true, Control::Query),
+        (
+            "both, gossiped",
+            Placement::Aware,
+            true,
+            Control::Gossip {
+                period: gossip_period,
+            },
+        ),
+    ];
+
+    for name in distances.split(',') {
+        let Ok(d) = name.trim().parse::<Distance>() else {
+            println!("skipping unknown distance {name}");
+            continue;
+        };
+        let topo = Topology::cluster(nodes, units_per_node, per_node, d, cost);
+        println!(
+            "== {} : {:.0} us hop, {:.2} ns/byte ==",
+            d.label(),
+            d.one_way_ns() as f64 / 1000.0,
+            d.ns_per_byte()
+        );
+        println!(
+            "{:<22} {:>12} {:>12} {:>10} {:>9} {:>10} {:>12}",
+            "arm", "stall/req", "deciding", "of stall", "stale", "cold", "ctl rpc/req"
+        );
+        let mut base = 0.0;
+        let mut per_class: Vec<ClassRow<'_>> = Vec::new();
+        for (label, placement, flow, control) in &arms {
+            let mut m = Machine::new(
+                topo.clone(),
+                nvme / nodes as u64,
+                Policy::Gdsf,
+                |cap| Quota::from_split(cap, split, bands, false),
+                *placement,
+            );
+            m.set_flow_aware(*flow);
+            m.set_control(*control, cost);
+            let (mut total, mut served) = (0u64, 0u64);
+            let mut by_kind = [0u64; BlobKind::N];
+            let mut ops_kind = [0u64; BlobKind::N];
+            let mut decide_kind = [0u64; BlobKind::N];
+            for req in polyphonic::work::Workload::new(seed, ops, 1.0) {
+                let k = req.chain.first().map_or(0, |(_, m)| m.kind.idx());
+                let c = m.serve_request(&req);
+                if c.pending {
+                    continue;
+                }
+                total += c.total_ns();
+                by_kind[k] += c.total_ns();
+                decide_kind[k] += c.decide_ns;
+                ops_kind[k] += 1;
+                served += 1;
+            }
+            let stall = mean_ms(total, served);
+            if base == 0.0 {
+                base = stall;
+            }
+            println!(
+                "{label:<22} {stall:>11.3}ms {:>11.3}ms {:>9.2}% {:>8.1}% {:>9.1}% {:>12.1}",
+                mean_ms(m.decide_ns, served),
+                100.0 * m.decide_ns as f64 / total.max(1) as f64,
+                100.0 * m.stale_decisions as f64 / served.max(1) as f64,
+                100.0 * m.cold as f64 / served.max(1) as f64,
+                m.control_rpcs as f64 / served.max(1) as f64,
+            );
+            per_class.push((*label, by_kind, ops_kind, decide_kind));
+        }
+
+        class_table(&per_class);
+    }
+    crossover(&ladder, cost);
+}
+
+/// The boundary tax is not a fixed overhead, it is a fraction -- and the fraction depends
+/// entirely on how long the work being scheduled takes. The ladder is measured; this only
+/// divides it by service times spanning a warm `FaaS` invocation to a full prefill.
+fn crossover(ladder: &polyphonic::boundary::Ladder, grpc: polyphonic::boundary::Cost) {
+    use polyphonic::boundary::Boundary;
+    const RPCS: f64 = 4.0;
+    let Some(ring) = ladder.get(Boundary::Ring) else {
+        return;
+    };
+    let q = 1024;
+    let (g, r) = (RPCS * grpc.ns(q) as f64, RPCS * ring.ns(q) as f64);
+    println!(
+        "control-plane tax as a share of one request, at {RPCS:.0} decisions/request\n\
+         (gRPC {:.1} us and shared ring {:.2} us per decision, both measured)\n",
+        grpc.ns(q) as f64 / 1000.0,
+        ring.ns(q) as f64 / 1000.0
+    );
+    println!(
+        "{:<34} {:>12} {:>12}",
+        "work being scheduled", "over gRPC", "over a ring"
+    );
+    for (name, ns) in [
+        ("warm FaaS invocation (10 us)", 10_000.0),
+        ("FaaS snapshot restore (1 ms)", 1_000_000.0),
+        ("agent turn, cached prefix (5 ms)", 5_000_000.0),
+        ("inference request (30 ms)", 30_000_000.0),
+        ("cold start (1 s)", 1_000_000_000.0),
+    ] {
+        println!(
+            "{name:<34} {:>11.1}% {:>11.2}%",
+            100.0 * g / (g + ns),
+            100.0 * r / (r + ns)
+        );
     }
 }

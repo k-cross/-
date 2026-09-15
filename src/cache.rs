@@ -493,6 +493,9 @@ impl TierPool {
 pub struct Cost {
     pub transfer_ns: u64,
     pub recompute_ns: u64,
+    /// What it cost to *decide*, as distinct from what it cost to do. Zero when the
+    /// scheduler and the ledger are the same process; a boundary crossing when they are not.
+    pub decide_ns: u64,
     pub bytes_in: u64,
     pub pending: bool,
 }
@@ -500,7 +503,7 @@ pub struct Cost {
 impl Cost {
     #[must_use]
     pub fn total_ns(&self) -> u64 {
-        self.transfer_ns + self.recompute_ns
+        self.transfer_ns + self.recompute_ns + self.decide_ns
     }
 }
 

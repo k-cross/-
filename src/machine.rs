@@ -6,11 +6,12 @@
 //! twice, badly.
 
 use crate::blob::{BlobId, BlobMeta};
+use crate::boundary::Cost as Crossing;
 use crate::cache::{Cost, Hierarchy, Policy, Quota};
 use crate::tier::TierSpec;
 use crate::topo::Topology;
 use crate::work::Request;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Placement {
@@ -23,6 +24,36 @@ pub enum Placement {
     Sticky,
     /// Run the work where its state already lives.
     Aware,
+}
+
+/// Where residency knowledge lives, and what it costs to consult.
+///
+/// This is the architectural question the prototype exists to answer. A scheduler that shares
+/// a process with the ledger reads residency off a field. One that does not must either ask
+/// -- and pay a boundary crossing on the request's critical path -- or work from a view that
+/// was true a moment ago. Both alternatives are what a Kubernetes scheduler extender and an
+/// informer cache respectively are.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Control {
+    /// Scheduler and ledger in one address space. A decision is a function call.
+    Unified,
+    /// Scheduler asks every candidate node before placing. Always correct, and pays the
+    /// measured crossing on every request.
+    Query,
+    /// Scheduler places from a view refreshed every `period` requests. Free at decision time;
+    /// wrong in proportion to how fast residency moves.
+    Gossip { period: u64 },
+}
+
+impl Control {
+    #[must_use]
+    pub fn label(self) -> String {
+        match self {
+            Self::Unified => "unified (in-process)".to_string(),
+            Self::Query => "query (rpc per decision)".to_string(),
+            Self::Gossip { period } => format!("gossip (every {period})"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -49,6 +80,22 @@ pub struct Machine {
     pub cold: u64,
     pub interconnect_ns: u64,
     pub bytes_crossed: u64,
+    control: Control,
+    crossing: Crossing,
+    /// Co-place a task's downstream stage with its upstream. Orthogonal to residency
+    /// placement: the scheduler learns the upstream's location by having placed it, so this
+    /// needs no cross-node knowledge and pays no crossing to use.
+    flow_aware: bool,
+    /// Residency as the scheduler believes it to be. Identical to the truth under `Unified`
+    /// and `Query`; a snapshot under `Gossip`.
+    view: Vec<HashSet<BlobId>>,
+    ops: u64,
+    /// Latency charged to requests for deciding where to run them.
+    pub decide_ns: u64,
+    /// Crossings spent on control traffic, whether or not they sit on the critical path.
+    pub control_rpcs: u64,
+    /// Decisions where the scheduler's view of the chosen node disagreed with the truth.
+    pub stale_decisions: u64,
 }
 
 impl Machine {
@@ -92,14 +139,72 @@ impl Machine {
             cold: 0,
             interconnect_ns: 0,
             bytes_crossed: 0,
+            control: Control::Unified,
+            crossing: Crossing::default(),
+            flow_aware: false,
+            view: vec![HashSet::new(); n_domains],
+            ops: 0,
+            decide_ns: 0,
+            control_rpcs: 0,
+            stale_decisions: 0,
+        }
+    }
+
+    /// Install the control-plane model. `crossing` should come from `boundary::measure` on
+    /// the host being modelled, not from a constant.
+    pub fn set_flow_aware(&mut self, on: bool) {
+        self.flow_aware = on;
+    }
+
+    pub fn set_control(&mut self, control: Control, crossing: Crossing) {
+        self.control = control;
+        self.crossing = crossing;
+        if let Control::Gossip { .. } = control {
+            self.refresh_view();
+        }
+    }
+
+    fn refresh_view(&mut self) {
+        for (d, h) in self.domains.iter().enumerate() {
+            let set: HashSet<BlobId> = h.dram.resident_ids().collect();
+            self.view[d] = set;
+        }
+        self.control_rpcs += self.domains.len() as u64;
+    }
+
+    /// Residency as the scheduler sees it, which is not always residency as it is.
+    fn believes_resident(&self, d: usize, id: &BlobId) -> bool {
+        match self.control {
+            Control::Gossip { .. } => self.view[d].contains(id),
+            Control::Unified | Control::Query => self.domains[d].dram.contains(id),
+        }
+    }
+
+    /// What one placement decision costs, and what it costs the cluster. A fan-out query is
+    /// charged one crossing of *latency* because the asks go out in parallel, but N crossings
+    /// of *work*, which is what caps the decision rate.
+    fn decide(&mut self, chain_len: usize) -> u64 {
+        self.ops += 1;
+        match self.control {
+            Control::Unified => 0,
+            Control::Query => {
+                self.control_rpcs += self.active.len() as u64;
+                self.crossing.ns(QUERY_BYTES_PER_BLOB * chain_len as u64)
+            }
+            Control::Gossip { period } => {
+                if period > 0 && self.ops.is_multiple_of(period) {
+                    self.refresh_view();
+                }
+                0
+            }
         }
     }
 
     /// Domain holding the deepest resident prefix of this chain, and how deep.
     fn deepest(&self, chain: &[(BlobId, BlobMeta)]) -> (usize, usize) {
         let mut best = (0usize, 0usize);
-        for (d, h) in self.domains.iter().enumerate() {
-            let depth = chain.partition_point(|(id, _)| h.dram.contains(id));
+        for d in 0..self.domains.len() {
+            let depth = chain.partition_point(|(id, _)| self.believes_resident(d, id));
             if depth > best.1 {
                 best = (d, depth);
             }
@@ -157,23 +262,23 @@ impl Machine {
         }
     }
 
-    fn least_loaded(&self) -> usize {
-        self.active
-            .iter()
-            .copied()
-            .min_by_key(|&d| self.domains[d].dram.used())
-            .unwrap_or(0)
-    }
-
-    fn choose_unit(&mut self, target: usize) -> usize {
+    /// The domain this policy would pick knowing nothing about flows: round-robin for
+    /// `Blind`, content hash for `Sticky`, deepest resident prefix for `Aware`.
+    fn policy_target(&mut self, affinity: usize, best: usize, value: u64) -> usize {
         match self.placement {
-            Placement::Aware => self.unit_in(target),
             Placement::Blind => {
                 let d = self.active[self.next_unit % self.active.len()];
                 self.next_unit += 1;
-                self.unit_in(d)
+                d
             }
-            Placement::Sticky => self.sticky_unit,
+            Placement::Sticky => affinity,
+            Placement::Aware => {
+                if value > 0 {
+                    best
+                } else {
+                    affinity
+                }
+            }
         }
     }
 
@@ -181,19 +286,28 @@ impl Machine {
     /// prefix of its chain, plus any shared dependencies. Weight shards dwarf a KV prefix, so
     /// scoring by bytes is what lets sharing outvote caller identity.
     fn resident_value(&self, d: usize, req: &Request) -> u64 {
-        let h = &self.domains[d];
-        let depth = req.chain.partition_point(|(id, _)| h.dram.contains(id));
+        let depth = req
+            .chain
+            .partition_point(|(id, _)| self.believes_resident(d, id));
         let chain_bytes: u64 = req.chain[..depth].iter().map(|(_, m)| m.bytes).sum();
         let dep_bytes: u64 = req
             .requires
             .iter()
-            .filter(|(id, _)| h.dram.contains(id))
+            .filter(|(id, _)| self.believes_resident(d, id))
             .map(|(_, m)| m.bytes)
             .sum();
         chain_bytes + dep_bytes
     }
 
+    /// Bytes domain `d` really holds for this chain, regardless of what the scheduler thinks.
+    fn truly_resident(&self, d: usize, chain: &[(BlobId, BlobMeta)]) -> u64 {
+        let depth = chain.partition_point(|(id, _)| self.domains[d].dram.contains(id));
+        chain[..depth].iter().map(|(_, m)| m.bytes).sum()
+    }
+
     pub fn serve_request(&mut self, req: &Request) -> Cost {
+        let decide_ns = self.decide(req.chain.len());
+        self.decide_ns += decide_ns;
         if self.placement != Placement::Blind {
             self.sticky_unit = self.affinity_unit(&req.chain);
         }
@@ -207,34 +321,28 @@ impl Machine {
 
         // A task's downstream stage belongs where its upstream ran: neither workload's own
         // identity hashes to the other's domain, so only a scheduler that sees the flow can
-        // put them together.
-        let flow_home = req.completes.and_then(|t| self.upstream.get(&t).copied());
-        let target = if self.placement == Placement::Aware
-            && let Some(d) = flow_home
-        {
-            d
-        } else if self.placement == Placement::Aware && value > 0 {
-            best
-        } else if self.placement == Placement::Blind {
-            self.least_loaded()
-        } else {
-            self.topo.units[self.sticky_unit].home as usize
+        // put them together. This overrides the placement policy for every policy, which is
+        // what makes it separable from residency routing.
+        let flow_home = req
+            .completes
+            .filter(|_| self.flow_aware)
+            .and_then(|t| self.upstream.get(&t).copied());
+        let affinity = self.topo.units[self.sticky_unit].home as usize;
+        let target = match flow_home {
+            Some(d) => d,
+            None => self.policy_target(affinity, best, value),
         };
-        let unit = self.choose_unit(target);
+        let unit = self.unit_in(target);
         let home = self.topo.units[unit].home as usize;
+        if value > 0 && self.truly_resident(target, &req.chain) == 0 {
+            self.stale_decisions += 1;
+        }
         let serving = if self.kv_transfer && value > 0 {
             best
         } else {
             home
         };
 
-        if value == 0 {
-            self.cold += 1;
-        } else if serving == home {
-            self.local += 1;
-        } else {
-            self.remote += 1;
-        }
         let bytes: u64 = req.chain.iter().map(|(_, m)| m.bytes).sum();
         let link_ns = self.topo.fetch_ns(unit, serving, bytes);
         self.interconnect_ns += link_ns;
@@ -257,6 +365,18 @@ impl Machine {
         }
 
         let mut cost = self.domains[serving].access(&req.chain);
+        cost.decide_ns = decide_ns;
+        // Counted after the fact: a refused request never ran, so charging it a placement
+        // outcome would inflate every rate by the refusal rate.
+        if !cost.pending {
+            if value == 0 {
+                self.cold += 1;
+            } else if serving == home {
+                self.local += 1;
+            } else {
+                self.remote += 1;
+            }
+        }
         if !req.requires.is_empty() {
             let dep = self.domains[serving].access_set(&req.requires);
             cost.transfer_ns += dep.transfer_ns;
@@ -268,23 +388,23 @@ impl Machine {
     }
 
     pub fn serve(&mut self, chain: &[(BlobId, BlobMeta)]) -> Cost {
+        let decide_ns = self.decide(chain.len());
+        self.decide_ns += decide_ns;
         if self.placement != Placement::Blind {
             self.sticky_unit = self.affinity_unit(chain);
         }
         let (held, depth) = self.deepest(chain);
         // With nothing resident anywhere the placement policy picks freely; with state on the
         // floor, `held` is where the work wants to run.
-        let target = if depth > 0 {
-            held
-        } else if self.placement == Placement::Aware {
-            // Content affinity, not load balance: spreading cold chains by bytes scatters a
-            // tenant's sessions and destroys the locality this policy exists to capture.
-            self.topo.units[self.sticky_unit].home as usize
-        } else {
-            self.least_loaded()
-        };
-        let unit = self.choose_unit(target);
+        // Content affinity, not load balance: spreading cold chains by bytes scatters a
+        // tenant's sessions and destroys the locality this policy exists to capture.
+        let affinity = self.topo.units[self.sticky_unit].home as usize;
+        let target = self.policy_target(affinity, held, depth as u64);
+        let unit = self.unit_in(target);
         let home = self.topo.units[unit].home as usize;
+        if depth > 0 && self.truly_resident(target, chain) == 0 {
+            self.stale_decisions += 1;
+        }
 
         // A prefix cache is node-local process state, not shared memory: a replica on one
         // domain cannot read another's KV blocks even over a coherent link. Work therefore
@@ -311,6 +431,7 @@ impl Machine {
 
         let mut cost = self.domains[serving].access(chain);
         cost.transfer_ns += link_ns;
+        cost.decide_ns = decide_ns;
         cost
     }
 
@@ -344,3 +465,6 @@ impl Machine {
         }
     }
 }
+
+/// A residency question names a blob by its 32-byte id and its size.
+const QUERY_BYTES_PER_BLOB: u64 = 40;
