@@ -1,5 +1,10 @@
 use crate::blob::{BlobId, BlobKind, BlobMeta, ROOT};
+use crate::flow::FlowHint;
 use crate::rng::Rng;
+use std::collections::{HashMap, VecDeque};
+
+/// A content-addressed chain: an ordered blob list where each entry's parent is its predecessor.
+pub type Chain = Vec<(BlobId, BlobMeta)>;
 
 pub const KV_BLOCK_BYTES: u64 = 512 * 1024;
 pub const KV_BLOCK_NS: u64 = 400_000;
@@ -12,11 +17,21 @@ const TENANTS: u64 = 24;
 const SESSIONS: usize = 512;
 const FUNCTIONS: u64 = 400;
 const SHARDS: u64 = 8;
+const MODELS: u64 = 4;
+const SHARDS_PER_MODEL: u64 = 2;
 const SERVICES: u64 = 3;
 pub const SERVICE_BYTES: u64 = 384 * 1024 * 1024;
 pub const SERVICE_COLD_NS: u64 = 15_000_000_000;
 const REPLICAS: [u64; PHASES] = [3, 1, 2, 3];
 const MAX_TURNS: u32 = 24;
+
+/// Fraction of function invocations that call into inference -- the README's canonical
+/// cross-workload task.
+const FLOW_FRACTION: f64 = 0.45;
+const FLOW_LEAD_OPS: u32 = 6;
+const FLOW_PROMPT_BLOCKS: u64 = 24;
+/// Function output handed to the model: a prompt plus retrieved context.
+pub const FLOW_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct Session {
@@ -30,7 +45,15 @@ pub const PHASES: usize = 4;
 #[derive(Clone, Debug)]
 pub struct Request {
     pub phase: usize,
-    pub chain: Vec<(BlobId, BlobMeta)>,
+    pub chain: Chain,
+    /// Non-chain dependencies: state this request needs resident but does not extend, such
+    /// as the model weight shards behind an inference call. Shared across identities, so no
+    /// hash of the caller can predict where it belongs.
+    pub requires: Chain,
+    /// Set on an upstream stage that will call into another workload.
+    pub hint: Option<FlowHint>,
+    /// Set on the downstream stage, naming the task it completes.
+    pub completes: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,10 +75,14 @@ pub struct Workload {
     rng: Rng,
     ops: u64,
     volatility: f64,
+    share_weights: bool,
     issued: u64,
-    tenant_prefix: Vec<Vec<(BlobId, BlobMeta)>>,
+    tenant_prefix: Vec<Chain>,
     sessions: Vec<Session>,
     next_session: u64,
+    pending: VecDeque<(u64, u64, Chain)>,
+    prompt_cache: HashMap<u64, Chain>,
+    next_task: u64,
 }
 
 fn kv(parent: BlobId, tag: &[u8]) -> (BlobId, BlobMeta) {
@@ -89,10 +116,14 @@ impl Workload {
             rng,
             ops,
             volatility,
+            share_weights: false,
             issued: 0,
             tenant_prefix,
             sessions: Vec::new(),
             next_session: 0,
+            pending: VecDeque::new(),
+            prompt_cache: HashMap::new(),
+            next_task: 0,
         };
         for _ in 0..SESSIONS {
             let s = w.fresh_session();
@@ -109,6 +140,13 @@ impl Workload {
             id: self.next_session,
             turns: 1,
         }
+    }
+
+    /// Make inference requests depend on their model's weight shards, shared across tenants.
+    #[must_use]
+    pub fn with_shared_weights(mut self) -> Self {
+        self.share_weights = true;
+        self
     }
 
     #[must_use]
@@ -147,7 +185,7 @@ impl Workload {
         }
     }
 
-    fn service(&mut self) -> Vec<(BlobId, BlobMeta)> {
+    fn service(&mut self) -> Chain {
         let s = self.rng.zipf(SERVICES, 1.2);
         let r = self.rng.below(REPLICAS[self.phase()]);
         let id = BlobId::leaf(format!("svc:{s}:{r}").as_bytes());
@@ -162,7 +200,27 @@ impl Workload {
         )]
     }
 
-    fn inference(&mut self) -> Vec<(BlobId, BlobMeta)> {
+    /// Weight shards behind a tenant's model. Many tenants map to one model, so this set is
+    /// shared *across* identities -- no hash of the caller can predict where it belongs.
+    fn model_shards(tenant: usize) -> Chain {
+        let model = tenant as u64 % MODELS;
+        (0..SHARDS_PER_MODEL)
+            .map(|i| {
+                let id = BlobId::leaf(format!("shard:{}", model * SHARDS_PER_MODEL + i).as_bytes());
+                (
+                    id,
+                    BlobMeta {
+                        kind: BlobKind::WeightShard,
+                        bytes: WEIGHT_BYTES,
+                        parent: None,
+                        recompute_ns: WEIGHT_NS,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn inference(&mut self) -> Chain {
         let slot = self.rng.zipf(self.sessions.len() as u64, 1.3) as usize;
         let s = self.sessions[slot].clone();
         let mut chain = self.tenant_prefix[s.tenant].clone();
@@ -182,8 +240,34 @@ impl Workload {
         chain
     }
 
-    fn faas(&mut self) -> Vec<(BlobId, BlobMeta)> {
-        let f = self.rng.zipf(FUNCTIONS, 1.5);
+    /// The inference working set a given function calls into: a per-function system prompt
+    /// (shared across that function's invocations) plus a short per-call suffix.
+    fn flow_chain(&mut self, f: u64) -> Chain {
+        // The per-function system prompt is deterministic and shared across that function's
+        // invocations; rehashing 24 chained blake3 blocks per call is pure waste.
+        let prompt = self.prompt_cache.entry(f).or_insert_with(|| {
+            let mut p = Vec::with_capacity(FLOW_PROMPT_BLOCKS as usize);
+            let mut parent = ROOT;
+            for d in 0..FLOW_PROMPT_BLOCKS {
+                let (id, meta) = kv(parent, format!("fnprompt:{f}:{d}").as_bytes());
+                parent = id;
+                p.push((id, meta));
+            }
+            p
+        });
+        let mut chain = Vec::with_capacity(prompt.len() + 4);
+        chain.extend_from_slice(prompt);
+        let mut parent = chain.last().map_or(ROOT, |(id, _)| *id);
+        let call = self.rng.below(64);
+        for d in 0..4 {
+            let (id, meta) = kv(parent, format!("fncall:{f}:{call}:{d}").as_bytes());
+            parent = id;
+            chain.push((id, meta));
+        }
+        chain
+    }
+
+    fn faas_for(&mut self, f: u64) -> Chain {
         let id = BlobId::leaf(format!("fn:{f}").as_bytes());
         let scale = 1 + self.rng.below(4);
         vec![(
@@ -197,7 +281,7 @@ impl Workload {
         )]
     }
 
-    fn weights(&mut self) -> Vec<(BlobId, BlobMeta)> {
+    fn weights(&mut self) -> Chain {
         let s = self.rng.zipf(SHARDS, 2.0);
         let id = BlobId::leaf(format!("shard:{s}").as_bytes());
         vec![(
@@ -216,22 +300,103 @@ impl Iterator for Workload {
     type Item = Request;
 
     fn next(&mut self) -> Option<Self::Item> {
+        let phase = self.phase();
+        // pending is pushed in non-decreasing due order, so only the front can ever be ready.
+        let ready = self
+            .pending
+            .front()
+            .is_some_and(|(due, _, _)| *due <= self.issued);
+        if ready {
+            let (_, task, chain) = self.pending.pop_front().expect("front checked");
+            self.issued += 1;
+            return Some(Request {
+                phase,
+                chain,
+                requires: Vec::new(),
+                hint: None,
+                completes: Some(task),
+            });
+        }
         if self.issued >= self.ops {
+            // Drain anything still queued so every started task resolves, rather than being
+            // counted as attempted but neither completed nor broken.
+            if let Some((_, task, chain)) = self.pending.pop_front() {
+                return Some(Request {
+                    phase,
+                    chain,
+                    requires: Vec::new(),
+                    hint: None,
+                    completes: Some(task),
+                });
+            }
             return None;
         }
         let mix = self.mix();
-        let phase = self.phase();
         let roll = self.rng.unit();
         self.issued += 1;
-        let chain = if roll < mix.inference {
-            self.inference()
-        } else if roll < mix.faas {
-            self.faas()
-        } else if roll < mix.weights {
+        if roll >= mix.inference && roll < mix.faas {
+            let f = self.rng.zipf(FUNCTIONS, 1.5);
+            let chain = self.faas_for(f);
+            if self.rng.chance(FLOW_FRACTION) {
+                self.next_task += 1;
+                let task = self.next_task;
+                let downstream = self.flow_chain(f);
+                self.pending.push_back((
+                    self.issued + u64::from(FLOW_LEAD_OPS),
+                    task,
+                    downstream.clone(),
+                ));
+                let hint = FlowHint {
+                    task,
+                    downstream,
+                    probability: 1.0,
+                    lead_ops: FLOW_LEAD_OPS,
+                    payload_bytes: FLOW_PAYLOAD_BYTES,
+                };
+                return Some(Request {
+                    phase,
+                    chain,
+                    requires: Vec::new(),
+                    hint: Some(hint),
+                    completes: None,
+                });
+            }
+            return Some(Request {
+                phase,
+                chain,
+                requires: Vec::new(),
+                hint: None,
+                completes: None,
+            });
+        }
+        if roll < mix.inference {
+            let slot = self.rng.zipf(self.sessions.len() as u64, 1.3) as usize;
+            let tenant = self.sessions[slot].tenant;
+            let chain = self.inference();
+            let requires = if self.share_weights {
+                Self::model_shards(tenant)
+            } else {
+                Vec::new()
+            };
+            return Some(Request {
+                phase,
+                chain,
+                requires,
+                hint: None,
+                completes: None,
+            });
+        }
+        let chain = if roll < mix.weights {
             self.weights()
         } else {
             self.service()
         };
-        Some(Request { phase, chain })
+        Some(Request {
+            phase,
+            chain,
+            requires: Vec::new(),
+            hint: None,
+            completes: None,
+        })
     }
 }

@@ -1,0 +1,21 @@
+syntax = "proto3";
+package admission;
+
+message Blob {
+  bytes id = 1;
+  uint64 bytes = 2;
+}
+
+message CanSatisfyRequest {
+  uint64 task = 1;
+  repeated Blob downstream = 2;
+}
+
+message CanSatisfyReply {
+  bool ok = 1;
+  uint64 reclaimable = 2;
+}
+
+service Admission {
+  rpc CanSatisfy(CanSatisfyRequest) returns (CanSatisfyReply);
+}

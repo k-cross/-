@@ -2,11 +2,30 @@
 name = "polyphonic"
 version = "0.1.0"
 edition = "2024"
+default-run = "polyphonic"
 
 [dependencies]
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
+tonic = { version = "0.12", optional = true }
+prost = { version = "0.13", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"], optional = true }
+
+[build-dependencies]
+tonic-build = { version = "0.12", optional = true }
+
+[features]
+grpc = ["dep:tonic", "dep:prost", "dep:tokio", "dep:tonic-build"]
+
+[[bin]]
+name = "polyphonic"
+path = "src/main.rs"
+
+[[bin]]
+name = "rpcbench"
+path = "src/bin/rpcbench.rs"
+required-features = ["grpc"]
 
 [profile.release]
 debug = true

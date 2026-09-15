@@ -18,6 +18,16 @@ impl BlobId {
     pub fn leaf(content: &[u8]) -> Self {
         Self::chain(ROOT, content)
     }
+
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn from_bytes(b: [u8; 32]) -> Self {
+        Self(b)
+    }
 }
 
 impl fmt::Debug for BlobId {

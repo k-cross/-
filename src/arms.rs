@@ -1,10 +1,13 @@
 use crate::blob::BlobKind;
 use crate::cache::{Hierarchy, Policy, Quota};
+use crate::flow::FlowMode;
 use crate::tier::TierSpec;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Trial {
     pub bands: [u8; BlobKind::N],
+    pub flows: FlowMode,
     pub dram: u64,
     pub nvme: u64,
     pub policy: Policy,
@@ -28,18 +31,53 @@ pub struct Report {
     pub served: [u64; BlobKind::N],
     pub pinned_skips: u64,
     pub over_capacity: bool,
+    pub gated: u64,
+    pub flow_started: u64,
+    pub flow_attempted: u64,
+    pub flow_done: u64,
+    pub flow_broken: u64,
+    pub flow_e2e_ns: u64,
+    pub prewarmed_bytes: u64,
+    pub prewarm_ns: u64,
 }
 
 impl Report {
     #[must_use]
     pub fn goodput(&self) -> f64 {
         let served: u64 = self.served.iter().sum();
-        let total: u64 = served + self.refused.iter().sum::<u64>();
+        let total: u64 = served + self.refused.iter().sum::<u64>() + self.gated;
         if total == 0 {
             0.0
         } else {
             served as f64 / total as f64
         }
+    }
+
+    /// Fraction of *started* tasks whose downstream stage could not be served. A gated task
+    /// never starts, so this measures wasted upstream work, not task success.
+    #[must_use]
+    pub fn broken_rate(&self) -> f64 {
+        if self.flow_started == 0 {
+            0.0
+        } else {
+            self.flow_broken as f64 / self.flow_started as f64
+        }
+    }
+
+    /// Fraction of *attempted* tasks that completed. Counts gated tasks as failures, so a
+    /// gate cannot win by refusing everything.
+    #[must_use]
+    pub fn task_completion(&self) -> f64 {
+        if self.flow_attempted == 0 {
+            0.0
+        } else {
+            self.flow_done as f64 / self.flow_attempted as f64
+        }
+    }
+
+    #[must_use]
+    pub fn flow_e2e_ms(&self) -> f64 {
+        mean_ms(self.flow_e2e_ns, self.flow_done)
     }
 
     #[must_use]
@@ -54,7 +92,19 @@ impl Report {
 }
 
 #[must_use]
+pub fn trace(t: Trial) -> Vec<crate::work::Request> {
+    crate::work::Workload::new(t.seed, t.ops, t.vol).collect()
+}
+
+#[must_use]
 pub fn run(label: &str, t: Trial, quota: Quota) -> Report {
+    run_on(label, t, quota, &trace(t))
+}
+
+/// The request stream is a pure function of (seed, ops, vol), so a sweep over quotas can
+/// generate it once instead of rebuilding an identical trace for every candidate.
+#[must_use]
+pub fn run_on(label: &str, t: Trial, quota: Quota, trace: &[crate::work::Request]) -> Report {
     let mut h = Hierarchy::new(
         TierSpec::dram(t.dram),
         TierSpec::nvme(t.nvme),
@@ -68,11 +118,52 @@ pub fn run(label: &str, t: Trial, quota: Quota) -> Report {
     let mut kind_ops = [0u64; BlobKind::N];
     let mut served = [0u64; BlobKind::N];
 
-    for req in crate::work::Workload::new(t.seed, t.ops, t.vol) {
+    let mut started: HashMap<u64, u64> = HashMap::new();
+    let mut gated_tasks: HashSet<u64> = HashSet::new();
+    let (mut gated, mut flow_started, mut flow_done, mut flow_broken, mut flow_e2e) =
+        (0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut flow_attempted = 0u64;
+
+    for req in trace {
         let k = req.chain.first().map_or(0, |(_, m)| m.kind.idx());
+
+        if let Some(hint) = &req.hint
+            && t.flows == FlowMode::Gate
+            && !h.can_satisfy(hint)
+        {
+            // Refusing the upstream must also cancel the task's downstream stage, or the
+            // gate "avoids" work that still runs and the saving is imaginary.
+            gated_tasks.insert(hint.task);
+            gated += 1;
+            flow_attempted += 1;
+            continue;
+        }
+        if let Some(task) = req.completes
+            && gated_tasks.remove(&task)
+        {
+            continue;
+        }
+
         let c = h.access(&req.chain);
+
+        if let Some(up) = req.completes.and_then(|task| started.remove(&task)) {
+            if c.pending {
+                flow_broken += 1;
+            } else {
+                flow_done += 1;
+                flow_e2e += up + c.total_ns();
+            }
+        }
         if c.pending {
             continue;
+        }
+        if let Some(hint) = &req.hint {
+            flow_started += 1;
+            flow_attempted += 1;
+            started.insert(hint.task, c.total_ns());
+            if t.flows != FlowMode::Blind {
+                h.announce(hint);
+            }
         }
         served[k] += 1;
         total += c.total_ns();
@@ -84,6 +175,43 @@ pub fn run(label: &str, t: Trial, quota: Quota) -> Report {
     }
 
     costs.sort_unstable();
+    finish(
+        label,
+        &h,
+        &costs,
+        &Tally {
+            total,
+            transfer,
+            phase_ns,
+            kind_ns,
+            kind_ops,
+            served,
+            gated,
+            flow_started,
+            flow_attempted,
+            flow_done,
+            flow_broken,
+            flow_e2e,
+        },
+    )
+}
+
+struct Tally {
+    total: u64,
+    transfer: u64,
+    phase_ns: [u64; crate::work::PHASES],
+    kind_ns: [u64; BlobKind::N],
+    kind_ops: [u64; BlobKind::N],
+    served: [u64; BlobKind::N],
+    gated: u64,
+    flow_started: u64,
+    flow_attempted: u64,
+    flow_done: u64,
+    flow_broken: u64,
+    flow_e2e: u64,
+}
+
+fn finish(label: &str, h: &Hierarchy, costs: &[u64], t: &Tally) -> Report {
     let pick = |q: f64| {
         costs
             .get(((costs.len() as f64 * q) as usize).min(costs.len().saturating_sub(1)))
@@ -104,18 +232,26 @@ pub fn run(label: &str, t: Trial, quota: Quota) -> Report {
     }
     Report {
         label: label.to_string(),
-        total_ns: total,
-        transfer_ns: transfer,
+        total_ns: t.total,
+        transfer_ns: t.transfer,
         p99_ns: pick(0.99),
         hit,
         resident,
-        phase_ns,
-        kind_ns,
-        kind_ops,
+        phase_ns: t.phase_ns,
+        kind_ns: t.kind_ns,
+        kind_ops: t.kind_ops,
         refused: h.dram.refused,
-        served,
+        served: t.served,
         pinned_skips: h.dram.pinned_skips,
         over_capacity: h.dram.over_capacity(),
+        gated: t.gated,
+        flow_started: t.flow_started,
+        flow_attempted: t.flow_attempted,
+        flow_done: t.flow_done,
+        flow_broken: t.flow_broken,
+        flow_e2e_ns: t.flow_e2e,
+        prewarmed_bytes: h.prewarmed_bytes,
+        prewarm_ns: h.prewarm_ns,
     }
 }
 

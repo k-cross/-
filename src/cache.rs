@@ -2,6 +2,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 
 use crate::blob::{BlobId, BlobKind, BlobMeta};
+use crate::flow::FlowHint;
 use crate::tier::TierSpec;
 
 const FREQ_CAP: u32 = 16;
@@ -84,6 +85,9 @@ impl Quota {
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     meta: BlobMeta,
+    /// Anticipated near-term accesses announced by a flow, in the same units as `freq`.
+    /// Prewarming is therefore a change of *value*, not a separate subsystem.
+    expect: f64,
     last_touch: u64,
     freq: u32,
     resident_children: u32,
@@ -164,6 +168,15 @@ impl TierPool {
         &self.spec
     }
 
+    pub fn resident_ids(&self) -> impl Iterator<Item = BlobId> + '_ {
+        self.entries.keys().copied()
+    }
+
+    #[must_use]
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+
     #[must_use]
     pub fn contains(&self, id: &BlobId) -> bool {
         self.entries.contains_key(id)
@@ -179,11 +192,54 @@ impl TierPool {
         self.used > self.spec.capacity
     }
 
-    fn score(&self, meta: &BlobMeta, freq: u32) -> f64 {
+    fn score(&self, meta: &BlobMeta, freq: u32, expect: f64) -> f64 {
         match self.policy {
-            Policy::Gdsf => self.inflation + f64::from(freq.min(FREQ_CAP)) * meta.value_per_byte(),
+            Policy::Gdsf => {
+                self.inflation + (f64::from(freq.min(FREQ_CAP)) + expect) * meta.value_per_byte()
+            }
             Policy::Lru => self.clock as f64,
         }
+    }
+
+    /// Raise a blob's value because a flow says it is about to be needed. Expressed in the
+    /// ledger's own currency, so an anticipated access competes with a real one directly.
+    pub fn anticipate(&mut self, id: BlobId, weight: f64) {
+        let (inflation, policy, clock) = (self.inflation, self.policy, self.clock);
+        let Some(e) = self.entries.get_mut(&id) else {
+            return;
+        };
+        // One announced access is worth at most one access. Accumulating would let a
+        // repeatedly-announced blob outrank anything real and never fall back.
+        let expect = e.expect.max(weight.min(1.0));
+        if (expect - e.expect).abs() < f64::EPSILON {
+            return;
+        }
+        e.expect = expect;
+        e.priority = match policy {
+            Policy::Gdsf => {
+                inflation + (f64::from(e.freq.min(FREQ_CAP)) + expect) * e.meta.value_per_byte()
+            }
+            Policy::Lru => clock as f64,
+        };
+        self.reheap(id);
+    }
+
+    #[must_use]
+    pub fn free_bytes(&self) -> u64 {
+        self.spec.capacity.saturating_sub(self.used)
+    }
+
+    /// Free space plus burstable bytes that are actually reclaimable. Deliberately
+    /// conservative: bytes held by a class whose entries are typically pinned while serving
+    /// are not counted, since promising against them is how a task gets admitted and then
+    /// stalls.
+    #[must_use]
+    pub fn reclaimable(&self) -> u64 {
+        let burst: u64 = (0..BlobKind::N)
+            .filter(|&k| BlobKind::ALL[k] != BlobKind::ServiceHeap)
+            .map(|k| self.by_kind[k].saturating_sub(self.quota.floor[k]))
+            .sum();
+        self.free_bytes() + burst
     }
 
     fn is_serving(&self, e: &Entry) -> bool {
@@ -215,8 +271,9 @@ impl TierPool {
         };
         e.freq = e.freq.saturating_add(1);
         e.last_touch = self.clock;
+        e.expect = 0.0;
         let (meta, freq) = (e.meta, e.freq);
-        let p = self.score(&meta, freq);
+        let p = self.score(&meta, freq, 0.0);
         if let Some(e) = self.entries.get_mut(&id) {
             e.priority = p;
         }
@@ -393,12 +450,13 @@ impl TierPool {
         self.clock += 1;
         self.used += meta.bytes;
         self.by_kind[k] += meta.bytes;
-        let priority = self.score(&meta, 1);
+        let priority = self.score(&meta, 1, 0.0);
         self.epoch += 1;
         self.entries.insert(
             id,
             Entry {
                 meta,
+                expect: 0.0,
                 last_touch: self.clock,
                 freq: 1,
                 resident_children: 0,
@@ -408,6 +466,18 @@ impl TierPool {
         );
         self.reheap(id);
         Admission::Admitted
+    }
+
+    /// Empty the pool, handing back everything it held. Used when a domain is drained: the
+    /// state is migrating, not being discarded, so callers must re-admit it somewhere.
+    pub fn drain_all(&mut self) -> Vec<(BlobId, BlobMeta)> {
+        let out: Vec<(BlobId, BlobMeta)> =
+            self.entries.iter().map(|(id, e)| (*id, e.meta)).collect();
+        self.entries.clear();
+        self.evictable.iter_mut().for_each(BinaryHeap::clear);
+        self.used = 0;
+        self.by_kind = [0; BlobKind::N];
+        out
     }
 
     pub fn remove(&mut self, id: &BlobId) -> Option<BlobMeta> {
@@ -441,6 +511,8 @@ pub struct Hierarchy {
     pub hits: [u64; BlobKind::N],
     pub nvme_hits: [u64; BlobKind::N],
     pub misses: [u64; BlobKind::N],
+    pub prewarmed_bytes: u64,
+    pub prewarm_ns: u64,
 }
 
 impl Hierarchy {
@@ -452,6 +524,8 @@ impl Hierarchy {
             hits: [0; BlobKind::N],
             nvme_hits: [0; BlobKind::N],
             misses: [0; BlobKind::N],
+            prewarmed_bytes: 0,
+            prewarm_ns: 0,
         }
     }
 
@@ -463,6 +537,78 @@ impl Hierarchy {
             let _ = self.nvme.admit(did, dmeta, &mut dropped);
         }
         a
+    }
+
+    /// Value the downstream working set of a task before it is requested, and prewarm any of
+    /// it that fits in free space. Prewarming never preempts: speculative work must not evict
+    /// state someone is actually using.
+    pub fn announce(&mut self, hint: &FlowHint) {
+        for &(id, meta) in &hint.downstream {
+            if self.dram.contains(&id) {
+                self.dram.anticipate(id, hint.probability);
+                continue;
+            }
+            if meta.bytes > self.dram.free_bytes() {
+                break;
+            }
+            let staged = self.nvme.contains(&id);
+            if self.admit_dram(id, meta) == Admission::Pending {
+                break;
+            }
+            // Prewarming moves materialization off the critical path; it does not make it
+            // free. Charged to a background budget so the two are never conflated.
+            if staged {
+                self.prewarm_ns += self.nvme.spec().fetch_ns(meta.bytes);
+                self.nvme.remove(&id);
+            } else {
+                self.prewarm_ns += meta.recompute_ns;
+            }
+            self.dram.anticipate(id, hint.probability);
+            self.prewarmed_bytes += meta.bytes;
+        }
+    }
+
+    /// Could this task's remaining downstream state be made resident? Admitting an upstream
+    /// stage whose downstream cannot land burns a warm cell on work that will stall.
+    #[must_use]
+    pub fn can_satisfy(&self, hint: &FlowHint) -> bool {
+        let missing = hint.missing_bytes(|id| self.dram.contains(id));
+        missing <= self.dram.reclaimable()
+    }
+
+    /// Admit migrated state without charging for it: the bytes already exist, they just live
+    /// somewhere else now.
+    pub fn reinstate(&mut self, id: BlobId, meta: BlobMeta) {
+        let _ = self.admit_dram(id, meta);
+    }
+
+    /// Materialise an unordered dependency set. Unlike a chain these have no parent
+    /// relation, so each is admitted independently and a refusal does not abort the rest.
+    pub fn access_set(&mut self, blobs: &[(BlobId, BlobMeta)]) -> Cost {
+        let mut cost = Cost::default();
+        for &(id, meta) in blobs {
+            let k = meta.kind.idx();
+            if self.dram.contains(&id) {
+                self.dram.touch(id);
+                self.hits[k] += 1;
+                continue;
+            }
+            let staged = self.nvme.contains(&id);
+            if self.admit_dram(id, meta) == Admission::Pending {
+                cost.pending = true;
+                continue;
+            }
+            if staged {
+                cost.transfer_ns += self.nvme.spec().fetch_ns(meta.bytes);
+                self.nvme.remove(&id);
+                self.nvme_hits[k] += 1;
+            } else {
+                cost.recompute_ns += meta.recompute_ns;
+                self.misses[k] += 1;
+            }
+            cost.bytes_in += meta.bytes;
+        }
+        cost
     }
 
     pub fn access(&mut self, chain: &[(BlobId, BlobMeta)]) -> Cost {

@@ -195,57 +195,246 @@ metric by refusing work. Both numbers are always reported together.
 This is a scheduling primitive, not an error path — it is `Pending` in the orchestrator
 sense, and it is where elastic capacity acquisition would hook in.
 
-## Flows: dependency across phases *(designed, not built)*
+## Flows: dependency across phases
 
-Two workloads registered independently — a FaaS function and an inference service — are
-often one task: `Invoke → Prefill → Decode`. Nothing in the model above can see that, which
-is precisely the boundary the whole thesis is about.
+Two workloads registered independently — a function and an inference service — are often one
+task: `Invoke -> Prefill -> Decode`. Neither workload can see that; the orchestrator can.
+45% of function invocations in the trace call into inference after a short lead, against a
+per-function system prompt shared across that function's invocations.
 
 ```rust
-pub struct Stage { workload: WorkloadId, phase: Phase }
-
-pub enum Phase {
-    Init, Invoke, Drain,      // FaaS
-    Prefill, Decode,          // inference
-    Fetch, Step, Checkpoint,  // training
-    Start, Serve,             // long-running
-}
-
-pub struct Flow {
-    from: Stage,
-    to: Stage,
-    probability: f64,   // P(to fires | from fired)
-    lead_ns: u64,       // observed delay
-    payload_bytes: u64, // handoff size: decides pointer vs. copy
+pub struct FlowHint {
+    task: u64,
+    downstream: Vec<(BlobId, BlobMeta)>,  // the working set the next stage will need
+    probability: f64,                     // P(to fires | from fired)
+    lead_ops: u32,                        // observed delay
 }
 ```
 
-A task is the transitive closure of flows from an entry stage. Flows may be **declared**,
-but the default should be **learned**: the content-addressed index can attribute each access
-to the stage that caused it, so edges are inferable from observed `(stage, blob)` traces
-without user annotation.
+### Anticipatory value
 
-Three things a flow buys, all of them residency decisions in the existing currency:
+`Hierarchy::announce` does two things when an upstream stage is admitted. Downstream blobs
+already resident get `anticipate(probability)`, which adds to the GDSF numerator alongside
+`freq`:
 
-1. **Anticipatory value — prewarm without a prewarm subsystem.** When `from` is admitted,
-   every blob `to` will need has a known expected access at `now + lead_ns`. Add
-   `probability × value_per_byte` to its priority for that window. Evicting a block that is
-   about to be needed becomes expensive *in the same units as everything else*. No hint
-   protocol, no separate warming service.
+```
+priority = inflation + (min(freq, FREQ_CAP) + expect) * value_per_byte
+```
 
-2. **Temporal floors.** Two stages in one flow can share a floor that *moves along the task*
-   rather than holding two independent ones. A function that always calls inference does not
-   need its snapshot resident while the inference stage runs. Soft boundaries become
-   temporal, not merely per-class.
+Prewarming is therefore a change of **value**, not a subsystem: an anticipated access
+competes against a real one in the same currency, and `expect` clears on access. Downstream
+blobs *not* resident are admitted if they fit in free space — **prewarming never preempts**,
+because speculative work must not evict state someone is actually using.
 
-3. **Admission with downstream knowledge.** Refusal currently inspects only the requested
-   blob. With flows it can ask whether the *whole task's* working set can be made resident
-   before admitting stage one — refusing early instead of admitting a function that strands a
-   warm cell blocking on an inference stage that will never be admitted. This is the
-   queue-amplification collapse of siloed stacks, and it is a small extension of the refusal
-   path.
+### Downstream-aware admission
 
-The single hook is `TierPool::score`. A flow-aware valuation changes that one function.
+`can_satisfy` asks whether the task's remaining downstream working set could be made
+resident before admitting the upstream stage. Admitting a function whose inference stage
+cannot land burns a warm cell on work that will stall — the queue amplification that siloed
+stacks suffer.
+
+The estimate must be **conservative about what is actually reclaimable**. A first version
+counted burstable service bytes that were in fact pinned-while-serving, so every downstream
+looked satisfiable and the gate never fired.
+
+### Results
+
+8 GiB, 15k requests, identical quota and trace in every row. `task e2e` and `stall total` are
+critical-path only; `prewarm work` is materialisation moved off it.
+
+| flows | task e2e | stall total | prewarm work | net work | inference |
+|---|---|---|---|---|---|
+| `blind` | 39.45 ms | 377.77 s | 0.00 s | 377.77 s | 4.16 ms |
+| `announce` | **34.35 ms** | 366.67 s | 8.74 s | 375.41 s | **2.87 ms** |
+| `gate` | 34.35 ms | 366.67 s | 8.74 s | 375.41 s | 2.87 ms |
+
+**Announce relocates work; it does not eliminate it.** Critical-path stall falls 11.1 s, but
+8.74 s of that reappears as background materialisation — **79% of the apparent saving is
+moved, not saved.** Net work drops 0.6%.
+
+So announce is a *latency* win (task e2e -12.9%, inference stall -31%) and very nearly a
+*work* no-op. It is worth doing when there is idle capacity to absorb the background
+materialisation, and close to worthless when the machine is saturated. Any claim that
+prewarming is free is an accounting error — an earlier revision of this document made
+exactly that error, because `announce` admitted blobs into DRAM without charging the
+`fetch_ns` or `recompute_ns` that `access` charges for the identical work.
+
+Under scarcity the gate matters, but its accounting has to be honest too: a gated task must
+*cancel its downstream stage*, and must count as an attempted task. Otherwise "gate
+eliminates broken tasks" is definitional — the gated task simply leaves the denominator.
+`task_completion` counts gated tasks as failures so a gate cannot win by refusing everything.
+
+### Which tier is this? — measured
+
+An earlier revision claimed the gate was Tier 2 because "across a gRPC boundary that query
+costs more than the stall it avoids." **That was wrong, and the measurement refutes it.**
+
+`cargo run --release --features grpc --bin rpcbench` measures a real tonic unary RPC against
+the direct call on a populated ledger (6300 resident blobs, 7.5 GiB), with the real query
+payload (28 downstream blobs, ~1.1 KB):
+
+| admission query | p50 | p99 | p999 |
+|---|---|---|---|
+| in-process (direct call) | **0.96 µs** | 1.42 µs | 2.13 µs |
+| gRPC unary (TCP loopback) | **55.6 µs** | 96.2 µs | 155.8 µs |
+| raw TCP echo, same payload | 20.0 µs | 33.2 µs | 39.0 µs |
+
+~58x, and ~64% of gRPC's cost is HTTP/2 framing and protobuf above the raw socket. Loopback
+is the *best* case; a network-attached extender adds another 0.5-1 ms.
+
+But the gate fires once per flow task, against a break-even budget of ~5775 µs (assumed:
+7.7% broken x ~75 ms wasted upstream). At 55.6 µs, gRPC is ~100x under it. **The boundary is
+entirely affordable for admission, and the gate is Tier 1.**
+
+### Where the boundary actually bites
+
+Not per-request latency — control-plane throughput. `Hierarchy::access` measured in-process
+is **0.6-1.2 µs p50** and carries ~4.0 evictions per request:
+
+```
+single decision thread
+  in-process   830k-1.6M req/s   (measured)
+  over gRPC          ~3.6k req/s (extrapolated: 5.0 decisions x 55.6 us)
+  ratio              230x-450x
+```
+
+The in-process figure is timer-resolution-limited — `Instant::now()` overhead is a
+meaningful fraction of a sub-microsecond operation — so treat the ratio as two orders of
+magnitude, not a precise number. The gRPC column is an **extrapolation** of what it would
+cost if each in-process decision instead crossed a boundary; only `access` and the RPC are
+directly measured.
+
+Adding ~220 µs to a request whose mean stall is ~24 ms is under 1% of latency — invisible.
+What it costs is a scheduler fleet two orders of magnitude larger for the same request rate.
+
+This sharpens the README's "zero cost extension" goal and narrows it. The claim is false for
+coarse decisions — admission, placement, scale-up — where a sidecar or extender is fine and
+k8s is not obviously wrong. It holds for the **inner loop**: eviction, block placement, and
+routing within a batch, where a decision costs under a microsecond and the boundary costs
+fifty. Put the extension boundary where decisions are coarse; never inside the ledger's hot
+path. That is what the ABI and WASM interfaces are for.
+
+## Topology and placement
+
+`topo.rs` models compute units, memory domains, and the links between them. The consequential
+field on a link is **coherence**, not bandwidth: a coherent link is traversed by reference, a
+non-coherent one requires a copy, and that decides whether co-placement saves a dereference or
+a whole materialisation.
+
+`Topology::discover()` probes the host — sysctl perflevels on darwin, sysfs NUMA nodes and the
+kernel distance matrix on Linux. On this machine that is 8 performance + 4 efficiency units
+over **one** memory domain.
+
+### The host cannot measure what the model is for
+
+Two attempts, both reported rather than buried. Streaming bandwidth is memory-bound and
+identical across clusters. The right probe is a dependent-load chase sized against the two L2s
+(16 MiB perf vs 4 MiB efficiency) — but macOS QoS is advisory and runs background threads on
+performance cores when idle, so both probes land on the same cluster and the ratio column is
+noise. The separation test requires **direction-consistency across working sets** rather than
+tripping on a single outlier, and prints "did not separate".
+
+What is real is the one-domain latency curve — ~6 ns in L2, ~20 ns at 16 MiB, ~120 ns at
+256 MiB — which is what a per-domain link cost should be derived from. Everything cross-domain
+below runs on `Topology::synthetic`, whose constants are **modelled**: coherent, ~2x per-byte,
+120 ns hop. Re-derive them on multi-socket or multi-GPU hardware before trusting any number
+that depends on them.
+
+### Placement: a negative result
+
+`machine.rs` gives each memory domain its own ledger. A chain is served from the domain that
+already holds its deepest prefix, and the compute unit pays the interconnect cost to reach it
+— so placement decides whether that link is local or a hop, with no cross-domain chains and no
+double-charging.
+
+Synthetic 4 domains x 2 GiB, 3 units each, 15k requests:
+
+| placement | stall/req | materialise | interconnect | cold | spread |
+|---|---|---|---|---|---|
+| `blind` (round-robin) | 189.47 ms | 2610.7 s | 129.6 s | 39.3% | 1.13 |
+| `sticky` (hash chain root) | **30.56 ms** | 357.0 s | 86.2 s | 38.6% | 1.17 |
+| `aware` (residency lookup) | **30.56 ms** | 357.0 s | 86.2 s | 38.6% | 1.17 |
+
+**Residency-aware placement adds exactly nothing over consistent hashing.** Identical on every
+metric.
+
+The first version of this experiment showed `aware` beating `blind` 3.3x, and that was a
+strawman: round-robin re-scatters continuations of the same session, which no real load
+balancer does. Against a consistent hash on the chain root the win vanishes entirely — because
+in this workload the chain root **is** the tenant identity, so the hash already predicts
+residency perfectly and the ledger lookup is redundant.
+
+Note also that the `blind` gap was never mostly interconnect (129.6 s of 2740 s). Scattering
+placement fragments a shared tenant prefix across domains, storing it up to 4x and evicting
+far more. The cost of state-blind placement is duplicated state, not extra hops.
+
+### When residency should beat hashing — three tests, three answers
+
+A content hash predicts where state *belongs*. It is wrong exactly when state is somewhere
+else. Three cases were named and all three were built. Columns below: mean stall per served
+request, materialisation, cross-domain flow handoff, and the share of cross-workload tasks
+whose two stages landed in different domains.
+
+**1. Stale hash after a node drain.** Domain 0 is drained halfway through; its state migrates
+to the survivors, so the bytes survive but placements pointing at it do not.
+
+| placement | stall/req | materialise | tasks split |
+|---|---|---|---|
+| `sticky` (rendezvous hash) | **34.22 ms** | 394.9 s | 70.0% |
+| `aware` (residency) | 34.73 ms | 422.9 s | 0.0% |
+
+**Aware loses.** An intermediate version showed aware winning by 4%, but only because the
+baseline hashed with `root % n`, which remaps nearly every key on resize. Against *rendezvous*
+hashing — which remaps only the keys that lived on the drained domain, as a real balancer does
+— the win inverts. The reason is worth keeping: migrated state lands scattered across the
+survivors, so "follow the bytes" locks in a fragmented layout while the hash **re-normalises**
+it. A residency-aware placer needs a compaction notion, not just pursuit.
+
+**2. Sharing across identity boundaries.** Inference depends on its model's weight shards;
+24 tenants map to 4 models, so the shards are shared across identities no caller hash can
+co-locate.
+
+| placement | stall/req | materialise | cold |
+|---|---|---|---|
+| `sticky` | **75.14 ms** | 844.4 s | 47.9% |
+| `aware` | 147.00 ms | 1979.6 s | 41.7% |
+
+**Aware loses badly — 2x.** Scoring a domain by resident bytes makes a 512 MiB shared shard a
+*gravity well*: every tenant on that model is pulled onto one domain, KV locality is destroyed
+and capacity blows out. The correct handling of shared, read-only, hot state is **replication**,
+not co-location — and scattering by hash achieves that implicitly, giving every domain its own
+copy and every access a local one. Duplication is the right answer here, which is the opposite
+of the lesson from the `blind` arm.
+
+**3. Cross-workload co-placement.** A task's FaaS snapshot (`fn:f`) and its inference prefix
+(`fnprompt:f`) hash to different domains. The flow carries a 4 MiB intermediate payload, which
+crosses the interconnect whenever the two stages are split.
+
+| placement | stall/req | materialise | handoff | tasks split |
+|---|---|---|---|---|
+| `sticky` | 30.34 ms | 346.9 s | 0.35 s | 73.2% |
+| `aware` (flow-aware) | **30.31 ms** | 346.8 s | **0.00 s** | **0.0%** |
+
+**The mechanism works perfectly and is worth almost nothing.** Flow-aware placement drives
+split tasks from 73.2% to zero and eliminates the handoff entirely — no hash on either
+workload's own identity can do this, so it is a genuine Tier-2 joint decision. But the total
+gain is 0.03 ms/req, **0.1%**, because a 4 MiB handoff over a coherent link is ~280 µs against
+~30 ms of materialisation per request.
+
+From the measured numbers, co-placement would need the handoff to grow ~50x — multi-hundred-MB
+tensors — or the link to be ~50x slower — cross-AZ or cross-region rather than cross-socket —
+before it pays for itself. Both are real regimes; neither is this one.
+
+### What this says about placement
+
+Three named cases, built and measured: one loss, one heavy loss, one win worth 0.1%.
+**Placement is not where a unified ledger pays.** Consistent hashing on content identity is a
+strong baseline that captures nearly all available locality, replicates shared state for free
+by scattering, and survives a drain better than residency-following does.
+
+The ledger's demonstrated wins remain where they started: eviction priced in recompute-cost per
+byte, and admission that refuses rather than overcommits. That is a narrower claim than the
+README makes, and it is the one the measurements support.
 
 ## Tier model, measured not guessed
 
@@ -408,6 +597,5 @@ uninformatively.
 ## Not built
 
 No VMM, no WASM ABI, no exec rings, no edge agent, no live migration, no multi-region. No
-topology or interconnect graph — placement cost is a two-tier table, not a fabric. Flows are
-designed above but unimplemented. The byte store is real but is exercised by `calibrate`
+topology or interconnect graph — placement cost is a two-tier table, not a fabric. The byte store is real but is exercised by `calibrate`
 only; the residency experiments run on the calibrated model rather than moving real bytes.
