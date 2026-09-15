@@ -12,6 +12,10 @@ const TENANTS: u64 = 24;
 const SESSIONS: usize = 512;
 const FUNCTIONS: u64 = 400;
 const SHARDS: u64 = 40;
+const SERVICES: u64 = 6;
+pub const SERVICE_BYTES: u64 = 512 * 1024 * 1024;
+pub const SERVICE_COLD_NS: u64 = 15_000_000_000;
+const REPLICAS: [u64; PHASES] = [4, 1, 2, 4];
 const MAX_TURNS: u32 = 24;
 
 #[derive(Clone, Debug)]
@@ -33,13 +37,14 @@ pub struct Request {
 pub struct Mix {
     pub inference: f64,
     pub faas: f64,
+    pub weights: f64,
 }
 
-const PHASE_MIX: [[f64; 3]; PHASES] = [
-    [0.80, 0.15, 0.05],
-    [0.25, 0.72, 0.03],
-    [0.40, 0.20, 0.40],
-    [0.50, 0.40, 0.10],
+const PHASE_MIX: [[f64; 4]; PHASES] = [
+    [0.55, 0.12, 0.03, 0.30],
+    [0.18, 0.62, 0.02, 0.18],
+    [0.30, 0.15, 0.35, 0.20],
+    [0.35, 0.28, 0.07, 0.30],
 ];
 
 #[derive(Debug)]
@@ -123,22 +128,38 @@ impl Workload {
     #[must_use]
     pub fn mix(&self) -> Mix {
         let p = PHASE_MIX[self.phase()];
-        let mut flat = [0.0; 3];
+        let mut flat = [0.0; 4];
         for m in PHASE_MIX {
-            for i in 0..3 {
+            for i in 0..4 {
                 flat[i] += m[i] / PHASES as f64;
             }
         }
         let v = self.volatility;
-        let mut w = [0.0; 3];
-        for i in 0..3 {
+        let mut w = [0.0; 4];
+        for i in 0..4 {
             w[i] = flat[i] + v * (p[i] - flat[i]);
         }
         let sum: f64 = w.iter().sum();
         Mix {
             inference: w[0] / sum,
             faas: (w[0] + w[1]) / sum,
+            weights: (w[0] + w[1] + w[2]) / sum,
         }
+    }
+
+    fn service(&mut self) -> Vec<(BlobId, BlobMeta)> {
+        let s = self.rng.zipf(SERVICES, 1.2);
+        let r = self.rng.below(REPLICAS[self.phase()]);
+        let id = BlobId::leaf(format!("svc:{s}:{r}").as_bytes());
+        vec![(
+            id,
+            BlobMeta {
+                kind: BlobKind::ServiceHeap,
+                bytes: SERVICE_BYTES,
+                parent: None,
+                recompute_ns: SERVICE_COLD_NS,
+            },
+        )]
     }
 
     fn inference(&mut self) -> Vec<(BlobId, BlobMeta)> {
@@ -206,8 +227,10 @@ impl Iterator for Workload {
             self.inference()
         } else if roll < mix.faas {
             self.faas()
-        } else {
+        } else if roll < mix.weights {
             self.weights()
+        } else {
+            self.service()
         };
         Some(Request { phase, chain })
     }

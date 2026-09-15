@@ -19,7 +19,7 @@ impl Cache {
     }
 
     #[must_use]
-    pub fn siloed(dram: u64, nvme: u64, split: [f64; 3], policy: Policy) -> Self {
+    pub fn siloed(dram: u64, nvme: u64, split: [f64; BlobKind::N], policy: Policy) -> Self {
         let pools = split
             .iter()
             .map(|f| {
@@ -43,7 +43,7 @@ impl Cache {
         }
     }
 
-    fn pools(&self) -> &[Hierarchy] {
+    pub fn pools(&self) -> &[Hierarchy] {
         match self {
             Cache::Unified(h) => std::slice::from_ref(&**h),
             Cache::Siloed(p) => p,
@@ -77,9 +77,13 @@ pub struct Report {
     pub transfer_ns: u64,
     pub p50_ns: u64,
     pub p99_ns: u64,
-    pub hit: [f64; 3],
-    pub resident: [u64; 3],
+    pub hit: [f64; BlobKind::N],
+    pub resident: [u64; BlobKind::N],
     pub phase_ns: [u64; crate::work::PHASES],
+    pub kind_ns: [u64; BlobKind::N],
+    pub kind_ops: [u64; BlobKind::N],
+    pub overcommit: u64,
+    pub pinned_skips: u64,
 }
 
 #[must_use]
@@ -87,11 +91,16 @@ pub fn run(label: &str, mut cache: Cache, seed: u64, ops: u64, vol: f64) -> Repo
     let mut costs: Vec<u64> = Vec::with_capacity(ops as usize);
     let (mut total, mut transfer) = (0u64, 0u64);
     let mut phase_ns = [0u64; crate::work::PHASES];
+    let mut kind_ns = [0u64; BlobKind::N];
+    let mut kind_ops = [0u64; BlobKind::N];
     for req in crate::work::Workload::new(seed, ops, vol) {
         let c = cache.access(&req.chain);
         total += c.total_ns();
         transfer += c.transfer_ns;
         phase_ns[req.phase] += c.total_ns();
+        let k = req.chain.first().map_or(0, |(_, m)| m.kind.idx());
+        kind_ns[k] += c.total_ns();
+        kind_ops[k] += 1;
         costs.push(c.total_ns());
     }
     costs.sort_unstable();
@@ -101,8 +110,8 @@ pub fn run(label: &str, mut cache: Cache, seed: u64, ops: u64, vol: f64) -> Repo
             .copied()
             .unwrap_or(0)
     };
-    let mut hit = [0.0; 3];
-    let mut resident = [0; 3];
+    let mut hit = [0.0; BlobKind::N];
+    let mut resident = [0; BlobKind::N];
     for k in BlobKind::ALL {
         hit[k.idx()] = cache.hit_rate(k);
         resident[k.idx()] = cache.resident_bytes(k);
@@ -116,5 +125,9 @@ pub fn run(label: &str, mut cache: Cache, seed: u64, ops: u64, vol: f64) -> Repo
         hit,
         resident,
         phase_ns,
+        kind_ns,
+        kind_ops,
+        overcommit: cache.pools().iter().map(|p| p.dram.overcommit).sum(),
+        pinned_skips: cache.pools().iter().map(|p| p.dram.pinned_skips).sum(),
     }
 }

@@ -1,3 +1,4 @@
+// Constants fitted from `polyphonic calibrate` on darwin/arm64 with direct I/O; re-derive per host.
 #[derive(Clone, Copy, Debug)]
 pub struct TierSpec {
     pub capacity: u64,
@@ -10,8 +11,8 @@ impl TierSpec {
     pub fn dram(capacity: u64) -> Self {
         Self {
             capacity,
-            fixed_ns: 100,
-            ns_per_byte: 1.0 / 20.0,
+            fixed_ns: 0,
+            ns_per_byte: 1.0 / 28.0,
         }
     }
 
@@ -19,8 +20,8 @@ impl TierSpec {
     pub fn nvme(capacity: u64) -> Self {
         Self {
             capacity,
-            fixed_ns: 90_000,
-            ns_per_byte: 1.0 / 3.0,
+            fixed_ns: 113_000,
+            ns_per_byte: 1.0 / 7.8,
         }
     }
 

@@ -34,10 +34,17 @@ pub enum BlobKind {
     KvBlock,
     Snapshot,
     WeightShard,
+    ServiceHeap,
 }
 
 impl BlobKind {
-    pub const ALL: [BlobKind; 3] = [BlobKind::KvBlock, BlobKind::Snapshot, BlobKind::WeightShard];
+    pub const N: usize = 4;
+    pub const ALL: [BlobKind; Self::N] = [
+        BlobKind::KvBlock,
+        BlobKind::Snapshot,
+        BlobKind::WeightShard,
+        BlobKind::ServiceHeap,
+    ];
 
     #[must_use]
     pub fn idx(self) -> usize {
@@ -45,6 +52,7 @@ impl BlobKind {
             BlobKind::KvBlock => 0,
             BlobKind::Snapshot => 1,
             BlobKind::WeightShard => 2,
+            BlobKind::ServiceHeap => 3,
         }
     }
 }

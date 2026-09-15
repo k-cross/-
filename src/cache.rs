@@ -2,6 +2,11 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 
 use crate::blob::{BlobId, BlobKind, BlobMeta};
+
+const FREQ_CAP: u32 = 16;
+
+// A replica with live connections cannot be evicted at any price; only an idle one is a candidate.
+const SERVING_WINDOW: u64 = 600;
 use crate::tier::TierSpec;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -13,6 +18,7 @@ pub enum Policy {
 #[derive(Clone, Copy, Debug)]
 struct Entry {
     meta: BlobMeta,
+    last_touch: u64,
     freq: u32,
     resident_children: u32,
     priority: f64,
@@ -57,8 +63,9 @@ pub struct TierPool {
     inflation: f64,
     entries: HashMap<BlobId, Entry>,
     evictable: BinaryHeap<Reverse<Ranked>>,
-    pub evicted: [u64; 3],
+    pub evicted: [u64; BlobKind::N],
     pub overcommit: u64,
+    pub pinned_skips: u64,
 }
 
 impl TierPool {
@@ -74,8 +81,9 @@ impl TierPool {
             inflation: 0.0,
             entries: HashMap::new(),
             evictable: BinaryHeap::new(),
-            evicted: [0; 3],
+            evicted: [0; BlobKind::N],
             overcommit: 0,
+            pinned_skips: 0,
         }
     }
 
@@ -100,7 +108,7 @@ impl TierPool {
 
     fn score(&self, meta: &BlobMeta, freq: u32) -> f64 {
         match self.policy {
-            Policy::Gdsf => self.inflation + f64::from(freq) * meta.value_per_byte(),
+            Policy::Gdsf => self.inflation + f64::from(freq.min(FREQ_CAP)) * meta.value_per_byte(),
             Policy::Lru => self.clock as f64,
         }
     }
@@ -154,7 +162,21 @@ impl TierPool {
         }
     }
 
+    fn is_serving(&self, e: &Entry) -> bool {
+        e.meta.kind == BlobKind::ServiceHeap
+            && self.clock.saturating_sub(e.last_touch) < SERVING_WINDOW
+    }
+
     fn pop_victim(&mut self) -> Option<(BlobId, Entry)> {
+        let mut parked = Vec::new();
+        let victim = self.scan_victim(&mut parked);
+        for r in parked {
+            self.evictable.push(Reverse(r));
+        }
+        victim
+    }
+
+    fn scan_victim(&mut self, parked: &mut Vec<Ranked>) -> Option<(BlobId, Entry)> {
         while let Some(Reverse(r)) = self.evictable.pop() {
             let Some(e) = self.entries.get(&r.id) else {
                 continue;
@@ -163,6 +185,11 @@ impl TierPool {
                 continue;
             }
             if self.leaf_first && e.resident_children > 0 {
+                continue;
+            }
+            if self.is_serving(e) {
+                self.pinned_skips += 1;
+                parked.push(r);
                 continue;
             }
             let e = self.entries.remove(&r.id)?;
@@ -196,6 +223,7 @@ impl TierPool {
             id,
             Entry {
                 meta,
+                last_touch: self.clock,
                 freq: 1,
                 resident_children: 0,
                 priority,
@@ -231,9 +259,9 @@ impl Cost {
 pub struct Hierarchy {
     pub dram: TierPool,
     pub nvme: TierPool,
-    pub hits: [u64; 3],
-    pub nvme_hits: [u64; 3],
-    pub misses: [u64; 3],
+    pub hits: [u64; BlobKind::N],
+    pub nvme_hits: [u64; BlobKind::N],
+    pub misses: [u64; BlobKind::N],
 }
 
 impl Hierarchy {
@@ -242,9 +270,9 @@ impl Hierarchy {
         Self {
             dram: TierPool::new(dram, policy, true),
             nvme: TierPool::new(nvme, policy, false),
-            hits: [0; 3],
-            nvme_hits: [0; 3],
-            misses: [0; 3],
+            hits: [0; BlobKind::N],
+            nvme_hits: [0; BlobKind::N],
+            misses: [0; BlobKind::N],
         }
     }
 
