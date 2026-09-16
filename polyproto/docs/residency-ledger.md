@@ -4,6 +4,11 @@ Design notes for Polyphonic's scheduler core. Prototype: this records what is bu
 each mechanism is worth on the measured workload, and which constants are measured rather
 than modelled. Numbers are from `darwin/arm64`; re-derive per host.
 
+The host is Apple silicon, one unified memory pool. **The target is not**: a datacenter node
+has accelerator HBM for model state and a separate host DDR pool for everything else (see
+`docs/prototype.md`). Every experiment models the split by default; `--hbm 0` reproduces
+unified memory for comparison.
+
 ## The claim under test
 
 > A single scheduler that owns FaaS, AI inference, and long-running compute beats three
@@ -15,7 +20,9 @@ Two tiers of cross-workload win, and only one is a moat:
   A siloed stack retrofits this with a hint API.
 - **Tier 2 — joint decisions.** Cannot be expressed as a hint without becoming a distributed
   agreement problem: co-placement fused with routing, preemption across classes, and **one
-  memory ledger arbitrating every workload's state at once.**
+  memory ledger arbitrating every workload's state at once.** On datacenter hardware
+  that is one ledger over two pools, and the pools meet only where the accelerator
+  offloads into host memory. See *Memory pools*.
 
 This document is about Tier 2, specifically the ledger.
 
@@ -46,14 +53,61 @@ structural distinction in the model.
 | | eviction means | cost |
 |---|---|---|
 | `KvBlock` | drop prefix | re-prefill (~400 µs / 512 KiB) |
-| `Snapshot` | drop warm cell | cold init (~200 ms / 32 MiB) |
+| `Snapshot` | drop warm cell | lazy restore (~9 ms / 32 MiB) |
 | `WeightShard` | drop weights | reload (~4 s / 512 MiB) |
 | `ServiceHeap` **idle** | scale down | cold start (~15 s / 384 MiB) |
 | `ServiceHeap` **serving** | *forbidden* | — |
 
+**The FaaS substrate is Firecracker with lazy snapshot restore**, and the constant says so
+(`work::snapshot_restore_ns`):
+
+```
+restore_ns(bytes) = 4 ms                              # VMM setup, device restore, mmap
+                  + bytes × 0.15 × 1.0 ns/byte        # touched working set, UFFD page-in
+```
+
+The merkle lineage `H(image, init_result, env)` was always Firecracker-shaped: a serialised
+memory image with ancestry. The old constant, 200 ms / 32 MiB charged linearly, was a cold
+*container* start, which is a different substrate. Demand-paged restore costs a fixed few
+milliseconds plus the pages actually touched, so it is roughly **flat** in image size. The
+footprint stays the whole guest image, because a warm cell holds all of it. So a snapshot is
+now big to hold and cheap to rebuild, which is exactly the profile of something to evict
+first. v8 isolates are explicitly not modelled: they would be a third answer, with no image
+to restore.
+
 A long-running replica is a blob whose recompute cost is its cold start. Scale-up and
 scale-down are admission and eviction — which is what puts an autoscaler and a KV-cache
 allocator in the same ledger.
+
+### Memory pools
+
+```
+node
+├── HBM   (accelerator)  KvBlock, WeightShard        -- hot model state, usable only here
+├── DDR   (host)         Snapshot, ServiceHeap       -- function cells, service replicas
+│                        + offloaded KvBlock, WeightShard
+└── NVMe  (spill)        anything evicted from DDR
+```
+
+`Hierarchy` is one node. KV and weights are usable only in HBM; function cells and service
+heaps only in DDR. **The pools meet in exactly one place**: state evicted from HBM is
+offloaded to DDR rather than dropped, the way Dynamo's KV block manager, LMCache and
+host-side weight caches (ServerlessLLM) all do. Promoting it back over PCIe is far cheaper
+than rebuilding it:
+
+| | rebuild | promote from DDR (PCIe, 50 µs + 0.04 ns/B) | read from NVMe |
+|---|---|---|---|
+| KV block, 512 KiB | 400 µs | **71 µs** | 182 µs + PCIe |
+| weight shard, 512 MiB | 4 s | **21 ms** | 69 ms + PCIe |
+
+So offloaded KV and weights are *host* state. They sit under DDR's quota beside function
+cells and service replicas, in the most sacrificial band (`Quota::offloaded`): host memory
+exists for host workloads, and an offload is a cache of state whose real home is elsewhere.
+Eviction runs HBM → DDR → NVMe and costs the request nothing; promotion runs back up and is
+charged. PCIe is **modelled**; this host has no link to measure.
+
+`--hbm 0` collapses the node to one pool, where every class competes in DDR directly. That
+is the Apple-silicon model the earlier rounds ran on, and it is kept for comparison only.
 
 ### Monotone residency invariant
 
@@ -78,26 +132,114 @@ priority = inflation + (min(freq, FREQ_CAP) + expect) × (recompute_ns / bytes)
 ```
 
 `inflation` (`L`) rises to each victim's priority on eviction. It keeps the structure
-O(log n) without periodic rescoring, and it doubles as **the shadow price of memory** — the
-marginal value of the cheapest byte the system will currently give up. That is the number an
-autoscaler should consult before scaling a replica down, and it exists only because one
-ledger holds every class.
+O(log n) without periodic rescoring. It is *not* a price: it carries the frequency factor and
+only ever rises. The shadow price of memory, the expected cost per byte of the cheapest state
+a pool would give up now, is `marginal_price` (see *Scored placement*). There is one per
+pool, because HBM and DDR are separate markets.
 
 The cost term alone predicts something non-obvious:
 
 | | size | recompute | **ns/byte** |
 |---|---|---|---|
+| FaaS snapshot | 16–64 MiB | 6.5–14 ms | **0.21–0.39** |
 | KV block | 512 KiB | 400 µs | **0.76** |
-| FaaS snapshot | 32 MiB | 200 ms | **5.96** |
 | Weight shard | 512 MiB | 4 s | **7.45** |
 | Service heap | 384 MiB | 15 s | **37.3** |
 
-KV bytes are the *cheapest* in the machine by a wide margin. A siloed stack handing vLLM a
-large fixed KV pool is hoarding the least valuable bytes while the warm pool thrashes.
-`freq` cuts the other way — hot prefixes are reused hard — so the outcome is contested
-rather than foregone.
+**Warm microVM cells are the cheapest bytes to rebuild** once restore is modelled as
+Firecracker actually does it. Under the cold-container constant they were 5.96 ns/byte.
+
+An earlier version of this section compared them with KV blocks as if the two competed for
+the same bytes, and concluded the warm pool was hoarding memory that KV should have. **That
+only holds on unified memory.** In a datacenter node, cells live in DDR and hot KV lives in
+HBM. The comparison that remains real is against *offloaded* KV in DDR. There the cell's low
+rebuild cost and the offload's low promote cost are both cheap, and the offload yields first
+by band. Two consequences survive the split:
+
+- **Bigger cells are cheaper per byte to evict** (0.39 → 0.21 across the size range), because
+  the fixed restore cost amortises. Under a linear model, size was neutral.
+- **Keep-alive matters less than it used to.** In the single-node arbitration run, FaaS
+  costs 4–5 ms of stall per request whatever the snapshot hit rate, because a restore is
+  cheap.
+
+`freq` still cuts the other way. A hot function is reused hard, so the outcome is contested
+per function rather than settled per class.
+
+## Serving engines
+
+A decode step reads the weights once whatever the batch size, so a second sequence is nearly
+free and the sixty-fourth is not. Per-token latency rises with occupancy while throughput
+saturates:
+
+```
+step_ns(batch) = STEP_BASE_NS + (batch - 1) × STEP_PER_SEQ_NS     # 7 ms + 40 µs
+```
+
+`Engine` holds one of these per domain, tracks in-flight sequences against an arrival clock
+set by `--rate`, and queues a request that finds the batch at `MAX_BATCH`. Constants are
+**modelled**; the base is chosen so a batch of one reproduces the flat 125 tok/s the workload
+used before, which keeps the unbatched arm comparable. Batch is sampled once at admission and
+held for the sequence — a step-accurate engine is a different simulation, and the error is
+second-order next to modelling no batch at all.
+
+This is not a refinement. **Modelling decode as a constant makes the central inference
+scheduling tradeoff invisible**, because the reason to route by KV prefix is to avoid the
+recompute a *full* node would force, and a node cannot be full if occupancy has no cost. With
+`--rate 0` the engine is off and the older results reproduce; every claim below about
+placement depends on it being on.
+
+### The congestion toll
+
+`projected_ns` prices what an engine's current batch does to an arriving request. That is
+only the private half. Joining a batch of `live` sequences also widens every one of *their*
+steps, and a scheduler that sees only the private half will pile work onto the deepest node,
+because joining a full batch costs the joiner barely more than joining an empty one.
+`Engine::congestion_ns` prices the other half:
+
+```
+congestion = live × STEP_PER_SEQ_NS × tokens / (1 − min(live / MAX_BATCH, 0.95))
+```
+
+The numerator is the widening. On its own it is linear, and a linear toll cannot represent
+the knee: what actually hurts near capacity is the wait every *future* arrival inherits once
+the batch fills. That wait grows like `1 / (1 − u)`, the classical shape of a queue's
+congestion toll. The factor is 1 on an empty engine, so at low load this is exactly the
+linear term, and it diverges only where placement starts to matter. The cap keeps a
+saturated node expensive rather than infinite, so a cluster where every node is full still
+has an argmin. This is the same move as pricing displacement, applied to engine slots instead
+of memory: a cost that someone else pays, charged to the request that causes it.
 
 ## Policy
+
+### Fan-out admission
+
+A multi-agent orchestrator dispatches N sub-agents and cannot resume until every one of them
+returns. A per-request scheduler admits them one by one, so a fan-out whose fourth agent is
+refused still runs the other three. That work is wasted, and it was done on engines and memory
+other requests needed. Ray gangs its actors for the same reason. The shape to schedule is the
+fan-out, not the agent.
+
+`Machine::serve_gang` places agents hardest first, the one that needs the most bytes, and
+**stages** each placement before placing the next. Staging marks the agent's context and
+weights as about to be resident on that node, reserves its bytes, and reserves its decode
+slot. The next sibling is then priced against the node as it *will* be, which is what lets
+the score see both sides of co-location:
+
+- **for:** siblings share the orchestrator's context prefix, so a second agent on the same
+  node finds it already paid for, and its result comes home without a handoff;
+- **against:** every co-located sibling widens the same batch, and the fan-out finishes only
+  when its *slowest* agent does. Congestion on one node sets the whole job's latency.
+
+Every placement is checked against `Hierarchy::could_admit`, a read-only reclaimability test,
+and nothing is admitted until every agent has a feasible node. If any agent has none, the
+fan-out is refused, and so is the orchestrator's resume turn when it arrives.
+`fanout_atomic` off is the baseline: the same assignment, but the agents that fit run anyway.
+
+Each agent's tool calls are FaaS invocations placed like any other request, with the agent as
+their flow. Arguments go out and the result comes back, so a remote call pays the link twice,
+against restoring the function's snapshot beside the agent. Tool time is added to the agent's
+wall time as a pause. The decode slot stays held through it, which overstates occupancy for
+an engine that parks sequences during tool calls.
 
 ### Floors, bands, limits
 
@@ -152,11 +294,22 @@ acquisition hooks in. Growing the pool is deliberately not modelled.
 
 ## Workload
 
-Three classes, matching `docs/prototype.md`. `WeightShard` survives as a *dependency* of
-inference, not a workload of its own; there is no training class.
+Three request classes, matching `docs/prototype.md`. `WeightShard` is a *dependency* of
+inference rather than a workload of its own.
 
 - **Inference** — multi-turn agent sessions. Each turn extends the chain, requires its
-  model's shards, and costs `tokens × 8 ms` of decode. 35% of turns call a tool.
+  model's shards, and costs `tokens × step_ns(batch)` at whichever engine it lands on. 35% of
+  turns call a tool.
+- **Multi-agent fan-outs** — with `--fanout f` (default 0.10 in `distributed`), that fraction
+  of agent turns dispatch 2–6 sub-agents instead. Each sub-agent forks the orchestrator's
+  context with six blocks of its own. It runs on the orchestrator's model or, with a skewed
+  pick, another one, decodes 24–224 tokens, and makes 0–4 function calls with 256 KiB of
+  arguments and results each. About 400 requests later the orchestrator resumes, with two
+  result blocks per agent handed back from wherever the agents ran. All of these shapes are
+  **modelled**, and they are the numbers most worth replacing with traces from a real agent
+  framework. Fan-outs add roughly half again as much decode load, which is why
+  `distributed` defaults to 250 req/s rather than 350. `--fanout 0` reproduces the
+  pre-fan-out results within the measured-crossing noise between runs.
 - **FaaS** — function invocations. **Warm** when the snapshot is still resident, which is the
   ledger's decision rather than the workload's: the body runs either way, in 40–200 µs. 45%
   of invocations call into inference.
@@ -253,9 +406,42 @@ boundary where decisions are coarse, never inside the ledger's hot path.
 memory domain per node, because a node's DRAM is the unit another node cannot address.
 Crossing is a copy, charged the **measured** transport tax on top of the **modelled** link.
 
-A prefix cache is node-local process state: a replica on one node cannot read another's KV
-blocks. Work runs against its own node's ledger, so landing in the wrong place means
-recomputing, not fetching remotely.
+### Acquiring state: place, fetch, or rebuild
+
+A prefix cache is node-local process state — a replica cannot read another's KV blocks by
+load/store — but that is a statement about addressing, not about transport. Blocks can be
+*copied* over a link, and whether they should be is a question with a different answer every
+time. `Machine::plan` prices all three routes at each candidate node and takes the cheapest:
+
+```
+acquire(node) = min over the missing suffix of
+                  0                                  # already resident here
+                  link_ns(node <- peer, bytes)       # ship it from a peer that holds it
+                  nvme_fetch_ns(bytes)               # read it off this node's spill tier
+                  recompute_ns                       # rebuild it
+```
+
+The chain case is a prefix property, so a peer supplies `chain[local_depth..peer_depth]` as
+one transfer charged one latency, and everything past the deepest peer is rebuilt regardless.
+Every peer is scanned rather than assuming the deepest is the cheapest, because the deepest
+peer is only the cheapest peer when all links are identical.
+
+The crossover is not a tuning constant, it falls out of the blob sizes already in the model:
+
+| | rebuild | rack (30 µs, 0.32 ns/B) | zone (400 µs, 0.80 ns/B) |
+|---|---|---|---|
+| KV block, 512 KiB | 400 µs | **198 µs — ship** | 819 µs — rebuild |
+| weight shard, 512 MiB | 4 s | **172 ms — ship** | **430 ms — ship** |
+
+So the policy the system should follow is *KV travels within a rack and is rebuilt across a
+zone, weights travel anywhere* — and nothing has to say so. Pricing the three routes produces
+it, and re-produces it when the block size or the link changes.
+
+`Hierarchy::supply` installs what arrives without a recompute charge, which is the entire
+point; the caller has already paid for the traversal. A fetch is planned against the
+scheduler's view and executed against the truth, so a source that has since evicted the state
+supplies a shorter prefix or none, and the remainder falls back to a rebuild. That is what
+makes a stale view cost something here instead of silently succeeding.
 
 `Control` models where residency knowledge lives — `Unified` (a field read), `Query` (an RPC
 per decision), `Gossip` (a periodically refreshed view). This is the architectural question:
@@ -264,99 +450,206 @@ a Kubernetes scheduler extender is `Query`; an informer cache is `Gossip`.
 ### Scored placement
 
 ```
-score(node) = resident_recompute_ns          # work this node's residency avoids
-            - short_bytes × marginal_price   # what claiming the room makes someone re-pay
-            - handoff_ns                     # what not co-placing costs
+cost(node) = acquire_ns                     # cheapest of resident / fetch / spill / rebuild
+           + short_bytes × marginal_price   # expected re-pay for what claiming the room evicts
+           + handoff_ns                     # what not co-placing costs
+           + engine_ns                      # this request's own wait and step width here
+           + congestion_ns                  # what it does to the batch it joins
 ```
 
-`TierPool::marginal_price` is the recompute cost per byte of the cheapest state the pool would
-give up: it peeks each reclaimable class's heap top in the same band order `pick_class`
-reclaims in, abstaining on a stale or pinned top, falling back to `inflation`. An estimate on
-purpose — a faithful dry run costs as much as the eviction itself, per candidate, per request.
+Minimised, not maximised. The earlier form scored the recompute a node's residency *avoided*,
+which is the same decision by a constant whenever rebuilding is the only way to get state —
+and stops being the same decision the moment shipping it is an option, because what a node
+avoids no longer determines what the request costs there.
+
+`TierPool::marginal_price` is the *expected* cost per byte of the cheapest state the pool
+would give up, and `Hierarchy::displacement` charges each pool's shortfall at that pool's
+price. It peeks each reclaimable class's heap top in the same band order `pick_class`
+reclaims in, abstaining on a stale or pinned top. It is an estimate on purpose: a faithful
+dry run costs as much as the eviction itself, per candidate, per request. Three corrections
+make it a price rather than a number:
+
+- **Recovery, not rebuild.** An evicted blob moves down a tier rather than vanishing, so
+  wanting it back costs the cheaper of a rebuild or a recovery from that tier: PCIe from DDR
+  for HBM, the spill tier for DDR. Priced as a rebuild, a weight shard pushed off a full
+  accelerator cost 4 s, where the real cost is a 21 ms promote. Once fetching made full
+  accelerators candidates, that error dominated every other term.
+- **Units on the fallback.** When nothing is reclaimable, the price is the last price
+  actually paid, in ns/byte. It used to fall back to `inflation`, a GDSF priority that only
+  ever grows. On unified memory the fallback was rarely hit. Under split memory the
+  accelerator's two classes often both sit at their floors. The fetch arm's displacement
+  spread then read **26–49 s**, and fell to 14 ms once the units were fixed.
+- **Expected, because evicted state only costs anything if someone wants it back.** Each
+  class's loss per byte is multiplied by its **measured regret rate**: the fraction of its evictions
+that were later requested again. That comes from a bounded ghost list of recently evicted
+ids, which is ARC's ghost cache used for pricing instead of admission. The rate is smoothed
+as `(regrets + 1) / (evictions + 1)`, so a pool with no history prices displacement at the
+full recompute cost, as before, and converges on the observed rate as evidence accumulates.
+
+Without the discount, displacement priced every evicted byte as a certain rebuild. Its mean
+spread across candidate nodes was **3.5 s against 68 ms** for engine and congestion
+combined. An argmin decides on spread, so neither load term could win anything but ties:
+`moved by load` read 0.0%. The discount alone cut displacement spread 4×; the convex toll did
+the rest. `term spread` in the `distributed` output reports the mean spread of every term,
+because a term whose spread is an order of magnitude under another's is a comment, not a
+policy.
 
 Two rules the score needs to be a decision rather than a suggestion:
 
 - **The score is the whole decision.** Gating it on a separate residency threshold discards
   the scored choice using a metric the score never consulted.
-- **Never move without a reason.** With nothing resident anywhere all scores are zero and an
-  argmax over ties sends every cold request to one node; the score must strictly beat the
-  affinity node's, otherwise content affinity stands.
+- **Never move without a reason.** With nothing resident anywhere all costs are equal and an
+  argmin over ties sends every cold request to one node; the chosen node must strictly beat
+  the affinity node, otherwise content affinity stands.
 
 ## Results
 
+All numbers below are split memory unless marked unified. Two methodology changes since the
+previous round apply to everything here:
+
+- **Service time leads.** Once decode cost depends on the batch a request joins, placement
+  moves execution as well as waiting. `stall` excludes execution, so on its own it
+  misreports which arm is better. The `distributed` table now leads with end-to-end
+  `service/req`. It also shows fan-out completion, because arms that refuse the most
+  expensive work look faster than they are.
+- **Baselines filter before they choose.** The unscored policies used to send every sibling
+  to one node and refuse whenever the siblings did not fit there. Under split memory that
+  meant 55% of fan-outs, a failure no real system has. They now filter infeasible nodes
+  first, as a Kubernetes filter phase or a model-aware inference router would, and apply
+  their rule to what remains.
+
 ### Memory arbitration
 
-20k requests, 8 GiB, bands `0,1,2,1`, oracle-best split per arm. `weights` is a dependency
-class, so its stall is charged to the inference requests that need it.
+Single node, 20k requests, bands `0,1,2,1`, oracle-best split per arm. Split memory is 4 GiB
+HBM + 8 GiB DDR; unified is the same 12 GiB as one pool. The search applies one split to
+both pools. In HBM it keeps the split's KV-to-weights ratio over the whole pool, so a hard
+partition does not strand accelerator budget on classes that never live there.
 
-| arm | stall/req | goodput | inference | faas | service | wt hit |
+| arm | split: stall/req | inference | wt hit | unified: stall/req | inference | wt hit |
 |---|---|---|---|---|---|---|
-| `hard-partition` | 44.21 ms | 99.6% | 75.3 | 19.1 | 28.4 | 0.52 |
-| `soft-floor` | **43.73 ms** | **100%** | **74.5** | **19.0** | **28.1** | 0.53 |
-| `no-floor` | 72.14 ms | 100% | 144.1 | 19.3 | 29.0 | **0.01** |
+| `hard-partition` | 26.80 ms | 43.9 | 0.51 | **12.54 ms** | 9.0 | 1.00 |
+| `soft-floor` | **18.35 ms** | **25.0** | **0.66** | 12.62 ms | **8.2** | 1.00 |
+| `no-floor` | 76.03 ms | 168.4 | 0.06 | 65.11 ms | 139.3 | 0.04 |
 
-`soft-floor` dominates the tuned partition on stall, goodput, and every class — but the
-margin is 1.1%, and **the headline is `no-floor`**: floors off, the ledger evicts weight
-shards to near-zero residency (hit 0.53 → 0.01) and inference stall doubles. Unconstrained
-sharing is 65% worse than either bounded arm. Soft floors are not a refinement of hard
-partitions here; they are what stops the global price from eating the one class whose
-working set is indivisible.
+**On datacenter memory, soft floors beat hard partitions by 32%. On unified memory they
+tie.** The mechanism is the one coupling between the pools. A soft floor lets weights and KV
+evicted from HBM grow into idle host DDR, and promote back over PCIe instead of being
+rebuilt: weight residency rises 0.51 → 0.66. A hard partition caps the offload at its floor,
+however much host memory sits unused. **Open sharing is still the worst arm by far** in both
+models. Without floors the ledger evicts weights to near-zero residency and inference stall
+multiplies.
+
+The split itself costs something: 18.3 ms against 12.6 ms for the same total bytes, because
+unified memory lets any class use any byte. That is a property of the hardware, not of the
+policy, and it is exactly what this prototype must not count as a win.
 
 ### Flows
 
-15k requests, identical quota and trace. `task e2e` and `stall total` are critical-path only.
+Single node, 15k requests, identical quota and trace. Critical-path only.
 
-| flows | task e2e | stall total | prewarm work | net work | inference |
-|---|---|---|---|---|---|
-| `blind` | 102.65 ms | 711.98 s | 0.00 s | 711.98 s | 74.22 ms |
-| `announce` | **90.64 ms** | 670.95 s | 44.88 s | 715.83 s | **73.03 ms** |
-| `gate` | 90.64 ms | 670.95 s | 44.88 s | 715.83 s | 73.03 ms |
+| flows | split: task e2e | net work | unified: task e2e | net work |
+|---|---|---|---|---|
+| `blind` | 31.10 ms | 312.45 s | 14.85 ms | 224.09 s |
+| `announce` | **27.77 ms** | 312.79 s | **12.24 ms** | 224.91 s |
 
-**Announce relocates work; it does not eliminate it.** Critical-path stall falls 41.0 s and
-44.9 s reappears as background materialisation — net work is 0.5% *worse*. It is a latency
-win (−11.7% task e2e) worth having when there is idle capacity to absorb the background work,
-and worthless when the machine is saturated. Any claim that prewarming is free is an
-accounting error.
-
-The gate fires once per flow task against a break-even budget of milliseconds. At 49 µs a
-gRPC crossing is orders of magnitude under it, so **the boundary is affordable here and the
+**Announce relocates work; it does not eliminate it.** Task latency improves 11% (split) to
+18% (unified), and net work is slightly worse in both. The gate fires once per flow task
+against a break-even budget of milliseconds, and a gRPC crossing is far under it, so **the
 gate is Tier 1.**
 
-### Placement
+### Placement across load
 
-4 nodes × 2 GiB, 15k requests, gRPC crossing charged per decision.
+4 nodes, 4 GiB HBM + 8 GiB DDR each, rack distance, 12k requests, 10% of agent turns fanning
+out. Every arm completes every fan-out.
 
-| arm | socket | rack | zone | region | node spread |
+| arm | 150 req/s | 250 | 350 |
+|---|---|---|---|
+| hash only | 469.6 ms | 520.5 | 974.0 |
+| flow only | 474.8 | 520.2 | 934.1 |
+| residency only | 502.9 | 2404.0 | 4121.1 |
+| both, gossiped | 473.9 | 640.6 | 1454.5 |
+| scored | 454.3 | 488.2 | 580.2 |
+| **scored + fetch** | **451.9** | **487.3** | **575.7** |
+
+(Mean service time per request, decode included.)
+
+**The unified score is the best arm at every load.** Its end-to-end lead over the best
+specialist is **4% at 150 req/s, 6% at 250 and 38% at 350.** That is much smaller than
+the stall ratios suggested (2.3× at 250), because decode dominates service time and every arm
+has to pay it. Greedy prefix affinity is still the arm that collapses past the knee.
+
+### Placement across distance
+
+Same cluster, 15k requests, `--rate 250`.
+
+| arm | socket | rack | zone | region | stall (rack) | siblings co-located | tool calls beside agent: zone / region |
+|---|---|---|---|---|---|---|---|
+| hash only | 523.3 ms | 523.4 | 523.7 | 532.0 | 38.2 | 86% | 25% @ 1.8 ms / 25% @ **46.2 ms** |
+| flow only | 518.9 | 518.9 | 518.9 | 520.0 | 35.6 | 86% | 100% @ 4.8 / 100% @ 4.8 |
+| both, gossiped | 693.3 | 693.3 | 693.3 | 694.4 | 203.9 | 85% | 100% @ 4.8 / 100% @ 4.8 |
+| residency only | 2902.6 | 2902.7 | 2903.0 | 2911.8 | 2398.8 | 77% | 24% @ 1.8 / 24% @ 46.8 |
+| scored | 490.6 | 490.7 | 491.0 | 495.8 | 13.3 | 66% | 30% @ 1.8 / **100% @ 4.6** |
+| **scored + fetch** | **490.7** | **489.9** | **490.0** | **494.3** | 14.8 | 63% | 29% @ 1.8 / 100% @ 4.8 |
+
+Unified memory, same total bytes (12 GiB per node), for comparison at rack: `scored + fetch`
+488.8, `scored` 490.6, gossiped 508.7, flow only 530.0, hash 535.7.
+
+**The score is the best arm at every distance, by 5–6% end to end against the best
+specialist (`flow only`).** Two behaviours still emerge without being told:
+
+- **Fan-out siblings are split according to load.** The score co-locates 63–66% of them,
+  against 85–86% for the specialists once they filter for feasibility (100% before).
+- **Tool placement flips at the region boundary.** Within a zone, the score runs 70% of
+  calls wherever the function is warm, at the same ~1.8 ms a hash router achieves. Across a
+  region it runs all of them beside the agent, at 4.6 ms, where hashing pays **46 ms**.
+  Last round's claim that the score's tool calls are 3× cheaper within a zone does not
+  survive: hashing lands on warm cells just as often.
+
+**State transfer is roughly neutral.** Fetch ships 26–35 GiB at socket and rack and costs
+about 1.5 ms more stall. It improves balance enough that service time comes out equal or
+0.2% better. Across a zone or region it ships only weight shards (5–6 GiB), never KV.
+
+**Retracted: "state transfer taxes the FaaS warm pool."** Last round, fetch was 7–9% slower
+and function warm hits fell from 73% to 39%. Shipped KV copies were evicting microVM cells.
+Both effects came from putting KV and cells in one pool. With separate pools, function calls
+cost the same with and without fetch (1.07 vs 1.06 ms). With unified memory at matched
+capacity (48 GiB) the effect also disappears, so it was partly a capacity artifact as well.
+
+**The split changes which specialist wins.** Under unified memory, the gossiped residency arm
+is the best specialist (508.7). Under split memory it is the worst but one (693.3): with
+weights confined to a small HBM, a stale view of where they live costs far more. Hashing
+improves under the split, because protected HBM stops function and service state from
+evicting weights.
+
+Counted at rack for `scored + fetch` (single requests and tool calls; agent placements not
+counted): load moves 13.6% of decisions, congestion 4.7%, flow 3.1%, displacement 2.2%.
+Mean term spreads are acquire 183 ms, congestion 30 ms, displacement 14 ms and engine 5 ms.
+
+### Fan-out admission
+
+15k requests, rack, `--rate 250`, `scored + fetch`, sweeping cluster capacity. `wasted
+work` is the service time of agents, tool calls included, whose fan-out never resumed.
+
+| HBM + DDR (cluster) | fan-outs run (per agent / atomic) | wasted work | stall/req | inference stall | served |
 |---|---|---|---|---|---|
-| hash only | 40.98 ms | 41.01 | 41.10 | 44.09 | 1.12 |
-| residency only | 32.43 | 32.50 | 32.66 | 36.28 | 1.09 |
-| flow only | 47.00 | 47.00 | 47.00 | 47.00 | 1.10 |
-| both, unified | 38.24 | 38.24 | 38.24 | 38.24 | 1.11 |
-| **scored** | **30.76** | **30.84** | **31.01** | **33.97** | **1.00** |
+| 4 + 8 GiB | 0 / 0 of 450 | 0 | identical | — | 55.3% |
+| 5 + 10 GiB | 7 / 7 | 6.6 s / 6.6 s | identical | identical | 56.1% |
+| 6 + 12 GiB | 251 / **306** | 505 s → **0** | 38.55 → **35.93** ms | 65.51 → **58.90** ms | 97.4 → **98.1%** |
+| 8 + 16 GiB | 450 / 450 | 0 | identical | identical | 100% |
 
-**Scored placement is the best arm at every distance** — 25% over hash, 5.2% over the best
-alternative — and the only one that leaves the cluster balanced. Counted rather than assumed:
-displacement moves **97.3%** of decisions, the flow term 15.5%, the affinity floor holds
-31.7%. Co-placement becomes selective at 48.4% of flow requests, against 0% for hash and 100%
-for the unconditional arm.
-
-Three structural findings underneath it:
-
-- **Consistent hashing captures all the locality it created, and none of the locality it did
-  not.** Residency routing ties hashing exactly on session KV — a hash puts session S on node
-  d, so S's blocks come to live on d. It wins 18% only because shared model weights are 4 GiB
-  against 2 GiB per node: no node holds every model, the cluster must specialise, and a hash
-  on session identity cannot see that.
-- **Unconditional co-placement concentrates pressure without pricing eviction** — 15% worse
-  than hash, because agents drag 16–64 MiB tool snapshots onto nodes holding 512 MiB weight
-  shards. Pricing the displacement is the whole difference between `flow only` at 47.00 and
-  `scored` at 30.76.
-- **The control plane's own cost is 0.32% of total stall** with a measured gRPC crossing
-  charged to every placement decision, and gossiping a stale view instead costs nothing
-  measurable. Being in-process buys almost
-  nothing at agent-turn service times. See the crossover table for where it does.
+**Where admission binds, all-or-nothing wins on every column.** At 6 + 12 GiB it completes 22%
+more fan-outs, wastes nothing, and cuts inference stall 10%. The contended band is narrow.
+Below it, accelerators are too small to hold a fan-out's models at all, and the system serves
+half its requests. Above it, everything fits. At 5 + 10 GiB the atomic arm still wastes
+6.6 s. That comes from fan-outs admitted against the conservative feasibility estimate that
+then lose an agent at admission.
 
 ### The falsification test that fails
+
+*Measured before the engine model, the Firecracker constants and the corrected score. It has
+not been re-run, and the numbers below are from that model.* The structural conclusion does
+not depend on them: a greedy per-request score cannot price residency its own decisions
+create.
 
 If the score prices the handoff, raising the handoff should buy more co-placement. Sweeping
 the flow payload 512× at region distance:
@@ -420,8 +713,10 @@ exceeds ~40% of total stall *and* its per-class numbers are within noise across 
 experiment is measuring that class's unservability, not policy. `share of total stall by
 class` prints every run for this reason.
 
-Target regime: `rho` 2–4, `lambda` 0.1–0.3, `P/C` 0.3–0.5. Current: `C` = 8 GiB, `P` = 3.4
-GiB, `A` = 4.6 GiB, `lambda` = 0.11, `P/C` = 0.42.
+Target regime: `rho` 2–4, `lambda` 0.1–0.3, `P/C` 0.3–0.5. The last measured values
+(`C` = 8 GiB unified, `P` = 3.4 GiB, `A` = 4.6 GiB, `lambda` = 0.11, `P/C` = 0.42) predate
+the memory split. Under the split these quantities are per pool: HBM has no pinned state,
+and DDR's pinned set is the serving replicas. They have not been re-derived.
 
 ### Avoiding a tuned result
 
@@ -445,7 +740,8 @@ absorb it.
 Correcting the NVMe bandwidth guess moved a headline by 42%. The constants in `tier.rs` are a
 darwin/arm64 fit, not a law.
 
-**Modelled, not measured:** node link latency and bandwidth in `Distance`, and the workload's
+**Modelled, not measured:** node link latency and bandwidth in `Distance`, PCIe between host
+and accelerator (`TierSpec::pcie`), the HBM/DDR capacities and splits, and the workload's
 `exec_ns` constants. These are the numbers most worth replacing with real traces.
 
 The hot path — lookup, scoring, eviction — makes **no syscalls**, so it is portable at zero
@@ -458,19 +754,28 @@ the decision loop.
 No VMM, no WASM ABI, no exec rings, no edge agent, no live migration. The byte store is real
 but exercised by `calibrate` only; the residency experiments run on the calibrated model
 rather than moving real bytes. `Topology::discover` probes the host but the host is one
-memory domain, so every cross-node constant is modelled.
+unified memory domain, so every cross-node constant is modelled and the HBM/DDR split exists
+only in the model. There is no accelerator runtime: KV and weights are sized and priced, never
+computed.
 
 ## Standing
 
 | claim | status |
 |---|---|
-| eviction priced in recompute-cost per byte | holds |
+| eviction priced as expected recovery cost per byte | holds — regret-discounted, recovery from the tier below |
 | admission that refuses rather than overcommits | holds |
-| soft floors beat both hard partition and open sharing | holds — 1.1% over partition, **65% over open** |
-| placement scored as gain minus displacement | holds — 25% over hash, and balances the cluster |
-| residency-aware routing beats consistent hashing | holds — 18%, on state the hash did not place |
-| the score's handoff term prices co-placement | **fails** — invariant to a 512× payload sweep |
-| unconditional flow co-placement | loses 15%, except where the payload dominates |
-| unified control plane beats RPC-queried | 0.32% in aggregate; 43–60% of a warm invocation |
-| announce / anticipatory prewarm | latency win, net work 0.5% worse |
+| soft floors beat hard partitions | **holds on split memory (32%), via host offload; ties on unified** |
+| open sharing | worst arm in both memory models |
+| warm microVM cells are the cheapest state to rebuild | holds — 0.21–0.39 ns/byte |
+| cells and KV compete for the same bytes | **unified-memory only** — separate pools in the target |
+| greedy prefix affinity | right at low load, collapses past the knee |
+| scored placement | best arm at every load and distance — **4–6% end to end at moderate load, 38% near the knee** |
+| score adapts sibling co-location to load | holds — 63–66% vs 85–86% for filtered specialists |
+| score adapts tool placement to distance | holds — all calls local across regions, where hashing pays 10× |
+| all-or-nothing fan-out admission | holds where it binds — +22% fan-outs, inference stall −10% |
+| KV state transfer | roughly neutral end to end |
+| state transfer taxes the FaaS warm pool | **retracted** — a unified-memory and capacity artifact |
+| the score's handoff term prices co-placement | **fails** (pre-batching model, not re-run) |
+| unified control plane beats RPC-queried | rounding error in aggregate; 43–60% of a warm invocation |
+| announce / anticipatory prewarm | 11–18% faster tasks, net work slightly worse |
 | downstream-aware gate | Tier 1 — replicable by a hint API |

@@ -1,13 +1,14 @@
 use crate::blob::BlobKind;
-use crate::cache::{Hierarchy, Policy, Quota};
+use crate::cache::{Hierarchy, NodeMemory, Policy, Quota, accelerated};
 use crate::flow::FlowMode;
-use crate::tier::TierSpec;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Trial {
     pub bands: [u8; BlobKind::N],
     pub flows: FlowMode,
+    /// Accelerator memory; zero models a unified-memory host.
+    pub hbm: u64,
     pub dram: u64,
     pub nvme: u64,
     pub policy: Policy,
@@ -96,21 +97,78 @@ pub fn trace(t: Trial) -> Vec<crate::work::Request> {
     crate::work::Workload::new(t.seed, t.ops, t.vol).collect()
 }
 
+/// How a trial budgets memory between classes.
+#[derive(Clone, Copy, Debug)]
+pub enum Budget {
+    /// Per-class floors as fractions of a pool, soft or hard.
+    Split {
+        split: [f64; BlobKind::N],
+        hard: bool,
+    },
+    /// No floors at all.
+    Open,
+}
+
+impl Budget {
+    /// The budget for host memory: the split as given. Beside an accelerator, the classes it
+    /// hosts are offloads and give up host bytes first.
+    fn host(self, capacity: u64, bands: [u8; BlobKind::N], beside_hbm: bool) -> Quota {
+        let q = match self {
+            Self::Split { split, hard } => Quota::from_split(capacity, split, bands, hard),
+            Self::Open => Quota::open(capacity, bands),
+        };
+        if beside_hbm { q.offloaded() } else { q }
+    }
+
+    /// The budget for accelerator memory: the split's KV-to-weights ratio over the classes
+    /// that actually live there, with the same share of the pool reserved as the split
+    /// reserves in total. Applying the split verbatim would strand the accelerator budget of
+    /// host-only classes, and a hard partition would lose most of the pool to state that can
+    /// never occupy it.
+    fn accelerator(self, capacity: u64, bands: [u8; BlobKind::N]) -> Quota {
+        let Self::Split { split, hard } = self else {
+            return Quota::open(capacity, bands);
+        };
+        let reserved: f64 = split.iter().sum();
+        let here: f64 = BlobKind::ALL
+            .iter()
+            .filter(|k| accelerated(**k))
+            .map(|k| split[k.idx()])
+            .sum();
+        let moved = std::array::from_fn(|i| {
+            if accelerated(BlobKind::ALL[i]) && here > 0.0 {
+                split[i] / here * reserved
+            } else {
+                0.0
+            }
+        });
+        Quota::from_split(capacity, moved, bands, hard)
+    }
+}
+
+fn memory_for(t: Trial, budget: Budget) -> NodeMemory {
+    NodeMemory {
+        hbm: t.hbm,
+        ddr: t.dram,
+        nvme: t.nvme,
+        hbm_quota: budget.accelerator(t.hbm, t.bands),
+        ddr_quota: budget.host(t.dram, t.bands, t.hbm > 0),
+    }
+}
+
 #[must_use]
-pub fn run(label: &str, t: Trial, quota: Quota) -> Report {
-    run_on(label, t, quota, &trace(t))
+pub fn run(label: &str, t: Trial, budget: Budget) -> Report {
+    run_on(label, t, budget, &trace(t))
 }
 
 /// The request stream is a pure function of (seed, ops, vol), so a sweep over quotas can
 /// generate it once instead of rebuilding an identical trace for every candidate.
 #[must_use]
-pub fn run_on(label: &str, t: Trial, quota: Quota, trace: &[crate::work::Request]) -> Report {
-    let mut h = Hierarchy::new(
-        TierSpec::dram(t.dram),
-        TierSpec::nvme(t.nvme),
-        t.policy,
-        quota,
-    );
+///
+/// With split memory one budget governs both pools: in HBM it sets KV against weights, in DDR
+/// it sets function cells and service heaps against what the accelerator has offloaded.
+pub fn run_on(label: &str, t: Trial, budget: Budget, trace: &[crate::work::Request]) -> Report {
+    let mut h = Hierarchy::new(memory_for(t, budget), t.policy);
     let mut costs: Vec<u64> = Vec::with_capacity(t.ops as usize);
     let (mut total, mut transfer) = (0u64, 0u64);
     let mut phase_ns = [0u64; crate::work::PHASES];
@@ -125,7 +183,11 @@ pub fn run_on(label: &str, t: Trial, quota: Quota, trace: &[crate::work::Request
     let mut flow_attempted = 0u64;
 
     for req in trace {
-        let k = req.chain.first().map_or(0, |(_, m)| m.kind.idx());
+        // Gangs need somewhere to be placed across; a single ledger has no second node.
+        if req.gang.is_some() {
+            continue;
+        }
+        let k = req.kind_idx();
 
         if let Some(hint) = &req.hint
             && t.flows == FlowMode::Gate
@@ -231,13 +293,13 @@ fn finish(label: &str, h: &Hierarchy, costs: &[u64], t: &Tally) -> Report {
     let mut resident = [0; BlobKind::N];
     for kind in BlobKind::ALL {
         let k = kind.idx();
-        let n = h.hits[k] + h.nvme_hits[k] + h.misses[k];
+        let n = h.hits[k] + h.nvme_hits[k] + h.offload_hits[k] + h.misses[k];
         hit[k] = if n == 0 {
             0.0
         } else {
             h.hits[k] as f64 / n as f64
         };
-        resident[k] = h.dram.resident_bytes(kind);
+        resident[k] = h.resident_bytes(kind);
     }
     Report {
         label: label.to_string(),
@@ -249,10 +311,10 @@ fn finish(label: &str, h: &Hierarchy, costs: &[u64], t: &Tally) -> Report {
         phase_ns: t.phase_ns,
         kind_ns: t.kind_ns,
         kind_ops: t.kind_ops,
-        refused: h.dram.refused,
+        refused: h.refused(),
         served: t.served,
-        pinned_skips: h.dram.pinned_skips,
-        over_capacity: h.dram.over_capacity(),
+        pinned_skips: h.pinned_skips(),
+        over_capacity: h.over_capacity(),
         gated: t.gated,
         flow_started: t.flow_started,
         flow_attempted: t.flow_attempted,

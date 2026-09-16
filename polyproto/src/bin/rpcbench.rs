@@ -2,9 +2,8 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use polyphonic::blob::BlobKind;
-use polyphonic::cache::{Hierarchy, Policy, Quota};
+use polyphonic::cache::{Hierarchy, NodeMemory, Policy, Quota, accelerated};
 use polyphonic::flow::FlowHint;
-use polyphonic::tier::TierSpec;
 
 #[allow(
     clippy::pedantic,
@@ -19,14 +18,19 @@ use pb::admission_client::AdmissionClient;
 use pb::admission_server::{Admission, AdmissionServer};
 use pb::{Blob, CanSatisfyReply, CanSatisfyRequest};
 
+const HBM: u64 = 4 << 30;
 const DRAM: u64 = 8 << 30;
 const NVME: u64 = 64 << 30;
 const WARMUP_OPS: u64 = 6000;
 const ITERS: usize = 3000;
 
+/// What the ledger would tell a remote asker: the hot set, and what each pool could still give
+/// up. The two pools are separate budgets, so a remote answer has to carry both or it answers
+/// a different question from the in-process one.
 struct Downstream {
     resident: HashSet<[u8; 32]>,
-    reclaimable: u64,
+    reclaimable_hbm: u64,
+    reclaimable_ddr: u64,
 }
 
 #[tonic::async_trait]
@@ -36,7 +40,7 @@ impl Admission for Downstream {
         req: tonic::Request<CanSatisfyRequest>,
     ) -> Result<tonic::Response<CanSatisfyReply>, tonic::Status> {
         let r = req.into_inner();
-        let mut missing = 0u64;
+        let (mut missing_hbm, mut missing_ddr) = (0u64, 0u64);
         for b in &r.downstream {
             // A malformed id must not silently hash to zeros and report as non-resident:
             // that answers a different question than the one asked.
@@ -46,13 +50,19 @@ impl Admission for Downstream {
                     b.id.len()
                 ))
             })?;
-            if !self.resident.contains(&key) {
-                missing += b.bytes;
+            if self.resident.contains(&key) {
+                continue;
+            }
+            if b.accelerated {
+                missing_hbm += b.bytes;
+            } else {
+                missing_ddr += b.bytes;
             }
         }
         Ok(tonic::Response::new(CanSatisfyReply {
-            ok: missing <= self.reclaimable,
-            reclaimable: self.reclaimable,
+            ok: missing_hbm <= self.reclaimable_hbm && missing_ddr <= self.reclaimable_ddr,
+            reclaimable: self.reclaimable_ddr,
+            reclaimable_hbm: self.reclaimable_hbm,
         }))
     }
 }
@@ -79,13 +89,15 @@ fn report(name: &str, mut ns: Vec<u64>) -> u64 {
 /// Build a genuinely populated ledger, and collect the flow hints the gate would query on.
 fn populate() -> (Hierarchy, Vec<FlowHint>, Vec<u64>) {
     let bands = [0u8, 1, 2, 1];
-    let split = [0.12, 0.12, 0.12, 0.25];
-    let quota = Quota::from_split(DRAM, split, bands, false);
     let mut h = Hierarchy::new(
-        TierSpec::dram(DRAM),
-        TierSpec::nvme(NVME),
+        NodeMemory {
+            hbm: HBM,
+            ddr: DRAM,
+            nvme: NVME,
+            hbm_quota: Quota::from_split(HBM, [0.25, 0.0, 0.50, 0.0], bands, false),
+            ddr_quota: Quota::from_split(DRAM, [0.10, 0.15, 0.15, 0.35], bands, false).offloaded(),
+        },
         Policy::Gdsf,
-        quota,
     );
     let mut hints = Vec::new();
     let mut access_ns = Vec::new();
@@ -104,7 +116,7 @@ fn populate() -> (Hierarchy, Vec<FlowHint>, Vec<u64>) {
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (h, hints, access_ns) = populate();
-    let resident_blobs = h.dram.resident_ids().count();
+    let resident_blobs = h.hot_ids().count();
     let Some(sample) = hints.first() else {
         return Err("warmup produced no flow hints; nothing to benchmark".into());
     };
@@ -114,15 +126,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|(id, m)| Blob {
             id: id.as_bytes().to_vec(),
             bytes: m.bytes,
+            accelerated: accelerated(m.kind),
         })
         .collect();
-    let wire_bytes: usize = payload.iter().map(|b| b.id.len() + 8).sum();
+    let wire_bytes: usize = payload.iter().map(|b| b.id.len() + 9).sum();
 
     println!(
         "ledger: {resident_blobs} resident blobs, {:.1} GiB used, {} flow hints",
         BlobKind::ALL
             .iter()
-            .map(|k| h.dram.resident_bytes(*k))
+            .map(|k| h.resident_bytes(*k))
             .sum::<u64>() as f64
             / (1u64 << 30) as f64,
         hints.len()
@@ -148,10 +161,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let p50_direct = report("in-process (direct call)", direct);
 
     // 2. real gRPC over TCP loopback: the sidecar/extender shape
-    let resident: HashSet<[u8; 32]> = h.dram.resident_ids().map(|id| *id.as_bytes()).collect();
+    let resident: HashSet<[u8; 32]> = h.hot_ids().map(|id| *id.as_bytes()).collect();
     let svc = Downstream {
         resident,
-        reclaimable: h.dram.reclaimable(),
+        reclaimable_hbm: h.hbm.reclaimable(),
+        reclaimable_ddr: h.ddr.reclaimable(),
     };
     let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = probe.local_addr()?;
@@ -207,7 +221,7 @@ fn decision_rates(h: &Hierarchy, access_ns: &[u64], p50_rpc: u64) {
     let mut sorted = access_ns.to_vec();
     sorted.sort_unstable();
     let p50_access = percentile(&sorted, 0.50);
-    let evictions: u64 = h.dram.evicted.iter().sum();
+    let evictions: u64 = h.hbm.evicted.iter().chain(&h.ddr.evicted).sum();
     let per_req = evictions as f64 / access_ns.len() as f64 + 1.0;
 
     println!(

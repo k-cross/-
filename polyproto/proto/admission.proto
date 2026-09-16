@@ -4,6 +4,7 @@ package admission;
 message Blob {
   bytes id = 1;
   uint64 bytes = 2;
+  bool accelerated = 3;
 }
 
 message CanSatisfyRequest {
@@ -14,6 +15,7 @@ message CanSatisfyRequest {
 message CanSatisfyReply {
   bool ok = 1;
   uint64 reclaimable = 2;
+  uint64 reclaimable_hbm = 3;
 }
 
 service Admission {

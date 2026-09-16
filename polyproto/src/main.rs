@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
-use polyphonic::arms::{Report, Trial, mean_ms, run, run_on, trace};
+use polyphonic::arms::{Budget, Report, Trial, mean_ms, run, run_on, trace};
 use polyphonic::blob::BlobKind;
-use polyphonic::cache::{Policy, Quota};
+use polyphonic::cache::{NodeMemory, Policy, Quota};
 use polyphonic::flow::FlowMode;
 
 #[derive(Parser, Debug)]
@@ -15,7 +15,11 @@ struct Cli {
 enum Cmd {
     /// Unified vs siloed residency ledger under a phase-shifting workload
     Residency {
-        /// DRAM tier capacity, e.g. 8GiB
+        /// Accelerator HBM holding KV and weights, e.g. 4GiB. 0 models unified memory, where
+        /// every class shares the DRAM pool
+        #[arg(long, default_value = "4GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        /// Host DDR capacity, e.g. 8GiB
         #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
         dram: u64,
         /// `NVMe` tier capacity
@@ -32,13 +36,17 @@ enum Cmd {
         /// Phase-shift amplitude: 0 = flat mix, 1 = full swing
         #[arg(long, default_value_t = 1.0)]
         volatility: f64,
-        /// Priority bands as inference,faas,training,service (0 = highest)
+        /// Priority bands as inference,faas,weights,service (0 = highest)
         #[arg(long, default_value = "0,1,2,1", value_parser = parse_bands)]
         bands: String,
     },
 
     /// Do cross-workload flows pay: blind vs. anticipatory value vs. downstream-aware admission
     Flows {
+        /// Accelerator HBM holding KV and weights, e.g. 4GiB. 0 models unified memory, where
+        /// every class shares the DRAM pool
+        #[arg(long, default_value = "4GiB", value_parser = parse_bytes)]
+        hbm: u64,
         #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
         dram: u64,
         #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
@@ -60,8 +68,12 @@ enum Cmd {
         sockets: usize,
         #[arg(long, default_value_t = 3)]
         units_per_socket: usize,
-        /// Total DRAM across all domains
-        #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
+        /// Total accelerator HBM across all domains, holding KV and weights. 0 models unified
+        /// memory; compare against it with the HBM added to --dram
+        #[arg(long, default_value = "16GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        /// Total host DDR across all domains
+        #[arg(long, default_value = "32GiB", value_parser = parse_bytes)]
         dram: u64,
         #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
         nvme: u64,
@@ -71,6 +83,10 @@ enum Cmd {
         seed: u64,
         #[arg(long, default_value = "0,1,2,1", value_parser = parse_bands)]
         bands: String,
+        /// Arrival rate in requests/sec, driving the engine model. 0 charges a flat
+        /// per-token decode cost instead
+        #[arg(long, default_value_t = 350.0)]
+        rate: f64,
         /// Drain one domain at this fraction through the trace (0 = never). Its state
         /// migrates to the survivors, so the bytes remain but every hash to it is stale.
         #[arg(long, default_value_t = 0.0)]
@@ -83,8 +99,12 @@ enum Cmd {
         nodes: usize,
         #[arg(long, default_value_t = 3)]
         units_per_node: usize,
-        /// Total DRAM across all nodes
-        #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
+        /// Total accelerator HBM across all nodes, holding KV and weights. 0 models unified
+        /// memory; compare against it with the HBM added to --dram
+        #[arg(long, default_value = "16GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        /// Total host DDR across all nodes
+        #[arg(long, default_value = "32GiB", value_parser = parse_bytes)]
         dram: u64,
         #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
         nvme: u64,
@@ -103,6 +123,14 @@ enum Cmd {
         /// Requests between gossip refreshes for the stale-view arm
         #[arg(long, default_value_t = 200)]
         gossip_period: u64,
+        /// Arrival rate in requests/sec. Drives the engine model: decode cost depends on
+        /// batch occupancy, which depends on load. 0 charges a flat per-token cost instead
+        #[arg(long, default_value_t = 250.0)]
+        rate: f64,
+        /// Fraction of agent turns that fan out to sub-agents (each making function tool calls);
+        /// 0 leaves fan-outs out of the stream
+        #[arg(long, default_value_t = 0.10)]
+        fanout: f64,
         /// Boundary-ladder repetitions
         #[arg(long, default_value_t = 3)]
         repeat: usize,
@@ -136,6 +164,10 @@ enum Cmd {
 
     /// Does the unified advantage scale with volatility, and vanish at zero?
     Volatility {
+        /// Accelerator HBM holding KV and weights, e.g. 4GiB. 0 models unified memory, where
+        /// every class shares the DRAM pool
+        #[arg(long, default_value = "4GiB", value_parser = parse_bytes)]
+        hbm: u64,
         #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
         dram: u64,
         #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
@@ -188,9 +220,9 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Band-lexicographic objective: inference first, then customer-facing, then training.
-/// Training is best-effort, so a configuration is preferred if it improves a higher band
-/// even at the cost of a lower one.
+/// Band-lexicographic objective: the most latency-critical band first, the most sacrificial
+/// last, so a configuration is preferred if it improves a higher band even at the cost of a
+/// lower one.
 fn prefer(a: &Report, b: &Report, bands: [u8; BlobKind::N]) -> bool {
     // Throughput before latency: a config may not buy a faster band by dropping requests.
     let (ga, gb) = (a.goodput(), b.goodput());
@@ -244,8 +276,7 @@ fn best_split(t: Trial, hard: bool, step: f64) -> (Report, [f64; BlobKind::N]) {
                 // splits sum to less than n; the remainder is shared slack
                 for d in 1..n - a - b - c {
                     let split = [a, b, c, d].map(|x| x as f64 / n as f64);
-                    let q = Quota::from_split(t.dram, split, t.bands, hard);
-                    let r = run_on("", t, q, &stream);
+                    let r = run_on("", t, Budget::Split { split, hard }, &stream);
                     let better = best.as_ref().is_none_or(|(x, _)| prefer(&r, x, t.bands));
                     if better {
                         best = Some((r, split));
@@ -259,6 +290,41 @@ fn best_split(t: Trial, hard: bool, step: f64) -> (Report, [f64; BlobKind::N]) {
 
 const PHASE_NAME: [&str; 4] = ["agent-heavy", "faas-burst", "service-steady", "mixed"];
 const CLASS_NAME: [&str; BlobKind::N] = ["inference-kv", "faas", "weights", "service"];
+
+fn memory_label(hbm: u64, dram: u64) -> String {
+    if hbm == 0 {
+        format!("unified memory: dram={:.1}GiB", gib(dram))
+    } else {
+        format!("hbm={:.1}GiB ddr={:.1}GiB", gib(hbm), gib(dram))
+    }
+}
+
+/// One node's memory for the multi-node experiments.
+///
+/// Split memory budgets each pool for what lives in it. HBM carries KV against weights; the
+/// weights floor holds two whole models, since one model is two 512 MiB shards and a floor
+/// under that thrashes on something no policy can repair. DDR carries function cells and
+/// service heaps, with modest floors for what the accelerator offloads. Unified memory keeps
+/// the one-pool split the earlier rounds used, so the comparison is against what was there.
+fn node_memory(hbm: u64, ddr: u64, nvme: u64, bands: [u8; BlobKind::N]) -> NodeMemory {
+    if hbm == 0 {
+        let q = Quota::from_split(ddr, [0.10, 0.12, 0.50, 0.26], bands, false);
+        return NodeMemory {
+            hbm: 0,
+            ddr,
+            nvme,
+            hbm_quota: Quota::open(0, bands),
+            ddr_quota: q,
+        };
+    }
+    NodeMemory {
+        hbm,
+        ddr,
+        nvme,
+        hbm_quota: Quota::from_split(hbm, [0.25, 0.0, 0.50, 0.0], bands, false),
+        ddr_quota: Quota::from_split(ddr, [0.10, 0.15, 0.15, 0.35], bands, false).offloaded(),
+    }
+}
 
 fn ms(ns: u64) -> f64 {
     ns as f64 / 1e6
@@ -340,11 +406,13 @@ fn arm_row(r: &Report) {
 fn placement(
     sockets: usize,
     units_per_socket: usize,
+    hbm: u64,
     dram: u64,
     nvme: u64,
     ops: u64,
     seed: u64,
     bands: [u8; BlobKind::N],
+    rate: f64,
     drain_at: f64,
 ) {
     use polyphonic::machine::{Machine, Placement};
@@ -352,7 +420,12 @@ fn placement(
 
     let per_socket = dram / sockets as u64;
     let topo = Topology::synthetic(sockets, units_per_socket, per_socket);
-    let split = [0.12, 0.12, 0.12, 0.25];
+    let memory = node_memory(
+        hbm / sockets as u64,
+        per_socket,
+        nvme / sockets as u64,
+        bands,
+    );
     println!(
         "synthetic machine: {sockets} domains x {:.1} GiB, {units_per_socket} units each\n\
          cross-domain link constants are MODELLED (coherent, ~2x per-byte, 120 ns hop)",
@@ -368,7 +441,7 @@ fn placement(
     }
 
     println!(
-        "{:<10} {:>12} {:>14} {:>12} {:>10} {:>12} {:>14}",
+        "{:<13} {:>12} {:>14} {:>12} {:>10} {:>12} {:>14}",
         "placement",
         "stall/req",
         "interconnect",
@@ -377,14 +450,20 @@ fn placement(
         "bytes moved",
         "domain spread"
     );
-    for mode in [Placement::Blind, Placement::Sticky, Placement::Aware] {
-        let mut m = Machine::new(
-            topo.clone(),
-            nvme / sockets as u64,
-            Policy::Gdsf,
-            |cap| Quota::from_split(cap, split, bands, false),
-            mode,
-        );
+    // Cross-socket links are coherent and cheap, so this is the topology where shipping
+    // state should beat rebuilding it almost always. Whether it does is the point of the row.
+    let modes = [
+        (Placement::Blind, false),
+        (Placement::Sticky, false),
+        (Placement::Aware, false),
+        (Placement::Aware, true),
+        (Placement::Scored, false),
+        (Placement::Scored, true),
+    ];
+    for (mode, transfer) in modes {
+        let mut m = Machine::new(topo.clone(), memory, Policy::Gdsf, mode);
+        m.set_state_transfer(transfer);
+        m.set_arrival_rate(rate);
         let mut total = 0u64;
         let mut served = 0u64;
         let drain_op = if drain_at > 0.0 {
@@ -403,14 +482,16 @@ fn placement(
             total += c.total_ns();
             served += 1;
         }
-        let label = match mode {
-            Placement::Blind => "blind",
-            Placement::Sticky => "sticky",
-            Placement::Aware => "aware",
-            Placement::Scored => "scored",
+        let label = match (mode, transfer) {
+            (Placement::Blind, _) => "blind",
+            (Placement::Sticky, _) => "sticky",
+            (Placement::Aware, false) => "aware",
+            (Placement::Aware, true) => "aware+fetch",
+            (Placement::Scored, false) => "scored",
+            (Placement::Scored, true) => "scored+fetch",
         };
         println!(
-            "{label:<10} {:>11.3}ms {:>13.1}s {:>10.2}s {:>11.1}% {:>9.1}% {:>13.2}",
+            "{label:<13} {:>11.3}ms {:>13.1}s {:>10.2}s {:>11.1}% {:>9.1}% {:>13.2}",
             mean_ms(total, served),
             total.saturating_sub(m.interconnect_ns + m.handoff_ns) as f64 / 1e9,
             m.handoff_ns as f64 / 1e9,
@@ -579,14 +660,23 @@ fn topology(bytes: u64, iters: u32) {
     }
 }
 
-fn flows_report(dram: u64, nvme: u64, ops: u64, seed: u64, step: f64, bands: [u8; BlobKind::N]) {
+fn flows_report(
+    hbm: u64,
+    dram: u64,
+    nvme: u64,
+    ops: u64,
+    seed: u64,
+    step: f64,
+    bands: [u8; BlobKind::N],
+) {
     println!(
-        "dram={:.1}GiB ops={ops} seed={seed} bands={bands:?}\n",
-        gib(dram)
+        "{} ops={ops} seed={seed} bands={bands:?}\n",
+        memory_label(hbm, dram)
     );
     let cfg = Trial {
         bands,
         flows: FlowMode::Blind,
+        hbm,
         dram,
         nvme,
         policy: Policy::Gdsf,
@@ -595,7 +685,7 @@ fn flows_report(dram: u64, nvme: u64, ops: u64, seed: u64, step: f64, bands: [u8
         vol: 1.0,
     };
     let (_, split) = best_split(cfg, false, step);
-    let quota = Quota::from_split(dram, split, bands, false);
+    let budget = Budget::Split { split, hard: false };
     println!(
         "soft floors [{:.2}/{:.2}/{:.2}/{:.2}], identical quota and trace in every row\n\
          task e2e is critical-path only; prewarm work is materialisation moved off it\n",
@@ -608,7 +698,7 @@ fn flows_report(dram: u64, nvme: u64, ops: u64, seed: u64, step: f64, bands: [u8
     );
     for mode in [FlowMode::Blind, FlowMode::Announce, FlowMode::Gate] {
         let trial = Trial { flows: mode, ..cfg };
-        let r = run("", trial, quota);
+        let r = run("", trial, budget);
         let label = match mode {
             FlowMode::Blind => "blind",
             FlowMode::Announce => "announce",
@@ -626,9 +716,9 @@ fn flows_report(dram: u64, nvme: u64, ops: u64, seed: u64, step: f64, bands: [u8
     }
 }
 
-fn volatility_sweep(dram: u64, nvme: u64, ops: u64, seed: u64, step: f64) {
+fn volatility_sweep(hbm: u64, dram: u64, nvme: u64, ops: u64, seed: u64, step: f64) {
     let bands = [0u8, 1, 2, 1];
-    println!("dram={:.1}GiB ops={ops} seed={seed}\n", gib(dram));
+    println!("{} ops={ops} seed={seed}\n", memory_label(hbm, dram));
     println!(
         "{:>10} {:>18} {:>16} {:>12}",
         "volatility", "hard-partition (ms)", "soft-floor (ms)", "advantage"
@@ -638,6 +728,7 @@ fn volatility_sweep(dram: u64, nvme: u64, ops: u64, seed: u64, step: f64) {
         let t = Trial {
             bands,
             flows: FlowMode::Blind,
+            hbm,
             dram,
             nvme,
             policy: Policy::Gdsf,
@@ -656,7 +747,12 @@ fn volatility_sweep(dram: u64, nvme: u64, ops: u64, seed: u64, step: f64) {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "experiment knobs, all independent"
+)]
 fn residency_report(
+    hbm: u64,
     dram: u64,
     nvme: u64,
     ops: u64,
@@ -666,8 +762,8 @@ fn residency_report(
     bands: [u8; BlobKind::N],
 ) {
     println!(
-        "dram={:.1}GiB nvme={:.1}GiB ops={ops} seed={seed} volatility={volatility}\n",
-        gib(dram),
+        "{} nvme={:.1}GiB ops={ops} seed={seed} volatility={volatility}\n",
+        memory_label(hbm, dram),
         gib(nvme)
     );
     println!("priority bands (operator-configured): {bands:?}\n");
@@ -675,6 +771,7 @@ fn residency_report(
     let t = Trial {
         bands,
         flows: FlowMode::Blind,
+        hbm,
         dram,
         nvme,
         policy: Policy::Gdsf,
@@ -692,7 +789,7 @@ fn residency_report(
         "soft-floor     [{:.2}/{:.2}/{:.2}/{:.2}]",
         ss[0], ss[1], ss[2], ss[3]
     );
-    let mut open = run("", t, Quota::open(dram, t.bands));
+    let mut open = run("", t, Budget::Open);
     open.label = "no-floor       [open]".to_string();
 
     println!(
@@ -763,9 +860,14 @@ fn residency_report(
     );
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per subcommand, nothing else"
+)]
 fn main() {
     match Cli::parse().cmd {
         Cmd::Residency {
+            hbm,
             dram,
             nvme,
             ops,
@@ -774,13 +876,23 @@ fn main() {
             volatility,
             bands,
         } => {
-            residency_report(dram, nvme, ops, seed, step, volatility, bands_of(&bands));
+            residency_report(
+                hbm,
+                dram,
+                nvme,
+                ops,
+                seed,
+                step,
+                volatility,
+                bands_of(&bands),
+            );
         }
         Cmd::Calibrate { path, iters } => calibrate(&path, iters),
         Cmd::Boundary { repeat } => boundary(repeat),
         Cmd::Distributed {
             nodes,
             units_per_node,
+            hbm,
             dram,
             nvme,
             ops,
@@ -789,10 +901,13 @@ fn main() {
             distances,
             crossing,
             gossip_period,
+            rate,
+            fanout,
             repeat,
         } => distributed(
             nodes,
             units_per_node,
+            hbm,
             dram,
             nvme,
             ops,
@@ -801,31 +916,38 @@ fn main() {
             &distances,
             &crossing,
             gossip_period,
+            rate,
+            fanout,
             repeat,
         ),
         Cmd::Topology { bytes, iters } => topology(bytes, iters),
         Cmd::Placement {
             sockets,
             units_per_socket,
+            hbm,
             dram,
             nvme,
             ops,
             seed,
             bands,
+            rate,
             drain_at,
         } => {
             placement(
                 sockets,
                 units_per_socket,
+                hbm,
                 dram,
                 nvme,
                 ops,
                 seed,
                 bands_of(&bands),
+                rate,
                 drain_at,
             );
         }
         Cmd::Flows {
+            hbm,
             dram,
             nvme,
             ops,
@@ -833,16 +955,17 @@ fn main() {
             step,
             bands,
         } => {
-            flows_report(dram, nvme, ops, seed, step, bands_of(&bands));
+            flows_report(hbm, dram, nvme, ops, seed, step, bands_of(&bands));
         }
         Cmd::Volatility {
+            hbm,
             dram,
             nvme,
             ops,
             seed,
             step,
         } => {
-            volatility_sweep(dram, nvme, ops, seed, step);
+            volatility_sweep(hbm, dram, nvme, ops, seed, step);
         }
     }
 }
@@ -989,59 +1112,152 @@ fn class_table(rows: &ClassRows<'_>) {
 
 use polyphonic::machine::{Control, Placement};
 
-type Arm = (&'static str, Placement, bool, Control);
+struct Arm {
+    label: &'static str,
+    placement: Placement,
+    flow: bool,
+    control: Control,
+    /// May a node pull missing state off a peer instead of rebuilding it? Held apart from
+    /// placement so the two can be attributed separately: one decides where work runs, the
+    /// other decides how its state gets there once that is settled.
+    transfer: bool,
+}
+
+fn arm(
+    label: &'static str,
+    placement: Placement,
+    flow: bool,
+    control: Control,
+    transfer: bool,
+) -> Arm {
+    Arm {
+        label,
+        placement,
+        flow,
+        control,
+        transfer,
+    }
+}
 
 fn distributed_arms(gossip_period: u64) -> Vec<Arm> {
+    use Control::{Gossip, Query, Unified};
+    use Placement::{Aware, Scored, Sticky};
     vec![
-        ("hash only", Placement::Sticky, false, Control::Unified),
-        ("residency only", Placement::Aware, false, Control::Unified),
-        ("flow only", Placement::Sticky, true, Control::Unified),
-        ("both, unified", Placement::Aware, true, Control::Unified),
-        ("both, rpc query", Placement::Aware, true, Control::Query),
-        (
+        arm("hash only", Sticky, false, Unified, false),
+        arm("residency only", Aware, false, Unified, false),
+        arm("flow only", Sticky, true, Unified, false),
+        arm("both, unified", Aware, true, Unified, false),
+        arm("both, rpc query", Aware, true, Query, false),
+        arm(
             "both, gossiped",
-            Placement::Aware,
+            Aware,
             true,
-            Control::Gossip {
+            Gossip {
                 period: gossip_period,
             },
-        ),
-        ("scored", Placement::Scored, true, Control::Unified),
-        (
-            "scored, no flows",
-            Placement::Scored,
             false,
-            Control::Unified,
+        ),
+        arm("residency + fetch", Aware, false, Unified, true),
+        arm("scored, no flows", Scored, false, Unified, false),
+        arm("scored", Scored, true, Unified, false),
+        arm("scored + fetch", Scored, true, Unified, true),
+        arm(
+            "scored + fetch, gossiped",
+            Scored,
+            true,
+            Gossip {
+                period: gossip_period,
+            },
+            true,
         ),
     ]
+}
+
+/// How the three acquisition routes actually split, what the engine did with the load, and
+/// how fan-outs and their tool calls were placed. Printed for every arm because an arm that never
+/// fetches and an arm that cannot fetch produce the same stall number for opposite reasons.
+fn state_terms(mach: &polyphonic::machine::Machine, served: u64) {
+    let pct = |n: u64| 100.0 * n as f64 / served.max(1) as f64;
+    // Shares of materialisations, not of requests: a request whose chain was already
+    // resident acquired nothing, and counting it would hide the split this line is for.
+    let acts = (mach.fetches + mach.rebuilds).max(1) as f64;
+    print!(
+        "{:<22} acquired: {:.1}% fetched ({:.1} GiB), {:.1}% rebuilt, {:.1}% stale",
+        "",
+        100.0 * mach.fetches as f64 / acts,
+        gib(mach.fetched_bytes),
+        100.0 * mach.rebuilds as f64 / acts,
+        pct(mach.stale_fetches),
+    );
+    if mach.mean_batch() > 0.0 {
+        // Per decode rather than as a share of stall: a fan-out's stall is its slowest
+        // agent's, but every agent queued, so the share stops meaning anything once agents run.
+        print!(
+            "; batch {:.1}, queue {:.2} ms/decode, {:.1}% of decodes arrived saturated",
+            mach.mean_batch(),
+            mean_ms(mach.queue_ns(), mach.decodes()),
+            100.0 * mach.saturated() as f64 / mach.decodes().max(1) as f64,
+        );
+    }
+    println!();
+    let fanouts = mach.fanouts_admitted + mach.fanouts_refused;
+    if fanouts > 0 {
+        println!(
+            "{:<22} fan-outs {}/{} ran, {:.1} ms each; agents co-located {:.1}%; \
+             {} tool calls, {:.1}% beside their agent, {:.2} ms each",
+            "",
+            mach.fanouts_admitted,
+            fanouts,
+            mean_ms(mach.fanout_service_ns, mach.fanouts_admitted),
+            100.0 * mach.agents_colocated as f64 / mach.agents_run.max(1) as f64,
+            mach.tool_calls,
+            100.0 * mach.tool_coplaced as f64 / mach.tool_calls.max(1) as f64,
+            mean_ms(mach.tool_ns, mach.tool_calls),
+        );
+    }
+}
+
+/// Mean spread of each term across candidate nodes. An argmin is decided by spread alone, so
+/// this is what says whether a term can ever outvote another one.
+fn term_spread(mach: &polyphonic::machine::Machine) {
+    use polyphonic::machine::TERM_LABELS;
+    let n = mach.scored_decisions.max(1) as f64;
+    print!("{:<22} term spread (mean, ms):", "");
+    for (label, total) in TERM_LABELS.iter().zip(mach.term_spread) {
+        print!(" {label} {:.2}", total / n / 1e6);
+    }
+    println!();
 }
 
 fn score_terms(mach: &polyphonic::machine::Machine, served: u64) {
     let pct = |n: u64| 100.0 * n as f64 / served.max(1) as f64;
     println!(
-        "{:<22} moved by displacement {:.1}%, by flow {:.1}%, held at affinity {:.1}%; \
-         {:.1}% of {} flows co-placed",
+        "{:<22} moved by displacement {:.1}%, by flow {:.1}%, by load {:.1}%, by congestion \
+         {:.1}%, held at affinity {:.1}%; {:.1}% of {} flows co-placed; engine spread {:.2}",
         "",
         pct(mach.moved_by_displacement),
         pct(mach.moved_by_flow),
+        pct(mach.moved_by_load),
+        pct(mach.moved_by_congestion),
         pct(mach.held_by_affinity),
         100.0 * mach.flow_coplaced as f64 / mach.flow_requests.max(1) as f64,
         mach.flow_requests,
+        mach.engine_spread(),
     );
 }
 
 fn cluster_header(
     nodes: usize,
     units_per_node: usize,
-    per_node: u64,
+    memory: &NodeMemory,
     crossing: &str,
     cost: polyphonic::boundary::Cost,
 ) {
     println!(
-        "cluster: {nodes} nodes x {:.1} GiB, {units_per_node} units each\n\
+        "cluster: {nodes} nodes, {} per node, {units_per_node} units each\n\
          control crossing: {crossing} = {:.1} us + {:.3} ns/byte (MEASURED on this host)\n\
-         node link latency and bandwidth are MODELLED\n",
-        gib(per_node),
+         node link latency, bandwidth and PCIe are MODELLED\n",
+        memory_label(memory.hbm, memory.ddr),
         cost.fixed_ns / 1000.0,
         cost.ns_per_byte,
     );
@@ -1068,6 +1284,7 @@ fn crossing_of(l: &polyphonic::boundary::Ladder, name: &str) -> Option<polyphoni
 fn distributed(
     nodes: usize,
     units_per_node: usize,
+    hbm: u64,
     dram: u64,
     nvme: u64,
     ops: u64,
@@ -1076,6 +1293,8 @@ fn distributed(
     distances: &str,
     crossing: &str,
     gossip_period: u64,
+    rate: f64,
+    fanout: f64,
     repeat: usize,
 ) {
     use polyphonic::machine::Machine;
@@ -1087,12 +1306,9 @@ fn distributed(
         return;
     };
     let per_node = dram / nodes as u64;
-    // A class's floor must be at least its smallest indivisible working-set unit. One model is
-    // two 512 MiB shards, so a weights floor below 1 GiB per node cannot hold a whole model and
-    // the ledger thrashes on something no policy can fix.
-    let split = [0.10, 0.12, 0.50, 0.26];
+    let memory = node_memory(hbm / nodes as u64, per_node, nvme / nodes as u64, bands);
 
-    cluster_header(nodes, units_per_node, per_node, crossing, cost);
+    cluster_header(nodes, units_per_node, &memory, crossing, cost);
 
     // Residency routing and flow co-placement are separate mechanisms that were previously
     // bundled into one arm. Split so the win can be attributed to one of them.
@@ -1111,48 +1327,39 @@ fn distributed(
             dist.one_way_ns() as f64 / 1000.0,
             dist.ns_per_byte()
         );
+        // Service time leads: once decode cost depends on the batch a request joins, placement
+        // moves execution as well as waiting, and stall alone cannot see the difference.
         println!(
-            "{:<22} {:>12} {:>12} {:>10} {:>9} {:>10} {:>12}",
-            "arm", "stall/req", "deciding", "of stall", "split", "handoff", "node spread"
+            "{:<22} {:>13} {:>12} {:>9} {:>10} {:>11} {:>9} {:>9} {:>9} {:>11}",
+            "arm",
+            "service/req",
+            "stall/req",
+            "served",
+            "fan-outs",
+            "deciding",
+            "of stall",
+            "split",
+            "handoff",
+            "spread"
         );
-        let mut base = 0.0;
         let mut per_class: Vec<ClassRow<'_>> = Vec::new();
-        for (label, placement, flow, control) in &arms {
-            let mut mach = Machine::new(
-                topo.clone(),
-                nvme / nodes as u64,
-                Policy::Gdsf,
-                |cap| Quota::from_split(cap, split, bands, false),
-                *placement,
-            );
-            mach.set_flow_aware(*flow);
-            mach.set_control(*control, cost);
-            let (mut total, mut served) = (0u64, 0u64);
-            let mut t = ClassTally::default();
-            for req in polyphonic::work::Workload::new(seed, ops, 1.0) {
-                let k = req.chain.first().map_or(0, |(_, meta)| meta.kind.idx());
-                let c = mach.serve_request(&req);
-                if c.pending {
-                    continue;
-                }
-                total += c.total_ns();
-                t.stall[k] += c.total_ns();
-                t.service[k] += c.service_ns();
-                t.decide[k] += c.decide_ns;
-                t.ops[k] += 1;
-                // Warm means the ledger had everything: no fetch, no recompute, just the work.
-                if c.transfer_ns == 0 && c.recompute_ns == 0 {
-                    t.warm[k] += 1;
-                    t.warm_ns[k] += c.service_ns();
-                }
-                served += 1;
-            }
+        for a in &arms {
+            let label = a.label;
+            let mut mach = Machine::new(topo.clone(), memory, Policy::Gdsf, a.placement);
+            mach.set_flow_aware(a.flow);
+            mach.set_control(a.control, cost);
+            mach.set_state_transfer(a.transfer);
+            mach.set_arrival_rate(rate);
+            mach.set_fanout_atomic(true);
+            let (t, total, served, offered) = drive(&mut mach, seed, ops, rate, fanout);
             let stall = mean_ms(total, served);
-            if base == 0.0 {
-                base = stall;
-            }
+            let service = mean_ms(t.service.iter().sum(), served);
             println!(
-                "{label:<22} {stall:>11.3}ms {:>11.3}ms {:>9.2}% {:>8.1}% {:>9.2}s {:>12.2}",
+                "{label:<22} {service:>11.3}ms {stall:>10.3}ms {:>8.1}% {:>9.1}% {:>9.3}ms \
+                 {:>8.2}% {:>8.1}% {:>8.2}s {:>11.2}",
+                100.0 * served as f64 / offered.max(1) as f64,
+                100.0 * mach.fanouts_admitted as f64
+                    / (mach.fanouts_admitted + mach.fanouts_refused).max(1) as f64,
                 mean_ms(mach.decide_ns, served),
                 100.0 * mach.decide_ns as f64 / total.max(1) as f64,
                 100.0 * mach.split_tasks as f64
@@ -1160,19 +1367,103 @@ fn distributed(
                 mach.handoff_ns as f64 / 1e9,
                 mach.domain_spread(),
             );
-            if *placement == Placement::Scored {
+            state_terms(&mach, served);
+            if a.placement == Placement::Scored {
                 score_terms(&mach, served);
+                term_spread(&mach);
             }
             for (seen, (ns, n)) in warm_seen.iter_mut().zip(t.warm_ns.iter().zip(&t.warm)) {
                 seen.0 += ns;
                 seen.1 += n;
             }
-            per_class.push((*label, t));
+            per_class.push((label, t));
         }
 
         class_table(&per_class);
+        fanout_admission(&topo, memory, seed, ops, rate, fanout);
     }
     crossover(&ladder, cost, &warm_seen);
+}
+
+/// Run one configured machine over the trace, tallying per class. Shared by every arm so a
+/// comparison can never accidentally be between two different accounting rules.
+fn drive(
+    mach: &mut polyphonic::machine::Machine,
+    seed: u64,
+    ops: u64,
+    rate: f64,
+    fanout: f64,
+) -> (ClassTally, u64, u64, u64) {
+    mach.set_arrival_rate(rate);
+    let mut t = ClassTally::default();
+    let (mut total, mut served, mut offered) = (0u64, 0u64, 0u64);
+    for req in polyphonic::work::Workload::with_fanout(seed, ops, 1.0, fanout) {
+        let k = req.kind_idx();
+        offered += 1;
+        let c = mach.serve_request(&req);
+        if c.pending {
+            continue;
+        }
+        total += c.total_ns();
+        t.stall[k] += c.total_ns();
+        t.service[k] += c.service_ns();
+        t.decide[k] += c.decide_ns;
+        t.ops[k] += 1;
+        // Warm means the ledger had everything: no fetch, no recompute, just the work.
+        if c.transfer_ns == 0 && c.recompute_ns == 0 {
+            t.warm[k] += 1;
+            t.warm_ns[k] += c.service_ns();
+        }
+        served += 1;
+    }
+    (t, total, served, offered)
+}
+
+/// What all-or-nothing fan-out admission is worth, measured rather than argued.
+///
+/// The baseline is the same agents admitted one at a time, which is what a per-request
+/// scheduler does when nobody told it the requests belong together. An orchestrator missing
+/// one agent cannot resume, so every agent that did run was work for nothing -- and it ran on
+/// engines and memory that other requests needed.
+fn fanout_admission(
+    topo: &polyphonic::topo::Topology,
+    memory: NodeMemory,
+    seed: u64,
+    ops: u64,
+    rate: f64,
+    fanout: f64,
+) {
+    use polyphonic::machine::{Machine, Placement};
+    if fanout <= 0.0 {
+        return;
+    }
+    println!("\n  fan-out admission (scored + fetch, unified control)");
+    println!(
+        "  {:<16} {:>11} {:>13} {:>12} {:>12} {:>16} {:>9}",
+        "admission", "fan-outs", "wasted work", "fan-out", "stall/req", "inference stall", "served"
+    );
+    for atomic in [false, true] {
+        let mut mach = Machine::new(topo.clone(), memory, Policy::Gdsf, Placement::Scored);
+        mach.set_flow_aware(true);
+        mach.set_state_transfer(true);
+        mach.set_fanout_atomic(atomic);
+        let (t, total, served, offered) = drive(&mut mach, seed, ops, rate, fanout);
+        println!(
+            "  {:<16} {:>6}/{:<4} {:>11.2}s {:>10.1}ms {:>10.3}ms {:>14.3}ms {:>8.1}%",
+            if atomic {
+                "all-or-nothing"
+            } else {
+                "per agent"
+            },
+            mach.fanouts_admitted,
+            mach.fanouts_admitted + mach.fanouts_refused,
+            mach.fanout_wasted_ns as f64 / 1e9,
+            mean_ms(mach.fanout_service_ns, mach.fanouts_admitted),
+            mean_ms(total, served),
+            mean_ms(t.stall[0], t.ops[0]),
+            100.0 * served as f64 / offered.max(1) as f64,
+        );
+    }
 }
 
 /// The boundary tax is not a fixed overhead, it is a fraction -- and the fraction depends

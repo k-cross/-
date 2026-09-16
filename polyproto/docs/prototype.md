@@ -6,3 +6,6 @@ The focus of this prototype is to collect realistic data on:
 
 The hypothesis:
 Are emergent properties that unlock new use cases when using a unified control plane instead of siloed but specialized ones?
+
+Caveats:
+On Mac and Apple silicon, we have access to an entire pool of unified memory but datacenter targets are going to be different and are more important to us, GPU/TPU and other accelerators will likely be working off of a separate pool of HBM where the traditional compute still happens on a seperate pool of DDR.

@@ -8,8 +8,33 @@ pub type Chain = Vec<(BlobId, BlobMeta)>;
 
 pub const KV_BLOCK_BYTES: u64 = 512 * 1024;
 pub const KV_BLOCK_NS: u64 = 400_000;
+/// Guest memory of one warm microVM cell. Small for a Firecracker guest and deliberately so:
+/// the VMM's own footprint is a few MiB, and a function's guest is sized to the function.
 pub const SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
-pub const SNAPSHOT_NS: u64 = 200_000_000;
+/// Fixed cost of resuming a Firecracker snapshot: VMM setup, device restore, and mapping the
+/// memory file. Independent of image size, which is the property that matters.
+pub const SNAPSHOT_RESTORE_NS: u64 = 4_000_000;
+/// Fraction of a restored guest's pages an invocation actually touches. Lazy restore faults
+/// pages on demand, so this -- not the image size -- is what a cold start pays for.
+pub const SNAPSHOT_WORKING_SET: f64 = 0.15;
+/// Fault-driven page-in over `UFFD`, roughly 1 `GiB/s`: a userfaulting round trip per fault is
+/// far short of a `memcpy`, which is why the touched fraction is worth modelling at all.
+pub const SNAPSHOT_PAGE_IN_NS_PER_BYTE: f64 = 1.0;
+
+/// Cost of bringing a warm cell back, under **lazy snapshot restore** rather than a cold
+/// container start.
+///
+/// This is a deliberate commitment to the Firecracker model, and it is not a tuning change.
+/// A cold container start is linear in image size and measured in hundreds of milliseconds; a
+/// demand-paged snapshot resume is a fixed few milliseconds plus the working set, which makes
+/// it roughly **flat** in image size. The two differ by more than an order of magnitude and
+/// they order the ledger's eviction priorities differently, so the model has to say which one
+/// it means. A v8-isolate substrate would be a third answer again and is explicitly not this.
+#[must_use]
+pub fn snapshot_restore_ns(bytes: u64) -> u64 {
+    SNAPSHOT_RESTORE_NS
+        + (bytes as f64 * SNAPSHOT_WORKING_SET * SNAPSHOT_PAGE_IN_NS_PER_BYTE) as u64
+}
 pub const WEIGHT_BYTES: u64 = 512 * 1024 * 1024;
 pub const WEIGHT_NS: u64 = 4_000_000_000;
 
@@ -19,6 +44,25 @@ const FUNCTIONS: u64 = 400;
 const MODELS: u64 = 4;
 const SHARDS_PER_MODEL: u64 = 2;
 const SERVICES: u64 = 3;
+/// Shape of a multi-agent fan-out: an orchestrator turn dispatches between `AGENTS_MIN` and
+/// `AGENTS_MIN + AGENTS_SPAN - 1` sub-agents, each of which extends the orchestrator's context
+/// with its own role prompt and subtask and makes up to `TOOLS_MAX` tool calls. **Modelled**,
+/// and the numbers most worth replacing with traces from a real agent framework.
+const AGENTS_MIN: u64 = 2;
+const AGENTS_SPAN: u64 = 5;
+const SUBAGENT_BLOCKS: u64 = 6;
+const TOOLS_MAX: u64 = 4;
+/// Result blocks each sub-agent contributes to the orchestrator's resumed context.
+const RESULT_BLOCKS: u64 = 2;
+/// Task specification handed to each sub-agent, and the result each one hands back.
+pub const DISPATCH_PAYLOAD_BYTES: u64 = 64 * 1024;
+pub const RESULT_PAYLOAD_BYTES: u64 = 256 * 1024;
+/// Ops between the orchestrator deciding to fan out and the sub-agents starting.
+const FANOUT_LEAD_OPS: u32 = 6;
+/// Ops between dispatch and the orchestrator resuming. Sub-agents decode for about a second,
+/// which is several hundred arrivals at the rates the experiments run; the workload cannot see
+/// the machine's clock, so this is a stand-in for "after the slowest sub-agent returns".
+const RESUME_LEAD_OPS: u32 = 400;
 pub const SERVICE_BYTES: u64 = 384 * 1024 * 1024;
 pub const SERVICE_COLD_NS: u64 = 15_000_000_000;
 const REPLICAS: [u64; PHASES] = [3, 1, 2, 3];
@@ -31,7 +75,9 @@ const MAX_TURNS: u32 = 24;
 pub const FAAS_EXEC_MIN_NS: u64 = 40_000;
 pub const FAAS_EXEC_SPAN_NS: u64 = 160_000;
 pub const SERVICE_EXEC_NS: u64 = 250_000;
-/// One decoded token at roughly 125 tok/s, the regime a served model actually runs in.
+/// One decoded token at a batch of one. The served cost is `engine::Engine::step_ns` of the
+/// batch the request lands in; this is the unbatched floor, kept so an arm with no engine
+/// model stays comparable.
 pub const DECODE_NS_PER_TOKEN: u64 = 8_000_000;
 const TOKENS_MIN: u64 = 24;
 const TOKENS_SPAN: u64 = 200;
@@ -56,6 +102,17 @@ struct Queued {
     chain: Chain,
     requires: Chain,
     exec_ns: u64,
+    tokens: u64,
+    fanout: Option<Fanout>,
+}
+
+/// A dispatched fan-out and the orchestrator turn that resumes once it returns.
+#[derive(Clone, Debug)]
+struct Fanout {
+    gang: Gang,
+    resume: Chain,
+    resume_requires: Chain,
+    resume_tokens: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +123,40 @@ struct Session {
 }
 
 pub const PHASES: usize = 4;
+
+/// One function invocation a sub-agent makes while it works.
+#[derive(Clone, Debug)]
+pub struct ToolCall {
+    pub chain: Chain,
+    pub exec_ns: u64,
+    /// Arguments out and result back, each this size.
+    pub payload_bytes: u64,
+}
+
+/// One sub-agent: a session forked from the orchestrator's context.
+#[derive(Clone, Debug)]
+pub struct Agent {
+    /// The orchestrator's context followed by this agent's own blocks. Siblings share the
+    /// prefix, which is what makes placing them together worth something.
+    pub chain: Chain,
+    /// Weight shards of the model this agent's role runs on.
+    pub requires: Chain,
+    pub tokens: u64,
+    pub tools: Vec<ToolCall>,
+}
+
+/// An orchestrator's fan-out: sub-agents that must all be admitted or none of them.
+///
+/// The orchestrator cannot resume until every sub-agent has returned, so admitting three of
+/// four does not buy three quarters of an answer -- it buys nothing, and the three decode
+/// anyway. That is the admission shape a per-request scheduler cannot express. The job also
+/// finishes when its *slowest* agent does, so the placement question is not where each agent
+/// is cheapest but where the worst of them is least bad: siblings placed together reuse their
+/// shared context and hand results back for free, and pile their decodes onto one engine.
+#[derive(Clone, Debug)]
+pub struct Gang {
+    pub agents: Vec<Agent>,
+}
 
 #[derive(Clone, Debug)]
 pub struct Request {
@@ -81,10 +172,32 @@ pub struct Request {
     pub completes: Option<u64>,
     /// Work this request does once its state is resident.
     pub exec_ns: u64,
+    /// Tokens to decode, or zero for work that is not a decode. Carried separately from
+    /// `exec_ns` because what a token costs is a property of the engine it lands on, not of
+    /// the request.
+    pub tokens: u64,
+    /// Set on a multi-agent fan-out.
+    pub gang: Option<Gang>,
 }
 
-/// Cumulative class boundaries. Three workloads, not four: model weights are a dependency of
-/// inference rather than a workload of their own, and training is out of scope.
+impl Request {
+    /// Ledger class this request bills against. A fan-out carries its agents rather than a
+    /// chain of its own, so the class has to come from the first of them.
+    #[must_use]
+    pub fn kind_idx(&self) -> usize {
+        self.chain
+            .first()
+            .or_else(|| {
+                self.gang
+                    .as_ref()
+                    .and_then(|g| g.agents.first().and_then(|a| a.chain.first()))
+            })
+            .map_or(0, |(_, m)| m.kind.idx())
+    }
+}
+
+/// Cumulative class boundaries over the request-driven mix. Fan-outs are not a class of their
+/// own: they are what some agent turns turn into.
 #[derive(Clone, Copy, Debug)]
 pub struct Mix {
     pub inference: f64,
@@ -112,6 +225,10 @@ pub struct Workload {
     pending: VecDeque<Queued>,
     prompt_cache: HashMap<u64, Chain>,
     next_task: u64,
+    /// Fraction of agent turns that fan out to sub-agents. Zero by default so the single-node
+    /// experiments, which have no second node to spread a fan-out across, see the same trace
+    /// they always did.
+    fanout_fraction: f64,
 }
 
 fn kv(parent: BlobId, tag: &[u8]) -> (BlobId, BlobMeta) {
@@ -152,12 +269,73 @@ impl Workload {
             pending: VecDeque::new(),
             prompt_cache: HashMap::new(),
             next_task: 0,
+            fanout_fraction: 0.0,
         };
         for _ in 0..SESSIONS {
             let s = w.fresh_session();
             w.sessions.push(s);
         }
         w
+    }
+
+    /// The same stream with a fraction of agent turns fanning out to sub-agents.
+    #[must_use]
+    pub fn with_fanout(seed: u64, ops: u64, volatility: f64, fraction: f64) -> Self {
+        let mut w = Self::new(seed, ops, volatility);
+        w.fanout_fraction = fraction;
+        w
+    }
+
+    /// Sub-agents of one orchestrator turn, and the turn that resumes once they return.
+    ///
+    /// Roles may run different models, but most share the orchestrator's: a skewed pick keeps
+    /// that realistic without making every sibling identical.
+    fn fanout(&mut self, parent: &Chain, tenant: usize, task: u64) -> Fanout {
+        let n = AGENTS_MIN + self.rng.below(AGENTS_SPAN);
+        let home_model = tenant as u64 % MODELS;
+        let base = parent.last().map_or(ROOT, |(id, _)| *id);
+        let mut agents = Vec::with_capacity(n as usize);
+        for a in 0..n {
+            let mut chain = parent.clone();
+            let mut at = base;
+            for b in 0..SUBAGENT_BLOCKS {
+                let (id, meta) = kv(at, format!("agent:{task}:{a}:{b}").as_bytes());
+                at = id;
+                chain.push((id, meta));
+            }
+            let model = (home_model + self.rng.zipf(MODELS, 2.0)) % MODELS;
+            let tools = (0..self.rng.below(TOOLS_MAX + 1))
+                .map(|_| {
+                    let f = self.rng.zipf(FUNCTIONS, 1.5);
+                    ToolCall {
+                        chain: self.faas_for(f),
+                        exec_ns: self.faas_exec(),
+                        payload_bytes: TOOL_PAYLOAD_BYTES,
+                    }
+                })
+                .collect();
+            agents.push(Agent {
+                chain,
+                requires: Self::shards_of(model),
+                tokens: self.tokens(),
+                tools,
+            });
+        }
+        let mut resume = parent.clone();
+        let mut at = base;
+        for a in 0..n {
+            for b in 0..RESULT_BLOCKS {
+                let (id, meta) = kv(at, format!("result:{task}:{a}:{b}").as_bytes());
+                at = id;
+                resume.push((id, meta));
+            }
+        }
+        Fanout {
+            gang: Gang { agents },
+            resume,
+            resume_requires: Self::model_shards(tenant),
+            resume_tokens: self.tokens(),
+        }
     }
 
     fn fresh_session(&mut self) -> Session {
@@ -231,7 +409,10 @@ impl Workload {
     /// Weight shards behind a tenant's model. Many tenants map to one model, so this set is
     /// shared *across* identities -- no hash of the caller can predict where it belongs.
     fn model_shards(tenant: usize) -> Chain {
-        let model = tenant as u64 % MODELS;
+        Self::shards_of(tenant as u64 % MODELS)
+    }
+
+    fn shards_of(model: u64) -> Chain {
         (0..SHARDS_PER_MODEL)
             .map(|i| {
                 let id = BlobId::leaf(format!("shard:{}", model * SHARDS_PER_MODEL + i).as_bytes());
@@ -301,13 +482,14 @@ impl Workload {
     fn faas_for(&mut self, f: u64) -> Chain {
         let id = BlobId::leaf(format!("fn:{f}").as_bytes());
         let scale = 1 + self.rng.below(4);
+        let bytes = SNAPSHOT_BYTES * scale / 2;
         vec![(
             id,
             BlobMeta {
                 kind: BlobKind::Snapshot,
-                bytes: SNAPSHOT_BYTES * scale / 2,
+                bytes,
                 parent: None,
-                recompute_ns: SNAPSHOT_NS * scale / 2,
+                recompute_ns: snapshot_restore_ns(bytes),
             },
         )]
     }
@@ -318,12 +500,34 @@ impl Iterator for Workload {
 
     fn next(&mut self) -> Option<Self::Item> {
         let phase = self.phase();
-        // pending is pushed in non-decreasing due order, so only the front can ever be ready.
+        // pending is kept sorted by due, so only the front can ever be ready.
         let ready = self.pending.front().is_some_and(|q| q.due <= self.issued);
         if ready || self.issued >= self.ops {
             let q = self.pending.pop_front()?;
             if ready {
                 self.issued += 1;
+            }
+            if let Some(f) = q.fanout {
+                let payload = RESULT_PAYLOAD_BYTES * f.gang.agents.len() as u64;
+                let hint = self.enqueue_after(
+                    RESUME_LEAD_OPS,
+                    f.resume,
+                    f.resume_requires,
+                    f.resume_tokens * DECODE_NS_PER_TOKEN,
+                    f.resume_tokens,
+                    payload,
+                    None,
+                );
+                return Some(Request {
+                    phase,
+                    chain: Vec::new(),
+                    requires: Vec::new(),
+                    hint: Some(hint),
+                    completes: Some(q.task),
+                    exec_ns: 0,
+                    tokens: 0,
+                    gang: Some(f.gang),
+                });
             }
             return Some(Request {
                 phase,
@@ -332,6 +536,8 @@ impl Iterator for Workload {
                 hint: None,
                 completes: Some(q.task),
                 exec_ns: q.exec_ns,
+                tokens: q.tokens,
+                gang: None,
             });
         }
         let mix = self.mix();
@@ -350,26 +556,68 @@ impl Iterator for Workload {
             hint: None,
             completes: None,
             exec_ns: SERVICE_EXEC_NS,
+            tokens: 0,
+            gang: None,
         })
     }
 }
 
 impl Workload {
-    fn enqueue(&mut self, chain: Chain, requires: Chain, exec_ns: u64, payload: u64) -> FlowHint {
-        self.next_task += 1;
-        let task = self.next_task;
-        self.pending.push_back(Queued {
-            due: self.issued + u64::from(FLOW_LEAD_OPS),
-            task,
-            chain: chain.clone(),
+    fn enqueue(
+        &mut self,
+        chain: Chain,
+        requires: Chain,
+        exec_ns: u64,
+        tokens: u64,
+        payload: u64,
+    ) -> FlowHint {
+        self.enqueue_after(
+            FLOW_LEAD_OPS,
+            chain,
             requires,
             exec_ns,
-        });
+            tokens,
+            payload,
+            None,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one stage, described field by field"
+    )]
+    fn enqueue_after(
+        &mut self,
+        lead: u32,
+        chain: Chain,
+        requires: Chain,
+        exec_ns: u64,
+        tokens: u64,
+        payload: u64,
+        fanout: Option<Fanout>,
+    ) -> FlowHint {
+        self.next_task += 1;
+        let task = self.next_task;
+        let due = self.issued + u64::from(lead);
+        // Lead times differ by stage, so arrival order is not due order; insert in place.
+        let at = self.pending.partition_point(|q| q.due <= due);
+        self.pending.insert(
+            at,
+            Queued {
+                due,
+                task,
+                chain: chain.clone(),
+                requires,
+                exec_ns,
+                tokens,
+                fanout,
+            },
+        );
         FlowHint {
             task,
             downstream: chain,
             probability: 1.0,
-            lead_ops: FLOW_LEAD_OPS,
+            lead_ops: lead,
             payload_bytes: payload,
         }
     }
@@ -380,11 +628,25 @@ impl Workload {
         let (chain, tenant) = self.agent_turn();
         let tokens = self.tokens();
         let requires = Self::model_shards(tenant);
-        let hint = if self.rng.chance(TOOL_FRACTION) {
+        let hint = if self.fanout_fraction > 0.0 && self.rng.chance(self.fanout_fraction) {
+            let task = self.next_task + 1;
+            let plan = self.fanout(&chain, tenant, task);
+            let hint = self.enqueue_after(
+                FANOUT_LEAD_OPS,
+                Vec::new(),
+                Vec::new(),
+                0,
+                0,
+                DISPATCH_PAYLOAD_BYTES * plan.gang.agents.len() as u64,
+                Some(plan),
+            );
+            debug_assert_eq!(hint.task, task);
+            Some(hint)
+        } else if self.rng.chance(TOOL_FRACTION) {
             let f = self.rng.zipf(FUNCTIONS, 1.5);
             let tool = self.faas_for(f);
             let exec = self.faas_exec();
-            Some(self.enqueue(tool, Vec::new(), exec, TOOL_PAYLOAD_BYTES))
+            Some(self.enqueue(tool, Vec::new(), exec, 0, TOOL_PAYLOAD_BYTES))
         } else {
             None
         };
@@ -395,6 +657,8 @@ impl Workload {
             hint,
             completes: None,
             exec_ns: tokens * DECODE_NS_PER_TOKEN,
+            tokens,
+            gang: None,
         }
     }
 
@@ -412,6 +676,7 @@ impl Workload {
                 downstream,
                 requires,
                 tokens * DECODE_NS_PER_TOKEN,
+                tokens,
                 FLOW_PAYLOAD_BYTES,
             ))
         } else {
@@ -424,6 +689,8 @@ impl Workload {
             hint,
             completes: None,
             exec_ns,
+            tokens: 0,
+            gang: None,
         }
     }
 }

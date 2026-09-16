@@ -1,5 +1,5 @@
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::flow::FlowHint;
@@ -11,6 +11,11 @@ const FREQ_CAP: u32 = 16;
 const SERVING_WINDOW: u64 = 600;
 
 const PINNED_SCAN_LIMIT: u32 = 8;
+
+/// Evicted ids remembered for regret accounting. Bounded so a long run cannot grow it without
+/// limit; an eviction whose ghost ages out can no longer register a regret, which biases the
+/// measured rate low by at most the fraction of re-requests arriving after this many evictions.
+const GHOST_CAP: usize = 1 << 16;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Policy {
@@ -50,6 +55,20 @@ impl Quota {
             limit: [capacity; BlobKind::N],
             hard: false,
         }
+    }
+
+    /// The same quota applied to host memory beside an accelerator, where the accelerator's
+    /// classes are only ever *offloaded* copies. Those give up host bytes first: DDR exists
+    /// for host workloads, and an offload is a cache of state whose real home is elsewhere.
+    #[must_use]
+    pub fn offloaded(mut self) -> Self {
+        let last = self.max_band();
+        for k in BlobKind::ALL {
+            if accelerated(k) {
+                self.band[k.idx()] = last;
+            }
+        }
+        self
     }
 
     #[must_use]
@@ -139,6 +158,17 @@ pub struct TierPool {
     pub refused: [u64; BlobKind::N],
     pub pinned_skips: u64,
     pub nonleaf_drops: u64,
+    /// Recently evicted ids, oldest first: ARC's ghost list, used here for pricing rather than
+    /// for admission. A ghost that is requested again is an eviction that was regretted.
+    ghosts: VecDeque<BlobId>,
+    ghost_set: HashSet<BlobId>,
+    pub regrets: [u64; BlobKind::N],
+    /// What it costs to bring an evicted blob back from the tier it is demoted to, if there is
+    /// one. Eviction from a pool with a tier beneath it is not a loss, it is a move.
+    recovery: Option<TierSpec>,
+    /// Expected loss per byte of the last blob actually evicted, in the same units as
+    /// `marginal_price`. The fallback when nothing is currently reclaimable.
+    last_price: f64,
 }
 
 impl TierPool {
@@ -160,6 +190,46 @@ impl TierPool {
             refused: [0; BlobKind::N],
             pinned_skips: 0,
             nonleaf_drops: 0,
+            ghosts: VecDeque::new(),
+            ghost_set: HashSet::new(),
+            regrets: [0; BlobKind::N],
+            recovery: None,
+            last_price: 0.0,
+        }
+    }
+
+    pub fn set_recovery(&mut self, spec: TierSpec) {
+        self.recovery = Some(spec);
+    }
+
+    /// Per-byte cost of wanting an evicted blob back: rebuilding it, or recovering it from the
+    /// tier below if that is cheaper.
+    fn loss_per_byte(&self, meta: &BlobMeta) -> f64 {
+        let rebuild = meta.value_per_byte();
+        self.recovery.map_or(rebuild, |r| {
+            (r.fetch_ns(meta.bytes) as f64 / meta.bytes as f64).min(rebuild)
+        })
+    }
+
+    /// Fraction of this class's evictions that were later wanted back, measured.
+    ///
+    /// Smoothed with one phantom regret over one phantom eviction, so a pool that has evicted
+    /// nothing prices displacement at the full recompute cost -- the conservative answer, and
+    /// the one the ledger gave before it measured anything -- and converges on the observed
+    /// rate as evidence accumulates.
+    #[must_use]
+    pub fn regret_rate(&self, k: usize) -> f64 {
+        (self.regrets[k] + 1) as f64 / (self.evicted[k] + 1) as f64
+    }
+
+    fn remember_eviction(&mut self, id: BlobId) {
+        if self.ghost_set.insert(id) {
+            self.ghosts.push_back(id);
+        }
+        while self.ghosts.len() > GHOST_CAP {
+            if let Some(old) = self.ghosts.pop_front() {
+                self.ghost_set.remove(&old);
+            }
         }
     }
 
@@ -170,6 +240,16 @@ impl TierPool {
 
     pub fn resident_ids(&self) -> impl Iterator<Item = BlobId> + '_ {
         self.entries.keys().copied()
+    }
+
+    pub fn resident_ids_where<'a>(
+        &'a self,
+        keep: impl Fn(BlobKind) -> bool + 'a,
+    ) -> impl Iterator<Item = BlobId> + 'a {
+        self.entries
+            .iter()
+            .filter(move |(_, e)| keep(e.meta.kind))
+            .map(|(id, _)| *id)
     }
 
     #[must_use]
@@ -242,12 +322,24 @@ impl TierPool {
         self.free_bytes() + burst
     }
 
-    /// Recompute cost per byte of the cheapest state this pool would give up, which is the
-    /// price of putting something new here. Read-only, so it peeks each reclaimable class's
-    /// heap top rather than draining it: a stale or pinned top makes that class abstain, and
-    /// if every class abstains the price falls back to `inflation`, the last price actually
-    /// paid. An estimate, deliberately -- a faithful dry run would cost as much as the
-    /// eviction itself, on every candidate node, on every request.
+    /// *Expected* recompute cost per byte of the cheapest state this pool would give up,
+    /// which is the price of putting something new here. Read-only, so it peeks each
+    /// reclaimable class's heap top rather than draining it: a stale or pinned top makes that
+    /// class abstain, and if every class abstains the price falls back to the last price
+    /// actually paid -- not to `inflation`, which is a GDSF priority, carries a frequency
+    /// factor, only ever rises, and so is in the wrong units. An estimate, deliberately -- a faithful dry run would cost as
+    /// much as the eviction itself, on every candidate node, on every request.
+    ///
+    /// Expected, not worst-case. Evicted state only costs anything if it is wanted again, so
+    /// each class's price is discounted by how often its evictions have actually been
+    /// regretted. And what it costs then is not necessarily a rebuild: state evicted from a
+    /// pool with a tier beneath it is demoted, not lost, and comes back at that tier's price.
+    /// Accelerator memory is the sharpest case -- a weight shard pushed to host DDR returns
+    /// over `PCIe` in tens of milliseconds, where a rebuild is seconds, and pricing it as the
+    /// rebuild made every full accelerator look untouchable. Pricing every evicted byte as a certain rebuild made displacement two orders
+    /// of magnitude louder than any cost paid with certainty *now* -- queueing, batch
+    /// widening -- and a placement score in which one term cannot be outvoted is not weighing
+    /// anything.
     #[must_use]
     pub fn marginal_price(&self) -> f64 {
         let mut best: Option<f64> = None;
@@ -268,7 +360,7 @@ impl TierPool {
                 if self.leaf_first && e.resident_children > 0 {
                     continue;
                 }
-                let p = e.meta.value_per_byte();
+                let p = self.loss_per_byte(&e.meta) * self.regret_rate(k);
                 if best.is_none_or(|bp| p < bp) {
                     best = Some(p);
                 }
@@ -277,7 +369,7 @@ impl TierPool {
                 return best.unwrap_or(0.0);
             }
         }
-        best.unwrap_or(self.inflation.max(0.0))
+        best.unwrap_or(self.last_price)
     }
 
     fn is_serving(&self, e: &Entry) -> bool {
@@ -434,7 +526,9 @@ impl TierPool {
         self.used -= e.meta.bytes;
         self.by_kind[k] -= e.meta.bytes;
         self.inflation = r.priority;
+        self.last_price = self.loss_per_byte(&e.meta) * self.regret_rate(k);
         self.evicted[k] += 1;
+        self.remember_eviction(r.id);
         self.unlink_parent(e.meta.parent);
         Some((r.id, e))
     }
@@ -450,6 +544,11 @@ impl TierPool {
             return Admission::Admitted;
         }
         let k = meta.kind.idx();
+        // Counted on the attempt, not the success: wanting evicted state back is the regret,
+        // whether or not there is now room to readmit it.
+        if self.ghost_set.remove(&id) {
+            self.regrets[k] += 1;
+        }
         let ceiling = if self.quota.hard {
             self.quota.floor[k].min(self.spec.capacity)
         } else {
@@ -506,11 +605,30 @@ impl TierPool {
         Admission::Admitted
     }
 
+    /// Admit without recording a refusal. For state the ledger is moving down a tier on its
+    /// own initiative: a demotion that does not fit is housekeeping, not a request turned away,
+    /// and counting it would bill the refusal rate for the ledger's own eviction policy.
+    pub fn offer(
+        &mut self,
+        id: BlobId,
+        meta: BlobMeta,
+        out: &mut Vec<(BlobId, BlobMeta)>,
+    ) -> Admission {
+        let a = self.admit(id, meta, out);
+        if a == Admission::Pending {
+            let k = meta.kind.idx();
+            self.refused[k] = self.refused[k].saturating_sub(1);
+        }
+        a
+    }
+
     /// Empty the pool, handing back everything it held. Used when a domain is drained: the
     /// state is migrating, not being discarded, so callers must re-admit it somewhere.
     pub fn drain_all(&mut self) -> Vec<(BlobId, BlobMeta)> {
         let out: Vec<(BlobId, BlobMeta)> =
             self.entries.iter().map(|(id, e)| (*id, e.meta)).collect();
+        self.ghosts.clear();
+        self.ghost_set.clear();
         self.entries.clear();
         self.evictable.iter_mut().for_each(BinaryHeap::clear);
         self.used = 0;
@@ -534,6 +652,9 @@ pub struct Cost {
     /// What it cost to *decide*, as distinct from what it cost to do. Zero when the
     /// scheduler and the ledger are the same process; a boundary crossing when they are not.
     pub decide_ns: u64,
+    /// Time waiting for a slot rather than for state. A residency policy moves this too:
+    /// placing work on a saturated engine is a stall the ledger never sees.
+    pub queue_ns: u64,
     /// The work itself, once its state is resident: a function body, a decode loop, a request
     /// handler. Without this a warm invocation costs nothing at all and every overhead looks
     /// infinite beside it.
@@ -548,7 +669,7 @@ impl Cost {
     /// Execution is deliberately excluded: adding a fixed 200 ms decode to every arm would
     /// bury the differences under a constant.
     pub fn total_ns(&self) -> u64 {
-        self.transfer_ns + self.recompute_ns + self.decide_ns
+        self.transfer_ns + self.recompute_ns + self.decide_ns + self.queue_ns
     }
 
     /// End-to-end time for the request. This is the denominator an overhead is a fraction of.
@@ -558,39 +679,278 @@ impl Cost {
     }
 }
 
+/// Capacity and policy of one node's memory. `hbm` of zero is unified memory: every class
+/// lives in the one host pool, which is what the development machine has and what the
+/// datacenter target does not.
+#[derive(Clone, Copy, Debug)]
+pub struct NodeMemory {
+    pub hbm: u64,
+    pub ddr: u64,
+    pub nvme: u64,
+    pub hbm_quota: Quota,
+    pub ddr_quota: Quota,
+}
+
+/// Classes whose hot copy lives on the accelerator when there is one.
+#[must_use]
+pub fn accelerated(kind: BlobKind) -> bool {
+    matches!(kind, BlobKind::KvBlock | BlobKind::WeightShard)
+}
+
+/// One node's memory: accelerator HBM, host DDR, and the spill tier under both.
+///
+/// In a datacenter node these are separate pools with separate budgets. KV blocks and weight
+/// shards are usable only in HBM; function cells and service heaps live in DDR. The two meet
+/// in exactly one place: state evicted from HBM is **offloaded** to DDR rather than dropped,
+/// the way Dynamo's block manager, `LMCache` and host-side weight caches do, because promoting
+/// it back over `PCIe` is far cheaper than rebuilding it. That makes offloaded KV and weights
+/// a class of *host* state, competing with function cells and service heaps under DDR's
+/// quota. It is the only coupling between the pools, and it is priced like every other.
+///
+/// With no HBM the node is unified memory, and every class competes in DDR directly.
 #[derive(Debug)]
 pub struct Hierarchy {
-    pub dram: TierPool,
+    pub hbm: TierPool,
+    pub ddr: TierPool,
     pub nvme: TierPool,
+    split: bool,
+    link: TierSpec,
     pub hits: [u64; BlobKind::N],
     pub nvme_hits: [u64; BlobKind::N],
+    /// Promoted from host DDR back to the accelerator.
+    pub offload_hits: [u64; BlobKind::N],
     pub misses: [u64; BlobKind::N],
+    /// Blobs materialised from a peer's memory rather than recomputed. Counted apart from
+    /// `hits` because they were not free: they cost a link traversal, just less than a rebuild.
+    pub remote_hits: [u64; BlobKind::N],
     pub prewarmed_bytes: u64,
     pub prewarm_ns: u64,
 }
 
 impl Hierarchy {
     #[must_use]
-    pub fn new(dram: TierSpec, nvme: TierSpec, policy: Policy, quota: Quota) -> Self {
+    pub fn new(mem: NodeMemory, policy: Policy) -> Self {
+        let nvme = TierSpec::nvme(mem.nvme);
+        let mut hbm = TierPool::new(TierSpec::hbm(mem.hbm), policy, true, mem.hbm_quota);
+        let mut ddr = TierPool::new(TierSpec::dram(mem.ddr), policy, true, mem.ddr_quota);
+        // Recovery is priced from the first tier an evictee lands in: host DDR under the
+        // accelerator, the spill tier under the host.
+        hbm.set_recovery(TierSpec::pcie());
+        ddr.set_recovery(nvme);
         Self {
-            dram: TierPool::new(dram, policy, true, quota),
-            nvme: TierPool::new(nvme, policy, false, Quota::open(nvme.capacity, quota.band)),
+            hbm,
+            ddr,
+            nvme: TierPool::new(
+                nvme,
+                policy,
+                false,
+                Quota::open(mem.nvme, mem.ddr_quota.band),
+            ),
+            split: mem.hbm > 0,
+            link: TierSpec::pcie(),
             hits: [0; BlobKind::N],
             nvme_hits: [0; BlobKind::N],
+            offload_hits: [0; BlobKind::N],
             misses: [0; BlobKind::N],
+            remote_hits: [0; BlobKind::N],
             prewarmed_bytes: 0,
             prewarm_ns: 0,
         }
     }
 
-    fn admit_dram(&mut self, id: BlobId, meta: BlobMeta) -> Admission {
-        let mut demoted = Vec::new();
-        let a = self.dram.admit(id, meta, &mut demoted);
-        for (did, dmeta) in demoted {
-            let mut dropped = Vec::new();
-            let _ = self.nvme.admit(did, dmeta, &mut dropped);
+    #[must_use]
+    pub fn split(&self) -> bool {
+        self.split
+    }
+
+    fn on_accelerator(&self, kind: BlobKind) -> bool {
+        self.split && accelerated(kind)
+    }
+
+    /// The pool a class is usable from.
+    #[must_use]
+    pub fn home(&self, kind: BlobKind) -> &TierPool {
+        if self.on_accelerator(kind) {
+            &self.hbm
+        } else {
+            &self.ddr
+        }
+    }
+
+    fn home_mut(&mut self, kind: BlobKind) -> &mut TierPool {
+        if self.on_accelerator(kind) {
+            &mut self.hbm
+        } else {
+            &mut self.ddr
+        }
+    }
+
+    /// Usable right now, with no copy.
+    #[must_use]
+    pub fn is_hot(&self, id: &BlobId, kind: BlobKind) -> bool {
+        self.home(kind).contains(id)
+    }
+
+    /// Held in memory on this node at all, hot or offloaded. A peer can read either over
+    /// RDMA, so either can be a source.
+    #[must_use]
+    pub fn holds(&self, id: &BlobId, kind: BlobKind) -> bool {
+        self.home(kind).contains(id) || (self.on_accelerator(kind) && self.ddr.contains(id))
+    }
+
+    pub fn hot_ids(&self) -> impl Iterator<Item = BlobId> + '_ {
+        let split = self.split;
+        self.hbm.resident_ids().chain(
+            self.ddr
+                .resident_ids_where(move |k| !(split && accelerated(k))),
+        )
+    }
+
+    /// What it costs this node to make one missing blob hot without leaving the node: promote
+    /// it from host DDR, read it off the spill tier, or rebuild it.
+    #[must_use]
+    pub fn local_ns(&self, id: &BlobId, meta: &BlobMeta) -> u64 {
+        let up = self.on_accelerator(meta.kind);
+        if up && self.ddr.contains(id) {
+            return self.link.fetch_ns(meta.bytes);
+        }
+        if self.nvme.contains(id) {
+            let lift = if up {
+                self.link.fetch_ns(meta.bytes)
+            } else {
+                0
+            };
+            return self.nvme.spec().fetch_ns(meta.bytes) + lift;
+        }
+        meta.recompute_ns
+    }
+
+    /// Bytes a set of per-class needs would claim in each pool.
+    fn by_pool(&self, need: &[u64; BlobKind::N]) -> (u64, u64) {
+        BlobKind::ALL.iter().fold((0, 0), |(h, d), &k| {
+            if self.on_accelerator(k) {
+                (h + need[k.idx()], d)
+            } else {
+                (h, d + need[k.idx()])
+            }
+        })
+    }
+
+    /// Would this node take these bytes, on top of `reserved`, without refusing? Read-only,
+    /// so a fan-out can be checked across every node it needs before any is committed.
+    #[must_use]
+    pub fn could_admit(&self, need: &[u64; BlobKind::N], reserved: &[u64; BlobKind::N]) -> bool {
+        let (nh, nd) = self.by_pool(need);
+        let (rh, rd) = self.by_pool(reserved);
+        nh + rh <= self.hbm.reclaimable() && nd + rd <= self.ddr.reclaimable()
+    }
+
+    /// Expected recompute this node's other work pays for making room, each pool at its own
+    /// price. The pools are separate markets: evicting KV from HBM says nothing about what a
+    /// byte of function cell is worth.
+    #[must_use]
+    pub fn displacement(&self, need: &[u64; BlobKind::N], reserved: &[u64; BlobKind::N]) -> f64 {
+        let (nh, nd) = self.by_pool(need);
+        let (rh, rd) = self.by_pool(reserved);
+        let short = |pool: &TierPool, n: u64, r: u64| {
+            n.saturating_sub(pool.free_bytes().saturating_sub(r)) as f64 * pool.marginal_price()
+        };
+        short(&self.hbm, nh, rh) + short(&self.ddr, nd, rd)
+    }
+
+    #[must_use]
+    pub fn used(&self) -> u64 {
+        self.hbm.used() + self.ddr.used()
+    }
+
+    #[must_use]
+    pub fn resident_bytes(&self, kind: BlobKind) -> u64 {
+        self.home(kind).resident_bytes(kind)
+    }
+
+    #[must_use]
+    pub fn refused(&self) -> [u64; BlobKind::N] {
+        std::array::from_fn(|k| self.hbm.refused[k] + self.ddr.refused[k])
+    }
+
+    #[must_use]
+    pub fn pinned_skips(&self) -> u64 {
+        self.hbm.pinned_skips + self.ddr.pinned_skips
+    }
+
+    #[must_use]
+    pub fn over_capacity(&self) -> bool {
+        self.hbm.over_capacity() || self.ddr.over_capacity()
+    }
+
+    fn spill(&mut self, id: BlobId, meta: BlobMeta) {
+        let mut dropped = Vec::new();
+        let _ = self.nvme.offer(id, meta, &mut dropped);
+    }
+
+    /// Where evicted state goes next. Off the accelerator it is offloaded to host DDR, and
+    /// whatever *that* displaces falls to the spill tier; off the host it spills directly.
+    /// Demotion is background work and is not charged to the request that caused it.
+    fn demote(&mut self, id: BlobId, meta: BlobMeta) {
+        if !self.on_accelerator(meta.kind) {
+            self.spill(id, meta);
+            return;
+        }
+        let mut out = Vec::new();
+        if self.ddr.offer(id, meta, &mut out) == Admission::Pending {
+            self.spill(id, meta);
+        }
+        for (vid, vmeta) in out {
+            self.spill(vid, vmeta);
+        }
+    }
+
+    fn admit_hot(&mut self, id: BlobId, meta: BlobMeta) -> Admission {
+        let mut out = Vec::new();
+        let a = self.home_mut(meta.kind).admit(id, meta, &mut out);
+        for (vid, vmeta) in out {
+            self.demote(vid, vmeta);
         }
         a
+    }
+
+    /// Make one missing blob hot by the cheapest local route, charging `cost`.
+    fn materialise(&mut self, id: BlobId, meta: BlobMeta, cost: &mut Cost) -> Admission {
+        let k = meta.kind.idx();
+        let up = self.on_accelerator(meta.kind);
+        let offloaded = up && self.ddr.contains(&id);
+        let staged = self.nvme.contains(&id);
+        if self.admit_hot(id, meta) == Admission::Pending {
+            return Admission::Pending;
+        }
+        if offloaded {
+            cost.transfer_ns += self.link.fetch_ns(meta.bytes);
+            self.ddr.remove(&id);
+            self.offload_hits[k] += 1;
+        } else if staged {
+            let lift = if up {
+                self.link.fetch_ns(meta.bytes)
+            } else {
+                0
+            };
+            cost.transfer_ns += self.nvme.spec().fetch_ns(meta.bytes) + lift;
+            self.nvme.remove(&id);
+            self.nvme_hits[k] += 1;
+        } else {
+            cost.recompute_ns += meta.recompute_ns;
+            self.misses[k] += 1;
+        }
+        cost.bytes_in += meta.bytes;
+        Admission::Admitted
+    }
+
+    /// Drop any colder copies of a blob that has just become hot, so a node never holds the
+    /// same state twice.
+    fn forget_cold(&mut self, id: &BlobId, kind: BlobKind) {
+        if self.on_accelerator(kind) {
+            self.ddr.remove(id);
+        }
+        self.nvme.remove(id);
     }
 
     /// Value the downstream working set of a task before it is requested, and prewarm any of
@@ -598,26 +958,22 @@ impl Hierarchy {
     /// state someone is actually using.
     pub fn announce(&mut self, hint: &FlowHint) {
         for &(id, meta) in &hint.downstream {
-            if self.dram.contains(&id) {
-                self.dram.anticipate(id, hint.probability);
+            if self.is_hot(&id, meta.kind) {
+                self.home_mut(meta.kind).anticipate(id, hint.probability);
                 continue;
             }
-            if meta.bytes > self.dram.free_bytes() {
+            if meta.bytes > self.home(meta.kind).free_bytes() {
                 break;
             }
-            let staged = self.nvme.contains(&id);
-            if self.admit_dram(id, meta) == Admission::Pending {
+            let ns = self.local_ns(&id, &meta);
+            if self.admit_hot(id, meta) == Admission::Pending {
                 break;
             }
+            self.forget_cold(&id, meta.kind);
             // Prewarming moves materialization off the critical path; it does not make it
             // free. Charged to a background budget so the two are never conflated.
-            if staged {
-                self.prewarm_ns += self.nvme.spec().fetch_ns(meta.bytes);
-                self.nvme.remove(&id);
-            } else {
-                self.prewarm_ns += meta.recompute_ns;
-            }
-            self.dram.anticipate(id, hint.probability);
+            self.prewarm_ns += ns;
+            self.home_mut(meta.kind).anticipate(id, hint.probability);
             self.prewarmed_bytes += meta.bytes;
         }
     }
@@ -626,14 +982,46 @@ impl Hierarchy {
     /// stage whose downstream cannot land burns a warm cell on work that will stall.
     #[must_use]
     pub fn can_satisfy(&self, hint: &FlowHint) -> bool {
-        let missing = hint.missing_bytes(|id| self.dram.contains(id));
-        missing <= self.dram.reclaimable()
+        let mut need = [0u64; BlobKind::N];
+        for (id, meta) in &hint.downstream {
+            if !self.is_hot(id, meta.kind) {
+                need[meta.kind.idx()] += meta.bytes;
+            }
+        }
+        self.could_admit(&need, &[0; BlobKind::N])
     }
 
     /// Admit migrated state without charging for it: the bytes already exist, they just live
     /// somewhere else now.
     pub fn reinstate(&mut self, id: BlobId, meta: BlobMeta) {
-        let _ = self.admit_dram(id, meta);
+        let _ = self.admit_hot(id, meta);
+    }
+
+    /// Empty the node's memory, handing back everything it held, hot or offloaded.
+    pub fn drain_all(&mut self) -> Vec<(BlobId, BlobMeta)> {
+        let mut out = self.hbm.drain_all();
+        out.extend(self.ddr.drain_all());
+        out
+    }
+
+    /// Install state that arrived over a link. The caller has already paid for the traversal,
+    /// so the bytes land without a recompute charge -- that is the entire point of fetching
+    /// rather than rebuilding. Stops at the first refusal, leaving the rest to be recomputed
+    /// by `access`, which is the correct fallback: a node that cannot hold the state cannot
+    /// be helped by shipping it.
+    pub fn supply(&mut self, chain: &[(BlobId, BlobMeta)]) -> usize {
+        for (n, &(id, meta)) in chain.iter().enumerate() {
+            if self.is_hot(&id, meta.kind) {
+                self.home_mut(meta.kind).touch(id);
+                continue;
+            }
+            if self.admit_hot(id, meta) == Admission::Pending {
+                return n;
+            }
+            self.forget_cold(&id, meta.kind);
+            self.remote_hits[meta.kind.idx()] += 1;
+        }
+        chain.len()
     }
 
     /// Materialise an unordered dependency set. Unlike a chain these have no parent
@@ -641,54 +1029,31 @@ impl Hierarchy {
     pub fn access_set(&mut self, blobs: &[(BlobId, BlobMeta)]) -> Cost {
         let mut cost = Cost::default();
         for &(id, meta) in blobs {
-            let k = meta.kind.idx();
-            if self.dram.contains(&id) {
-                self.dram.touch(id);
-                self.hits[k] += 1;
+            if self.is_hot(&id, meta.kind) {
+                self.home_mut(meta.kind).touch(id);
+                self.hits[meta.kind.idx()] += 1;
                 continue;
             }
-            let staged = self.nvme.contains(&id);
-            if self.admit_dram(id, meta) == Admission::Pending {
+            if self.materialise(id, meta, &mut cost) == Admission::Pending {
                 cost.pending = true;
-                continue;
             }
-            if staged {
-                cost.transfer_ns += self.nvme.spec().fetch_ns(meta.bytes);
-                self.nvme.remove(&id);
-                self.nvme_hits[k] += 1;
-            } else {
-                cost.recompute_ns += meta.recompute_ns;
-                self.misses[k] += 1;
-            }
-            cost.bytes_in += meta.bytes;
         }
         cost
     }
 
     pub fn access(&mut self, chain: &[(BlobId, BlobMeta)]) -> Cost {
         let mut cost = Cost::default();
-        let hit = chain.partition_point(|(id, _)| self.dram.contains(id));
+        let hit = chain.partition_point(|(id, m)| self.is_hot(id, m.kind));
         if hit > 0 {
             let (id, meta) = chain[hit - 1];
-            self.dram.touch(id);
+            self.home_mut(meta.kind).touch(id);
             self.hits[meta.kind.idx()] += hit as u64;
         }
         for &(id, meta) in &chain[hit..] {
-            let k = meta.kind.idx();
-            let staged = self.nvme.contains(&id);
-            if self.admit_dram(id, meta) == Admission::Pending {
+            if self.materialise(id, meta, &mut cost) == Admission::Pending {
                 cost.pending = true;
                 return cost;
             }
-            if staged {
-                cost.transfer_ns += self.nvme.spec().fetch_ns(meta.bytes);
-                self.nvme.remove(&id);
-                self.nvme_hits[k] += 1;
-            } else {
-                cost.recompute_ns += meta.recompute_ns;
-                self.misses[k] += 1;
-            }
-            cost.bytes_in += meta.bytes;
         }
         cost
     }
