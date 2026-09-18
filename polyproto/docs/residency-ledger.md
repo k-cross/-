@@ -875,6 +875,16 @@ cost. Platform-specific code lives only in promote/demote, which runs at µs–1
 where a vtable is free. Portability and performance collide only if the OS is allowed into
 the decision loop.
 
+## Next
+
+[`owned-and-observed.md`](owned-and-observed.md) is the design for the next step: a telemetry
+boundary separating state the orchestrator *owns* from what it *infers* and what it only
+*observes*, the workload taxonomy in [`taxo.md`](taxo.md) as a scheduler input rather than a
+document, and an oracle with regret and coupling metrics so results stop needing baseline
+caveats. It also corrects a mistake underneath every memory result here: the ledger currently
+*allocates* KV, when the architecture is explicit that an engine like vLLM owns that memory and
+the orchestrator only tracks it. The results marked there as contaminated are expected to shrink.
+
 ## Not built
 
 No VMM, no WASM ABI, no exec rings, no edge agent, no live migration. The byte store is real
