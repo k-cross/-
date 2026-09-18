@@ -146,6 +146,15 @@ pub struct Machine {
     /// All-or-nothing fan-out admission. Off admits whichever agents fit and lets the
     /// orchestrator stall anyway, which is the baseline a per-request scheduler provides.
     fanout_atomic: bool,
+    /// Fixed origin used for a downstream flow's recorded location, in place of wherever its
+    /// upstream actually ran. See `set_tool_anchor`.
+    tool_anchor: Option<usize>,
+    /// Where requests enter the cluster, and the bytes that make the round trip when the work
+    /// runs somewhere else. See `set_origin`.
+    origin: Option<(usize, u64)>,
+    /// Link time spent carrying requests to the node that can serve them and results back.
+    pub origin_ns: u64,
+    pub origin_hops: u64,
     pub fanouts_admitted: u64,
     pub fanouts_refused: u64,
     /// Decode and tool time spent by agents of fan-outs that could never resume. Zero under
@@ -166,10 +175,18 @@ pub struct Machine {
 
 impl Machine {
     #[must_use]
-    pub fn new(topo: Topology, memory: NodeMemory, policy: Policy, placement: Placement) -> Self {
+    /// `memory` is a function of domain index rather than one shared value, so a cluster can be
+    /// heterogeneous: a domain with `hbm: 0, can_decode: false` is a host-only node that can
+    /// run `FaaS`/service work but never decode. Every existing experiment passes `|_| mem`.
+    pub fn new(
+        topo: Topology,
+        memory: impl Fn(usize) -> NodeMemory,
+        policy: Policy,
+        placement: Placement,
+    ) -> Self {
         let n_domains = topo.domains.len();
         let domains = (0..n_domains)
-            .map(|_| Hierarchy::new(memory, policy))
+            .map(|d| Hierarchy::new(memory(d), policy))
             .collect();
         Self {
             topo,
@@ -219,6 +236,10 @@ impl Machine {
             stale_fetches: 0,
             moved_by_fetch: 0,
             fanout_atomic: false,
+            tool_anchor: None,
+            origin: None,
+            origin_ns: 0,
+            origin_hops: 0,
             fanouts_admitted: 0,
             fanouts_refused: 0,
             fanout_wasted_ns: 0,
@@ -252,6 +273,35 @@ impl Machine {
         self.fanout_atomic = on;
     }
 
+    /// Anchor the recorded origin of every downstream flow to a fixed domain, rather than
+    /// wherever its upstream stage actually ran.
+    ///
+    /// Real agent frameworks dispatch tool calls from the orchestrator's own process, not from
+    /// wherever the model happened to run a decode step -- the two are on different hosts by
+    /// construction on split-memory hardware. Without an anchor, a tool call's flow-affinity
+    /// pulls it toward the decode node, which is only correct when the orchestrator and the
+    /// engine are the same place. `None` (the default) keeps the original behaviour: downstream
+    /// work follows its upstream's actual location.
+    pub fn set_tool_anchor(&mut self, anchor: Option<usize>) {
+        self.tool_anchor = anchor;
+    }
+
+    /// Where requests enter the cluster and where their results must return.
+    ///
+    /// An agent host with no engine cannot decode, so each reasoning request crosses to a node
+    /// that can and its result crosses back. No placement policy can remove that round trip --
+    /// it is the price of running the orchestrator off the accelerator, and the one cost here
+    /// that grows with distance. `payload` is what makes the trip: the context delta going in,
+    /// which is dominated by whatever the last tool call returned, and the generated tokens
+    /// coming back.
+    ///
+    /// Charged only to decode-bearing work that starts here. A downstream stage already pays
+    /// its own handoff from the origin recorded for it, and charging both would count the same
+    /// transfer twice.
+    pub fn set_origin(&mut self, origin: Option<(usize, u64)>) {
+        self.origin = origin;
+    }
+
     #[must_use]
     pub fn mean_batch(&self) -> f64 {
         let admitted: u64 = self.engines.iter().map(|e| e.admitted).sum();
@@ -271,6 +321,13 @@ impl Machine {
     #[must_use]
     pub fn decodes(&self) -> u64 {
         self.engines.iter().map(|e| e.admitted).sum()
+    }
+
+    /// Sequences admitted by one domain's engine. In a heterogeneous cluster this is the check
+    /// that the decode constraint held: a host-only node must report zero.
+    #[must_use]
+    pub fn decodes_on(&self, d: usize) -> u64 {
+        self.engines.get(d).map_or(0, |e| e.admitted)
     }
 
     #[must_use]
@@ -356,18 +413,44 @@ impl Machine {
 
     /// Domain a chain belongs to by content, independent of what is currently resident:
     /// a consistent hash of the chain root, which identifies the tenant or session.
-    fn affinity_unit(&self, chain: &[(BlobId, BlobMeta)]) -> usize {
+    fn affinity_unit(&self, chain: &[(BlobId, BlobMeta)], candidates: &[usize]) -> usize {
         let root = Self::root_key(chain);
         // Rendezvous hashing, not modulo: removing a domain remaps only the keys that lived
         // on it, which is what a real balancer achieves. Modulo would remap nearly every key
         // on resize and make the residency-aware arm look good for the wrong reason.
-        let d = self
-            .active
+        let d = candidates
             .iter()
             .copied()
             .max_by_key(|&d| Self::rendezvous(root, d))
             .unwrap_or(0);
         self.unit_in(d)
+    }
+
+    /// Domains that can serve a decode-bearing request, falling back to every active domain
+    /// if none can -- a misconfigured cluster should behave as it always did, not panic.
+    fn decode_pool(&self) -> Vec<usize> {
+        let pool: Vec<usize> = self
+            .active
+            .iter()
+            .copied()
+            .filter(|&d| self.domains[d].can_decode())
+            .collect();
+        if pool.is_empty() {
+            self.active.clone()
+        } else {
+            pool
+        }
+    }
+
+    /// Whether this request's chain needs a domain that can actually decode: a `KvBlock` or
+    /// `WeightShard` chain, or anything charged tokens. `Snapshot`/`ServiceHeap` work has no
+    /// such requirement and may run on a host-only node.
+    fn needs_decode(req: &Request) -> bool {
+        req.tokens > 0
+            || req
+                .chain
+                .first()
+                .is_some_and(|(_, m)| matches!(m.kind, BlobKind::KvBlock | BlobKind::WeightShard))
     }
 
     fn root_key(chain: &[(BlobId, BlobMeta)]) -> u64 {
@@ -410,10 +493,16 @@ impl Machine {
 
     /// The domain this policy would pick knowing nothing about flows: round-robin for
     /// `Blind`, content hash for `Sticky`, deepest resident prefix for `Aware`.
-    fn policy_target(&mut self, affinity: usize, best: usize, value: u64) -> usize {
+    fn policy_target(
+        &mut self,
+        affinity: usize,
+        best: usize,
+        value: u64,
+        candidates: &[usize],
+    ) -> usize {
         match self.placement {
             Placement::Blind => {
-                let d = self.active[self.next_unit % self.active.len()];
+                let d = candidates[self.next_unit % candidates.len()];
                 self.next_unit += 1;
                 d
             }
@@ -630,9 +719,14 @@ impl Machine {
     /// Argmin of the cost, plus what each term changed. Reported rather than assumed: a term
     /// worth four orders of magnitude less than another one cannot move an argmin, and saying
     /// so is more useful than shipping it and believing otherwise.
-    fn best_scored(&mut self, req: &Request, flow: &[(usize, u64)], affinity: usize) -> usize {
-        let terms: Vec<Terms> = self
-            .active
+    fn best_scored(
+        &mut self,
+        req: &Request,
+        flow: &[(usize, u64)],
+        affinity: usize,
+        candidates: &[usize],
+    ) -> usize {
+        let terms: Vec<Terms> = candidates
             .iter()
             .map(|&d| self.placement_terms(d, req, flow))
             .collect();
@@ -685,16 +779,16 @@ impl Machine {
     }
 
     /// Where a residency-greedy policy would run this: the node holding the most of it.
-    fn greedy_best(&self, req: &Request) -> usize {
-        self.active
+    fn greedy_best(&self, req: &Request, candidates: &[usize]) -> usize {
+        candidates
             .iter()
             .copied()
             .max_by_key(|&d| self.resident_value(d, req))
             .unwrap_or(0)
     }
 
-    fn affinity_domain(&self, chain: &[(BlobId, BlobMeta)]) -> usize {
-        self.topo.units[self.affinity_unit(chain)].home as usize
+    fn affinity_domain(&self, chain: &[(BlobId, BlobMeta)], candidates: &[usize]) -> usize {
+        self.topo.units[self.affinity_unit(chain, candidates)].home as usize
     }
 
     /// Bytes domain `d` really holds for this request, regardless of what the scheduler
@@ -729,8 +823,14 @@ impl Machine {
         }
         let decide_ns = self.decide(req.chain.len());
         self.decide_ns += decide_ns;
+        let decode_needed = Self::needs_decode(req);
+        let candidates = if decode_needed {
+            self.decode_pool()
+        } else {
+            self.active.clone()
+        };
         if self.placement != Placement::Blind {
-            self.sticky_unit = self.affinity_unit(&req.chain);
+            self.sticky_unit = self.affinity_unit(&req.chain, &candidates);
         }
         let flow: Vec<(usize, u64)> = req
             .completes
@@ -740,9 +840,9 @@ impl Machine {
         let scored = self.placement == Placement::Scored;
         let affinity = self.topo.units[self.sticky_unit].home as usize;
         let best = if scored {
-            self.best_scored(req, &flow, affinity)
+            self.best_scored(req, &flow, affinity, &candidates)
         } else {
-            self.greedy_best(req)
+            self.greedy_best(req, &candidates)
         };
         let value = self.resident_value(best, req);
 
@@ -750,7 +850,9 @@ impl Machine {
         // identity hashes to the other's domain, so only a scheduler that sees the flow can
         // put them together. This overrides the placement policy for every policy, which is
         // what makes it separable from residency routing. With several upstream nodes, as
-        // after a fan-out, the unscored policy follows the first of them.
+        // after a fan-out, the unscored policy follows the first of them that can actually
+        // serve this request -- a flow recorded from a host-only anchor must not force a
+        // decode-bearing downstream onto a node that cannot decode.
         // Under `Scored` the score is the whole decision: the flow's pull is already inside
         // it, priced against what co-placing would evict, and gating on `resident_value` as
         // well would discard the scored choice using a metric the score never consulted.
@@ -758,8 +860,8 @@ impl Machine {
             best
         } else {
             match flow.first() {
-                Some(&(d, _)) => d,
-                None => self.policy_target(affinity, best, value),
+                Some(&(d, _)) if !decode_needed || self.domains[d].can_decode() => d,
+                _ => self.policy_target(affinity, best, value, &candidates),
             }
         };
         let home = self.topo.units[self.unit_in(target)].home as usize;
@@ -773,19 +875,36 @@ impl Machine {
         }
 
         if let Some(hint) = &req.hint {
+            let recorded = self.tool_anchor.unwrap_or(home);
             self.upstream
-                .insert(hint.task, vec![(home, hint.payload_bytes)]);
+                .insert(hint.task, vec![(recorded, hint.payload_bytes)]);
         }
         let sources = req
             .completes
             .and_then(|t| self.upstream.remove(&t))
             .unwrap_or_default();
         let handoff = self.collect(home, &sources);
+        let arrival = self.reach(home, req, decode_needed);
 
         let mut cost = self.run_here(home, req);
         cost.decide_ns = decide_ns;
-        cost.transfer_ns += handoff;
+        cost.transfer_ns += handoff + arrival;
         cost
+    }
+
+    /// Charge a request's round trip from wherever it entered the cluster to the node that can
+    /// actually serve it. Zero when the two are the same place, or when no origin is set.
+    fn reach(&mut self, home: usize, req: &Request, decode_needed: bool) -> u64 {
+        let Some((origin, payload)) = self.origin else {
+            return 0;
+        };
+        if origin == home || !decode_needed || req.completes.is_some() {
+            return 0;
+        }
+        let hop = 2 * self.topo.fetch_ns(self.unit_in(origin), home, payload);
+        self.origin_ns += hop;
+        self.origin_hops += 1;
+        hop
     }
 
     /// Charge the handoffs from a task's upstream nodes into `home`, counting joined and
@@ -1042,7 +1161,7 @@ impl Machine {
     /// it given what its siblings have already reserved.
     fn place_agent(&mut self, probe: &Request, flow: &[(usize, u64)]) -> Option<(usize, Need)> {
         let feasible: Vec<(usize, Need)> = self
-            .active
+            .decode_pool()
             .iter()
             .filter_map(|&d| {
                 let need = self.plan(d, probe).need;
@@ -1052,7 +1171,8 @@ impl Machine {
             })
             .collect();
         let need_on = |d: usize| feasible.iter().find(|(f, _)| *f == d).map(|&(_, n)| n);
-        let affinity = self.affinity_domain(&probe.chain);
+        let candidates: Vec<usize> = feasible.iter().map(|&(d, _)| d).collect();
+        let affinity = self.affinity_domain(&probe.chain, &candidates);
         let target = if self.placement == Placement::Scored {
             let terms: Vec<Terms> = feasible
                 .iter()
@@ -1067,8 +1187,7 @@ impl Machine {
                 _ => top.0,
             }
         } else {
-            let ok: Vec<usize> = feasible.iter().map(|&(d, _)| d).collect();
-            self.unscored_among(probe, flow, &ok)?
+            self.unscored_among(probe, flow, &candidates)?
         };
         need_on(target).map(|need| (target, need))
     }
@@ -1150,15 +1269,16 @@ impl Machine {
         let decide_ns = self.decide(probe.chain.len());
         self.decide_ns += decide_ns;
         let flow = [(caller, tool.payload_bytes), (caller, tool.payload_bytes)];
-        let affinity = self.affinity_domain(&probe.chain);
+        let candidates = self.active.clone();
+        let affinity = self.affinity_domain(&probe.chain, &candidates);
         let target = if self.placement == Placement::Scored {
-            self.best_scored(&probe, &flow, affinity)
+            self.best_scored(&probe, &flow, affinity, &candidates)
         } else if self.flow_aware {
             caller
         } else {
-            let best = self.greedy_best(&probe);
+            let best = self.greedy_best(&probe, &candidates);
             let value = self.resident_value(best, &probe);
-            self.policy_target(affinity, best, value)
+            self.policy_target(affinity, best, value, &candidates)
         };
         self.tool_calls += 1;
         let mut cost = self.run_here(target, &probe);

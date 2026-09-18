@@ -136,6 +136,59 @@ enum Cmd {
         repeat: usize,
     },
 
+    /// One model host and one agent-framework host, swept from same-socket to cross-region.
+    /// The agent host has no accelerator: it can never decode, only run tool calls and hold
+    /// its own bookkeeping. Every reasoning step pays the round trip to the model host; tool
+    /// calls default to the agent host and ship only when that is actually cheaper.
+    CodeReview {
+        /// Model host's accelerator memory, holding KV and weight shards
+        #[arg(long, default_value = "24GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        /// Model host's DDR: the offload target under HBM
+        #[arg(long, default_value = "16GiB", value_parser = parse_bytes)]
+        model_ddr: u64,
+        /// Agent host's DDR: tool-call (`FaaS`) cells and orchestration bookkeeping. This
+        /// node has no HBM and no decode engine
+        #[arg(long, default_value = "32GiB", value_parser = parse_bytes)]
+        agent_ddr: u64,
+        #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
+        nvme: u64,
+        #[arg(long, default_value_t = 3)]
+        units_per_node: usize,
+        #[arg(long, default_value_t = 15_000)]
+        ops: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value = "0,1,2,1", value_parser = parse_bands)]
+        bands: String,
+        /// Distances to sweep, local to cross-region
+        #[arg(long, default_value = "socket,rack,zone,region")]
+        distances: String,
+        /// Transport the control plane crosses on: native|ring|syscall|pipe|unix|tcp|grpc
+        #[arg(long, default_value = "grpc")]
+        crossing: String,
+        #[arg(long, default_value_t = 200)]
+        gossip_period: u64,
+        /// Arrival rate in requests/sec. One engine serves the whole cluster here, so the
+        /// saturation knee sits near half the symmetric-cluster rate -- about 130/s at these
+        /// defaults. 110 keeps the sweep below it, where placement still decides something
+        #[arg(long, default_value_t = 110.0)]
+        rate: f64,
+        /// Fraction of agent turns that call a tool (read a file, grep, run tests) -- a code
+        /// review agent reaches for one far more often than a chat agent does
+        #[arg(long, default_value_t = 0.70)]
+        tool_fraction: f64,
+        /// Tool-call payload: file-sized, not a small function argument
+        #[arg(long, default_value = "512KiB", value_parser = parse_bytes)]
+        tool_payload: u64,
+        /// Give every class a fixed, non-borrowable slice, the way separate orchestrators
+        /// owning separate budgets would. Off means one ledger arbitrates all of them
+        #[arg(long)]
+        hard_pools: bool,
+        #[arg(long, default_value_t = 3)]
+        repeat: usize,
+    },
+
     /// Discover the host's compute/memory graph and measure its link asymmetry
     Topology {
         /// Streaming buffer per probe; must exceed the largest cache to measure memory
@@ -306,23 +359,29 @@ fn memory_label(hbm: u64, dram: u64) -> String {
 /// under that thrashes on something no policy can repair. DDR carries function cells and
 /// service heaps, with modest floors for what the accelerator offloads. Unified memory keeps
 /// the one-pool split the earlier rounds used, so the comparison is against what was there.
-fn node_memory(hbm: u64, ddr: u64, nvme: u64, bands: [u8; BlobKind::N]) -> NodeMemory {
+/// `hard` partitions every class at its floor: each class owns a fixed slice and may not
+/// borrow from another's. That is what separate orchestrators owning separate budgets looks
+/// like -- an inference gateway with a fixed KV allocation beside a `FaaS` control plane with
+/// a fixed warm pool, neither able to see or lend to the other.
+fn node_memory(hbm: u64, ddr: u64, nvme: u64, bands: [u8; BlobKind::N], hard: bool) -> NodeMemory {
     if hbm == 0 {
-        let q = Quota::from_split(ddr, [0.10, 0.12, 0.50, 0.26], bands, false);
+        let q = Quota::from_split(ddr, [0.10, 0.12, 0.50, 0.26], bands, hard);
         return NodeMemory {
             hbm: 0,
             ddr,
             nvme,
             hbm_quota: Quota::open(0, bands),
             ddr_quota: q,
+            can_decode: true,
         };
     }
     NodeMemory {
         hbm,
         ddr,
         nvme,
-        hbm_quota: Quota::from_split(hbm, [0.25, 0.0, 0.50, 0.0], bands, false),
-        ddr_quota: Quota::from_split(ddr, [0.10, 0.15, 0.15, 0.35], bands, false).offloaded(),
+        hbm_quota: Quota::from_split(hbm, [0.25, 0.0, 0.50, 0.0], bands, hard),
+        ddr_quota: Quota::from_split(ddr, [0.10, 0.15, 0.15, 0.35], bands, hard).offloaded(),
+        can_decode: true,
     }
 }
 
@@ -425,6 +484,7 @@ fn placement(
         per_socket,
         nvme / sockets as u64,
         bands,
+        false,
     );
     println!(
         "synthetic machine: {sockets} domains x {:.1} GiB, {units_per_socket} units each\n\
@@ -461,7 +521,7 @@ fn placement(
         (Placement::Scored, true),
     ];
     for (mode, transfer) in modes {
-        let mut m = Machine::new(topo.clone(), memory, Policy::Gdsf, mode);
+        let mut m = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, mode);
         m.set_state_transfer(transfer);
         m.set_arrival_rate(rate);
         let mut total = 0u64;
@@ -920,6 +980,41 @@ fn main() {
             fanout,
             repeat,
         ),
+        Cmd::CodeReview {
+            hbm,
+            model_ddr,
+            agent_ddr,
+            nvme,
+            units_per_node,
+            ops,
+            seed,
+            bands,
+            distances,
+            crossing,
+            gossip_period,
+            rate,
+            tool_fraction,
+            tool_payload,
+            hard_pools,
+            repeat,
+        } => code_review(
+            hbm,
+            model_ddr,
+            agent_ddr,
+            nvme,
+            units_per_node,
+            ops,
+            seed,
+            bands_of(&bands),
+            &distances,
+            &crossing,
+            gossip_period,
+            rate,
+            tool_fraction,
+            tool_payload,
+            hard_pools,
+            repeat,
+        ),
         Cmd::Topology { bytes, iters } => topology(bytes, iters),
         Cmd::Placement {
             sockets,
@@ -1306,7 +1401,13 @@ fn distributed(
         return;
     };
     let per_node = dram / nodes as u64;
-    let memory = node_memory(hbm / nodes as u64, per_node, nvme / nodes as u64, bands);
+    let memory = node_memory(
+        hbm / nodes as u64,
+        per_node,
+        nvme / nodes as u64,
+        bands,
+        false,
+    );
 
     cluster_header(nodes, units_per_node, &memory, crossing, cost);
 
@@ -1345,13 +1446,17 @@ fn distributed(
         let mut per_class: Vec<ClassRow<'_>> = Vec::new();
         for a in &arms {
             let label = a.label;
-            let mut mach = Machine::new(topo.clone(), memory, Policy::Gdsf, a.placement);
+            let mut mach = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, a.placement);
             mach.set_flow_aware(a.flow);
             mach.set_control(a.control, cost);
             mach.set_state_transfer(a.transfer);
             mach.set_arrival_rate(rate);
             mach.set_fanout_atomic(true);
-            let (t, total, served, offered) = drive(&mut mach, seed, ops, rate, fanout);
+            let (t, total, served, offered) = drive(
+                &mut mach,
+                rate,
+                polyphonic::work::Workload::with_fanout(seed, ops, 1.0, fanout),
+            );
             let stall = mean_ms(total, served);
             let service = mean_ms(t.service.iter().sum(), served);
             println!(
@@ -1385,19 +1490,178 @@ fn distributed(
     crossover(&ladder, cost, &warm_seen);
 }
 
-/// Run one configured machine over the trace, tallying per class. Shared by every arm so a
-/// comparison can never accidentally be between two different accounting rules.
+/// One model host and one agent-framework host, swept from same-socket to cross-region.
+///
+/// The two nodes are deliberately unequal. Node 0 has the accelerator and is the only place a
+/// decode can run. Node 1 has host memory and no engine at all, which is what an agent
+/// framework actually runs on: it holds the orchestrator process and its tool-call cells, and
+/// every reasoning step it wants has to cross the link to node 0 and come back.
+///
+/// `set_tool_anchor(1)` pins the recorded origin of each tool call to the agent host rather
+/// than to wherever the model ran the turn that asked for it. Without it, a tool call's
+/// flow-affinity would pull it toward the accelerator, which is only right when the
+/// orchestrator and the engine share a host -- exactly what this topology says they do not.
+/// Tool calls still *may* ship to node 0 when the score says a warm cell there beats a local
+/// restore; the anchor makes staying home the default, not the only option.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "experiment knobs, all independent"
+)]
+#[allow(clippy::too_many_lines, reason = "one scenario, printed in full")]
+fn code_review(
+    hbm: u64,
+    model_ddr: u64,
+    agent_ddr: u64,
+    nvme: u64,
+    units_per_node: usize,
+    ops: u64,
+    seed: u64,
+    bands: [u8; BlobKind::N],
+    distances: &str,
+    crossing: &str,
+    gossip_period: u64,
+    rate: f64,
+    tool_fraction: f64,
+    tool_payload: u64,
+    hard_pools: bool,
+    repeat: usize,
+) {
+    use polyphonic::machine::Machine;
+    use polyphonic::topo::{Distance, Topology};
+
+    const MODEL: usize = 0;
+    const AGENT: usize = 1;
+    const NODES: usize = 2;
+
+    let ladder = polyphonic::boundary::measure(repeat);
+    let Some(cost) = crossing_of(&ladder, crossing) else {
+        println!("no boundary rung available");
+        return;
+    };
+
+    let model_mem = node_memory(hbm, model_ddr, nvme / 2, bands, hard_pools);
+    // No accelerator and no engine: `FaaS` cells and service heaps only. Its DDR budget is the
+    // host split with the accelerator classes' floors left open, since neither can land here.
+    let agent_mem = NodeMemory {
+        hbm: 0,
+        ddr: agent_ddr,
+        nvme: nvme / 2,
+        hbm_quota: Quota::open(0, bands),
+        ddr_quota: Quota::from_split(agent_ddr, [0.0, 0.35, 0.0, 0.35], bands, hard_pools),
+        can_decode: false,
+    };
+    let memory_at = move |d: usize| if d == MODEL { model_mem } else { agent_mem };
+
+    println!(
+        "model host:  hbm={:.1}GiB ddr={:.1}GiB, decode engine\n\
+         agent host:  ddr={:.1}GiB, no accelerator -- cannot decode, runs tool calls\n\
+         control crossing: {crossing} = {:.1} us + {:.3} ns/byte (MEASURED on this host)\n\
+         node link, PCIe and every workload constant are MODELLED\n\
+         memory: {}\n\
+         tool calls: {:.0}% of turns, {:.0} KiB each way, anchored to the agent host\n",
+        gib(hbm),
+        gib(model_ddr),
+        gib(agent_ddr),
+        cost.fixed_ns / 1000.0,
+        cost.ns_per_byte,
+        if hard_pools {
+            "hard partitions -- each class owns a fixed slice, no borrowing"
+        } else {
+            "one ledger, soft floors"
+        },
+        100.0 * tool_fraction,
+        tool_payload as f64 / 1024.0,
+    );
+
+    let arms = distributed_arms(gossip_period);
+    let mut warm_seen = [(0u64, 0u64); BlobKind::N];
+
+    for name in distances.split(',') {
+        let Ok(dist) = name.trim().parse::<Distance>() else {
+            println!("skipping unknown distance {name}");
+            continue;
+        };
+        // `dram_per_node` only sizes the topology's domain records; the ledger's real budgets
+        // come from `memory_at`, which differs per node.
+        let topo = Topology::cluster(NODES, units_per_node, model_ddr, dist, cost);
+        println!(
+            "== {} : {:.0} us hop, {:.2} ns/byte ==",
+            dist.label(),
+            dist.one_way_ns() as f64 / 1000.0,
+            dist.ns_per_byte()
+        );
+        println!(
+            "{:<22} {:>13} {:>12} {:>9} {:>11} {:>10} {:>10} {:>11}",
+            "arm",
+            "service/req",
+            "stall/req",
+            "served",
+            "round trip",
+            "tools home",
+            "handoff",
+            "on model"
+        );
+        let mut per_class: Vec<ClassRow<'_>> = Vec::new();
+        for a in &arms {
+            let label = a.label;
+            let mut mach = Machine::new(topo.clone(), memory_at, Policy::Gdsf, a.placement);
+            mach.set_flow_aware(a.flow);
+            mach.set_control(a.control, cost);
+            mach.set_state_transfer(a.transfer);
+            mach.set_fanout_atomic(true);
+            mach.set_tool_anchor(Some(AGENT));
+            // Every reasoning request starts at the agent host and its answer returns there.
+            // The context delta going in is dominated by the last tool result the agent
+            // gathered, so that is what sizes the trip.
+            mach.set_origin(Some((AGENT, tool_payload)));
+            let (t, total, served, offered) = drive(
+                &mut mach,
+                rate,
+                polyphonic::work::Workload::new(seed, ops, 1.0)
+                    .with_tool_profile(tool_fraction, tool_payload),
+            );
+            let stall = mean_ms(total, served);
+            let service = mean_ms(t.service.iter().sum(), served);
+            // A task is "split" when its downstream stage did not run where its upstream did.
+            // Here that is the agent host keeping its own tool call, so the complement is the
+            // share of tool calls that stayed home.
+            let stages = (mach.split_tasks + mach.joined_tasks).max(1);
+            println!(
+                "{label:<22} {service:>11.3}ms {stall:>10.3}ms {:>8.1}% {:>9.3}ms {:>9.1}% \
+                 {:>9.2}s {:>10.1}%",
+                100.0 * served as f64 / offered.max(1) as f64,
+                mean_ms(mach.origin_ns, mach.origin_hops),
+                100.0 * mach.joined_tasks as f64 / stages as f64,
+                mach.handoff_ns as f64 / 1e9,
+                100.0 * mach.decodes_on(MODEL) as f64 / mach.decodes().max(1) as f64,
+            );
+            state_terms(&mach, served);
+            if a.placement == Placement::Scored {
+                score_terms(&mach, served);
+            }
+            for (seen, (ns, n)) in warm_seen.iter_mut().zip(t.warm_ns.iter().zip(&t.warm)) {
+                seen.0 += ns;
+                seen.1 += n;
+            }
+            per_class.push((label, t));
+        }
+        class_table(&per_class);
+    }
+    crossover(&ladder, cost, &warm_seen);
+}
+
+/// Run one configured machine over any request stream, tallying per class. Shared by every
+/// experiment so a comparison can never accidentally be between two different accounting
+/// rules; callers build whatever `Workload` shape the scenario calls for.
 fn drive(
     mach: &mut polyphonic::machine::Machine,
-    seed: u64,
-    ops: u64,
     rate: f64,
-    fanout: f64,
+    workload: polyphonic::work::Workload,
 ) -> (ClassTally, u64, u64, u64) {
     mach.set_arrival_rate(rate);
     let mut t = ClassTally::default();
     let (mut total, mut served, mut offered) = (0u64, 0u64, 0u64);
-    for req in polyphonic::work::Workload::with_fanout(seed, ops, 1.0, fanout) {
+    for req in workload {
         let k = req.kind_idx();
         offered += 1;
         let c = mach.serve_request(&req);
@@ -1443,11 +1707,15 @@ fn fanout_admission(
         "admission", "fan-outs", "wasted work", "fan-out", "stall/req", "inference stall", "served"
     );
     for atomic in [false, true] {
-        let mut mach = Machine::new(topo.clone(), memory, Policy::Gdsf, Placement::Scored);
+        let mut mach = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, Placement::Scored);
         mach.set_flow_aware(true);
         mach.set_state_transfer(true);
         mach.set_fanout_atomic(atomic);
-        let (t, total, served, offered) = drive(&mut mach, seed, ops, rate, fanout);
+        let (t, total, served, offered) = drive(
+            &mut mach,
+            rate,
+            polyphonic::work::Workload::with_fanout(seed, ops, 1.0, fanout),
+        );
         println!(
             "  {:<16} {:>6}/{:<4} {:>11.2}s {:>10.1}ms {:>10.3}ms {:>14.3}ms {:>8.1}%",
             if atomic {

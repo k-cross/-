@@ -153,6 +153,7 @@ fn memory_for(t: Trial, budget: Budget) -> NodeMemory {
         nvme: t.nvme,
         hbm_quota: budget.accelerator(t.hbm, t.bands),
         ddr_quota: budget.host(t.dram, t.bands, t.hbm > 0),
+        can_decode: true,
     }
 }
 

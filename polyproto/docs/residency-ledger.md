@@ -644,6 +644,132 @@ half its requests. Above it, everything fits. At 5 + 10 GiB the atomic arm still
 6.6 s. That comes from fan-outs admitted against the conservative feasibility estimate that
 then lose an agent at admission.
 
+### Heterogeneous nodes: a model host and an agent host
+
+`polyphonic code-review` is two unequal nodes at a swept distance. Node 0 has the accelerator
+and is the only place a decode can run. Node 1 has host memory and **no engine at all**, which
+is what an agent framework actually runs on. Three mechanisms make that expressible:
+
+- **Per-node memory.** `Machine::new` takes `impl Fn(usize) -> NodeMemory`, so a cluster can be
+  heterogeneous. `NodeMemory::can_decode` is separate from `hbm > 0` on purpose: zero HBM
+  already means "unified memory, every node decodes", and a host-only node is a different
+  claim.
+- **A hard placement filter.** Decode-bearing work -- a `KvBlock`/`WeightShard` chain, or
+  anything charged tokens -- is filtered to decode-capable domains before *any* policy runs,
+  scored or not. No real scheduler routes inference to a node with no GPU; that is a node-pool
+  constraint, not a policy quality question. A flow recorded at a host-only anchor cannot force
+  a decode onto it either.
+- **An origin round trip.** `set_origin` charges each reasoning request the trip from the agent
+  host to the node that can serve it and back. `set_tool_anchor` pins each tool call's recorded
+  origin to the agent host rather than to wherever the model ran the turn that asked for it --
+  otherwise flow-affinity drags tool calls onto the accelerator, which is only right when the
+  orchestrator and the engine share a host.
+
+15k requests, 24 GiB HBM + 16 GiB DDR on the model host, 32 GiB DDR on the agent host, tool
+calls on 70% of turns at 512 KiB each way.
+
+| | socket | rack | zone | region |
+|---|---|---|---|---|
+| round trip / reasoning request | 0.16 ms | 0.48 | 1.72 | **61.13** |
+| `hash only` service/req | 400.94 ms | 401.14 | 401.76 | 423.16 |
+| `scored` service/req | **400.93** | **401.12** | **401.70** | **420.33** |
+| `scored` stall/req | 15.28 | 15.47 | 16.04 | 34.68 |
+| `scored` tool calls kept on the agent host | 57.7% | 57.7% | 57.7% | **65.7%** |
+| `hash only` tool calls kept on the agent host | 31.9% | 31.9% | 31.9% | 31.9% |
+
+**Every decode lands on the model host, in every arm** -- the filter is a constraint, not a
+preference, and the table reports it as a check.
+
+**The round trip is identical across arms and no policy can touch it.** 61 ms per reasoning
+request at region distance, against 0.16 ms on the same socket: a 380× spread on the one term
+placement cannot move. It is 15% of end-to-end service time at region and 0.04% at socket.
+Separating the orchestrator from the accelerator is affordable within a zone and expensive
+across regions, and that conclusion is independent of how good the scheduler is.
+
+**What the scheduler can move is everything else, and it is worth about 0.7%.** `scored` beats
+hashing by 2.8 ms at region, almost all of it from keeping tool calls off the link: it holds
+65.7% of them on the agent host where hashing holds 31.9%, and moves half the handoff traffic
+(39.5 s against 74.0 s). It also adapts -- 57.7% local within a zone, 65.7% across regions --
+without being told the distance changed.
+
+The honest reading is that this topology is dominated by two costs the scheduler does not
+control: decode itself (~385 ms, the floor every arm pays) and the origin round trip. The
+placement question only governs the remainder.
+
+#### Against a siloed stack
+
+None of the arms above is a siloed orchestrator. They share one ledger, one admission path and
+one engine model, and differ only in placement policy. Siloing shows up on three axes, and only
+two of them are what the arms measure. `--hard-pools` supplies the third: every class capped at
+its floor, which is what separate orchestrators owning separate budgets looks like.
+
+15k requests, memory deliberately tightened until it binds -- 4 GiB HBM and 16 GiB DDR on the
+model host, 3 GiB DDR on the agent host. Best arm at each distance:
+
+| | socket | rack | zone | region | goodput |
+|---|---|---|---|---|---|
+| one ledger, soft floors | **409.98 ms** | **410.20** | **410.86** | **430.32** | **100%** |
+| fixed per-class budgets | 426.44 | 426.64 | 427.23 | 446.62 | 97.3% |
+| cost of partitioning | +4.0% | +4.0% | +4.0% | +3.8% | −2.7pp |
+
+| axis | cost |
+|---|---|
+| separate, non-borrowable budgets | **+4.0% service and 2.7pp of goodput, at every distance** |
+| distance, socket → region | +5.0% service; the round trip goes 0.20 ms → 61.17 ms |
+| cross-workload placement policy | +0.2% at socket, +0.5% at region |
+| control-plane RPC (`unified` → `rpc query`) | +0.02 ms/request; **33.7% of a warm `FaaS` invocation** |
+
+**Partitioning costs about as much as moving the agent host to another continent, and it costs
+it at every distance.** The two are comparable in size and independent in cause: one is a
+memory-accounting decision, the other is physics.
+
+The per-class table says where it goes. Partitioned, the `FaaS` warm rate halves (53% → 19%)
+and a function call costs 4.6 ms instead of 1.4 ms; inference pays 1.3% more because KV and
+weights cannot borrow from each other; and 2.7% of requests are refused outright rather than
+absorbed. Service replicas are unaffected -- they are pinned while serving under either policy.
+
+**The unified ledger's win here is a placement option, not just a better eviction.** With soft
+floors the score ships **90%** of tool calls to the model host, whose 16 GiB of DDR is mostly
+idle, and gets a 53% warm rate for them. With hard pools that host's `FaaS` slice is capped at
+its floor no matter how much memory is physically free beside it, so the option disappears and
+the score keeps 58% of tool calls at home instead. Partitioning does not only misprice
+eviction; it fences off capacity that exists, and forecloses the placement that would have used
+it.
+
+That inverts the earlier no-pressure result, where keeping tool calls local was right. Under
+pressure the binding constraint is agent-host memory rather than link cost, so shipping wins --
+until region distance makes the link expensive enough to flip it back (65.7% local).
+
+**Prefix-cache-aware routing is inert in this topology.** `residency only` is byte-identical to
+`hash only` at every distance and both pool models: with one decode-capable node there is no
+routing decision to make for inference. The mechanism that llm-d is built around has nothing to
+do in a single-model-host deployment.
+
+Two things keep this from being a clean verdict:
+
+- **The partition is not tuned.** Both arms use the same class split, so the hard arm can
+  neither borrow nor size its slices for its own workload. A real operator tunes each silo, so
+  4% is an upper bound at this split. The oracle-tuned version of this comparison is the
+  *Memory arbitration* table, which sweeps every split and reports each arm at its best -- 32%
+  on split memory, and that one is fair.
+- **At the command's default capacities there is no memory pressure at all** (`FaaS` warm
+  71–87%, service 100%, nothing fetched, no saturation), and hard and soft pools land within
+  0.17%. Every number above comes from the tightened configuration; the defaults cannot speak
+  to this question.
+
+Still not modelled as siloed: separate admission control per workload, separate autoscalers,
+separate retry and queueing. A refused request here simply vanishes -- no silo retries it,
+which if anything flatters the partitioned arm. Each specialist remains a routing policy inside
+a shared architecture, not an independent control plane.
+
+**Caveats.** One engine serves the whole cluster, so the saturation knee is near half the
+symmetric-cluster rate -- about 130 req/s at these defaults, and the sweep runs at 110 to stay
+under it. The workload is the generic agent-plus-tool-call stream with its tool rate and
+payload turned up, not a purpose-built code-review trace: there is no diff-shaped context, no
+per-file fan-out, and tool calls are undifferentiated (a `grep` and a test run cost the same).
+The round trip is sized by the tool payload, which is the largest term in a real context delta
+but not the only one.
+
 ### The falsification test that fails
 
 *Measured before the engine model, the Firecracker constants and the corrected score. It has
@@ -773,6 +899,9 @@ computed.
 | score adapts sibling co-location to load | holds — 63–66% vs 85–86% for filtered specialists |
 | score adapts tool placement to distance | holds — all calls local across regions, where hashing pays 10× |
 | all-or-nothing fan-out admission | holds where it binds — +22% fan-outs, inference stall −10% |
+| heterogeneous nodes (model host + agent host) | expressible — per-node memory, decode filter, origin round trip |
+| separating the orchestrator from the accelerator | free within a zone (0.16–1.7 ms), **61 ms per turn across regions** |
+| placement policy on that topology | worth 0.7% — the round trip and decode dominate, and no policy moves either |
 | KV state transfer | roughly neutral end to end |
 | state transfer taxes the FaaS warm pool | **retracted** — a unified-memory and capacity artifact |
 | the score's handoff term prices co-placement | **fails** (pre-batching model, not re-run) |

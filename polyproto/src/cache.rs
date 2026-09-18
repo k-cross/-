@@ -689,6 +689,12 @@ pub struct NodeMemory {
     pub nvme: u64,
     pub hbm_quota: Quota,
     pub ddr_quota: Quota,
+    /// Whether this node has a serving engine at all. `hbm > 0` says a node *has* accelerator
+    /// memory; this says whether it can *decode* -- the two usually agree, but a
+    /// heterogeneous cluster can have a host-only node with real DDR and no engine, which
+    /// `hbm == 0` alone cannot express (that also means "unified memory", where every node
+    /// decodes). Defaults belong at the call site: every existing experiment sets this `true`.
+    pub can_decode: bool,
 }
 
 /// Classes whose hot copy lives on the accelerator when there is one.
@@ -714,6 +720,7 @@ pub struct Hierarchy {
     pub ddr: TierPool,
     pub nvme: TierPool,
     split: bool,
+    can_decode: bool,
     link: TierSpec,
     pub hits: [u64; BlobKind::N],
     pub nvme_hits: [u64; BlobKind::N],
@@ -747,6 +754,7 @@ impl Hierarchy {
                 Quota::open(mem.nvme, mem.ddr_quota.band),
             ),
             split: mem.hbm > 0,
+            can_decode: mem.can_decode,
             link: TierSpec::pcie(),
             hits: [0; BlobKind::N],
             nvme_hits: [0; BlobKind::N],
@@ -761,6 +769,16 @@ impl Hierarchy {
     #[must_use]
     pub fn split(&self) -> bool {
         self.split
+    }
+
+    /// Can this node run a decode step at all? `false` for a host-only node in a heterogeneous
+    /// cluster: it can hold and serve `Snapshot`/`ServiceHeap` state, but `KvBlock` and
+    /// `WeightShard` state can never be *usable* here, so nothing decode-bearing may be placed
+    /// on it. Unlike `split`, this is never inferred from capacity -- a node can have DDR and
+    /// still have no engine, which `hbm == 0` alone does not distinguish from unified memory.
+    #[must_use]
+    pub fn can_decode(&self) -> bool {
+        self.can_decode
     }
 
     fn on_accelerator(&self, kind: BlobKind) -> bool {

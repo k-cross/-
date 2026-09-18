@@ -229,6 +229,12 @@ pub struct Workload {
     /// experiments, which have no second node to spread a fan-out across, see the same trace
     /// they always did.
     fanout_fraction: f64,
+    /// Fraction of agent turns that call a tool, and the size of that call's arguments and
+    /// result. Configurable per scenario: a chat agent's tool calls are small and occasional
+    /// (`TOOL_FRACTION`/`TOOL_PAYLOAD_BYTES`); a code-review agent's are frequent and carry
+    /// file-sized payloads.
+    tool_fraction: f64,
+    tool_payload_bytes: u64,
 }
 
 fn kv(parent: BlobId, tag: &[u8]) -> (BlobId, BlobMeta) {
@@ -270,6 +276,8 @@ impl Workload {
             prompt_cache: HashMap::new(),
             next_task: 0,
             fanout_fraction: 0.0,
+            tool_fraction: TOOL_FRACTION,
+            tool_payload_bytes: TOOL_PAYLOAD_BYTES,
         };
         for _ in 0..SESSIONS {
             let s = w.fresh_session();
@@ -284,6 +292,17 @@ impl Workload {
         let mut w = Self::new(seed, ops, volatility);
         w.fanout_fraction = fraction;
         w
+    }
+
+    /// Override how often an agent turn calls a tool, and how big that call's payload is.
+    /// Chainable onto any constructor: `Workload::new(..).with_tool_profile(0.7, 1 << 20)`
+    /// shapes something more like a code-review agent reading files than a chat agent's
+    /// occasional function call.
+    #[must_use]
+    pub fn with_tool_profile(mut self, fraction: f64, payload_bytes: u64) -> Self {
+        self.tool_fraction = fraction;
+        self.tool_payload_bytes = payload_bytes;
+        self
     }
 
     /// Sub-agents of one orchestrator turn, and the turn that resumes once they return.
@@ -642,11 +661,12 @@ impl Workload {
             );
             debug_assert_eq!(hint.task, task);
             Some(hint)
-        } else if self.rng.chance(TOOL_FRACTION) {
+        } else if self.rng.chance(self.tool_fraction) {
             let f = self.rng.zipf(FUNCTIONS, 1.5);
             let tool = self.faas_for(f);
             let exec = self.faas_exec();
-            Some(self.enqueue(tool, Vec::new(), exec, 0, TOOL_PAYLOAD_BYTES))
+            let payload = self.tool_payload_bytes;
+            Some(self.enqueue(tool, Vec::new(), exec, 0, payload))
         } else {
             None
         };
