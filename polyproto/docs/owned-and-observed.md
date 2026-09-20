@@ -1,17 +1,37 @@
 # Owned, Inferred, Observed
 
-Design notes for the next step: giving the orchestrator a telemetry boundary, making the
-workload taxonomy a scheduler input, and stating which of its advantages are emergent rather
-than assumed.
+Design notes for the next step: a telemetry boundary around the inference engine, a decision about
+what carries a request across it, the workload taxonomy as a scheduler input, and a statement of
+which advantages are emergent rather than assumed.
 
-Status: design only. Nothing here is built. Numbers cited as measured come from the runs
-recorded in [`residency-ledger.md`](residency-ledger.md); everything else is a proposal.
+Two boundaries, resolving in opposite directions. §1 hands the engine's memory back to the engine.
+§2 refuses to hand the request path to a proxy. **Cede the bytes, keep the path** -- and the second
+is only defensible because of the first, since routing is what is left to decide with once
+allocation is gone.
+
+Status: design only. Nothing here is built.
+
+**On the numbers.** Figures come from the runs in [`residency-ledger.md`](residency-ledger.md) and
+are not uniformly trustworthy. Three grades, worth keeping apart:
+
+- **Measured on the host.** The boundary ladder -- syscall, pipe, socket, ring, gRPC -- times real
+  crossings, best-of-5, timer overhead subtracted. It is the firmest evidence in the repository and
+  §2 leans on it deliberately. Caveat: Apple silicon, 4.2x spread on the cheap rungs, so the
+  **ordering** is the result and no constant survives being quoted to two digits.
+- **Simulated on modelled constants.** Every residency, placement and arbitration result. These run
+  on a calibrated model rather than moving bytes; the ledger lists link latency, PCIe, HBM/DDR
+  capacities and the workload's `exec_ns` as modelled, "most worth replacing with real traces".
+- **Simulated on assumptions since found invalid.** A subset of the above. The ledger allocating KV
+  (§1); one memory pool where the target has two; gangs shaped as training jobs rather than
+  multi-agent fan-outs; a cold-container snapshot cost that inverted a headline when replaced (§7).
+  The ledger's own *Standing* table already marks several claims retracted or failing.
+
+So a number here is a reason to run an experiment, not a result to build on. §1's contamination
+table covers **one** invalidation -- ownership -- and is not the complete list.
 
 Two inputs shape this document. [`taxo.md`](taxo.md) is the workload taxonomy it has to serve.
-[`k-cross/sched_lm`](https://github.com/k-cross/sched_lm) is a sibling prototype that reaches the
-same central decision from the llm-d/vLLM side; it is read here as **inspiration and evidence,
-not direction** -- what it got right, where a unified system needs more, and which of its
-methods are worth importing wholesale.
+[`k-cross/sched_lm`](https://github.com/k-cross/sched_lm) is a sibling prototype reaching the same
+central decision from the llm-d/vLLM side, read here as **evidence, not direction**.
 
 ---
 
@@ -19,46 +39,46 @@ methods are worth importing wholesale.
 
 ### Three categories, not two
 
-The obvious split is *what the orchestrator tracks* against *what stays external telemetry*.
-One category is missing from that, and it is the one where every observability-driven behaviour
-actually lives:
+The obvious split is *what the orchestrator tracks* against *what stays external telemetry*. One
+category is missing from that, and it is where every observability-driven behaviour lives:
 
 | | authority | freshness | if it is wrong |
 |---|---|---|---|
 | **Owned** | the orchestrator decided it; nothing else can be the source of truth | exact, per-request | the system is **invalid** -- overcommitted, double-admitted, a gang half-placed |
-| **Inferred** | an estimate the orchestrator maintains in-process from observation | fresh, explicitly uncertain | a decision is **worse**, and the error is self-correcting if it carries a deadline |
-| **Observed** | another system owns the fact | fresh (in-band/streamed) or sampled (metrics) | a placement is **suboptimal** or diagnosis is blurrier; no safety invariant breaks |
+| **Inferred** | an estimate the orchestrator maintains in-process from observation | fresh, explicitly uncertain | a decision is **worse**, and self-corrects if it carries a deadline |
+| **Observed** | another system owns the fact | streamed or sampled | a placement is **suboptimal**, diagnosis is blurrier; no invariant breaks |
 
 `ToolGapIndex` in `sched_lm` is the middle category exactly: not ground truth, not external, but
-orchestrator-resident and uncertain. Collapsing it into either neighbour is what produces the
-two failure modes to avoid -- treating an estimate as authoritative (a stale residency view that
-forces an illegal placement), or treating an estimate as merely advisory (a learned re-arrival
-gap that never changes an eviction).
+orchestrator-resident and uncertain. Collapsing it into either neighbour produces the two failure
+modes to avoid -- treating an estimate as authoritative (a stale residency view forcing an illegal
+placement), or treating one as merely advisory (a learned re-arrival gap that never changes an
+eviction).
 
 ### Tests for ownership
 
 Something must be **owned** if any of these hold:
 
-1. **Authority.** The orchestrator decided it, so no external system can report it back. Every
-   admission, eviction, placement, retention directive, and gang membership is in this class by
-   construction.
-2. **Correctness dependency.** A wrong value makes an outcome *invalid* rather than slow.
-   "Is this gang fully admitted", "is this replica still serving", "does durable state still
-   have a home" are correctness questions. "Which node is hottest" is not.
-3. **Hot-path rate.** It is consulted per request, orders of magnitude above any plausible
-   export interval. Nothing read per request can come from a 15-second scrape.
+1. **Authority.** The orchestrator decided it, so nothing external can report it back. Admissions,
+   evictions, placements, retention directives and gang membership are in this class by construction.
+2. **Correctness dependency.** A wrong value makes an outcome *invalid* rather than slow. "Is this
+   gang fully admitted", "is this replica still serving", "does durable state still have a home" are
+   correctness questions. "Which node is hottest" is not.
+3. **Hot-path rate.** Consulted per request, orders of magnitude above any export interval. Nothing
+   read per request can come from a 15-second scrape.
 
-Something should stay **observed** if all of these hold: another component owns the fact, it is
-an aggregate or a derivable statistic, and losing it degrades explanation rather than decisions.
+Something stays **observed** if all hold: another component owns the fact, it is an aggregate or
+derivable statistic, and losing it degrades explanation rather than decisions.
 
-Anything else is **inferred**, and inferred state carries three obligations: a confidence, a
-decay, and a deadline on any action it drives.
+Anything else is **inferred**, and inferred state carries three obligations: a confidence, a decay,
+and a deadline on any action it drives. §3.7 is about the first of those actually reaching a
+decision, which today it does not.
 
 ### Where polyproto's state falls
 
 | state | category | where it is now |
 |---|---|---|
-| per-blob residency per pool | **owned** | `TierPool.entries` |
+| per-blob residency, host classes (`Snapshot`, `ServiceHeap`) | **owned** | `TierPool.entries` |
+| per-blob residency, engine classes (`KvBlock`, `WeightShard`, offloaded KV) | **inferred** | **wrong** -- `TierPool.entries` claims it as owned |
 | quotas: floors, bands, limits | **owned** | `Quota`, operator config |
 | admission outcome, refusals | **owned** | `Admission`, `TierPool.refused` |
 | gang membership, staged reservations | **owned** | `staged_*`, `cancelled` |
@@ -70,689 +90,1164 @@ decay, and a deadline on any action it drives.
 | P(turn calls a tool), which tool, payload | **inferred** | **cheated** -- `FlowHint.probability` is `1.0` |
 | output length of a decode | **inferred** | **cheated** -- score reads exact `req.tokens` |
 | peer residency | **inferred** | **cheated** -- `Gossip` gives a stale *exact* set |
-| workload class | **inferred** | **missing** -- see §3 |
+| tenant identity and per-tenant quota | **owned** | **missing** -- §3.8 |
+| workload class | **inferred** | **missing** -- §4 |
 | realised TTFT / ITL, batch occupancy | **observed** | modelled internally instead |
 | engine prefix-cache hit rate | **observed** | **conflated** with owned residency |
 | node health, utilisation, power | **observed** | absent |
 
-Two entries in that table are already inferred and were built that way for good reasons.
-`marginal_price` is a deliberate estimate because a faithful dry run costs as much as the
-eviction it is pricing. `regret_rate` is measured from a bounded ghost list rather than assumed.
-Both are precedents: the pattern works, and the engine already has somewhere to put this kind of
-quantity.
+Two entries are already inferred, for good reasons. `marginal_price` is a deliberate estimate
+because a faithful dry run costs as much as the eviction it prices. `regret_rate` is measured from
+a bounded ghost list rather than assumed. Both are precedents: the pattern works and the engine has
+somewhere to put this kind of quantity.
 
-Four entries are cheats, and they are load-bearing. `FlowHint.probability` is hardcoded `1.0`
-(`work.rs:638`), so every cross-workload flow result rests on the scheduler being *told* the
-future with certainty. The placement score reads `req.tokens` (`machine.rs:696-704`) -- the exact
-output length, before decoding -- and both engine terms scale with it.
+Four are cheats, and they are load-bearing. `FlowHint.probability` is hardcoded `1.0`
+(`work.rs:638`), so every cross-workload flow result rests on the scheduler being *told* the future
+with certainty. The placement score reads `req.tokens` (`machine.rs:696-704`) -- the exact output
+length, before decoding -- and both engine terms scale with it.
 
-### The correction: the orchestrator does not own the KV cache
+### The correction: the orchestrator does not allocate the KV cache
 
-This is the most consequential section in the document, and an earlier draft of it was wrong.
+`README.md` is explicit: *"AI inference (llm-d style but model-type agnostic for routing/scheduling
+but does not replace inference engines like vLLM)."* **Model agnosticism requires not controlling
+the engine.** An orchestrator that owns KV block allocation must know block layout, attention
+scheme, quantisation and paging behaviour -- it becomes an inference engine, for one family of
+models, and the central goal is lost.
 
-`README.md` is explicit: *"AI inference (llm-d style but model-type agnostic for
-routing/scheduling but does not replace inference engines like vLLM)."* **Model agnosticism
-requires not controlling the engine.** An orchestrator that owns KV block allocation has to know
-block layout, attention scheme, quantisation and paging behaviour -- it becomes an inference
-engine, for one family of models, and the central goal is lost.
+So the engine **allocates** within memory the orchestrator **provisions**, and reports what it did;
+the orchestrator tracks that report. At the wrong grain this becomes "the engine owns its memory",
+which is false in a way that matters: the orchestrator sizes the partition and that capacity stays
+an owned fact. What moves is authority over *which blocks occupy it*.
 
-So there is no fork. The engine owns its memory and reports on it; the orchestrator **tracks**
-it. An earlier draft framed this as a choice between owning the cache and owning a belief. Only
-the second was ever available.
+**What the code does today is the old model.** `TierPool` *is* the KV cache: it admits, evicts by
+its own GDSF priority, refuses when full, and is the single source of truth. Every
+memory-arbitration result rests on an authority the architecture has disclaimed.
 
-**What the code does today is the first, and that is the mistake to correct.** `TierPool` *is*
-the KV cache: it admits, evicts by its own GDSF priority, refuses when full, and is the single
-source of truth. Every memory-arbitration result rests on an authority the architecture has
-disclaimed.
+### Ownership is per class
 
-### Ownership is per class, and the seam already exists
-
-The boundary is not global. It runs between workload classes, and `accelerated(kind)` -- already
-in `cache.rs` to separate HBM from DDR -- draws it exactly:
+The boundary runs between workload classes. `accelerated(kind)` in `cache.rs` already separates HBM
+from DDR and comes close to drawing it -- but it is a **tier** predicate, not an **ownership** one,
+and the table below cuts across it twice:
 
 | class / resource | who owns the bytes | what the orchestrator does |
 |---|---|---|
-| **HBM Partitions** | **the orchestrator** -- it provisions the engine | decide *how much HBM* an engine replica gets, scale replicas, and partition the hardware |
-| `KvBlock` | **the engine** (vLLM's block manager) | observe an approximate index; influence via retention directives; **route** |
-| `WeightShard` | **the engine**, once loaded | decide *which models load on which nodes*, and when to unload -- slow, coarse, and genuinely orchestration (Phase 6) |
+| **HBM partition** | **the orchestrator** -- it provisions the engine | decide how much HBM a replica gets, scale replicas, partition the hardware |
+| `KvBlock` | **the engine** (vLLM's block manager) | observe an approximate index; influence by directive; **route** |
+| `WeightShard` | **the engine**, once loaded | decide which models load where, and when to unload -- slow, coarse, genuinely orchestration (Phase 6) |
 | `Snapshot` | **the orchestrator** -- it starts and stops microVMs | own outright: admit, evict, refuse |
 | `ServiceHeap` | **the orchestrator** -- it scales replicas | own outright |
-| offloaded KV in host DDR | the engine's KV connector (`LMCache`, NIXL) | observe; ownership depends on the connector, so assume the engine's |
+| offloaded KV in host DDR | the engine's KV connector (`LMCache`, NIXL) | observe; ownership follows the connector, so assume the engine's |
 
-This establishes a **two-tiered control system**. The orchestrator retains macro-level authority over the hardware (provisioning, HBM partitioning, and model loading), but cedes micro-level, per-request authority (KV block eviction) to the engine.
+The two exceptions are the ones that matter: the orchestrator sizes an HBM partition the engine
+allocates *within*, and an engine-owned offload tier sits *inside* host DDR's quota. So "HBM" is
+not a synonym for engine-owned and "host" is not a synonym for orchestrator-owned. §8 returns to
+what that costs.
 
-Two consequences worth stating separately, because one is a loss and one is a save.
+This is a **two-tier control system**: macro authority over the hardware (provisioning, partition
+sizing, model loading) stays with the orchestrator; micro, per-request authority (KV block
+eviction) goes to the engine.
 
-**The loss: no admission control over inference state.** The orchestrator cannot refuse a specific KV
-admission, cannot choose an eviction victim, and cannot hold a block against the engine's will.
-An engine under pressure evicts or preempts and recomputes; it does not reject a request for lack
-of KV. So refusal, for inference, moves out of the ledger and into the router. However, because the
-orchestrator provisions the HBM and knows the engine's capacity, this refusal does not have to be a
-naive queue-depth threshold. It can be a **byte-depth or token-depth** threshold (derived from prompt
-sizes and max tokens) evaluated against the HBM partition the orchestrator granted. This preserves
-a form of authoritative admission control, just shifted to the router.
+**The loss: no *per-block* admission control over inference state.** The orchestrator cannot refuse
+a specific KV admission, choose an eviction victim, or hold a block against the engine's will. An
+engine under pressure evicts, preempts and recomputes; it does not reject for lack of KV. So
+refusal moves out of the ledger and into the router -- where it can still be authoritative, because
+the orchestrator granted the partition and knows its capacity. A byte- or token-depth threshold
+against that partition is a real check, not a naive queue-depth guess.
 
-**The save: macro-orchestration, topological dataflow, and targeted host DDR arbitration.**
-HBM and DDR are fundamentally two different classes of memory operating in physical isolation.
-Attempting to compare an accelerator HBM KV block directly against a host DDR microVM cell in the
-same eviction shadow price is an architectural category error: GPU prefill recompute (compute-bound,
-non-linear) and microVM restore (I/O-bound, flat) do not compete for the same physical memory bus.
+**That check has a hole worth stating.** It is authoritative only if its inputs are. Prompt bytes
+are known at admission; output length is not, and the table above lists it as cheated. Two options,
+neither clean:
 
-Furthermore, in production datacenter topology, expensive multi-GPU instances ($30–$40+/hr) do not
-treat host DDR as a municipal dump for arbitrary background services (`ServiceHeap`). Host DDR on GPU
-hosts is tightly provisioned for PCIe bounce buffers, NUMA-pinned staging, and accelerator offload
-connectors (`LMCache`, NIXL). Co-locating arbitrary CPU compute on GPU nodes risks memory bus
-saturation and NUMA interference that throttles accelerator throughput.
+- **Admit against `max_tokens`.** A declared bound, so the check stays authoritative -- but
+  `max_tokens` is routinely set far above actual output, so reserving against it strands most of the
+  partition and refuses work the node could have served.
+- **Admit against an estimate.** Usable, and **not authoritative**: an estimator wrong in the
+  optimistic direction admits what the partition cannot hold, and the engine resolves the
+  overcommit by evicting someone else's warm blocks.
 
-Instead, the orchestrator's value proposition splits across three distinct, realistic mechanisms:
+Per-block authority is not replaced by partition authority, then. It is replaced by a
+**bound-versus-utilisation tradeoff**, and where a deployment sits on it is a policy choice with a
+measurable cost. Phase 3 sweeps it rather than assuming the middle option works.
 
-1. **Topological Placement & Dataflow Locality (GPU Compute $\leftrightarrow$ CPU Compute):** The
-   primary relationship between GPU inference and tool/agent execution is not memory contention, but
-   **spatial dataflow placement**. The orchestrator's goal is to co-locate or proximity-schedule the
-   dependent tool workload as close as possible to the active GPU context (same-node, same-rack, or
-   same-zone) to minimize serialization overheads, link latency, and network congestion tolls.
-2. **Macro-Scale Orchestration & Gang Slicing:** The orchestrator maintains global authority over
-   what engines cannot see: multi-node gang flow admission (all-or-nothing sub-agent placement),
-   dynamic model weight loading/swapping across heterogeneous hardware, and coarse HBM partition sizing.
-3. **Targeted Intra-Host DDR Arbitration:** On nodes where tool execution is co-located with inference,
-   shadow pricing binds specifically between **Host-side Offload/KV connectors** and **Ephemeral Tool
-   Warm Cells (`Snapshot`)**. Here, soft floors beat hard static partitions by dynamically balancing
-   local tool working sets against offloaded inference state without starving the accelerator's PCIe
-   pipeline.
+**The save: macro-orchestration, dataflow placement, and targeted host DDR arbitration.** HBM and
+DDR are physically separate pools, so pricing an HBM KV block against a host DDR microVM cell in one
+eviction shadow price is a category error: GPU prefill recompute (compute-bound, non-linear) and
+microVM restore (I/O-bound, flat) do not compete for the same bus. Nor do expensive multi-GPU hosts
+run arbitrary background services -- their DDR is provisioned for PCIe bounce buffers, NUMA-pinned
+staging and offload connectors, and co-locating CPU compute there risks throttling the accelerator.
 
-That reframes the thesis cleanly: the unified advantage is **macro-scale capacity and gang orchestration**,
-**joint dataflow placement across topological boundaries**, and **targeted host DDR multiplexing** where
-co-location is physically sound. Whether this architectural coordination outperforms siloed specialists
-is the core empirical question to measure.
+What remains is three real mechanisms:
+
+1. **Dataflow locality.** The relationship between GPU inference and tool execution is *spatial*,
+   not memory contention: place the dependent tool workload near the active GPU context (same node,
+   rack, or zone) to cut serialisation, link latency and congestion tolls.
+2. **Macro-scale orchestration.** What engines cannot see: multi-node gang admission, model weight
+   loading across heterogeneous hardware, partition sizing, and the tenancy policy that follows from
+   it (§3.8).
+3. **Targeted intra-host DDR arbitration.** Where tool execution is co-located with inference,
+   shadow pricing binds between **host-side offload connectors** and **ephemeral tool cells**
+   (`Snapshot`). Soft floors beat hard partitions by balancing local tool working sets against
+   offloaded inference state without starving the PCIe pipeline.
+
+So the unified advantage is macro capacity and gang orchestration, joint dataflow placement across
+topological boundaries, and targeted host DDR multiplexing -- not cross-hardware arbitration of HBM
+bytes. Whether that beats siloed specialists is the empirical question.
 
 ### Which existing results this contaminates
 
-Stated up front, with the expected direction, so nobody builds on them and so the re-measurement
-cannot be quietly graded on a curve:
+Stated with expected direction, so the re-measurement cannot be quietly graded on a curve:
 
 | result | why it is affected | expected |
 |---|---|---|
-| soft floors beat hard partitions, 32% oracle-tuned (single node) | both arms assume one authoritative allocator across all four classes | **shrinks** -- the KV/weights half becomes advisory |
-| fixed budgets cost 4.0% service, 2.7pp goodput | same | **shrinks** |
-| 90% of tool calls shipped to idle model-host DDR | the option exists because the ledger controls that DDR; an engine KV connector may own it | **uncertain**, possibly unchanged for `Snapshot` cells |
-| all-or-nothing fan-out admission: +22% fan-outs | rests on `could_admit` as a hard HBM feasibility test, which no longer exists | **survives, but the binding constraint moves** to engine slots, queue depth, and host memory |
+| soft floors beat hard partitions, 32% oracle-tuned | its mechanism is entirely host DDR: a soft floor lets HBM-evicted state grow into idle DDR and promote back over PCIe (weight residency 0.51 -> 0.66). The **budget** stays orchestrator-owned; only the offload demand becomes engine-driven | **likely survives.** Still needs re-running: the ledger chose the HBM victims that generated the offload |
+| fixed budgets cost 4.0% service, 2.7pp goodput | measures what non-borrowable per-class budgets cost. The DDR half (`Snapshot` / `ServiceHeap` / offload) stays orchestrator-owned; the HBM half (`KvBlock` / `WeightShard`) becomes the engine's | **shrinks** by roughly the HBM half's share |
+| 90% of tool calls shipped to idle model-host DDR | the option exists because the ledger controls that DDR; an engine KV connector may own it | **uncertain**, probably unchanged for `Snapshot` cells |
+| all-or-nothing fan-out admission: +22% fan-outs | rests on `could_admit` as a *per-block* HBM feasibility test, gone at that granularity | **survives, test coarsens** to the granted partition budget, engine slots, queue depth, host memory |
 | tool-placement inversion under memory pressure | driven by host DDR contention, which the orchestrator owns | **likely survives** |
-| the acquisition crossover (KV ships within a rack, rebuilt across a zone) | a cost comparison, not an allocation decision | **survives** -- and becomes advice to the engine rather than an action |
+| acquisition crossover (KV ships within a rack, rebuilt across a zone) | a cost comparison, not an allocation decision | **survives**, and becomes advice to the engine rather than an action |
 | boundary-cost ladder, origin round trip, congestion toll | independent of memory ownership | **unaffected** |
 
-The pattern: results about *host* classes and about *costs* survive; results about *authority
-over inference memory* do not.
+The pattern: results about **costs** survive; results about **per-block authority over inference
+memory** do not; results about **budgets** survive in whichever pool the orchestrator sizes. Those
+do not divide along HBM/host lines, which is why "host" is not usable as shorthand for "survives".
 
 ### Observability is not a stale exact view
 
-`Control::Gossip` hands the scheduler a stale but **exact per-blob** residency set. No
-observability system can provide that: you cannot scrape "does node 3 hold prefix X". Real
-telemetry offers one of two things, which is precisely llm-d's precise-vs-approximate split:
+`Control::Gossip` hands the scheduler a stale but **exact per-blob** residency set. No observability
+system provides that -- you cannot scrape "does node 3 hold prefix X". Real telemetry offers llm-d's
+precise-versus-approximate split:
 
-- **`Metrics { interval }`** -- exact aggregates, no per-blob detail. Hit rate, queue depth,
-  pinned usage, batch occupancy.
-- **`Events { loss }`** -- an approximate per-blob index maintained from a KV event stream:
-  fresh, but lossy and probabilistic.
+- **`Metrics { interval }`** -- exact aggregates, no per-blob detail: hit rate, queue depth, pinned
+  usage, batch occupancy.
+- **`Events { loss }`** -- an approximate per-blob index from a KV event stream: fresh, lossy,
+  probabilistic.
 
-Replacing `Gossip` with these two is a correctness fix to the experiment, not a refinement.
+Replacing `Gossip` with these two is a correctness fix, not a refinement.
 
-#### Direct Ingestion: Step-Aligned Micro-Batching over ZMQ IPC
+#### Step-aligned ingestion over ZMQ IPC
 
-Relying on a traditional out-of-band monitoring pipeline (e.g. Prometheus / OTel with 5–15s scrape
-intervals) is an artificial handicap for hot-path decisions. Conversely, streaming per-block RPCs
-at request time floods the host CPU with tens of thousands of interrupts per second, while in-band
-response trailers arrive far too late (only after multi-second decode generations finish).
+Out-of-band monitoring (Prometheus/OTel at 5-15s) is far too slow for hot-path decisions.
+Per-block RPCs at request time flood the host with interrupts. In-band response trailers arrive
+only after a multi-second generation finishes. So the orchestrator ingests telemetry the engine
+emits directly, batched at the engine's own step boundary:
 
-Instead, the orchestrator directly ingests telemetry emitted by the inference engine via
-**step-aligned micro-batching over ZeroMQ (ZMQ) IPC**:
+1. **Step-aligned cadence (40-100 Hz).** Engines execute discrete forward iterations: prefill
+   chunks ~10-50 ms, decode steps ~10-25 ms, with allocations, preemptions and evictions happening
+   at step boundaries. Flushing at the end of each iteration rate-limits event volume to the step
+   frequency and keeps belief fresh to within ~15 ms.
+2. **Transport: ZMQ over Unix domain sockets** (`ipc:///tmp/poly_engine_{id}.ipc`), giving lock-free
+   queueing and clean framing between Python workers (`pyzmq`) and the Rust orchestrator.
+   **Chosen for adoptability, not speed.** At 40-100 Hz and ~400 bytes a batch, one engine costs
+   ~0.6 ms of wakeups per second and 6 us of crossing is 0.04% of the 15 ms freshness the cadence
+   already sets -- every boundary on the ladder is free at this rate. What decides it is that
+   **vLLM already publishes KV events over ZMQ** (`kv_events`, what llm-d's KV-aware routing
+   consumes; confirm the event set against the release targeted), making this promotion tier 0/1
+   with no serving-stack change. Ring-grade transport belongs on the request path, where cost is
+   paid per request and per decision (§2.2).
+3. **Asymmetric, eviction-centric wire format.** The router knows which prefixes it dispatched, so
+   allocations can be tracked optimistically. What it cannot guess is which blocks the engine
+   **evicted** under pressure and where capacity stands. A 32-byte `TelemetryBatchHeader`
+   (`engine_id`, `epoch`, `seq`, `free_kv_blocks`, `total_kv_blocks`, `queued`, `running`, `flags`
+   for normal/yellow >80%/red >95%, eviction and allocation counts) followed by truncated 64-bit
+   blake3 hashes. 100-400 bytes typical, under 15 KB/s per engine.
+4. **Drop detection.** The router tracks `seq`; a gap means the ZMQ high-water mark dropped a
+   message, which widens the uncertainty band on that engine (§3.7 is what makes that widening
+   change a decision). Every 1-2 seconds, or immediately on a gap, the engine pushes a **sync
+   batch** -- a prefix-tree snapshot or block bloom filter -- to reconcile drift.
 
-1. **Step-Aligned Cadence (40–100 Hz, ~10–25 ms):**
-   Inference engines (vLLM, SGLang) execute in discrete forward iterations (`step()`): prefill chunks
-   take ~10–50 ms, decode steps take ~10–25 ms. Block allocations, preemptions, and evictions occur
-   strictly during these step boundaries. Flusing telemetry *at the end of each iteration* naturally
-   rate-limits event volume to the engine's step frequency (40–100 Hz), completely eliminating
-   socket churn while keeping belief state fresh to within ~15 ms.
-2. **Transport via ZMQ IPC (`PUSH/PULL`):**
-   Transport runs over Unix Domain Sockets via ZeroMQ (`ipc:///tmp/poly_engine_{id}.ipc`). ZMQ provides
-   lock-free queueing, kernel-assisted batching, and clean multi-language framing between Python engine
-   workers (`pyzmq`) and the Rust orchestrator (`zeromq-rs`) at $< 5\,\mu\text{s}$ crossing cost,
-   bypassing the HTTP/2 framing overhead of gRPC without incurring custom shared-memory ring ABI debt.
-3. **Asymmetric, Eviction-Centric Wire Format:**
-   The router already knows which prompt prefixes it dispatched, so allocations can be tracked
-   optimistically. What the router cannot guess without telemetry is **which blocks the engine evicted
-   under pressure** and **current capacity watermarks**. Telemetry is packed into a compact binary struct:
-   - `TelemetryBatchHeader` (32 bytes): `engine_id: u32`, `epoch: u32`, `seq: u64` (monotonic step counter),
-     `free_kv_blocks: u32`, `total_kv_blocks: u32`, `queued_requests: u16`, `running_requests: u16`,
-     `flags: u16` (Bit 0: Normal, Bit 1: Yellow watermark $>80\%$, Bit 2: Red/Preempting $>95\%$),
-     `num_evictions: u16`, `num_allocations: u16`.
-   - Payload: array of truncated 64-bit blake3 hashes for evicted blocks, followed by newly committed prefix nodes.
-   - Total payload is typically 100–400 bytes, consuming $< 15\text{ KB/s}$ of bandwidth per GPU engine.
-4. **Drop Detection and Periodic Reconciliation:**
-   - **Gap detection:** The router tracks `seq`. If $seq_n \neq seq_{n-1} + 1$, a message was dropped
-     by the ZMQ high-water mark. The router immediately tags that engine's belief state as degraded
-     (widening the uncertainty interval on displacement cost).
-   - **Periodic Sync:** Every 1–2 seconds (or immediately upon a sequence gap), the engine pushes a
-     compact **Sync Batch** (a full prefix tree snapshot or block bloom filter) to reconcile drift.
+#### Two control loops, two clocks
 
-#### The Dual Time-Scale Control Loop
+Step-aligned ingestion closes the loop on **routing and admission**: the orchestrator learns of
+memory pressure within 15 ms and diverts incoming prefill before the engine descends into
+preemption cascades. It cannot close the loop on **provisioning**, which is physical: slicing new
+partitions, pulling 140 GB of weights, initialising contexts takes 5-30+ seconds.
 
-Step-aligned micro-batching closes the loop on **routing and admission control**: the orchestrator
-learns of memory pressure and evictions within 15 ms, diverting incoming prefill traffic *before* the
-engine descends into severe preemption cascades.
+That gap is the point. Near-instant micro-actions (diversion, backpressure) buy the time that slow
+macro-actions (provisioning, weight swapping) need, which is what makes the two-tier model viable.
 
-However, micro-batching cannot eliminate the physical latency of **macro-provisioning**:
-- **Detection & diversion are fast (10–25 ms):** The router catches watermark interrupts on the next step
-  and halts new prefill admissions to that node.
-- **Remediation is physical (5–30+ seconds):** Slicing new HBM partitions, pulling 140 GB of model
-  weights over PCIe/network, and initializing engine contexts takes seconds.
-
-Step-aligned ingestion is therefore what makes the two-tiered model viable: it buys the necessary time
-for slow macro-actions (provisioning and weight swapping) by executing near-instantaneous micro-actions
-(traffic diversion and backpressure admission).
-
-A measured aside on why staleness matters: sweeping the gossip period at rack distance,
+A measured aside on staleness, sweeping the gossip period at rack distance:
 
 | refresh every | `both, gossiped` service |
 |---|---|
 | 200 requests | 693.3 ms |
 | 1000 | 613.2 |
-| 3750 (≈15 s scrape at 250 req/s) | 499.8 |
+| 3750 (~15 s scrape at 250 req/s) | 499.8 |
 | 7500 | 481.3 |
 
-The residency-greedy arm gets **better** as its view gets staler, because staleness stops it
-concentrating work on whichever node looks hottest. Realistic telemetry lag is not a handicap
-for that policy; it is a crutch. Which means "how fresh is your view" is the wrong question to
-organise the control-plane experiment around. The right one is "does the score price
-congestion" -- a score that does needs no fresh view to avoid concentrating, and the scored arm
-does not show this effect.
+The residency-greedy arm gets **better** as its view goes stale, because staleness is the only
+thing stopping it concentrating work on whichever node looks hottest. Realistic telemetry lag is
+not a handicap for that policy; it is a crutch. So "how fresh is your view" is the wrong question
+to organise the experiment around. The right one is "does the score price congestion" -- and a
+score that does needs no fresh view to avoid concentrating.
 
 ---
 
-## 2. What changes in the engine
+## 2. The data path
 
-Ordered by what makes the rest trustworthy.
+§1 gave the engine its memory back. This section keeps the other half.
 
-### 2.1 A `Telemetry` boundary
+The two are load-bearing on each other. Once the orchestrator cannot refuse a per-block KV
+admission or pick an eviction victim, routing is the entire remaining lever. A design that gives
+the memory away *and* puts a proxy it does not control on the routing path has kept nothing.
+
+### 2.1 The sidecar is a second scheduler
+
+llm-d's request path, as deployed:
+
+```
+client -> Envoy gateway -> ext_proc gRPC callout to the Endpoint Picker -> back
+       -> network hop to the chosen node
+       -> node-local routing proxy sidecar
+       -> localhost HTTP -> vLLM
+```
+
+The sidecar mutates headers, injects `x-prefiller-host-port` and `remote_kv_source`, and runs the
+disaggregated handshake: fire a prefill with `max_tokens=1`, capture the `KVTransferParams`, hand
+them to the local decode engine.
+
+**Every one of those is a scheduling decision.** Choosing a prefiller is placement. Deciding to
+disaggregate is admission. Injecting a KV source is issuing a directive -- the object §3.3 prices.
+So the pattern is not "a proxy with an extension point". It is **a second scheduler, smuggled into
+the data path, running on a partial view**, and it exists because the first scheduler is a network
+hop away while decisions must be made at engine speed.
+
+Removing it is what "integrate deeper" means concretely: **the component holding the freshest
+belief and the component acting on it are the same component.** That is also the only way §3.6's
+divergence metric has a single referent -- with a sidecar there are two beliefs, and "how far has
+the router drifted from the engine" stops being well-formed.
+
+Neither predecessor had to answer this. Kubernetes is not on the request path: its decisions are
+per-pod-lifecycle, so a 50 us admission webhook is free, and where it does need per-candidate work
+-- scheduler `Score` plugins -- it already runs them in-process. Envoy is on the request path and
+has no scheduler, so its extension points can afford to be coarse. Polyproto proposes to be both,
+which is why the boundary question is load-bearing here and was not there.
+
+### 2.2 Put the boundary where the rate is low
+
+The ladder is measured and its costs are fixed per crossing, so what decides a transport is never
+its cost alone; it is **cost x rate**, against the service time of the work being scheduled. One
+rule covers every seam:
+
+| rate | seam | llm-d | polyproto | affordable boundaries |
+|---|---|---|---|---|
+| per connection | TLS, ALPN, protocol normalisation | Envoy listener | commodity edge or own listener | anything |
+| per step, 40-100 Hz | engine telemetry | KV events, scraped metrics | same, step-aligned (§1) | anything; choose for adoptability |
+| per request | dispatch to the engine | sidecar -> localhost HTTP, 15.4 us + parse | direct, UDS today, **6.0-6.6 us** | sockets; a ring for short-request classes |
+| **per decision, in an argmin** | **routing and policy hooks** | **`ext_proc` callout, 49 us** | **in-process, 0 ns / ring 52-232 ns** | **`Native` and `Ring` only** |
+
+The dispatch row is the seam that cannot be removed -- removing it means implementing the engine,
+which §1 forbids. It can only be made cheaper, and a shared ring would make it two orders of
+magnitude cheaper. That is a serving-stack change (promotion tier 2), and §6 is explicit about how
+to ask for one: measure the regret that justifies it first.
+
+**The last row sets the architecture, and `machine.rs` already argues it.** `decide()` charges
+`Control::Unified` nothing and `Control::Query` one crossing per placement, incrementing
+`control_rpcs` by `self.active.len()` under a comment stating the rule: a fan-out query costs "one
+crossing of *latency* ... but N crossings of *work*, **which is what caps the decision rate**". §2
+extends that from the query seam to the extension seam, where the multiplier is identical and the
+rate is higher.
+
+`best_scored` is an argmin over candidates, so a pluggable scoring term runs once per candidate. At
+the 4 nodes the current runs use, an `ext_proc`-shaped hook costs 4 x 49 us = **198 us per
+placement** -- more than a warm FaaS invocation takes to run. At a fleet of 32 it is **1.6 ms**, and
+the scheduler's decision rate becomes the cluster's throughput ceiling. The same fleet over a ring
+costs 2.1 us.
+
+That is not a performance difference, it is an **expressiveness** difference. At 49 us a hook runs
+once, at the gateway, with the policy pre-collapsed into a single score. At 65 ns it runs per
+candidate, per eviction candidate, per telemetry batch. `Boundary::Ring` is already documented in
+`boundary.rs` as "what an ABI or WASM extension can achieve at best"; this row is where the README's
+zero-cost-extension claim cashes out.
+
+### 2.3 The honest accounting
+
+Removing `ext_proc` and the sidecar saves roughly **65 us per request**: the gRPC callout at 49 us,
+the loopback hop at 15 us and its parse, less the ~6 us the integrated path still pays to reach the
+engine. That figure is from the measured ladder and is the solid half. The denominator is not:
+
+| work being scheduled | provenance | what the sidecar path adds |
+|---|---|---|
+| agent turn, ~1 s of decode | modelled | **0.007%** |
+| 30 ms classification or extraction | illustrative | 0.2% |
+| 1 ms of work | illustrative | 6.5% |
+| warm service request, 250 us | `SERVICE_EXEC_NS`, a **chosen constant** | +26% |
+| warm FaaS invocation, ~129 us | `FAAS_EXEC_MIN_NS` 40 us + `U[0, 160 us]`, a **chosen constant** | +50% |
+
+The bottom two are workload constants, not measurements -- `residency-ledger.md` labels them
+"measured" in one table and lists `exec_ns` as **modelled** four hundred lines later, and the code
+is `FAAS_EXEC_MIN_NS + rng.below(FAAS_EXEC_SPAN_NS)`.
+
+**So argue from the crossover, which needs no denominator.** At a 65 us tax the sidecar path costs
+more than 5% of a request below **~1.3 ms** of service time and less than 1% above **~6.5 ms**. The
+claim that survives any constant here: *the data-path choice binds for sub-millisecond work and
+dissolves an order of magnitude above it.* Whether that matters is then a question about the
+**request mix**, answerable from published FaaS duration distributions rather than polyproto's
+`exec_ns`.
+
+**For inference alone, killing the sidecar is not worth doing on latency grounds, and this document
+should not claim it is.** A decode-bound turn sits three orders of magnitude above the crossover;
+no plausible constant moves it. Three things make it worth doing anyway, and only the first is
+about speed.
+
+1. **One data path serves both denominators.** An inference-only stack can buy a proxy hop out of
+   the decode budget; a FaaS control plane cannot, which is why none of them have one on the invoke
+   path. Polyproto serves both from one path, so choosing Envoy makes the FaaS and service classes
+   pay the inference class's overhead budget. No silo can make this argument, because no silo has
+   both denominators.
+2. **Expressiveness in the argmin** (§2.2). Hook cost decides whether a policy can be a function of
+   the candidate or must be a constant attached to the request.
+3. **One belief, one actor.** Residency is a belief maintained at ~15 ms freshness. If the decision
+   point is a hop from the belief, the belief is stale again when used, and divergence has two
+   referents instead of one.
+
+### 2.4 The split moves; it does not vanish
+
+Polyproto still has two processes, a global scheduler and a node agent. What changes is where the
+seam falls, and it falls where §1 puts the memory seam:
+
+| | §1: who owns the bytes | §2: who owns the decision |
+|---|---|---|
+| **macro / global** | HBM partition sizing, model placement | cross-node routing, P/D pairing, gang admission |
+| **micro / local** | KV block allocation and eviction (engine) | dispatch, backpressure, policy hooks (node agent) |
+
+A decision goes to the tier holding the state it needs, and the tier boundary is crossed at the
+rate of the **coarser** tier. The sidecar pattern inverts this: it cuts the path at a seam every
+request must cross, rather than at one only globally-informed decisions cross.
+
+### 2.5 Prefill/decode: pair the request, size the fleet
+
+The sidecar's most substantial job is one polyproto already has machinery for, at one of its two
+timescales.
+
+**Per request**, choosing a prefiller and a decoder is one placement decision over a pair, not two
+independent ones: the transfer between them is a link cost `Topology` already prices, and its
+magnitude depends on both endpoints. It is also all-or-nothing -- a prefill placed without a decoder
+to receive its KV is wasted GPU work -- which is the primitive behind the +22% fan-out result,
+applied to a gang of two with a direction.
+
+**Per fleet**, prefill is FLOPs-bound and decode is memory-bandwidth-bound, so the right **P:D
+replica ratio** shifts with traffic shape: long prompts and short outputs want more prefill
+capacity; agent turns with short prompts and long generations want less. That is a slow capacity
+decision, so it sits in §2.4's macro tier and in Phase 6. Per-request pairing without it only
+distributes the imbalance evenly.
+
+The obvious objection: §1 removed the ability to refuse a per-block KV admission, so how can a pair
+be refused? Because this is a **placement** refusal made before dispatch -- against the granted
+partition budget, engine slots and queue depth -- not an eviction decision inside the engine.
+
+The transfer itself stays out of the data path: NIXL or Mooncake move bytes GPU-to-GPU over RDMA,
+and the orchestrator owns the **handshake, not the bytes**. Same discipline as §1 -- the value is in
+deciding the pair, not carrying their traffic. An orchestrator picks the pair and sets the ratio; a
+sidecar picks a prefiller from a list. That difference is a **coupling-tier-2** joint decision, and
+coupled % (§3.4) sizes it.
+
+### 2.6 What this gives up
+
+Worst first.
+
+1. **The protocol surface is real work and a permanent CVE surface.** TLS and cert rotation,
+   HTTP/1.1-2-3 normalisation, retries, timeouts, circuit breaking, outlier detection. Envoy has
+   spent a decade debugging semantics that look simple and are not.
+2. **Streaming is the whole workload and the easiest thing to get subtly wrong.** Every inference
+   response is a token stream; HTTP/2 flow control against backpressure from a saturated engine is
+   where a hand-rolled data path fails, and it fails as head-of-line stalls that look like engine
+   slowness.
+3. **In-process extensions trade isolation for the 0 ns.** `ext_proc`'s 49 us buys a separate
+   address space. A first-party ABI extension can corrupt the scheduler, and a segfault takes the
+   node's control plane with it.
+4. **Ecosystem.** SPIFFE/mTLS wiring, the WASM filter catalogue, observability that assumes an
+   Envoy in the path.
+
+Items 1 and 3 are scope decisions and resolve below. **Item 2 does not**: streaming backpressure is
+east-west by definition, so owning the path means owning it, and §8 lists it as the largest gap
+between this design being right and being shipped.
+
+**North-south stays commodity; east-west is ours.** Directly from §2.2: a proxy is acceptable where
+its cost amortises per connection and unacceptable where it is paid per decision. TLS termination,
+HTTP/3, WAF and DDoS handling are per-connection concerns at the internet edge and can stay behind
+a commodity proxy without touching anything claimed here. What gets replaced is the per-decision
+path from the trust boundary inward -- also the only part llm-d puts a sidecar on.
+
+**Isolation becomes a costed choice**, which is `README.md`'s ring 0 / ring 3 split made measurable:
+
+| extension | isolation | boundary | cost | where it may run |
+|---|---|---|---|---|
+| first-party policy: scoring terms, admission rules | none | `Native` | 0 ns | inside the argmin, per candidate |
+| third-party or untrusted policy | WASM sandbox | `Ring` | 52-232 ns | per request, per decision |
+| foreign runtime: a Python classifier, a small model | separate process | `UnixSocket` / `Grpc` | 6-49 us | once per request, off the argmin |
+
+"Can this extension be trusted" then has an answer in nanoseconds, priced by the ladder rather than
+settled by an architecture review.
+
+### 2.7 What to measure
+
+Two numbers, and the first needs no simulator.
+
+**Extend the ladder.** `boundary.rs` measures gRPC unary, which is not the shape of an `ext_proc`
+callout with header-mutation semantics, and it has no WASM rung at all -- so today's comparison is
+gRPC-unary-versus-native, which is nobody's actual choice. Add both rungs and publish the
+per-decision cost of a policy hook at each isolation level.
+
+**Then an arm.** `data_path: { Sidecar, Integrated }`, charging measured seam costs per request
+across the workload mix. Most of the mechanism exists: `Machine::decide` already charges a
+configurable `Boundary` per placement and scales the work term by candidate count, so
+`Control::Unified` against `Control::Query` over `Boundary::Grpc` *is* the comparison for the
+decision seam. Missing: the dispatch hop, a per-candidate hook rather than per-placement, and the
+sweep below.
+
+**Report a curve, not a point.** A run charging measured seam costs against modelled `exec_ns`
+returns whatever those constants imply -- predicting "25-50% for warm FaaS" would be predicting
+`FAAS_EXEC_MIN_NS`, which is circular. Sweep the service-time denominator and publish the crossover:
+where control-plane overhead passes 5% and 1% of a request. That is a property of the measured
+ladder alone.
+
+Predicted: ~1.3 ms and ~6.5 ms. If the crossover lands an order of magnitude lower -- plausible if
+seam costs are smaller on a datacenter Linux host than on this one, given the 4.2x spread -- then
+almost no real workload sits below it, the data-path case rests entirely on §2.2's expressiveness
+argument, and this section should say so rather than reach for a mix that rescues it.
+
+---
+
+## 3. What changes in the engine
+
+Ordered by what makes the rest trustworthy: the boundary first (3.1), then the estimates that stop
+being cheats (3.2-3.3), then the apparatus that makes any of it measurable (3.4-3.6), then three
+gaps the design had and did not notice (3.7-3.8) and two smaller additions (3.9-3.11).
+
+### 3.1 A `Telemetry` boundary
 
 One type mediates everything a policy may read. Owned state stays directly accessible to the
-ledger; the *scheduler* reaches residency, costs, and load only through it. Inferred quantities
-live behind it with confidences attached. Observed quantities arrive sampled.
+ledger; the *scheduler* reaches residency, costs and load only through it. Inferred quantities live
+behind it with confidences attached; observed quantities arrive sampled.
 
 This is `sched_lm`'s `RequestView` discipline -- "body observables, never the workload's
-ground-truth class" -- applied to the whole engine rather than to one policy signature. Without
-it, `req.tokens` and exact `recompute_ns` stay in the score and every subsequent result is
-contaminated by information no deployment has.
+ground-truth class" -- applied to the whole engine rather than one policy signature. Without it,
+`req.tokens` and exact `recompute_ns` stay in the score and every subsequent result is contaminated
+by information no deployment has.
 
-The migration is mechanical and the compiler finds the work: make `Request`'s ground-truth
-fields private to the workload and the ledger, and give the scheduler an observables view
-(prompt tokens, message count, whether the last message was a tool result, chain-root hash) plus
-estimator handles.
+The migration is mechanical and the compiler finds the work: make `Request`'s ground-truth fields
+private to the workload and the ledger, and give the scheduler an observables view (prompt tokens,
+message count, whether the last message was a tool result, chain-root hash) plus estimator handles.
 
-### 2.2 Predicted flows replace declared flows
+### 3.2 Predicted flows replace declared flows
 
 Replace `FlowHint { probability: 1.0, lead_ops, payload_bytes }` with an estimator over observed
-history, one per (tool, session-class):
+history, one per (tool, session-class): P(this turn calls a tool); which tool, as a distribution;
+re-arrival gap as EWMA mean **and variance**, so confidence is available rather than invented; and
+payload size.
 
-- P(this turn calls a tool)
-- which tool, as a distribution
-- re-arrival gap: EWMA mean **and variance**, so confidence is available and not invented
-- payload size: EWMA
+`Hierarchy::anticipate(id, weight)` already takes a probability and already caps an announced
+access at one real access. It has been fed `1.0` since it was written. Feed it the predicted
+probability and the mechanism becomes honest with no change to the ledger.
 
-`Hierarchy::anticipate(id, weight)` already takes a probability and is already capped at "one
-announced access is worth at most one access". It has been fed `1.0` since it was written. Feed
-it the predicted probability and the mechanism becomes honest with no change to the ledger.
+This unlocks the falsification the prewarm and gate results need: **how much of the
+coupling-tier-1 win survives when the hint is an estimate?** Announce currently buys 11-18% task
+latency against a perfect oracle. Against an EWMA with real variance it buys less, and the amount
+it loses is the honest value of the mechanism.
 
-The experiment this unlocks is the falsification the prewarm and gate results need: **how much
-of the Tier-1 win survives when the hint is an estimate?** Announce currently buys 11-18% task
-latency at slightly worse net work, measured against a perfect oracle. Against an EWMA with real
-variance it will buy less, and the amount it loses is the honest value of the mechanism.
+### 3.3 Retention directives in the ledger
 
-### 2.3 Retention directives in the ledger
+Add to `Entry`: `retain_until: u64`, a soft pin with a deadline, and `evict_first: bool`, the
+one-shot / cache-pollution mark.
 
-Add to `Entry`:
+This is RFC-0001's `50; ttl=<window>; scope=<session>` and `-1`, and it is strictly better than the
+current unbounded `expect` bump: a priority inflation with no deadline never self-corrects when the
+prediction was wrong, while a TTL does. It is also live in `sched_lm`'s forked simulator, so
+modelling it means modelling something that exists.
 
-- `retain_until: u64` -- a soft pin with a deadline
-- `evict_first: bool` -- the one-shot / cache-pollution mark
+The unified angle: a directive priced in the same ns/byte as everything else can be weighed against
+what it displaces. In a siloed stack a retention hint is advisory and unpriced.
 
-This is RFC-0001's `50; ttl=<window>; scope=<session>` and `-1`, and it is strictly better than
-the current unbounded `expect` bump, which was already flagged as a weakness: a priority
-inflation with no deadline never self-corrects when the prediction was wrong, while a TTL does.
-It is also the mechanism already live in `sched_lm`'s forked simulator with pinned-cache gauges,
-so modelling it means modelling something that exists.
+### 3.4 Oracle, regret, coupling
 
-The unified angle: a directive priced in the same ns/byte as everything else can be *weighed
-against what it displaces*. In a siloed stack a retention hint is advisory and unpriced -- the
-engine can honour it or not, and cannot compare it to its own eviction candidates.
+The methodological gap, and the reason every number so far carries a fairness caveat. Import three
+metrics from `sched_lm`:
 
-### 2.4 Oracle, regret, coupling
-
-The methodological gap, and the reason every number handed over so far has carried a fairness
-caveat. Import three metrics from `sched_lm`:
-
-- **Routing regret** -- `policy_cost − oracle_cost` computed on *the policy's own state*. This
-  separates decision quality from state quality, which arm-vs-arm comparison cannot.
-- **A clairvoyant eviction baseline** (`oracle-belady`), distinct from the routing oracle, so
-  ledger quality and placement quality are separable too.
-- **Coupled %** -- the fraction of decisions that change when evaluated globally rather than in silos.
-  To avoid conflating isolated physical hardware domains, coupling is reported along two orthogonal axes:
-  - **Memory Coupling % (DDR: Traditional Compute vs. FaaS):** How often the optimal retention,
-    eviction, or allocation of a FaaS snapshot changes when accounting for co-located service heaps
-    in host DDR. This directly tests whether soft floors beat hard cgroups for host memory.
-  - **Locality Coupling % (GPU Inference $\leftrightarrow$ CPU Tool Placement):** How often the
-    optimal placement of a tool execution changes based on which node/rack hosts the dependent
-    inference context and the network congestion ladder. This directly tests the value of
-    co-scheduling agent dataflow.
+- **Routing regret** -- `policy_cost - oracle_cost` computed on *the policy's own state*, which
+  separates decision quality from state quality.
+- **A clairvoyant eviction baseline** (`oracle-belady`), distinct from the routing oracle, so ledger
+  quality and placement quality are separable too.
+- **Coupled %** -- the fraction of decisions that change when evaluated globally rather than in
+  silos, reported on two orthogonal axes so isolated hardware domains are not conflated:
+  - **Memory coupling (host DDR):** how often optimal retention, eviction or allocation of a FaaS
+    snapshot changes once co-located service heaps and offload tiers are accounted for.
+  - **Locality coupling (topology):** how often optimal tool placement changes based on which node
+    or rack holds the dependent inference context.
 
 **Coupled % is the best available answer to "does unified beat siloed."** It measures how much a
-decision depends on state a silo would not have, directly and per request, with no baseline to
-tune and no arm to handicap. It also *bounds the unified advantage from above*: where coupling
-is low, a unified view provably cannot help much, and we should say so rather than hunt for a
-configuration where it does.
+decision depends on state a silo would not have, per request, with no baseline to tune and no arm
+to handicap. It also **bounds the unified advantage from above**: where coupling is low, a unified
+view provably cannot help much, and we should say so rather than hunt for a configuration where it
+does.
 
-### 2.5 Regime mix, including wait
+### 3.5 Regime mix, including wait
 
-`sched_lm` reports the share of requests resolved by wait / transfer / recompute. Polyproto
-reports fetched / rebuilt and has **no wait regime at all**, even though the congestion toll
-prices queueing implicitly. Adding the third regime makes the acquisition decision legible and
-comparable across the two prototypes.
+`sched_lm` reports the share of requests resolved by wait / transfer / recompute. Polyproto reports
+fetched / rebuilt and has **no wait regime**, though the congestion toll prices queueing
+implicitly. Adding the third makes the acquisition decision legible and comparable across the two
+prototypes.
 
-### 2.6 Divergence as a first-class signal
+### 3.6 Divergence as a first-class signal
 
-Once the engine's cache state is observed rather than owned (§1), the difference between what the
-ledger believes is resident and what the engine reports is itself a metric -- and the only
-honest measure of how well a directive-plus-belief architecture tracks reality. It should be
-reported, not smoothed away.
+Once cache state is observed rather than owned, the gap between what the ledger believes is
+resident and what the engine reports is itself the metric -- the only honest measure of how well a
+directive-plus-belief architecture tracks reality. Report it, do not smooth it:
 
-Formally, residency divergence at time $t$ for engine $e$ is published as:
-$$\text{Divergence}(e, t) = \frac{|\text{Belief Resident Blocks}(e) \setminus \text{Actual Resident Blocks}(e)|}{|\text{Belief Resident Blocks}(e)|}$$
+```
+Divergence(e, t) = |Belief(e) \ Actual(e)| / |Belief(e)|
+```
 
-Divergence spikes during three conditions:
-1. **Unobserved eviction cascades:** The engine drops blocks under burst decode pressure between micro-batches.
-2. **Telemetry drops:** A gap in the ZMQ `seq` counter indicates lost batches, immediately widening the
-   router's displacement cost uncertainty band.
-3. **Ignored retention directives:** The router issued a soft pin (`retain_until`), but the engine
-   evicted anyway under strict LRU pressure.
+It spikes on three things: eviction cascades the engine runs between batches; telemetry drops (a
+`seq` gap, which widens the router's uncertainty); and ignored retention directives. Tracking it
+isolates whether a routing mistake came from a bad cost model or from a belief that drifted.
 
-Tracking divergence allows Polyproto to isolate whether routing mistakes were caused by a bad cost
-scoring model or by an engine belief that drifted from physical reality.
+### 3.7 Confidence has to reach the argmin
+
+§1 requires inferred quantities to carry a confidence. §1's telemetry widens the uncertainty band
+on a sequence gap. §3.6 publishes divergence. **None of it changes a placement.** `Machine::plan`
+takes an argmin over expected cost, and an argmin over means is blind to variance: a node whose
+belief just went stale keeps whatever mean it last had and keeps winning on it.
+
+This bites hardest in exactly the situation the telemetry exists for. A node under memory pressure
+bursts evictions, overruns the ZMQ high-water mark and drops batches -- so to a mean-only score it
+becomes indistinguishable from a quiet node. The failure mode is not "the router learns slowly". It
+is **"the router herds onto whichever node has stopped reporting"**, because silence reads as calm.
+
+The fix is a scoring change:
+
+```
+cost(node) = E[cost] + lambda * sigma[cost]
+```
+
+with sigma widened by belief age, sequence-gap count and measured divergence. Lambda is the one new
+constant and §7's rule applies: sweep it, publish where conclusions flip, expect lambda = 0 --
+today's behaviour -- to be visibly worse under loss.
+
+Three things recommend it. It degrades to today's behaviour when sigma is small, so it costs
+nothing healthy. It makes staleness **self-limiting**: a node that stops reporting becomes
+progressively less attractive. And it turns an accident into a principle -- §1 measured that
+residency-greedy gets *better* as its view goes stale, because staleness happens to stop it
+concentrating. This is that effect on purpose, with a knob.
+
+### 3.8 Tenancy is soft, and the engine is tenant-blind
+
+The target is Kubernetes-shaped **soft** multi-tenancy: teams inside one company, separated by
+quota and policy, not mutually hostile. §1's cession has a consequence for that which is not
+obvious.
+
+**Ceding eviction cedes tenant fairness on that pool.** vLLM's block manager evicts LRU over block
+hashes. It has no tenant concept and cannot acquire one without becoming model-specific in exactly
+the way §1 forbids. So when one team's agent loop floods a shared engine with unique prefixes it
+evicts another team's warm blocks, and the orchestrator cannot choose otherwise: directives are
+advisory and the engine may ignore them. Under the old model this *was* expressible -- `TierPool`
+evicted by a GDSF priority the orchestrator controlled, and a tenant term could have gone into it.
+
+**What remains is the partition**, which lands tenancy back on a decision the orchestrator owns:
+
+| | one shared partition | a partition per tenant |
+|---|---|---|
+| cross-tenant prefix sharing | **yes**, the highest-value hit in this workload -- teams share system prompts and company context, which is why `work.rs` gives each tenant a shared prefix | no |
+| batch occupancy | one wide batch, `step_ns` amortised across tenants | fragmented; each tenant pays the weight-read floor |
+| noisy-neighbour isolation | **none**; LRU is tenant-blind | enforced by construction |
+
+Fairness on KV is purchasable only in units of partition, at a price in sharing and batch width.
+There is no hint-shaped workaround, and it makes **partition sizing a tenancy decision as well as a
+capacity one** (Phase 6).
+
+**The quota axis is missing.** `Quota` is per *class*: `band`, `floor` and `limit` are all
+`[_; BlobKind::N]`. Soft tenancy needs a second axis per tenant, and the two interact the standard
+way -- when a tenant is over quota and an under-floor class wants its bytes, one has to yield. The
+workload already carries tenants; the ledger does not. Same generator-side / scheduler-side split
+§4 describes for the taxonomy, same fix.
+
+One reframing falls out. The soft-floors-beat-hard-partitions result **is** this argument in
+miniature: a soft floor lets a class borrow idle capacity where a hard partition strands it, which
+is Kubernetes' requests-versus-limits trade one axis over. Read that way it is less a claim about
+memory arbitration than about **quota policy**, and it survives §1's correction better in that
+form.
+
+### 3.9 What the score already does
+
+Two objections arrive reliably enough to answer here rather than in review.
+
+**"Routing on prefix overlap causes herding."** Correct, and already priced. `Machine::plan` scores
+five named terms -- `acquire`, `displaced`, `handoff`, `engine`, `congestion` -- and
+`Engine::congestion_ns` charges what joining a batch does to *every sequence already in it*. In the
+recorded runs congestion alone changes 4.7% of placements and load 13.6%. §1 then measured the
+failure directly from the other side: residency-greedy improves as its view goes stale, because
+staleness is the only thing stopping it concentrating, while the scored arm shows no such effect.
+
+**"Use `alpha * PrefixOverlap - beta * TokenLoad`."** The same idea, weaker. A weighted sum needs
+alpha and beta tuned per deployment and they are not commensurable -- a unit of overlap and a unit
+of load have no exchange rate, so the tuning *is* the policy. The cost model denominates every term
+in **nanoseconds**, which have an exchange rate by construction. Nothing is tuned because nothing
+needs converting, which is also why a term can be added without re-tuning the others.
+
+### 3.10 A shared L2 tier, priced before it is built
+
+The acquire argmin is `min(resident, fetch from a peer, this node's NVMe spill, rebuild)`.
+Production stacks add a fifth option: a **cross-node NVMe pool** shared by every replica (SageMaker
+HyperPod mounts Curvine over FUSE for this), turning a cold replica's miss into a read rather than a
+recompute.
+
+It belongs in the cost model whether or not it is built, because its value is a crossover. A shared
+read is slower than a rack-local P2P pull and faster than recomputing a long prefill, so it wins in
+a band -- long contexts, cold replicas, peers that do not hold the prefix -- and loses outside it.
+Adding the term costs nothing; building the tier is infrastructure, and §6 names the way to ask:
+measure the residual regret that would justify it. Without the term, that regret is invisible and
+the question cannot be put.
+
+### 3.11 Tracing at the rate the ladder allows
+
+Standardised spans across the decision path (llm-d defines contracts like
+`gen_ai.latency.time_to_first_token` and `llm_d.kv_cache.lookup.cache_hit`) are worth adopting, and
+§2.2's rule decides where they go rather than taste.
+
+**One span per request**, recording the winning node and which of the five terms decided it: yes. A
+request costs hundreds of microseconds at minimum, so a span is lost in it, and this is the
+`observed` category doing its job. **One span per candidate inside the argmin**: no. That is the
+per-decision rate, where a bare syscall (97 ns) already exceeds an entire ring round trip.
+Instrumentation costing more than the decision it describes has stopped being instrumentation.
+
+Not a compromise -- the same rule that rejected `ext_proc`. An orchestrator that gets this wrong for
+telemetry has reintroduced as observability precisely the overhead §2 removed as architecture.
 
 ---
 
-## 3. The taxonomy as a scheduler input
+## 4. The taxonomy as a scheduler input
 
-[`taxo.md`](taxo.md) is ten patterns across four dimensions. That is right as analysis and wrong
-as an engine input: the scheduler needs a handful of fields it can act on, not a pattern name.
+[`taxo.md`](taxo.md) is ten patterns across four dimensions. That is right as analysis and wrong as
+an engine input: the scheduler needs a handful of fields it can act on, not a pattern name.
 
 ### Four dimensions, four fields
 
 | dimension | scheduler field | status |
 |---|---|---|
-| Control flow | `flow: None \| Declared \| Predicted(dist) \| Fanout(n)` | 3 of 4 built; **Predicted** is §2.2 |
+| Control flow | `flow: None \| Declared \| Predicted(dist) \| Fanout(n)` | 3 of 4 built; **Predicted** is §3.2 |
 | Knowledge grounding | which blob classes, and their sharing shape | KV / snapshot / weights built; **RAG missing** |
-| State and time horizon | `retention: evict_first \| until(deadline) \| durable` | **missing**; §2.3 covers the first two |
-| Authority to act | `authority: ReadOnly \| DraftOnly \| SideEffecting` + `pause_tolerance` | **missing**; drives speculative execution & preemption |
+| State and time horizon | `retention: evict_first \| until(deadline) \| durable` | **missing**; §3.3 covers the first two |
+| Authority to act | `authority: ReadOnly \| DraftOnly \| SideEffecting` + `pause_tolerance` | **missing**; drives speculation and preemption |
 
 Each of the ten patterns becomes a named preset over those fields, the way `sched_lm` takes
 `--mix tool=0.5,rag=0.3,oneshot=0.2`. Three consequences:
 
-**Control flow maps one-to-one onto machinery that already exists.** Single-call is a plain
-request; fixed multi-step is the declared flow polyproto has; parallel/delegated is the
-fan-out; dynamic multi-step -- the defining agentic case -- is definitionally the one that cannot
-be declared and must be predicted. That explains why declared hints felt natural: they are the
-*fixed*-pipeline case, and the prototype has been testing the easy half of the dimension.
+**Control flow maps onto machinery that exists.** Single-call is a plain request; fixed multi-step
+is the declared flow; parallel/delegated is the fan-out; dynamic multi-step -- the defining agentic
+case -- is definitionally the one that cannot be declared and must be predicted. That is why
+declared hints felt natural: they are the *fixed*-pipeline case, and the prototype has been testing
+the easy half of the dimension.
 
-**RAG-grounded is a genuinely missing class.** Retrieved chunks are shared across *sessions*
-with Zipf popularity, not chain-structured like a KV prefix, so they evict differently from
-anything currently modelled and they contend with KV for the same pool. `sched_lm` models this
-(`--rag-docs`, `--rag-zipf`); polyproto has no equivalent. It is the cheapest high-value addition
-to the workload, and it is the one grounding mode that changes the ledger's contention shape.
+**RAG-grounded is genuinely missing.** Retrieved chunks are shared across *sessions* with Zipf
+popularity, not chain-structured like a KV prefix, so they evict differently from anything modelled
+and contend with KV for the same pool. `sched_lm` models this (`--rag-docs`, `--rag-zipf`);
+polyproto has no equivalent. Cheapest high-value addition, and the one grounding mode that changes
+the ledger's contention shape.
 
 **Durable memory breaks an invariant.** Every class in the ledger is evictable at a priced cost.
-Durable state must never be *lost*, only demoted -- a correctness constraint, not a cost
-tradeoff. That exists today only as `ServiceHeap`'s serving pin, and generalising it means the
-ledger needs a class of state whose eviction is forbidden rather than expensive.
+Durable state must never be *lost*, only demoted -- a correctness constraint, not a cost tradeoff.
+That exists today only as `ServiceHeap`'s serving pin, and generalising it means a class of state
+whose eviction is forbidden rather than expensive.
 
-### Authority to act drives speculative scheduling, preemption, and idempotency
+### Authority drives speculation, preemption, and idempotency
 
-Dismissing authority as an audit or governance label leaves a major orchestrator capability
-untapped. In agent workflows, **authority directly sets what the scheduler may speculatively
-execute, branch, preempt, or checkpoint**:
+Authority is not an audit label. It sets what the scheduler may speculatively execute, branch,
+preempt or checkpoint:
 
-1. **`ReadOnly` (Idempotent / Informational):**
-   - *Workload shape:* Search queries, database reads, code analysis, document summarization.
-   - *Scheduling action:* **Speculative dispatch and parallel pre-warming.** When turn $N$ predicts
-     a tool call with probability $P$, the orchestrator can speculatively pre-warm the tool microVM
-     or even dispatch the query concurrently with the final decode tokens. If the model veers away
-     or cancels, the speculative branch is aborted with zero rollback penalty.
-2. **`DraftOnly` (Soft / Staged Output):**
-   - *Workload shape:* Draft responses, staged code patches, proposed calendar invites.
-   - *Scheduling action:* **Burstable scheduling with zero-compensation preemption.** These tasks
-     can safely occupy burstable slack in host DDR or low-priority engine slots. If high-priority
-     work arrives, they can be immediately preempted, evicted, or rescheduled without distributed
-     transaction sagas.
-3. **`SideEffecting` (High Authority / Material Action):**
-   - *Workload shape:* Financial transactions, database mutations, external webhooks, deployments.
-   - *Scheduling action:* **Strictly non-speculative, atomic gang reservation, and non-preemptibility.**
-     Speculative dispatch is strictly forbidden. The orchestrator must enforce synchronous durable
-     checkpointing *prior* to dispatch, and issue non-revocable resource leases so the execution cannot
-     be torn down mid-flight.
-4. **Human-approved execution (unbounded pauses):**
-   - A task awaiting human approval holds state for minutes to days. Once an action hits a human gate,
-     the orchestrator demotes the entire execution context out of expensive HBM and host DDR into
-     cold storage (NVMe/object store), releasing active memory until the external approval callback arrives.
+1. **`ReadOnly`** (search, reads, analysis, summarisation) -> **speculative dispatch and parallel
+   pre-warming.** When turn N predicts a tool call with probability P, the orchestrator can pre-warm
+   the tool microVM or dispatch the query concurrently with the final decode tokens. If the model
+   veers away, the branch aborts with zero rollback.
+2. **`DraftOnly`** (drafts, staged patches, proposed invites) -> **burstable scheduling with
+   zero-compensation preemption.** These can occupy burstable slack in host DDR or low-priority
+   engine slots and be evicted immediately when high-priority work arrives, with no saga.
+3. **`SideEffecting`** (transactions, mutations, webhooks, deployments) -> **strictly
+   non-speculative.** Durable checkpoint before dispatch, non-revocable leases so execution cannot
+   be torn down mid-flight.
+4. **Human-approved** (unbounded pauses) -> demote the whole execution context out of HBM and host
+   DDR into cold storage until the approval callback arrives.
 
 ### Generator-side truth, scheduler-side inference
 
-The structural recommendation: **the taxonomy exists twice, and telemetry is the only bridge.**
-
-- The **workload generator** uses the full taxonomy as ground truth to synthesise traces.
-- The **scheduler never sees the class.** It infers a profile from observables.
-
-Then classification accuracy, and the cost of getting it wrong, become measurable -- which is
-what `class_aware` plus `ToolGapIndex` do in `sched_lm`, and what polyproto cannot do today
-because its `Request` carries the truth. This is what turns `taxo.md` from a document into the
-experiment's independent variable.
+**The taxonomy exists twice, and telemetry is the only bridge.** The workload generator uses the
+full taxonomy as ground truth to synthesise traces. The scheduler never sees the class; it infers a
+profile from observables. Then classification accuracy, and the cost of getting it wrong, become
+measurable -- what `class_aware` plus `ToolGapIndex` do in `sched_lm`, and what polyproto cannot do
+while its `Request` carries the truth. This is what turns `taxo.md` into the experiment's
+independent variable. The same split applies to tenancy (§3.8).
 
 ### Per-pattern coupling is the falsifier
 
-Run coupled % per taxonomy cell across both dimensions:
-- **Memory Coupling (DDR):** tests how much traditional compute and FaaS gain from sharing host RAM.
-- **Locality Coupling (Topology):** tests how much tool and agent placement gains from knowing where
-  the GPU inference engine and KV context reside.
+Run coupled % per taxonomy cell on both axes. The output is a two-column table saying, for each
+pattern, whether a unified orchestrator can help at all.
 
-The output is a two-column table saying, for each workload pattern, whether a unified orchestrator
-can help at all. Expected shape, stated in advance so it can be wrong: batch inference and one-shot
-generation should show near-zero coupling on both axes (independent requests, nothing to co-decide);
-multi-agent and long-running agents should show high locality coupling (shared context, cross-node
-dataflow, atomic admission) and moderate-to-high memory coupling on the host. If that prediction
-fails, the thesis is narrower than claimed and the document should say so.
+Expected shape, stated in advance so it can be wrong: batch inference and one-shot generation show
+near-zero coupling on both axes (independent requests, nothing to co-decide); multi-agent and
+long-running agents show high locality coupling (shared context, cross-node dataflow, atomic
+admission) and moderate-to-high memory coupling on the host. If that fails, the thesis is narrower
+than claimed and this document should say so.
 
 ---
 
-## 4. Emergent properties: measured, and testable
+## 5. Emergent properties
 
-An advantage is *emergent* here if no silo can produce it independently and it is not merely a
-hint away. Five are measured, clarified by the separation between host memory arbitration and
-topological dataflow placement; two are proposed.
+An advantage is *emergent* if no silo can produce it independently and it is not merely a hint
+away. Five are simulated; two rest on the measured ladder but are not yet run end to end; five are
+proposed.
 
-**Measured within Host DDR (Orchestrator-Owned Memory):**
+**On the first five:** simulated, not measured, on a model since found wrong in more than one way.
+Treat each as what is expected to survive re-running rather than what has been re-run, and as
+directional rather than sized. The properties worth most are the ones whose *existence* does not
+depend on a constant.
 
-1. **A cross-class DDR shadow price.** One `marginal_price` for host DDR balances microVM warm pools
-   (`Snapshot`) against accelerator offload tiers (`LMCache`) and local services. Fixed budgets cost
-   4.0% service and 2.7pp goodput; oracle-tuned on a single node, soft floors beat hard cgroup
-   partitions by 32%. While multi-GPU production hosts will rarely co-locate heavy non-AI services,
-   soft floors excel where co-located tool cells compete directly with host-side KV offload.
-2. **Placement options that static host partitioning forecloses.** With soft floors the score
-   ships 90% of tool calls to idle host DDR and gets a 53% warm rate; with hard pools that host's
-   slice is capped no matter how much memory sits free beside it, the option disappears, and the
-   warm rate halves to 19%. This is about `Snapshot` cells in host DDR -- orchestrator-owned --
-   and survives intact because it does not depend on HBM authority.
+**Within host DDR (orchestrator-budgeted memory).** Budgeted, not owned: the orchestrator sizes the
+pool and sets its floors, but one occupant it arbitrates -- the engine's offload tier -- is
+engine-owned. That is why these survive the correction. The decision measured is a **budget**, and
+the budget stays the orchestrator's whoever fills it.
 
-**Measured across Topology (Dataflow, Macro-Capacity, and Placement):**
+1. **A cross-class DDR shadow price.** One `marginal_price` balances microVM warm pools against
+   offload tiers and local services. Fixed budgets cost 4.0% service and 2.7pp goodput; soft floors
+   beat hard cgroup partitions by 32%. Multi-GPU hosts rarely co-locate heavy non-AI services, but
+   soft floors excel where tool cells compete directly with host-side KV offload.
+2. **Placement options static partitioning forecloses.** With soft floors the score ships 90% of
+   tool calls to idle host DDR for a 53% warm rate; with hard pools that slice is capped however
+   much memory sits free beside it and the warm rate halves to 19%. This concerns `Snapshot` cells
+   -- orchestrator-owned -- so it does not depend on HBM authority.
 
-3. **Congestion and residency in one argmin.** Neither an inference router nor a FaaS control
-   plane can price "place the tool call as close to the active GPU context as possible, unless the
-   link is congested or local host memory is full". Measured consequence: the tool-placement decision
-   **inverts** between the unpressured and memory-bound regimes, and again at region distance.
-4. **Cross-workload atomic admission.** All-or-nothing placement of a fan-out across nodes is
-   not expressible per request. Where it binds: +22% fan-outs completed, inference stall −10%.
+**Across topology.**
+
+3. **Congestion and residency in one argmin.** Neither an inference router nor a FaaS control plane
+   can price "place the tool call near the active GPU context unless the link is congested or local
+   memory is full". Measured consequence: the tool-placement decision **inverts** between
+   unpressured and memory-bound regimes, and again at region distance.
+4. **Cross-workload atomic admission.** All-or-nothing placement of a fan-out across nodes is not
+   expressible per request. Where it binds: +22% fan-outs completed, inference stall -10%.
 5. **One currency for host hints.** A prewarm, a retention directive and an eviction priced in the
    same host DDR units can be traded against each other. A siloed hint is advisory and unpriced.
 
-**Proposed, and the reason to do §2 and §3:**
+**Measured at the boundary, not yet end to end (§2).**
 
-6. **Learned cross-class retention.** "This agent returns to this tool in ~800 ms, confidence
-   0.7" driving a *FaaS warm-cell* retention decision in host DDR, priced against what holding it
-   displaces. A silo can receive that as a hint; it cannot weigh it.
-7. **Authority-driven speculative scheduling.** Pre-executing idempotent (`ReadOnly`) tool calls
-   concurrently with model decode, and scheduling `DraftOnly` tasks into burstable capacity with
-   zero-compensation preemption rights.
-8. **Two-dimensional coupling as a published quantity.** Not an advantage but the measure of one,
-   separating host memory efficiency from topological dataflow affinity.
+6. **One data path serving two denominators.** Control-plane overhead is a fraction set by the work
+   being scheduled; the **crossover** is its durable form (§2.3). An inference-only stack buys a
+   proxy out of the decode budget; a FaaS control plane cannot. **Only a unified orchestrator is
+   forced to pick one path for both**, which makes "integrate, do not proxy" a consequence of
+   unification rather than a preference.
+7. **Extension cost as an expressiveness bound.** A hook at 49 us must be a constant attached to the
+   request; at 0-232 ns it can be a function of each candidate inside the argmin. The same ladder
+   prices trust. No silo needs this ordering, because no silo is simultaneously a scheduler and a
+   data plane.
 
-Worth stating plainly: the largest defensible effects are **topological dataflow co-placement**,
-**macro-orchestration of model weights and gang fan-outs**, and **targeted host DDR multiplexing**
-between offload tiers and local tool snapshots—not magical cross-hardware arbitration of HBM bytes.
-Once we stop pretending the orchestrator allocates HBM KV blocks, what remains is an orchestrator that
-solves three genuine problems existing stacks fail at: joint dataflow placement across network boundaries,
-macro-scale capacity and gang coordination, and authority-aware speculative execution. Phase 3 and
-Phase 7 test whether that advantage holds up under rigorous scrutiny.
+**Proposed, and the reason to do §3 and §4.**
+
+8. **Learned cross-class retention.** "This agent returns to this tool in ~800 ms, confidence 0.7"
+   driving a FaaS warm-cell retention decision priced against what holding it displaces. A silo can
+   receive that as a hint; it cannot weigh it.
+9. **Authority-driven speculative scheduling.** Pre-executing `ReadOnly` tool calls concurrently
+   with decode, and scheduling `DraftOnly` work into burstable capacity with zero-compensation
+   preemption.
+10. **Joint prefill/decode pairing and ratio.** Disaggregation as a two-member gang with a
+    direction, plus the fleet ratio behind it (§2.5). A sidecar picks a prefiller from a list.
+11. **Tenant fairness across a tenant-blind engine.** An engine evicts LRU and cannot see tenants. A
+    siloed router buys fairness only by partitioning, losing cross-tenant prefix sharing and batch
+    width. An orchestrator that both sizes partitions and routes into them can trade the two
+    deliberately -- shared where prefixes overlap and load shapes are compatible, separated where
+    one tenant is bursty enough to evict the others (§3.8).
+12. **Two-dimensional coupling as a published quantity.** Not an advantage but the measure of one.
+
+Plainly: the largest defensible effects are **topological dataflow co-placement**,
+**macro-orchestration of weights, partitions and gangs**, and **targeted host DDR multiplexing** --
+not cross-hardware arbitration of HBM bytes. Once we stop pretending the orchestrator allocates KV
+blocks, what remains is a system solving three problems existing stacks fail at: joint dataflow
+placement across network boundaries, macro capacity and gang coordination, and authority-aware
+speculative execution. Phases 3 and 7 test whether that holds.
 
 ---
 
-## 5. Reading `sched_lm`
+## 6. Reading `sched_lm`
 
-### What it gets right, and worth importing
+### Worth importing
 
 - **The argmin *is* the decision.** `cost.py` computes `wait + transfer + prefill(missing)` and
-  takes the minimum; the policy is not a heuristic layered over a cost model, it is the cost
-  model. Polyproto arrived at the same shape independently in `Machine::plan`, which is decent
-  evidence the primitive is right.
-- **Regret on the policy's own state.** Separating routing quality from cache-state quality is a
-  subtle decomposition and the reason its comparisons need no tuned baseline.
+  takes the minimum; the policy is the cost model, not a heuristic layered over one. Polyproto
+  arrived at the same shape independently in `Machine::plan`.
+- **Regret on the policy's own state.** Separating routing quality from cache-state quality is why
+  its comparisons need no tuned baseline.
 - **`RequestView`.** Refusing the policy access to ground truth, by type.
 - **Coupled %.** The best single metric for the unified question.
 - **Learning from timing metadata alone.** `ToolGapIndex` needs no new instrumentation, which is
-  what makes it adoptable in a real stack.
+  what makes it adoptable.
 - **Deadline-scoped directives.** `ttl` and `scope` rather than an unbounded priority bump.
-- **Using residual regret to justify infrastructure before it is built.** The transfer regime is
-  not expressible in stock llm-d, so the sim's job is to show the regret that would justify a KV
-  connector tier. That is the correct use of a simulator, and it is the posture this prototype
-  should copy.
-- **A promotion path.** Tier 0 config / Tier 1 plugin / Tier 2 serving-stack change, so a
+- **Using residual regret to justify infrastructure before it is built.** The transfer regime is not
+  expressible in stock llm-d, so the sim's job is to show the regret that would justify a KV
+  connector tier. That is the correct use of a simulator and the posture this prototype should copy
+  -- for the shared L2 tier (§3.10) and for a request-path ring (§2.2).
+- **A promotion path.** Promotion tier 0 config / tier 1 plugin / tier 2 serving-stack change, so a
   finding has somewhere to go.
 
 ### Where a unified system needs more
 
-- **It is inference-only.** One workload class in the cost model: no warm pool, no service
-  replicas, no cross-class contention -- so the effects that dominate every result here are
-  invisible to it by construction.
-- **One pool per node.** No HBM/DDR split and no offload tier priced as a recovery path, so
-  eviction cannot be priced as `min(rebuild, promote, fetch)`. That mispricing was worth two
-  orders of magnitude in the displacement term here before it was fixed.
-- **No refusal in the argmin.** Load shed is tallied in the live stack; the offline cost model
-  never declines a request, so admission is not part of the decision.
+- **It is inference-only.** One workload class in the cost model: no warm pool, no service replicas,
+  no cross-class contention, so the effects dominating every result here are invisible to it.
+- **One pool per node.** No HBM/DDR split and no offload tier priced as a recovery path, so eviction
+  cannot be priced as `min(rebuild, promote, fetch)`. That mispricing was worth two orders of
+  magnitude here before it was fixed.
+- **No refusal in the argmin.** Load shed is tallied in the live stack; the offline cost model never
+  declines a request, so admission is not part of the decision.
 - **Unpriced retention.** A directive is per-request and advisory, with no global shadow price to
   weigh a pin against what it evicts.
 - **No atomic multi-worker admission.** Nothing expresses a fan-out that must be placed whole.
-- **TTFT-only objective.** This is the transferable warning, learned the hard way here: once
-  decode cost depends on batch occupancy, **placement moves execution and not just waiting**, and
-  a wait-only metric misranks policies. Polyproto's headline had to move from stall to
-  end-to-end service time for exactly this reason, and stall is TTFT's analogue. Any policy
-  comparison on TTFT alone is exposed to the same inversion, and adding goodput alongside it
-  catches the related trap where an arm looks fast because it refused the expensive work.
+- **TTFT-only objective.** The transferable warning, learned the hard way here: once decode cost
+  depends on batch occupancy, **placement moves execution and not just waiting**, and a wait-only
+  metric misranks policies. Polyproto's headline had to move from stall to end-to-end service time
+  for exactly this reason, and stall is TTFT's analogue. Adding goodput alongside catches the
+  related trap where an arm looks fast because it refused the expensive work.
 
 ### The naming collision
 
-`sched_lm` uses Tier 0/1/2 for *promotion effort into production llm-d*. Polyproto uses
-Tier 1/Tier 2 for *information-sharing versus joint-decisions*. Same words, orthogonal axes.
-One should be renamed before the two vocabularies meet: **promotion tier** and **coupling tier**
-would do.
+`sched_lm` uses Tier 0/1/2 for *promotion effort into production llm-d*; polyproto uses Tier 1/2 for
+*information-sharing versus joint decisions*. Same words, orthogonal axes. **This document qualifies
+every use**: *promotion tier* for effort-to-ship, *coupling tier* for how tightly a decision is
+joined. The two meet inside §2 alone -- a shared ring is promotion tier 2, P/D pairing is coupling
+tier 2 -- which is what makes the qualification a rule rather than a suggestion.
 
 ---
 
-## 6. Constants are a method, not a debt
+## 7. Constants are a method, not a debt
 
 This prototype is for understanding architecture and tradeoffs, so modelled constants are
-legitimate. The discipline that makes them legitimate is **sensitivity, not precision**:
+legitimate. What makes them legitimate is **sensitivity, not precision**:
 
-> For every constant, know which conclusions are robust to it across its plausible range, and
-> which flip. Publish the ones that flip.
+> For every constant, know which conclusions are robust to it across its plausible range, and which
+> flip. Publish the ones that flip.
 
-This has already bitten once and is worth generalising from. The FaaS snapshot cost was a
-cold-container constant (200 ms / 32 MiB, linear); replacing it with a Firecracker lazy-restore
-model (~9 ms, roughly flat in image size) **inverted the ns/byte ordering** and reversed a
-headline about which bytes are cheapest in the machine. The constant was not slightly wrong; the
-conclusion depended on it entirely.
+This has bitten three times.
 
-So the rule for this document's proposals: a result may rest on constants, but it must come with
-the range over which it holds. Where a crossover is the finding -- KV ships within a rack and is
-rebuilt across a zone; tool calls go local at region distance -- the crossover's *position* moves
-with the constants while its *existence* does not, and the existence is the claim. Where an
-ordering is the finding, it is only worth as much as the gap between the constants that produce
-it.
+**A wrong value.** The FaaS snapshot cost was a cold-container constant (200 ms / 32 MiB, linear);
+replacing it with a Firecracker lazy-restore model (~9 ms, roughly flat in image size) **inverted
+the ns/byte ordering** and reversed a headline about which bytes are cheapest. The conclusion
+depended on it entirely.
+
+**The same constant, still untested.** The restore model is `4 ms + bytes * 0.15 * 1.0 ns/byte` for
+UFFD page-in -- but `UFFDIO_COPY` (a major fault that copies) and `UFFDIO_CONTINUE` (a minor fault
+mapping a page already in the page cache) differ by enough to move that slope several-fold, and work
+restoring snapshots through hardware decompression or overlay VMAs reports 3.7-4.3x cold-start
+improvements over the naive path. Since §5's second property is an *ordering* claim, and orderings
+are worth only the gap between the constants producing them, any result ranking snapshot bytes
+against KV bytes must be published across that range.
+
+**A wrong label, which is worse.** `exec_ns` is chosen -- `FAAS_EXEC_MIN_NS + rng.below(SPAN)` --
+and `residency-ledger.md` says so under *Modelled, not measured*. Its denominator table nonetheless
+prints "warm FaaS invocation (**measured**: 129 us)", and §2 built an argument on that label before
+checking. A wrong constant gets sensitivity-tested; one wearing the word *measured* is exempted
+from the test by its own label. Hence: **provenance is part of the number.** Any figure quoted here
+names where it came from, or it is not quoted.
+
+So the rule for this document's proposals: a result may rest on constants, but it must come with the
+range over which it holds. Where a crossover is the finding -- KV ships within a rack and is rebuilt
+across a zone; the data path binds below a millisecond -- the crossover's *position* moves with the
+constants while its *existence* does not, and the existence is the claim. Where an ordering is the
+finding, it is worth only the gap between the constants producing it.
 
 ---
 
-## 7. Feasibility
+## 8. Feasibility
 
-### Is the correction tractable at all?
+### Is the correction tractable?
 
-Yes, and more cheaply than the size of the claim suggests, for one reason: **the ownership
-boundary coincides with a partition the code already has.** `accelerated(kind)` exists in
-`cache.rs` to route classes between HBM and DDR, and it separates exactly the engine-owned classes
-from the orchestrator-owned ones. Every site that needs to change is a site that already asks that
-question, or is reachable from one.
+Yes, more cheaply than the size of the claim suggests -- though not because the ownership boundary
+"coincides with a partition the code already has". It does not. **`accelerated()` is a tier
+predicate, not an ownership one**, and §1's table cuts across it twice.
 
-The affected surface is small and concentrated:
+The useful half survives: `accelerated()` still *locates* nearly every site that has to change,
+because a site asking which pool a class lives in is about to assume something about who controls
+it. The two exceptions are narrow and named, and naming them is what Phase 1's type is for -- the
+compiler still generates the work list, it just needs a two-axis predicate to generate it correctly.
 
 | area | what changes | scale |
 |---|---|---|
-| `cache.rs` | HBM `TierPool` becomes an engine-cache *model* with its own policy; host pools keep current semantics | the bulk of it |
-| `machine.rs` | residency reads go through a belief; `could_admit` for KV disappears; displacement for KV becomes an estimate | moderate, mechanical |
-| `main.rs` | new arms (engine honours / ignores directives; precise / approximate index) | additive |
-| `work.rs` | unaffected by ownership; changes only for §2.2 and §3 | none for this correction |
-| `engine.rs` | gains the cache alongside the batch model -- they belong to the same component | small |
+| `cache.rs` | HBM `TierPool` splits into an orchestrator-sized partition and an engine-cache *model* inside it; `Snapshot` and `ServiceHeap` keep current semantics, offloaded KV does not | the bulk of it |
+| `machine.rs` | residency reads go through a belief; `could_admit` for KV coarsens; displacement for KV becomes an estimate; the score gains a variance term (§3.7) | moderate, mechanical |
+| `main.rs` | new arms (engine honours / ignores directives; precise / approximate index; data path) | additive |
+| `work.rs` | unaffected by ownership; changes for §3.2 and §4 | none for this correction |
+| `engine.rs` | gains the cache alongside the batch model -- same component | small |
+| `boundary.rs` | two new rungs, an `ext_proc`-shaped callout and a WASM invocation (§2.7) | small, independent of everything else |
 
-### What gets harder, and what might not survive
+### What gets harder
 
-Honest list, worst first.
+Worst first.
 
-1. **Admission control over inference state disappears.** An engine evicts and recomputes; it does
-   not refuse for lack of KV. `Admission::Pending` stops being reachable for `KvBlock` and
-   `WeightShard`. Three things currently lean on it:
-   - `Hierarchy::could_admit`, hence **gang feasibility**. A fan-out can no longer be refused for
-     HBM reasons. It can still be refused on host memory and on engine slots, so the primitive
-     survives with a different binding constraint -- but the measured +22% needs re-earning.
-   - `can_satisfy`, hence the **downstream-aware gate**. Same treatment: the gate becomes a
+1. **Per-block admission control over inference state disappears.** An engine evicts and recomputes;
+   it does not refuse for lack of KV. `Admission::Pending` stops being reachable for an individual
+   `KvBlock` or `WeightShard`. What it does *not* lose is the partition: the orchestrator sized it,
+   so its capacity stays an owned fact and a byte- or token-depth check against it stays
+   authoritative. The loss is **granularity, not authority**. Three things lean on the granularity:
+   - `Hierarchy::could_admit`, hence **gang feasibility**. A fan-out can no longer be refused block
+     by block, only against the partition budget, host memory and engine slots -- so the primitive
+     survives on a coarser, weaker test, and the +22% needs re-earning on it.
+   - `can_satisfy`, hence the **downstream-aware gate**, which becomes a partition-budget,
      queue-depth and host-memory judgement.
-   - **Goodput as an outcome.** Refusals for inference move to the router, so the goodput numbers
-     change shape even where they do not change size.
-2. **Displacement becomes an externality, not a decision.** Routing a request to a node still
-   *causes* the engine to evict something there; the orchestrator simply does not choose what. So
-   the term stays in the score but as an estimate from observed eviction pressure, which is noisier
-   and lagged. The regret-discounted, recovery-aware pricing built earlier applies unchanged to
-   host classes and becomes an inference for engine classes.
-3. **Two sources of truth, permanently.** What the engine holds and what the router believes are
-   different objects that drift. That is not a defect to engineer away; it is the architecture, and
-   the drift is a metric (§2.6).
-4. **The unified memory thesis may not survive.** Named plainly in §4. If the arbitration effects
-   vanish once the engine allocates its own memory, what is left is a router with good cost
-   accounting, and the honest report is that the ledger's value was an artifact of assumed
-   authority. Phase 3 is designed to be able to return that answer.
+   - **Goodput as an outcome.** Refusals for inference move to the router, so the numbers change
+     shape even where they do not change size.
+2. **Tenant fairness on KV goes with it** (§3.8). LRU is tenant-blind, so a noisy neighbour on a
+   shared partition is unpreventable and isolation costs a partition. That consequence was invisible
+   until the tenancy model was stated.
+3. **Displacement becomes an externality, not a decision.** Routing still *causes* the engine to
+   evict; the orchestrator does not choose what. The term stays in the score as an estimate from
+   observed eviction pressure -- noisier and lagged, which is what §3.7 exists to handle.
+4. **Two sources of truth, permanently.** What the engine holds and what the router believes drift.
+   Not a defect to engineer away; it is the architecture, and the drift is a metric (§3.6).
+5. **The cross-class arbitration thesis may not survive.** If the arbitration effects vanish once
+   the engine allocates its own memory, what remains is a router with good cost accounting, and the
+   honest report is that the ledger's value was an artifact of assumed authority. Phase 3 can return
+   that answer. (Called *that*, not "the unified memory thesis": in this project "unified memory"
+   means the **hardware** -- Apple silicon's single pool against the datacenter's split -- and two
+   meanings for one phrase is how a hardware caveat and an architectural thesis get read as each
+   other.)
+6. **Owning the path means owning HTTP.** §2.6 lists this worst-first, and it is the one item there
+   that is engineering rather than architecture: streaming backpressure, HTTP/2 flow control, retry
+   and timeout semantics, a permanent CVE surface. It threatens no result here -- the simulator
+   charges seam costs from a measured ladder and never parses a byte of HTTP -- but it is the
+   largest gap between this design being right and being shipped.
 
 ### What gets easier
 
-- **The engine cache is simpler than a `TierPool`.** LRU over block hashes, no quotas, no bands,
-  no floors, no refusal. Modelling vLLM means modelling *less* policy, not more.
+- **The engine cache is simpler than a `TierPool`.** LRU over block hashes: no quotas, bands,
+  floors or refusal. Modelling vLLM means modelling *less* policy, not more.
 - **Model agnosticism becomes checkable.** Once the orchestrator cannot see inside the engine, the
   interface it consumes is small enough to write down: capacity, hit/miss/eviction counts, queue
-  depth, load and unload cost per model, and a directive channel. Anything the scheduler needs
+  depth, load and unload cost per model, declared context window, and a directive channel. Anything
   beyond that list is a model-specific dependency, and the compiler enforces the list.
-- **Weights become orchestration rather than caching** (phase 6), which is both more realistic and
-  a capability no arm has today.
+
+  Context window earns its place because it is *declared metadata*, like size and load time, and
+  Phase 6's heterogeneous fleet needs it: dispatching a 200k-token prompt to a 32k model produces a
+  failure and a retry costing more than the placement saved. It also marks where the list stops.
+  Routing by **model accuracy** needs per-model, per-workload evaluation, which is model-specific by
+  definition and is what §1 gave up KV ownership to avoid. A capability *gate* is in scope; a
+  quality *ranking* is not, and the test is whether the engine can state the fact about itself.
+- **Weights become orchestration rather than caching** (Phase 6) -- more realistic, and a capability
+  no arm has today.
+
+### Security: what the architecture answers, what a prototype defers
+
+This is a prototype, so production hardening is out of scope. What is worth recording is which
+threats are **architectural** -- they would change a decision here -- and which are operational.
+Reviewing the standard Kubernetes vulnerability classes, most are architectural and already
+answered, which is evidence for decisions taken on other grounds.
+
+| threat class | k8s precedent | status here |
+|---|---|---|
+| annotation / header injection into a proxy config | Ingress-NGINX RCE via unsanitised annotations templated into `nginx.conf` | **structurally absent.** The vector is *config templating*; §2 has no templating step, only typed in-process values |
+| admission-webhook SSRF and redirect following | api-server following redirects into internal networks | **not applicable.** The webhook callout is the `ext_proc` shape §2 removes |
+| untrusted workload escaping its sandbox | `runc` fd leaks, overlayfs and page-cache bugs | **already the thesis.** `README.md` makes microVMs the native abstraction because containers isolate poorly; §2.6 tiers extensions by trust |
+| unauthenticated peer data channels | endpoint and ExternalIP hijacking | **deferred**, and the only one |
+
+One accidental benefit, from a decision made on other grounds: §1 chose **ZMQ over Unix domain
+sockets**. A UDS has no network surface -- it is scoped by filesystem permissions and unreachable
+off-node -- so the telemetry channel needs no transport authentication to be un-spoofable
+remotely. `tcp://` would have needed mTLS to reach the same place.
+
+The tenancy model is **soft** multi-tenancy (§3.8), which moves the question from confidentiality to
+**fairness** -- a scheduling problem, answered in §3.8, not here. Two residuals tracked rather than
+fixed:
+
+- **Cross-node transport is unauthenticated.** NIXL/RDMA peer pulls and cross-node control traffic
+  assume a trusted network. Under soft tenancy that is defensible for a prototype -- the threat is a
+  compromised node, not a hostile tenant -- but it is the boundary that needs workload-bound
+  identity first, and adding it changes a measured quantity: a handshake and per-message
+  authentication land on the P2P path §2.5 keeps out of the data plane precisely because it is
+  cheap.
+- **Prefix sharing is a timing channel between tenants.** A cache hit is observable as faster TTFT,
+  so one team can in principle detect that another sent a given prefix. Under soft tenancy that is
+  an accepted and favourable trade -- cross-tenant sharing of system prompts is the highest-value
+  hit in this workload. It stops being acceptable for a regulated subset, which wants an opt-out
+  rather than a global policy: a cache scope on the request, of the shape RFC-0001's
+  `scope=<session>` already has (§3.3). Cheap, and worth adding before a result depends on sharing
+  being universal.
 
 ---
 
-## 8. Phases
+## 9. Phases
 
-Each phase compiles, runs, and ends with a number. None requires a later one. The measurement
-apparatus comes before the thing it measures, so the phase that may invalidate the thesis is not
-also the phase that invents its own scoring.
+Each phase compiles, runs, and ends with a number. The measurement apparatus comes before the thing
+it measures, so the phase that may invalidate the thesis is not also the phase that invents its own
+scoring.
 
-### Phase 1 -- Name the boundary in types, change no behaviour
+### Phase 0 -- Price the seams
 
-Introduce `Ownership { Orchestrator, Engine }` derived from `BlobKind`, and route every ledger
-access through it while preserving today's semantics exactly. Engine-owned state becomes reachable
-only through one narrow interface.
+Extend `boundary.rs` with the two rungs the ladder is missing: an **`ext_proc`-shaped callout**
+(gRPC with header-mutation semantics, not bare unary) and a **WASM invocation** through a real
+sandbox. Publish the per-decision cost of a policy hook at each isolation level.
 
-- **Deliverable:** results byte-identical to today, plus a count of call sites that assume
-  authority over engine state. That count *is* the feasibility answer, generated by the compiler
-  rather than by reading.
-- **Risk:** none to results; the phase is a no-op by construction.
-- **Size:** small.
+- **Deliverable:** the price of an extension boundary, measured rather than asserted -- and the
+  first honest statement of the README's zero-cost-extension claim, which today's ladder supports
+  only by comparing gRPC unary against a native call.
+- **Risk:** none. It touches nothing else and can return "the gap is smaller than claimed", which is
+  a result.
+- **Size:** small. The cheapest number here and the only one available before any correction lands.
+
+### Phase 1 -- Name the memory boundary in types
+
+The *memory* boundary; §2's path boundary is Phases 0 and 8, and they are independent.
+
+Introduce an ownership predicate, route every ledger access through it, and preserve today's
+semantics exactly. Engine-owned state becomes reachable only through one narrow interface -- the
+`Telemetry` type of §3.1.
+
+The shape matters, and the obvious shape is wrong. `Ownership { Orchestrator, Engine }` keyed on
+`BlobKind` cannot express §1's table: the orchestrator sizes an HBM partition while the engine
+allocates the `KvBlock`s inside it, and an engine-owned offload tier sits inside host DDR's quota.
+Ownership is a function of **(kind, tier)** and of **which question is asked** -- *capacity* or
+*allocation* authority, §1's macro and micro tiers named as something an enum can hold. Getting it
+wrong here is what would leave Phase 3 ambiguous about what changes hands.
+
+- **Deliverable:** results byte-identical to today, plus a count of call sites assuming *allocation*
+  authority over engine state. That count *is* the feasibility answer, generated by the compiler.
+- **Risk:** none to results; a no-op by construction. **Size:** small.
 
 ### Phase 2 -- Oracle, regret, coupling
 
-Add the routing oracle, a clairvoyant eviction baseline, per-request regret on the policy's own
-state, and coupled %. No architectural change.
+The routing oracle, a clairvoyant eviction baseline, per-request regret on the policy's own state,
+the wait regime (§3.5), per-request tracing spans (§3.11), and coupled % **on both axes §3.4
+defines**. No architectural change.
 
-- **Deliverable:** every existing comparison restated as regret against an oracle instead of a
-  delta against a hand-built baseline. This retires the fairness caveat attached to every number
-  produced so far.
-- **Risk:** the oracle may reveal that the scored policy's margin over the specialists is mostly
-  baseline weakness. Better to find that here than after phase 3 muddies it.
-- **Size:** medium.
+A single blended coupling figure would average an orchestrator-owned pool against an engine-owned
+one and hide which is carrying the result -- which is exactly what Phase 3 changes.
 
-### Phase 3 -- The engine owns its cache
+- **Deliverable:** every existing comparison restated as regret against an oracle instead of a delta
+  against a hand-built baseline, retiring the fairness caveat on every number so far.
+- **Risk:** the oracle may reveal the scored policy's margin is mostly baseline weakness. Better
+  found here than after Phase 3 muddies it. **Size:** medium.
 
-Replace the HBM `TierPool` with an engine-cache model: LRU over block hashes, capacity-bounded,
-**never refuses**, reports metrics. The orchestrator routes and observes. Host classes keep every
-current mechanism.
+### Phase 3 -- The engine allocates; the orchestrator sizes the partition
 
-- **Deliverable:** the price of the boundary. Re-run each contaminated result from §1 and publish
-  how much survives, against the expectations tabulated there.
-- **Risk:** the headline result. Gang feasibility and the gate both lose their HBM test and must be
-  re-grounded on queue depth and host memory.
-- **Size:** large -- the core of the correction.
+The HBM pool splits in two rather than changing hands, along §1's macro/micro seam. The
+orchestrator keeps **capacity authority** -- how many bytes a replica gets -- and hands
+**allocation authority** to the engine: LRU over block hashes, bounded by the partition, **never
+refuses**, reports metrics. The orchestrator routes and observes.
 
-### Phase 4 -- Belief, not truth: Step-aligned ZMQ IPC telemetry
+Three scope lines, because "the engine owns its cache" is too coarse to build from:
 
-Split what the engine holds from what the router thinks it holds. Ingest telemetry via step-aligned
-micro-batches over ZMQ IPC (`PUSH/PULL`), packing `TelemetryBatchHeader` and truncated eviction/allocation
-hashes at engine forward-step cadence (40–100 Hz). Retire `Control::Gossip`, which models a stale *exact*
-view that no telemetry provides. Add monotonic sequence gap detection, periodic reconciliation sync
-batches, and explicit divergence reporting.
+- **`KvBlock` only.** `WeightShard` is also HBM-resident and engine-owned once loaded, but its
+  interesting decision is *placement*, on a slow timescale, and that is Phase 6. Weights keep
+  today's semantics so two corrections do not land in one measurement.
+- **The partition is a fixed input**, sized from config. Making it a decision is Phase 6.
+- **Host DDR is not a synonym for orchestrator-owned.** `Snapshot` and `ServiceHeap` keep every
+  current mechanism; **offloaded KV does not**, since `cache.rs` already models HBM eviction as
+  offload into DDR's quota. An engine-owned class sits inside the pool the DDR shadow price
+  arbitrates.
 
-- **Deliverable:** what routing quality costs when residency is a lossy, step-aligned belief. Evaluate
-  under synthetic telemetry loss rates (0%, 1%, 5% dropped micro-batches) to quantify router robustness.
-- **Risk:** low. Contained, and replaces a mechanism known to be unphysical.
-- **Size:** medium.
+Also lands the shared L2 term in the acquire argmin (§3.10), since this phase already rewrites that
+path.
+
+- **Deliverable:** the price of the boundary. Re-run each contaminated result from §1 against the
+  expectations tabulated there. Include the admission sweep §1 calls for -- refuse on `max_tokens`,
+  on an output-length estimate, or on neither -- since that is what tests the claim that
+  partition-level admission stays authoritative.
+- **Risk:** the headline. Gang feasibility and the gate lose their per-block test and must be
+  re-grounded. **Size:** large -- the core of the correction.
+
+### Phase 4 -- Belief, not truth: lossy telemetry and risk-adjusted scoring
+
+Two halves, in order.
+
+**First, the score learns to fear uncertainty** (§3.7): `cost = E[cost] + lambda * sigma[cost]`,
+with sigma widened by belief age, gap count and divergence. Without it the second half measures
+nothing -- a loss sweep against a score that cannot react to loss returns the same answer at every
+rate, and lambda = 0 is the control arm rather than the design.
+
+**Then, belief replaces truth.** Split what the engine holds from what the router thinks it holds.
+Ingest step-aligned micro-batches over ZMQ IPC at forward-step cadence. Retire `Control::Gossip`,
+which models a stale *exact* view no telemetry provides. Add sequence-gap detection, reconciliation
+sync batches, and divergence reporting (§3.6).
+
+What the simulator models here is **cadence and loss, not transport cost** -- §1 settled that the
+crossing is free at 40-100 Hz whichever boundary carries it.
+
+- **Deliverable:** what routing quality costs when residency is a lossy belief. Sweep loss (0/1/5%
+  dropped batches) **against lambda**, and publish whether risk-adjusted scoring recovers it --
+  including the failure mode §3.7 names, where a mean-only score herds onto the node that went
+  quiet.
+- **Risk:** low; contained, and replaces a mechanism known to be unphysical. **Size:** medium.
 
 ### Phase 5 -- Influence: retention directives
 
 Emit RFC-0001-shaped directives on the request path, with two engine arms: honours, and ignores.
+Directives are advisory by construction -- §1 removed any ability to hold a block against the
+engine's will -- so the `ignores` arm is not a pessimistic sweep, it is §3.6's third divergence
+source turned into an experiment.
 
-- **Deliverable:** what a directive is worth, and what the orchestrator can achieve through routing
-  alone when the serving stack does not cooperate. The second number is the one that matters for
-  planning, and it is the first Tier-1 result earned by influence rather than assumed by
-  declaration.
-- **Risk:** low.
-- **Size:** small to medium.
+- **Deliverable:** what a directive is worth, and what routing alone achieves when the serving stack
+  does not cooperate. The second number is the one that matters for planning, and the first
+  coupling-tier-1 result earned by influence rather than assumed by declaration.
+- **Risk:** low. **Size:** small to medium.
 
-### Phase 6 -- Model placement as orchestration
+### Phase 6 -- Macro authority: placement, partitions, tenancy
 
-Weight shards stop being per-request cache entries. The orchestrator decides which models load on
-which nodes on a slow timescale, with load and unload costs, through a model-agnostic interface:
-size, load time, no internals.
+The slow, coarse, orchestrator-owned decisions -- §2.4's macro tier, and between them everything
+Phase 3 froze.
+
+Weight shards stop being per-request cache entries: the orchestrator decides which models load
+where on a slow timescale, with load and unload costs, through a model-agnostic interface (size,
+load time, context window, no internals). **HBM partition sizing stops being Phase 3's fixed
+input**, since a node's partition budget and its resident model set are one allocation made twice.
+The **P:D replica ratio** (§2.5) is the third member, bound by different resources at each end, so
+the ratio serving a long-prompt mix starves an agent mix.
+
+**Tenancy constrains all three** (§3.8). Because engine eviction is tenant-blind, how many
+partitions exist and who shares one *is* the fairness policy, so this phase decides isolation and
+capacity in one act. It also adds the missing per-tenant axis to `Quota`, which is today per-class
+only.
 
 - **Deliverable:** a result no arm can produce today -- a heterogeneous fleet serving several model
-  types under a shifting request mix. This is where model agnosticism stops being a constraint and
-  starts being the capability.
-- **Risk:** needs a workload with a realistic model mix, which `taxo.md` supplies.
-- **Size:** medium.
+  types under a shifting request mix -- plus a tenancy arm: shared partitions against per-tenant
+  partitions under a bursty neighbour, reporting what isolation cost in cross-tenant prefix hits and
+  batch width.
+- **Risk:** needs a workload with a realistic model mix, which `taxo.md` supplies. **Size:** medium.
 
 ### Phase 7 -- Learned flows, speculative authority, and the taxonomy
 
-Predicted flows replacing declared ones (§2.2), a tool-gap estimator, taxonomy presets, the RAG
-class, durable retention, authority-driven speculative scheduling (speculative tool pre-execution for
-`ReadOnly`, burst preemption for `DraftOnly`, non-preemptible gang leases for `SideEffecting`), then
-per-pattern coupled %.
+Predicted flows replacing declared ones (§3.2), a tool-gap estimator, taxonomy presets, the RAG
+class, durable retention, and authority-driven speculative scheduling (`ReadOnly` pre-execution,
+`DraftOnly` burst preemption, non-preemptible `SideEffecting` leases), then per-pattern coupled %.
 
-- **Deliverable:** what the Tier-1 win is worth against estimates rather than oracles; the latency
-  and goodput delta bought by authority-driven speculative scheduling; and a table saying for which
-  workload patterns a unified orchestrator can help at all.
-- **Risk:** the per-pattern coupling table may show the advantage is confined to a few cells. That
-  is a result, not a failure.
-- **Size:** large, and separable into its own increments.
+- **Deliverable:** what the coupling-tier-1 win is worth against estimates rather than oracles; the
+  latency and goodput delta from speculative scheduling; and a table saying for which workload
+  patterns a unified orchestrator can help at all.
+- **Risk:** the coupling table may show the advantage confined to a few cells. That is a result.
+  **Size:** large, separable into increments.
 
-### Ordering logic
+### Phase 8 -- The data path as an arm
 
-Phases 1 and 2 are prerequisites for trusting anything after them: one makes the boundary visible,
-the other makes measurement fair. Phase 3 is the correction and the decision point. Phases 4 and 5
-are the two halves of the engine interface -- observe, then influence. Phase 6 adds the capability
-the corrected architecture makes central. Phase 7 is orthogonal to the ownership question and can
-run in parallel with 4 through 6.
+`data_path: { Sidecar, Integrated }`, charging Phase 0's seam costs per request across the workload
+mix, with the sidecar arm paying an `ext_proc` callout per placement and a loopback hop per
+dispatch.
 
-Phases 1, 2, 4 and 5 are low-risk and additive. Phase 3 is the one that can return a negative
-verdict on the project's central claim, which is why it comes early and why phase 2 precedes it.
+- **Deliverable:** the **crossover** -- the service time at which control-plane overhead passes 5%
+  and 1% of a request -- swept across the denominator rather than read off `exec_ns` (§2.7).
+  Predicted ~1.3 ms and ~6.5 ms. Per-class figures illustrate where each class sits on the curve;
+  they are not the result, because those service times are chosen constants.
+- **Risk:** falsifiable in the direction that matters. If the crossover lands far below a
+  millisecond, almost nothing real is beneath it and the case rests entirely on §2.2's
+  expressiveness argument -- which §2 should then say plainly.
+- **Size:** small given Phase 0. `Machine::decide` already charges a configurable boundary per
+  placement and scales it by candidate count, so the decision seam is new arms, not new mechanism.
+
+### Ordering
+
+Two independent chains.
+
+**The memory chain: 1 -> 2 -> 3 -> 4 -> 5 -> 6.** Phase 1 makes the boundary visible and
+specifically gates Phase 3 -- a one-axis ownership type makes the split unbuildable in the two
+places the boundary cuts *within* a pool. Phase 2 makes measurement fair before Phase 3 changes what
+is measured. Phase 3 is the correction and the decision point. Phases 4 and 5 are the two halves of
+the engine interface, observe then influence. Phase 6 adds the capability the corrected architecture
+makes central and unfreezes what Phase 3 held fixed, which is why it follows rather than precedes.
+
+**The path chain: 0 -> 8.** Phase 0 needs no simulator change, blocks nothing, and is the only phase
+that could be finished today. Phase 8 depends on it and nothing else. So the data-path question is
+answerable in parallel with the ownership correction rather than queued behind it.
+
+Phase 7 is orthogonal to both and can run alongside 4 through 6.
+
+Phases 0, 1, 2, 4, 5 and 8 are low-risk and additive. **Phase 3 is the one that can return a
+negative verdict on the project's central claim**, which is why it comes early and why Phase 2
+precedes it.
