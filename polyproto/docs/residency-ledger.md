@@ -342,46 +342,128 @@ or "the gate eliminates broken tasks" is definitional.
 
 ## Boundary costs
 
-Measured on the host, not modelled. `polyphonic boundary --repeat 5`, best-of-5 per rung,
-timer overhead subtracted from the per-operation rungs.
+Measured on the host, not modelled. One run of
+`cargo run --release --features grpc,wasm -- boundary --repeat 10`, best-of-10 per rung, timer
+overhead subtracted from the per-operation rungs. Phase 0 ([`phase-0.md`](phase-0.md)) added
+the `wasm` and `ext_proc` rows and re-timed `Ring`; **every row is from that one fresh run**,
+so the untouched rungs differ from their previously published values by ordinary run-to-run
+noise.
 
 | boundary | 64 B | 1 KiB | 8 KiB | ns/byte | spread |
 |---|---|---|---|---|---|
 | native call | 0 | 0 | 0 | 0.000 | 1.0× |
-| shared ring (spin) | 52 | 65 | 232 | 0.023 | 4.2× |
-| syscall floor | 97 | 97 | 97 | 0.000 | 2.2× |
-| pipe (same thread) | 459 | 475 | 638 | 0.022 | 1.8× |
-| unix socket RTT | 6023 | 6440 | 6649 | 0.059 | 1.2× |
-| TCP loopback RTT | 15483 | 15400 | 15899 | 0.058 | 1.0× |
-| gRPC unary RTT | 51232 | 49482 | 52483 | 0.253 | 1.1× |
+| wasm (warm instance) | 13 | 25 | 105 | 0.011 | 1.8× |
+| shared ring (spin) | 70 | 78 | 180 | 0.014 | 1.8× |
+| syscall floor | 97 | 97 | 97 | 0.000 | 1.0× |
+| pipe (same thread) | 434 | 450 | 611 | 0.022 | 1.0× |
+| unix socket RTT | 5733 | 5524 | 5233 | 0.000 | 1.4× |
+| TCP loopback RTT | 15525 | 15525 | 15900 | 0.048 | 1.0× |
+| ext_proc callout (open stream) | — | 36052 | 40733 | 0.633 | 1.1× |
+| gRPC unary RTT | 47649 | 49316 | 52316 | 0.516 | 1.1× |
 
-`spread` is worst run over best, up to 4.2× on the cheap rungs because this host migrates
-threads between core clusters and `pin_cluster` is only a QoS hint on macOS. **The ordering
-is the robust result; no single constant here should be quoted to two digits.**
+**`ext_proc` has no 64 B cell, and the dash is the point.** A realistic gateway header map at
+a fixed field count encodes to **367 bytes** before any filler is added, so this rung's floor
+is above the ladder's smallest payload and padding cannot go downwards. The fit is over the
+two achievable sizes and its 64 B figures below are extrapolations, labelled as such. An
+earlier version of this table reported a 64 B ext_proc cell; it was a 367-byte message wearing
+a 64-byte label, which put the missing 303 bytes of marshalling into the intercept.
+
+Two more figures, priced once rather than swept across sizes, because what they charge for is
+opening something rather than moving bytes through it:
+
+| what | ns | models |
+|---|---|---|
+| wasm: fresh instance + one call | 9483 | per-call isolation instead of a shared warm instance |
+| ext_proc: stream open + first callout | 63066 | Envoy's default `ext_proc` config — a stream per HTTP request |
+
+`spread` is worst run over best. The ring rung used to carry the ladder's worst spread —
+**4.2×** — because it was timed per operation against a ~35 ns timer, a 1.5:1
+signal-to-instrument ratio. Batch-timing it the way `native()` and `syscall()` already are
+tightens that; the price is that, like those two, it no longer reports a tail (p99 "—").
+Old and new, side by side, so the correction is visible rather than silently overwritten:
+
+| | 64 B / 1 KiB / 8 KiB | spread |
+|---|---|---|
+| per-operation (retired) | 52 / 65 / 232 ns | 4.2× |
+| batched (current) | 70 / 78 / 180 ns | 1.2–1.8× across runs |
+
+No conclusion here rested on the spread's *size*, only on the ladder's *ordering*, which is
+unchanged. Two rungs are worth distrusting individually: WASM and the ring now trade the
+noisiest spot run to run (1.2–2.8×), and the **unix socket rung is not monotone in payload** —
+it came back 5733 / 5524 / 5233 here and 5983 / 7441 / 6649 on an earlier run, wandering by
+more than its own payload term in both directions. The step it feeds ("waking a blocked
+thread") moved between 5.07 µs and 6.97 µs across runs on that instability alone. **The
+ordering is still the robust result; no single constant here should be quoted to two digits.**
 
 What each step adds, at 1 KiB:
 
 | step | adds | × |
 |---|---|---|
-| cross-core cache line + spin detect | 0.07 µs | 65 |
-| ring transition | 0.03 µs | 1.5 |
-| kernel buffer copy + second syscall | 0.38 µs | 4.9 |
-| **waking a blocked thread** | **5.96 µs** | **13.6** |
-| loopback network stack | 8.96 µs | 2.4 |
-| HTTP/2 framing + protobuf | 34.08 µs | 3.2 |
+| sandbox entry + linear-memory copy (native → wasm) | 0.03 µs | 25 |
+| cross-core cache line + spin detect (native → ring) | 0.08 µs | 78 |
+| ring transition | 0.02 µs | 1.2 |
+| kernel buffer copy + second syscall | 0.35 µs | 4.6 |
+| **waking a blocked thread** | **5.07 µs** | **12.3** |
+| loopback network stack | 10.00 µs | 2.8 |
+| HTTP/2 framing on an open stream (tcp → ext_proc) | 20.53 µs | 2.3 |
+| per-call stream setup (ext_proc → gRPC unary) | 13.26 µs | 1.4 |
+| HTTP/2 framing + protobuf (tcp → gRPC unary) | 33.79 µs | 3.2 |
 
-Four things to design against:
+Five things to design against:
 
-1. **A no-op syscall (97 ns) costs more than an entire shared-memory round trip (65 ns).**
+1. **A no-op syscall (97 ns) costs more than an entire shared-memory round trip (~70 ns).**
    Any hot path spending one syscall per decision has already given up more than the whole
    budget of the alternative. "Fewer syscalls" is not the lever; zero is.
-2. **The largest single step is waking a thread** — bigger than crossing the kernel, bigger
-   than the network stack. The tax to remove is the scheduler, which argues for spin-polled
-   rings and against anything that blocks on the hot path.
+2. **The largest single step below the network is waking a thread** — bigger than crossing the
+   kernel. The tax to remove is the scheduler, which argues for spin-polled rings and against
+   anything that blocks on the hot path. Its size is the least stable number in the table
+   (5.07–6.97 µs across runs, for the reason given above), so treat it as "microseconds, and
+   the biggest step before the wire", not as a constant.
 3. **Two thirds of a gRPC round trip is framing and encoding** — 34 µs of 49 µs sits above
    raw TCP. The majority of the cost is self-inflicted.
-4. **Marshalling slope is flat except for gRPC.** At control-plane message sizes the fixed
-   cost dominates, so batching decisions matters more than shrinking them.
+4. **Marshalling slope is flat except for the two protobuf-over-HTTP/2 rungs.** Every
+   in-process and socket rung sits at 0.000–0.048 ns/byte while `ext_proc` and gRPC run
+   0.5–0.7, more than an order of magnitude above. Which of those *two* is steeper flips
+   between runs (0.633 vs 0.516 here, the reverse on another), so the pair's internal ordering
+   is not a result. At control-plane sizes the fixed cost still dominates, so batching
+   decisions matters more than shrinking them.
+5. **WASM lands below the ring, not beside it, and `ext_proc` only beats gRPC unary on a
+   stream it gets to keep open.** A warm sandboxed call (13–25 ns) undercuts the shared-memory
+   ring (70–78 ns) — `phase-0.md`'s P1 predicted this and it held, so a sandboxed hook belongs
+   in the argmin on its own measured row rather than borrowing the ring's number. `ext_proc` on
+   an already-open stream is real savings against gRPC unary (36 µs vs 48 µs fixed, ~26%
+   cheaper) — P2's "if right" case. But Envoy's documented default opens a new stream per HTTP
+   request, and that shape measures at 63 µs, *above* gRPC unary — P2's "if wrong" case, and
+   the more realistic one for an unmodified sidecar deployment.
+
+### Policy hook cost in an argmin
+
+The ladder prices a single crossing; a routing or admission decision pays it once per
+candidate. `N × fixed_ns` is the per-placement tax and `1e9 / (N × fixed_ns)` is the
+single-thread decision-rate ceiling it implies — a property of the measured ladder alone,
+needing no workload, no `exec_ns`, and no simulator. Transcribed from the same run as the
+table above, at 64 B, since an argmin's per-candidate payload is small:
+
+```
+                        isolation      4 nodes    32 nodes   128 nodes  decisions/s @ 32
+native call             none           0.00 us     0.00 us     0.00 us         unbounded
+wasm (warm instance)    sandbox        0.05 us     0.42 us     1.66 us           2403846
+shared ring (spin)      threads        0.27 us     2.14 us     8.58 us            466418
+ext_proc callout        process      142.30 us  1138.37 us  4553.47 us               878
+gRPC unary RTT          process      192.79 us  1542.34 us  6169.34 us               648
+```
+
+Two labels carry caveats the numbers do not. The ring's isolation is **threads**, not
+processes: `ring()` spins two threads over one address space, so it prices a cross-core
+crossing, and a ring between real processes would pay mapping and a second scheduler domain on
+top of this. And `ext_proc`'s row is its fit **extrapolated down** to 64 B from a 367 B floor,
+for the reason given above.
+
+`ext_proc` at 4 nodes (142 µs) still exceeds the ~129 µs warm-FaaS figure this document uses
+below, but the margin has fallen from 69 µs — what the borrowed 49 µs unary figure implied —
+to about **13 µs**, one config change (stream reuse) away from crossing under it. At a fleet of
+32 or 128, `ext_proc` and gRPC unary both push the scheduler's decision rate below a plausible
+cluster request rate; `Native` and `Wasm` do not.
 
 ### Where it bites: the denominator
 

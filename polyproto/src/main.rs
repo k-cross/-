@@ -117,7 +117,7 @@ enum Cmd {
         /// Node distances to sweep
         #[arg(long, default_value = "rack,zone,region")]
         distances: String,
-        /// Transport the control plane crosses on: native|ring|syscall|pipe|unix|tcp|grpc
+        /// Transport the control plane crosses on: native|wasm|ring|syscall|pipe|unix|tcp|extproc|grpc
         #[arg(long, default_value = "grpc")]
         crossing: String,
         /// Requests between gossip refreshes for the stale-view arm
@@ -164,7 +164,7 @@ enum Cmd {
         /// Distances to sweep, local to cross-region
         #[arg(long, default_value = "socket,rack,zone,region")]
         distances: String,
-        /// Transport the control plane crosses on: native|ring|syscall|pipe|unix|tcp|grpc
+        /// Transport the control plane crosses on: native|wasm|ring|syscall|pipe|unix|tcp|extproc|grpc
         #[arg(long, default_value = "grpc")]
         crossing: String,
         #[arg(long, default_value_t = 200)]
@@ -1066,7 +1066,7 @@ fn main() {
 }
 
 fn boundary(repeat: usize) {
-    use polyphonic::boundary::{Boundary, measure};
+    use polyphonic::boundary::measure;
 
     let l = measure(repeat);
     println!(
@@ -1103,6 +1103,21 @@ fn boundary(repeat: usize) {
         );
     }
 
+    for (label, ns) in &l.extra {
+        println!("{label:<45}{ns:>10} ns  (single figure, not a by_size rung)");
+    }
+
+    step_deltas(&l);
+    hook_cost_table(&l);
+}
+
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "nanosecond counts, nowhere near i64::MAX"
+)]
+fn step_deltas(l: &polyphonic::boundary::Ladder) {
+    use polyphonic::boundary::Boundary;
+
     let mid = polyphonic::boundary::SIZES[1];
     let at = |b: Boundary| -> Option<u64> {
         l.rungs
@@ -1114,6 +1129,11 @@ fn boundary(repeat: usize) {
 
     println!("\nwhat each step adds, at {mid} B");
     let steps = [
+        (
+            Boundary::Native,
+            Boundary::Wasm,
+            "sandbox entry + linear-memory copy",
+        ),
         (
             Boundary::Native,
             Boundary::Ring,
@@ -1137,6 +1157,12 @@ fn boundary(repeat: usize) {
         ),
         (
             Boundary::TcpLoopback,
+            Boundary::ExtProc,
+            "HTTP/2 framing on an open stream",
+        ),
+        (Boundary::ExtProc, Boundary::Grpc, "per-call stream setup"),
+        (
+            Boundary::TcpLoopback,
             Boundary::Grpc,
             "HTTP/2 framing + protobuf",
         ),
@@ -1145,22 +1171,95 @@ fn boundary(repeat: usize) {
         let (Some(a), Some(b)) = (at(lo), at(hi)) else {
             continue;
         };
+        // Signed on purpose: if a "later" rung lands cheaper than the one before it (an
+        // ext_proc callout beating gRPC unary, say), that inversion is a finding and
+        // clamping it to zero would hide it.
+        let delta = b as i64 - a as i64;
         println!(
             "  {what:<38}{:>10.2} us   {:>6.1}x",
-            b.saturating_sub(a) as f64 / 1000.0,
+            delta as f64 / 1000.0,
             b as f64 / a.max(1) as f64
         );
     }
 
-    if let (Some(total), Some(ring)) = (at(Boundary::Grpc), at(Boundary::Ring)) {
-        let wake = at(Boundary::UnixSocket).unwrap_or(0) - at(Boundary::Pipe).unwrap_or(0);
-        let frame = total - at(Boundary::TcpLoopback).unwrap_or(0);
+    // Every rung this paragraph divides by has to be present: substituting 0 for a rung
+    // that failed to measure turns the subtractions below into an overflow, not a summary.
+    let (Some(total), Some(ring), Some(unix), Some(pipe), Some(tcp)) = (
+        at(Boundary::Grpc),
+        at(Boundary::Ring),
+        at(Boundary::UnixSocket),
+        at(Boundary::Pipe),
+        at(Boundary::TcpLoopback),
+    ) else {
+        return;
+    };
+    {
+        let wake = unix.saturating_sub(pipe);
+        let frame = total.saturating_sub(tcp);
         println!(
             "\nof a {:.1} us gRPC round trip: {:.0}% is HTTP/2 + protobuf, {:.0}% is one thread wakeup,\nand {:.2} us is what the same exchange costs through shared memory",
             total as f64 / 1000.0,
             100.0 * frame as f64 / total as f64,
             100.0 * wake as f64 / total as f64,
             ring as f64 / 1000.0
+        );
+    }
+}
+
+/// `N x fixed_ns` is the per-placement tax; `1e9 / (N x fixed_ns)` is the single-thread
+/// decision-rate ceiling it implies -- the form of §2.2's claim that needs no workload, no
+/// `exec_ns`, and no simulator.
+fn hook_cost_table(l: &polyphonic::boundary::Ladder) {
+    use polyphonic::boundary::{Boundary, SIZES};
+
+    let payload = SIZES[0] as u64;
+    // `Ring` is "threads", not "process": `ring()` spins two threads over one address
+    // space, so this rung prices a cross-core crossing and not an isolation boundary. A
+    // ring between real processes would pay mapping and a second scheduler domain on top.
+    let rows: [(Boundary, &str); 5] = [
+        (Boundary::Native, "none"),
+        (Boundary::Wasm, "sandbox"),
+        (Boundary::Ring, "threads"),
+        (Boundary::ExtProc, "process"),
+        (Boundary::Grpc, "process"),
+    ];
+
+    println!("\npolicy hook inside an argmin (one hook per candidate, {payload} B)\n");
+    println!(
+        "{:<24}{:<10}{:>12}{:>12}{:>12}{:>18}",
+        "", "isolation", "4 nodes", "32 nodes", "128 nodes", "decisions/s @ 32"
+    );
+    for (b, isolation) in rows {
+        let Some(fixed) = l.get(b).map(|c| c.ns(payload)) else {
+            println!("{:<24}{:<10}{:>12}", b.label(), isolation, "-");
+            continue;
+        };
+        let at_nodes = |n: u64| format!("{:.2} us", (n * fixed) as f64 / 1000.0);
+        let rate = if fixed == 0 {
+            "unbounded".to_string()
+        } else {
+            format!("{:.0}", 1e9 / (32.0 * fixed as f64))
+        };
+        println!(
+            "{:<24}{:<10}{:>12}{:>12}{:>12}{rate:>18}",
+            b.label(),
+            isolation,
+            at_nodes(4),
+            at_nodes(32),
+            at_nodes(128),
+        );
+    }
+
+    if let Some(floor) = l
+        .rungs
+        .iter()
+        .find(|r| r.boundary == Boundary::ExtProc)
+        .and_then(|r| r.by_size.first())
+        .map(|&(bytes, _)| bytes)
+        && floor > payload as usize
+    {
+        println!(
+            "\next_proc has no {payload} B sample: a realistic gateway header map encodes to\n{floor} B, so its row above is the fit extrapolated down to {payload} B."
         );
     }
 }
@@ -1358,18 +1457,36 @@ fn cluster_header(
     );
 }
 
-fn crossing_of(l: &polyphonic::boundary::Ladder, name: &str) -> Option<polyphonic::boundary::Cost> {
+/// Resolve a `--crossing` name against the measured ladder, returning what it was actually
+/// charged at as well as the cost. `wasm` and `extproc` only exist when their features are
+/// compiled in, and the fallback is two orders of magnitude more expensive than either, so
+/// the substitution is named rather than made silently.
+fn crossing_of(
+    l: &polyphonic::boundary::Ladder,
+    name: &str,
+) -> Option<(String, polyphonic::boundary::Cost)> {
     use polyphonic::boundary::Boundary;
     let b = match name {
         "native" => Boundary::Native,
+        "wasm" => Boundary::Wasm,
         "ring" => Boundary::Ring,
         "syscall" => Boundary::Syscall,
         "pipe" => Boundary::Pipe,
         "unix" => Boundary::UnixSocket,
         "tcp" => Boundary::TcpLoopback,
+        "extproc" => Boundary::ExtProc,
         _ => Boundary::Grpc,
     };
-    l.get(b).or_else(|| l.get(Boundary::TcpLoopback))
+    if let Some(c) = l.get(b) {
+        return Some((name.to_string(), c));
+    }
+    let fallback = Boundary::TcpLoopback;
+    l.get(fallback).map(|c| {
+        (
+            format!("{name} NOT BUILT -- charging {}", fallback.label()),
+            c,
+        )
+    })
 }
 
 #[allow(
@@ -1396,10 +1513,11 @@ fn distributed(
     use polyphonic::topo::{Distance, Topology};
 
     let ladder = polyphonic::boundary::measure(repeat);
-    let Some(cost) = crossing_of(&ladder, crossing) else {
+    let Some((crossing, cost)) = crossing_of(&ladder, crossing) else {
         println!("no boundary rung available");
         return;
     };
+    let crossing = crossing.as_str();
     let per_node = dram / nodes as u64;
     let memory = node_memory(
         hbm / nodes as u64,
@@ -1534,7 +1652,7 @@ fn code_review(
     const NODES: usize = 2;
 
     let ladder = polyphonic::boundary::measure(repeat);
-    let Some(cost) = crossing_of(&ladder, crossing) else {
+    let Some((crossing, cost)) = crossing_of(&ladder, crossing) else {
         println!("no boundary rung available");
         return;
     };

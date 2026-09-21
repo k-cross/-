@@ -403,7 +403,7 @@ impl Machine {
                 self.crossing.ns(QUERY_BYTES_PER_BLOB * chain_len as u64)
             }
             Control::Gossip { period } => {
-                if period > 0 && self.ops.is_multiple_of(period) {
+                if period > 0 && self.ops % period == 0 {
                     self.refresh_view();
                 }
                 0

@@ -15,10 +15,12 @@ Status: design only. Nothing here is built.
 **On the numbers.** Most figures come from the runs in [`residency-ledger.md`](residency-ledger.md)
 and are not uniformly trustworthy. Four grades, worth keeping apart:
 
-- **Measured on the host.** The boundary ladder -- syscall, pipe, socket, ring, gRPC -- times real
-  crossings, best-of-5, timer overhead subtracted. It is the firmest evidence in the repository and
-  §2 leans on it deliberately. Caveat: Apple silicon, 4.2x spread on the cheap rungs, so the
-  **ordering** is the result and no constant survives being quoted to two digits.
+- **Measured on the host.** The boundary ladder -- syscall, pipe, socket, ring, wasm, `ext_proc`,
+  gRPC -- times real crossings, best-of-10, timer overhead subtracted. It is the firmest evidence in
+  the repository and §2 leans on it deliberately. Caveat: Apple silicon, up to ~2-3x spread on the
+  cheap rungs (`Ring` was 4.2x before Phase 0 re-timed it) and a unix-socket rung that is not even
+  monotone in payload, so the **ordering** is the result and no constant survives being quoted to
+  two digits.
 - **Simulated on modelled constants.** Every residency, placement and arbitration result. These run
   on a calibrated model rather than moving bytes; the ledger lists link latency, PCIe, HBM/DDR
   capacities and the workload's `exec_ns` as modelled, "most worth replacing with real traces".
@@ -372,7 +374,7 @@ rule covers every seam:
 | per connection | TLS, ALPN, protocol normalisation | Envoy listener | commodity edge or own listener | anything |
 | per step, 40-100 Hz | engine telemetry | KV events, scraped metrics | same, step-aligned (§1) | anything; choose for adoptability |
 | per request | dispatch to the engine | sidecar -> localhost HTTP, 15.4 us + parse | direct, UDS today, **6.0-6.6 us** | sockets; a ring for short-request classes |
-| **per decision, in an argmin** | **routing and policy hooks** | **`ext_proc` callout, 49 us** | **in-process, 0 ns / ring 52-232 ns** | **`Native` and `Ring` only** |
+| **per decision, in an argmin** | **routing and policy hooks** | **`ext_proc` callout, open stream: 36 us (measured)** | **in-process, 0 ns / wasm 13-25 ns / ring 70-180 ns** | **`Native`, `Wasm` and `Ring`** |
 
 The dispatch row is the seam that cannot be removed -- removing it means implementing the engine,
 which §1 forbids. It can only be made cheaper, and a shared ring would make it two orders of
@@ -386,23 +388,31 @@ crossing of *latency* ... but N crossings of *work*, **which is what caps the de
 extends that from the query seam to the extension seam, where the multiplier is identical and the
 rate is higher.
 
-`best_scored` is an argmin over candidates, so a pluggable scoring term runs once per candidate. At
-the 4 nodes the current runs use, an `ext_proc`-shaped hook costs 4 x 49 us = **198 us per
-placement** -- more than a warm FaaS invocation takes to run. At a fleet of 32 it is **1.6 ms**, and
-the scheduler's decision rate becomes the cluster's throughput ceiling. The same fleet over a ring
-costs 2.1 us.
+`best_scored` is an argmin over candidates, so a pluggable scoring term runs once per candidate.
+Phase 0 ([`phase-0.md`](phase-0.md)) measured this row instead of borrowing gRPC unary's number for
+it: an `ext_proc`-shaped callout on a stream the hook service gets to keep open costs **36 us**, not
+49 us. At the 4 nodes the current runs use that is **142 us per placement** -- the margin over a
+warm FaaS invocation (~129 us) has fallen from 69 us to about **13 us**, one config change from
+crossing under it. At a fleet of 32 it is **1.1 ms**, and the scheduler's decision rate becomes the
+cluster's throughput ceiling. The same fleet over a ring costs 2.1 us; over WASM, 0.4 us.
 
-That is not a performance difference, it is an **expressiveness** difference. At 49 us a hook runs
-once, at the gateway, with the policy pre-collapsed into a single score. At 65 ns it runs per
-candidate, per eviction candidate, per telemetry batch. `Boundary::Ring` is already documented in
-`boundary.rs` as "what an ABI or WASM extension can achieve at best"; this row is where the README's
-zero-cost-extension claim cashes out.
+That is not a performance difference, it is an **expressiveness** difference. At 36 us a hook runs
+once, at the gateway, with the policy pre-collapsed into a single score. At 13-25 ns it runs per
+candidate, per eviction candidate, per telemetry batch. `Boundary::Wasm` and `Boundary::Ring` are
+now measured separately -- `phase-0.md`'s P1 predicted WASM would land at or below the ring rather
+than beside it, and it did, so this is where the README's zero-cost-extension claim cashes out for
+a sandboxed extension specifically, not just an in-process one.
 
 ### 2.3 The honest accounting
 
-Removing `ext_proc` and the sidecar saves roughly **65 us per request**: the gRPC callout at 49 us,
-the loopback hop at 15 us and its parse, less the ~6 us the integrated path still pays to reach the
-engine. That figure is from the measured ladder and is the solid half. The denominator is not:
+Removing `ext_proc` and the sidecar saves a tax that depends on how the sidecar's processor stream
+is configured -- `phase-0.md` measured both shapes rather than assuming one. Envoy's documented
+default opens a new `ext_proc` stream per HTTP request, measured at 63 us; a processor that gets to
+keep its stream open instead measures at 36 us. Adjusting the same estimate the two ways gives
+roughly **79 us per request** in the default configuration and roughly **52 us** with stream reuse:
+the callout, the loopback hop at 15 us and its parse, less the ~6 us the integrated path still pays
+to reach the engine. Both figures are from the measured ladder and are the solid half. The
+denominator is not:
 
 | work being scheduled | provenance | what the sidecar path adds |
 |---|---|---|
@@ -416,12 +426,12 @@ The bottom two are workload constants, not measurements -- `residency-ledger.md`
 "measured" in one table and lists `exec_ns` as **modelled** four hundred lines later, and the code
 is `FAAS_EXEC_MIN_NS + rng.below(FAAS_EXEC_SPAN_NS)`.
 
-**So argue from the crossover, which needs no denominator.** At a 65 us tax the sidecar path costs
-more than 5% of a request below **~1.3 ms** of service time and less than 1% above **~6.5 ms**. The
-claim that survives any constant here: *the data-path choice binds for sub-millisecond work and
-dissolves an order of magnitude above it.* Whether that matters is then a question about the
-**request mix**, answerable from published FaaS duration distributions rather than polyproto's
-`exec_ns`.
+**So argue from the crossover, which needs no denominator.** At a 52-79 us tax -- the range the two
+measured deployment shapes bracket -- the sidecar path costs more than 5% of a request below
+**~1.0-1.6 ms** of service time and less than 1% above **~5.2-7.9 ms**. The claim that survives any
+constant here, and either shape: *the data-path choice binds for sub-millisecond work and dissolves
+an order of magnitude above it.* Whether that matters is then a question about the **request mix**,
+answerable from published FaaS duration distributions rather than polyproto's `exec_ns`.
 
 **For inference alone, killing the sidecar is not worth doing on latency grounds, and this document
 should not claim it is.** A decode-bound turn sits three orders of magnitude above the crossover;
@@ -536,9 +546,9 @@ What remains, worst first:
      is not idempotent and throws away a warm prefix; hedging one duplicates prefill. These are
      scheduling decisions wearing transport clothes, which is an argument for holding them here,
      but they still have to be made.
-2. **In-process extensions trade isolation for the 0 ns.** `ext_proc`'s 49 us buys a separate
-   address space. A first-party ABI extension can corrupt the scheduler, and a segfault takes the
-   node's control plane with it.
+2. **In-process extensions trade isolation for the 0 ns.** `ext_proc`'s 36-63 us (measured;
+   depends on whether its stream stays open) buys a separate address space. A first-party ABI
+   extension can corrupt the scheduler, and a segfault takes the node's control plane with it.
 3. **Ecosystem.** SPIFFE/mTLS wiring, the WASM filter catalogue, observability that assumes an
    Envoy in the path.
 
@@ -552,32 +562,51 @@ HTTP/3, WAF and DDoS handling are per-connection concerns at the internet edge a
 a commodity proxy without touching anything claimed here. What gets replaced is the per-decision
 path from the trust boundary inward -- also the only part llm-d puts a sidecar on.
 
-**Isolation becomes a costed choice**, which is `README.md`'s ring 0 / ring 3 split made measurable:
+**Isolation becomes a costed choice**, which is `README.md`'s ring 0 / ring 3 split made measurable.
+`phase-0.md` replaced the borrowed `Ring` figure below with a real WASM measurement, and split it
+into two rows rather than one: a warm sandbox shared across calls, and a fresh instance per call.
+The two answer different trust questions and differ by ~400x, which the single borrowed number hid:
 
 | extension | isolation | boundary | cost | where it may run |
 |---|---|---|---|---|
 | first-party policy: scoring terms, admission rules | none | `Native` | 0 ns | inside the argmin, per candidate |
-| third-party or untrusted policy | WASM sandbox | `Ring` | 52-232 ns | per request, per decision |
-| foreign runtime: a Python classifier, a small model | separate process | `UnixSocket` / `Grpc` | 6-49 us | once per request, off the argmin |
+| policy trusted per tenant: a shared warm WASM instance | WASM sandbox | `Wasm` | 13-25 ns | inside the argmin, per candidate |
+| policy untrusted per call: a fresh WASM instance | WASM sandbox, no cross-call state | `Wasm` (fresh instance) | ~9.5 us | once per call, off the argmin |
+| a cross-core hop to another thread, over shared memory | **none measured** (see below) | `Ring` | 70-180 ns | per request, per decision |
+| foreign runtime: a Python classifier, a small model | separate process | `UnixSocket` / `Grpc` | 6-48 us | once per request, off the argmin |
+
+**The `Ring` row prices a crossing, not an isolation boundary, and the distinction is load-bearing
+in a table whose whole point is isolation.** `ring()` spins two threads over one address space, so
+70-180 ns buys a cross-core cache line and a spin detect -- nothing that would contain a hostile
+extension. A ring between genuinely separate processes pays shared-page mapping and a second
+scheduler domain on top, and this repository has never measured that. The row is here because it
+bounds what an in-process ABI extension costs, not because it is an isolation option.
 
 "Can this extension be trusted" then has an answer in nanoseconds, priced by the ladder rather than
-settled by an architecture review.
+settled by an architecture review -- and now a different answer depending on whether the trust
+boundary is per-tenant (share the instance, pay 13-25 ns) or per-call (pay ~9.5 us for isolation
+that survives a hostile input). `phase-0.md`'s P3 predicted the second row would cost 10-100x the
+first; measured, it is **400-750x**, so per-call WASM isolation is real but far pricier than the
+prediction expected, and it leaves the argmin entirely -- at that cost it belongs off to the side
+with the foreign-runtime row, not inside a per-candidate score.
 
 ### 2.7 What to measure
 
-Two numbers, and the first needs no simulator.
+Two numbers. The first no longer needs a simulator -- it is done.
 
-**Extend the ladder.** `boundary.rs` measures gRPC unary, which is not the shape of an `ext_proc`
-callout with header-mutation semantics, and it has no WASM rung at all -- so today's comparison is
-gRPC-unary-versus-native, which is nobody's actual choice. Add both rungs and publish the
-per-decision cost of a policy hook at each isolation level.
+**Extend the ladder. Done in `phase-0.md`.** `boundary.rs` used to measure gRPC unary standing in
+for both an `ext_proc` callout with header-mutation semantics and a WASM sandbox it had no rung for
+at all -- so the old comparison was gRPC-unary-versus-native, which is nobody's actual choice. It
+now has a warm-instance WASM rung, an `ext_proc` rung in both deployment shapes (stream kept open,
+and a stream per request), and a re-timed `Ring` rung, and publishes the per-decision cost of a
+policy hook at each isolation level (§2.2, §2.6).
 
 **Then an arm.** `data_path: { Sidecar, Integrated }`, charging measured seam costs per request
 across the workload mix. Most of the mechanism exists: `Machine::decide` already charges a
 configurable `Boundary` per placement and scales the work term by candidate count, so
 `Control::Unified` against `Control::Query` over `Boundary::Grpc` *is* the comparison for the
 decision seam. Missing: the dispatch hop, a per-candidate hook rather than per-placement, and the
-sweep below.
+sweep below. This is Phase 8, not Phase 0 -- it depends on this measurement and nothing else.
 
 **Report a curve, not a point.** A run charging measured seam costs against modelled `exec_ns`
 returns whatever those constants imply -- predicting "25-50% for warm FaaS" would be predicting
@@ -585,10 +614,12 @@ returns whatever those constants imply -- predicting "25-50% for warm FaaS" woul
 where control-plane overhead passes 5% and 1% of a request. That is a property of the measured
 ladder alone.
 
-Predicted: ~1.3 ms and ~6.5 ms. If the crossover lands an order of magnitude lower -- plausible if
-seam costs are smaller on a datacenter Linux host than on this one, given the 4.2x spread -- then
-almost no real workload sits below it, the data-path case rests entirely on §2.2's expressiveness
-argument, and this section should say so rather than reach for a mix that rescues it.
+Predicted, now from a measured tax rather than a borrowed one: **~1.0-1.6 ms and ~5.2-7.9 ms**,
+following §2.3's 52-79 us range across the two `ext_proc` deployment shapes rather than the single
+borrowed 65 us. If the crossover lands an order of magnitude lower -- plausible if seam costs are
+smaller on a datacenter Linux host than on this one -- then almost no real workload sits below it,
+the data-path case rests entirely on §2.2's expressiveness argument, and this section should say so
+rather than reach for a mix that rescues it.
 
 ---
 
@@ -1044,10 +1075,10 @@ the budget stays the orchestrator's whoever fills it.
    proxy out of the decode budget; a FaaS control plane cannot. **Only a unified orchestrator is
    forced to pick one path for both**, which makes "integrate, do not proxy" a consequence of
    unification rather than a preference.
-7. **Extension cost as an expressiveness bound.** A hook at 49 us must be a constant attached to the
-   request; at 0-232 ns it can be a function of each candidate inside the argmin. The same ladder
-   prices trust. No silo needs this ordering, because no silo is simultaneously a scheduler and a
-   data plane.
+7. **Extension cost as an expressiveness bound.** A hook at 36-63 us (measured, `ext_proc`) must be
+   a constant attached to the request; at 0-180 ns (native through ring) it can be a function of
+   each candidate inside the argmin. The same ladder prices trust. No silo needs this ordering,
+   because no silo is simultaneously a scheduler and a data plane.
 
 **Proposed, and the reason to do §3 and §4.**
 
@@ -1312,6 +1343,8 @@ it measures, so the phase that may invalidate the thesis is not also the phase t
 scoring.
 
 ### Phase 0 -- Price the seams
+
+Implementation plan: [`phase-0.md`](phase-0.md), which states its predictions before the run.
 
 Extend `boundary.rs` with the two rungs the ladder is missing: an **`ext_proc`-shaped callout**
 (gRPC with header-mutation semantics, not bare unary) and a **WASM invocation** through a real

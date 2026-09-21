@@ -1,0 +1,51 @@
+syntax = "proto3";
+package extproc;
+
+// Shape-equivalent to Envoy's `envoy.service.ext_proc.v3.ExternalProcessor`: a
+// bidirectional stream, a `oneof` on each side, a header map in, a header mutation out.
+// Envoy's real descriptor carries more optional fields and nesting, so a cost measured
+// against this is a lower bound on the real callout.
+service ExternalProcessor {
+  rpc Process(stream ProcessingRequest) returns (stream ProcessingResponse);
+}
+
+message HeaderValue {
+  string key = 1;
+  string value = 2;
+}
+
+message HeaderMap {
+  repeated HeaderValue headers = 1;
+}
+
+message HttpHeaders {
+  HeaderMap headers = 1;
+}
+
+message ProcessingRequest {
+  oneof request {
+    HttpHeaders request_headers = 1;
+  }
+}
+
+message HeaderValueOption {
+  HeaderValue header = 1;
+}
+
+message HeaderMutation {
+  repeated HeaderValueOption set_headers = 1;
+}
+
+message CommonResponse {
+  HeaderMutation header_mutation = 1;
+}
+
+message HeadersResponse {
+  CommonResponse response = 1;
+}
+
+message ProcessingResponse {
+  oneof response {
+    HeadersResponse request_headers = 1;
+  }
+}

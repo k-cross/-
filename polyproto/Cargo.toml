@@ -2,6 +2,7 @@
 name = "polyphonic"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
 default-run = "polyphonic"
 
 [dependencies]
@@ -10,13 +11,16 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 tonic = { version = "0.12", optional = true }
 prost = { version = "0.13", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"], optional = true }
+wasmtime = { version = "34", default-features = false, features = ["cranelift", "runtime", "wat"], optional = true }
+tokio-stream = { version = "0.1.19", default-features = false, features = ["sync"], optional = true }
 
 [build-dependencies]
 tonic-build = { version = "0.12", optional = true }
 
 [features]
-grpc = ["dep:tonic", "dep:prost", "dep:tokio", "dep:tonic-build"]
+grpc = ["dep:tonic", "dep:prost", "dep:tokio", "dep:tonic-build", "dep:tokio-stream"]
+wasm = ["dep:wasmtime"]
 
 [[bin]]
 name = "polyphonic"
