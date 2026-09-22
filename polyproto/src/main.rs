@@ -189,6 +189,46 @@ enum Cmd {
         repeat: usize,
     },
 
+    /// The data path as an arm: integrated vs. sidecar, charging Phase 0's measured seam
+    /// costs per request. Same trace and placement policy across arms, so the only
+    /// difference is who pays the routing hook and the dispatch hop, and what it costs.
+    /// Publishes the tax, the crossover against service time, and the fleet size at which
+    /// an unsharded scheduler saturates. See docs/phase-8.md.
+    DataPath {
+        #[arg(long, default_value_t = 4)]
+        nodes: usize,
+        #[arg(long, default_value_t = 3)]
+        units_per_node: usize,
+        #[arg(long, default_value = "16GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        #[arg(long, default_value = "32GiB", value_parser = parse_bytes)]
+        dram: u64,
+        #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
+        nvme: u64,
+        #[arg(long, default_value_t = 15_000)]
+        ops: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value = "0,1,2,1", value_parser = parse_bands)]
+        bands: String,
+        /// Node distance the class table and `d` are measured at. The tax and the fleet
+        /// ceiling come from the ladder alone and do not depend on it.
+        #[arg(long, default_value = "rack")]
+        distance: String,
+        #[arg(long, default_value_t = 250.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 0.10)]
+        fanout: f64,
+        /// Boundary-ladder repetitions
+        #[arg(long, default_value_t = 5)]
+        repeat: usize,
+        /// Override the tax the crossover divides by, in microseconds: a per-*request* figure,
+        /// the `realized/req` column, not one crossing. Recomputes the crossover for a host
+        /// this prototype has never run on -- phase-8.md §1.2, §4.5
+        #[arg(long)]
+        tax_us: Option<f64>,
+    },
+
     /// Discover the host's compute/memory graph and measure its link asymmetry
     Topology {
         /// Streaming buffer per probe; must exceed the largest cache to measure memory
@@ -1015,6 +1055,35 @@ fn main() {
             hard_pools,
             repeat,
         ),
+        Cmd::DataPath {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            bands,
+            distance,
+            rate,
+            fanout,
+            repeat,
+            tax_us,
+        } => data_path(
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            bands_of(&bands),
+            &distance,
+            rate,
+            fanout,
+            repeat,
+            tax_us,
+        ),
         Cmd::Topology { bytes, iters } => topology(bytes, iters),
         Cmd::Placement {
             sockets,
@@ -1304,7 +1373,7 @@ fn class_table(rows: &ClassRows<'_>) {
     println!();
 }
 
-use polyphonic::machine::{Control, Placement};
+use polyphonic::machine::{Control, DataPath, Placement};
 
 struct Arm {
     label: &'static str,
@@ -1771,18 +1840,19 @@ fn code_review(
 /// Run one configured machine over any request stream, tallying per class. Shared by every
 /// experiment so a comparison can never accidentally be between two different accounting
 /// rules; callers build whatever `Workload` shape the scenario calls for.
-fn drive(
+fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
     mach: &mut polyphonic::machine::Machine,
     rate: f64,
-    workload: polyphonic::work::Workload,
+    workload: impl IntoIterator<Item = R>,
 ) -> (ClassTally, u64, u64, u64) {
     mach.set_arrival_rate(rate);
     let mut t = ClassTally::default();
     let (mut total, mut served, mut offered) = (0u64, 0u64, 0u64);
     for req in workload {
+        let req = req.borrow();
         let k = req.kind_idx();
         offered += 1;
-        let c = mach.serve_request(&req);
+        let c = mach.serve_request(req);
         if c.pending {
             continue;
         }
@@ -1902,5 +1972,427 @@ fn crossover(
         ("hypothetical: 100 ms of work", 100_000_000.0),
     ] {
         row(name, ns);
+    }
+}
+
+/// One arm of the data-path sweep: which `DataPath` it runs, and the hook crossing it
+/// charges. `phase-8.md` §1.3 keeps the sidecar's two deployment shapes -- a stream it gets
+/// to keep open, and Envoy's documented default of a stream per request -- apart from the
+/// per-candidate multiplier `SidecarPluggable` prices, because charging the second to the
+/// first would overstate a deployed sidecar's tax by the candidate count.
+struct PathArm {
+    label: &'static str,
+    path: DataPath,
+    hook: polyphonic::boundary::Cost,
+}
+
+/// The arms, or `None` if the `ext_proc` rung they all need was not built (needs
+/// `--features grpc`). The stream-per-request arm needs a second measurement -- a single
+/// figure from `Ladder::extra`, produced by a runtime probe that can fail on its own -- so
+/// its absence drops that one row rather than the whole experiment.
+fn path_arms(l: &polyphonic::boundary::Ladder) -> Option<Vec<PathArm>> {
+    use polyphonic::boundary::{Boundary, Cost, EXTPROC_STREAM_OPEN};
+    let reuse = l.get(Boundary::ExtProc)?;
+    let mut arms = vec![
+        PathArm {
+            label: "integrated",
+            path: DataPath::Integrated,
+            hook: Cost::default(),
+        },
+        PathArm {
+            label: "sidecar (stream reuse)",
+            path: DataPath::Sidecar,
+            hook: reuse,
+        },
+    ];
+    if let Some(&(_, fresh_ns)) = l.extra.iter().find(|(k, _)| *k == EXTPROC_STREAM_OPEN) {
+        arms.push(PathArm {
+            label: "sidecar (stream/request)",
+            path: DataPath::Sidecar,
+            hook: Cost {
+                fixed_ns: fresh_ns as f64,
+                ns_per_byte: 0.0,
+            },
+        });
+    } else {
+        println!("no {EXTPROC_STREAM_OPEN} sample -- dropping the stream-per-request arm");
+    }
+    arms.push(PathArm {
+        label: "sidecar, pluggable policy",
+        path: DataPath::SidecarPluggable,
+        hook: reuse,
+    });
+    Some(arms)
+}
+
+/// One arm's outcome: what the tax, crossover and fleet-ceiling tables are computed from.
+/// `total_ns` is the sum `drive()` already reports, which is `Cost::total_ns()` summed over
+/// every served request -- the routing hook and the dispatch hop are inside it, execution is
+/// not, so a difference between two arms' means is exactly their tax difference.
+struct PathRun {
+    served: u64,
+    total_ns: u64,
+    decisions: u64,
+    candidates_seen: u64,
+    dispatches: u64,
+}
+
+impl PathRun {
+    fn d(&self) -> f64 {
+        self.decisions as f64 / self.served.max(1) as f64
+    }
+
+    fn mean_candidates(&self) -> f64 {
+        self.candidates_seen as f64 / self.decisions.max(1) as f64
+    }
+
+    /// Dispatches per served request -- not always 1: a gang's agents and their tool calls
+    /// each dispatch separately while the gang itself is one served item.
+    fn dispatch_mult(&self) -> f64 {
+        self.dispatches as f64 / self.served.max(1) as f64
+    }
+
+    /// Mean stall per served request. Every tax in the two tables below is a difference of
+    /// two of these, so it is defined once rather than per table.
+    fn mean_ns(&self) -> f64 {
+        self.total_ns as f64 / self.served.max(1) as f64
+    }
+}
+
+/// `docs/phase-8.md`: the data path as an arm. Every row runs the same trace through the
+/// same placement policy at the same control model (`Unified` -- §3.1 of the plan explains
+/// why mixing this with `Control::Query` would double-charge a crossing, since llm-d's
+/// Endpoint Picker holds its own residency view and still pays a callout to reach it). The
+/// only thing that varies is who pays the routing hook and the dispatch hop, and what each
+/// costs.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "experiment knobs, all independent"
+)]
+fn data_path(
+    nodes: usize,
+    units_per_node: usize,
+    hbm: u64,
+    dram: u64,
+    nvme: u64,
+    ops: u64,
+    seed: u64,
+    bands: [u8; BlobKind::N],
+    distance: &str,
+    rate: f64,
+    fanout: f64,
+    repeat: usize,
+    tax_us: Option<f64>,
+) {
+    use polyphonic::boundary::Boundary;
+    use polyphonic::machine::Machine;
+    use polyphonic::topo::{Distance, Topology};
+
+    // Everything that can be checked without the ladder is checked before it: `measure`
+    // spends seconds per repetition on microbenchmarks and gRPC servers, and a typo in a
+    // flag should not cost a full run to discover.
+    let Ok(dist) = distance.trim().parse::<Distance>() else {
+        println!("unknown distance {distance}");
+        return;
+    };
+    if nodes == 0 || units_per_node == 0 {
+        println!("--nodes and --units-per-node must be at least 1");
+        return;
+    }
+    if !cfg!(feature = "grpc") {
+        println!("ext_proc rungs not built -- run with --features grpc");
+        return;
+    }
+
+    let ladder = polyphonic::boundary::measure(repeat);
+    let Some(arms) = path_arms(&ladder) else {
+        println!("ext_proc rung did not measure on this host");
+        return;
+    };
+    let Some(integrated_dispatch) = ladder.get(Boundary::UnixSocket) else {
+        println!("no unix-socket rung available");
+        return;
+    };
+    let Some(sidecar_dispatch) = ladder.get(Boundary::TcpLoopback) else {
+        println!("no tcp-loopback rung available");
+        return;
+    };
+    let Some((topo_label, topo_crossing)) = crossing_of(&ladder, "grpc") else {
+        println!("no boundary rung available");
+        return;
+    };
+
+    let per_node = dram / nodes as u64;
+    let memory = node_memory(
+        hbm / nodes as u64,
+        per_node,
+        nvme / nodes as u64,
+        bands,
+        false,
+    );
+    let topo = Topology::cluster(nodes, units_per_node, per_node, dist, topo_crossing);
+
+    println!(
+        "cluster: {nodes} nodes, {} per node, {units_per_node} units each -- {} : {:.0} us hop\n\
+         node-to-node transport: {topo_label} = {:.1} us + {:.3} ns/byte (MEASURED, orthogonal to the data path below)\n\
+         node link latency, bandwidth and PCIe are MODELLED\n\
+         placement: scored, control: unified -- fixed across every arm, so the data path is the only thing that varies\n",
+        memory_label(memory.hbm, memory.ddr),
+        dist.label(),
+        dist.one_way_ns() as f64 / 1000.0,
+        topo_crossing.fixed_ns / 1000.0,
+        topo_crossing.ns_per_byte,
+    );
+
+    println!(
+        "{:<28}{:>13}{:>12}{:>8}{:>9}",
+        "arm", "service/req", "stall/req", "served", "d"
+    );
+    // The trace is deterministic in `seed` and identical for every arm; generating it once
+    // keeps three quarters of the blake3 chaining out of the loop.
+    let trace: Vec<_> = polyphonic::work::Workload::with_fanout(seed, ops, 1.0, fanout).collect();
+    let mut class_rows: Vec<ClassRow<'static>> = Vec::new();
+    let mut runs: Vec<PathRun> = Vec::new();
+    for a in &arms {
+        let mut mach = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, Placement::Scored);
+        mach.set_flow_aware(true);
+        mach.set_control(Control::Unified, topo_crossing);
+        let dispatch = if a.path == DataPath::Integrated {
+            integrated_dispatch
+        } else {
+            sidecar_dispatch
+        };
+        mach.set_data_path(a.path, a.hook, dispatch);
+        mach.set_state_transfer(true);
+        mach.set_fanout_atomic(true);
+        let (t, total, served, _offered) = drive(&mut mach, rate, &trace);
+        let run = PathRun {
+            served,
+            total_ns: total,
+            decisions: mach.decisions,
+            candidates_seen: mach.candidates_seen,
+            dispatches: mach.dispatches,
+        };
+        println!(
+            "{:<28}{:>11.3}ms{:>10.3}ms{:>8}{:>9.2}",
+            a.label,
+            mean_ms(t.service.iter().sum(), served),
+            mean_ms(total, served),
+            served,
+            run.d(),
+        );
+        class_rows.push((a.label, t));
+        runs.push(run);
+    }
+    class_table(&class_rows);
+
+    let taxes = path_taxes(&arms, &runs, integrated_dispatch, sidecar_dispatch);
+    tax_table(&taxes);
+    crossover_table(&taxes, tax_us, runs[0].d());
+    fleet_ceiling_table(&ladder, rate, nodes, runs[0].d());
+}
+
+/// One arm's tax, priced two ways. `bound_ns` is the closed form from the measured ladder,
+/// `realized_ns` the difference of two simulated means. `phase-8.md` §4.5 requires both:
+/// "P1 is the assertion that they agree; printing only one of them would make P1
+/// unfalsifiable."
+struct PathTax {
+    label: &'static str,
+    hook_label: String,
+    d: f64,
+    disp: f64,
+    bound_ns: f64,
+    realized_ns: f64,
+}
+
+/// Price every non-baseline arm against `runs[0]`, once, so the tax the tax table prints and
+/// the tax the crossover table divides by cannot drift apart.
+fn path_taxes(
+    arms: &[PathArm],
+    runs: &[PathRun],
+    integrated_dispatch: polyphonic::boundary::Cost,
+    sidecar_dispatch: polyphonic::boundary::Cost,
+) -> Vec<PathTax> {
+    use polyphonic::machine::{DISPATCH_BYTES, HOOK_BYTES};
+
+    let base_mean = runs[0].mean_ns();
+    let dispatch_delta =
+        sidecar_dispatch.ns(DISPATCH_BYTES) as f64 - integrated_dispatch.ns(DISPATCH_BYTES) as f64;
+    arms.iter()
+        .zip(runs)
+        .skip(1)
+        .map(|(a, r)| {
+            let hook_ns = a.hook.ns(HOOK_BYTES) as f64;
+            let per_decision = if a.path == DataPath::SidecarPluggable {
+                r.mean_candidates()
+            } else {
+                1.0
+            };
+            let hook_label = if a.path == DataPath::SidecarPluggable {
+                format!("{per_decision:.1} x {:.2} us", hook_ns / 1000.0)
+            } else {
+                format!("{:.2} us", hook_ns / 1000.0)
+            };
+            PathTax {
+                label: a.label,
+                hook_label,
+                d: r.d(),
+                disp: r.dispatch_mult(),
+                bound_ns: per_decision * hook_ns * r.d() + dispatch_delta * r.dispatch_mult(),
+                realized_ns: r.mean_ns() - base_mean,
+            }
+        })
+        .collect()
+}
+
+/// The control-plane tax each sidecar arm pays: `d`, `disp` (dispatches per served request,
+/// exactly tracked because it is not always 1 -- a gang's agents and their tool calls each
+/// dispatch separately) and `hook x d + dispatch-delta x disp` as an *upper bound*, next to
+/// the simulator's own realized mean -- `phase-8.md`'s P1 check.
+///
+/// The bound is not tight when `fanout > 0`, and that gap is itself a finding, not noise:
+/// `serve_gang` reports only its slowest agent's cost (every agent runs, but the orchestrator
+/// waits on the one that gates it), so every agent still pays its own dispatch charge --
+/// counted in `disp` -- while only the slowest agent's charge reaches the stall that feeds
+/// `total_ns`. A second, opposite gap sits underneath it: `serve_gang` charges one routing
+/// hook for a fan-out whose agents `place_agent` scores one argmin at a time, so the hook
+/// side of `d` is *under*-counted by the agent multiplier. Both scale with the fan-out rate,
+/// so the gap alone cannot tell them apart.
+fn tax_table(taxes: &[PathTax]) {
+    println!(
+        "\ncontrol-plane tax, from the measured ladder (parse term dropped -- phase-8.md §1.2)\n"
+    );
+    println!(
+        "{:<28}{:<18}{:>7}{:>7}{:>16}{:>16}",
+        "arm", "hook", "d", "disp", "upper bound/req", "realized/req"
+    );
+    for t in taxes {
+        println!(
+            "{:<28}{:<18}{:>7.2}{:>7.2}{:>13.2} us{:>13.2} us",
+            t.label,
+            t.hook_label,
+            t.d,
+            t.disp,
+            t.bound_ns / 1000.0,
+            t.realized_ns / 1000.0,
+        );
+    }
+}
+
+/// The crossover against the integrated path: the service time at which each arm's tax
+/// passes 5% and 1% of a request. `S* = T x (1/f - 1)` for a per-request tax `T` -- §1.1 of
+/// `phase-8.md`: there is no mechanism for the simulator to produce anything but this, so the
+/// number needs no sweep to compute, only to report from the realized `T` the tax table
+/// printed. Both tables read the same `PathTax`, so the tax quoted and the tax divided by
+/// cannot drift apart.
+///
+/// `--tax-us` substitutes a hand-supplied `T` for a host this prototype has never measured.
+/// It is read as a **per-request** tax, since that is what the formula divides by -- a
+/// per-crossing seam cost measured elsewhere has to be scaled by this workload's own
+/// multipliers first, which is why `d` is printed with the table rather than applied silently.
+fn crossover_table(taxes: &[PathTax], tax_us: Option<f64>, d: f64) {
+    println!(
+        "\ncrossover against the integrated path (S* = T x (1/f - 1), at d = {d:.2} decisions/request)\n"
+    );
+    println!(
+        "{:<28}{:>16}{:>18}",
+        "arm", "5% of a request", "1% of a request"
+    );
+    let mut rows: Vec<(&str, f64)> = taxes.iter().map(|t| (t.label, t.realized_ns)).collect();
+    if let Some(us) = tax_us {
+        rows.push(("override (--tax-us)", us * 1000.0));
+    }
+    for (label, t) in &rows {
+        println!(
+            "{label:<28}{:>13.2} ms{:>15.2} ms",
+            19.0 * t / 1e6,
+            99.0 * t / 1e6,
+        );
+    }
+    if tax_us.is_some() {
+        println!(
+            "\n--tax-us is read as a per-request tax, not a per-crossing one: scale a seam cost\nmeasured on another host by this workload's own d and dispatch multiplier before passing it."
+        );
+    }
+
+    println!("\noverhead share at a log grid of service times\n");
+    print!("{:<28}", "arm");
+    let grid = [10e3, 100e3, 1e6, 10e6, 100e6, 1e9];
+    for s in grid {
+        print!("{:>12}", format_ns_label(s));
+    }
+    println!();
+    for (label, t) in &rows {
+        print!("{label:<28}");
+        for s in grid {
+            print!("{:>11.2}%", 100.0 * t / (t + s));
+        }
+        println!();
+    }
+}
+
+fn format_ns_label(ns: f64) -> String {
+    if ns < 1e6 {
+        format!("{:.0} us", ns / 1e3)
+    } else if ns < 1e9 {
+        format!("{:.0} ms", ns / 1e6)
+    } else {
+        format!("{:.0} s", ns / 1e9)
+    }
+}
+
+/// The fleet size at which one unsharded scheduler saturates: `N_max = sqrt(1e9 / (lambda x d
+/// x c))` for a hook costing `c` ns/crossing at `phase-8.md` §1.4/§4.6's 64 B payload. Two
+/// assumptions are printed with it, because a reader who does not see them will read a
+/// ceiling where there is a design choice: one scheduler thread, and every active node
+/// scored -- sharding or pruning candidates divides the work by the shard count or the prune
+/// ratio instead.
+fn fleet_ceiling_table(l: &polyphonic::boundary::Ladder, rate: f64, nodes: usize, d: f64) {
+    use polyphonic::boundary::{Boundary, SIZES};
+
+    let payload = SIZES[0] as u64;
+    let lambda = rate / nodes.max(1) as f64;
+    println!(
+        "\nfleet size at which one unsharded scheduler saturates\n\
+         (lambda = {lambda:.1} req/s/node, d = {d:.2} measured, every active node scored)\n"
+    );
+    println!(
+        "{:<24}{:>14}{:>10}",
+        "hook boundary", "ns/crossing", "N_max"
+    );
+    for b in [
+        Boundary::Native,
+        Boundary::Wasm,
+        Boundary::Ring,
+        Boundary::ExtProc,
+        Boundary::Grpc,
+    ] {
+        let Some(c) = l.get(b).map(|cost| cost.ns(payload)) else {
+            println!("{:<24}{:>14}", b.label(), "-");
+            continue;
+        };
+        let n_max = if c == 0 {
+            "unbounded".to_string()
+        } else {
+            format!("{:.0}", (1e9 / (lambda * d * c as f64)).sqrt())
+        };
+        println!("{:<24}{c:>14}{n_max:>10}", b.label());
+    }
+    println!(
+        "\nassumes one scheduler thread and every active node scored; sharding the scheduler\n\
+         or pruning candidates before the hook divides the ceiling by the shard count or the\n\
+         prune ratio instead (phase-8.md §1.4)."
+    );
+    if let Some(floor) = l
+        .rungs
+        .iter()
+        .find(|r| r.boundary == Boundary::ExtProc)
+        .and_then(|r| r.by_size.first())
+        .map(|&(bytes, _)| bytes)
+        && floor > payload as usize
+    {
+        println!(
+            "ext_proc's row is its fit extrapolated down to {payload} B from a {floor} B floor."
+        );
     }
 }

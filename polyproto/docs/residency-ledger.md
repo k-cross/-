@@ -482,6 +482,76 @@ an agent turn that spends a second in decode, it is a rounding error. The zero-c
 thesis is not wrong, it is *conditional*, and the condition is sharp: put the extension
 boundary where decisions are coarse, never inside the ledger's hot path.
 
+## Data path
+
+[`phase-8.md`](phase-8.md) turns the sidecar-versus-integrated question into an arm:
+`data_path: { Integrated, Sidecar, SidecarPluggable }`, charging `phase-0.md`'s measured seam
+costs — a routing hook and a dispatch hop — on top of the same trace, the same scored
+placement policy and the same `Control::Unified` model every arm shares, so only the data path
+varies. One run of
+`cargo run --release --features grpc,wasm -- data-path --repeat 10`, `--fanout 0.10` (the
+`distributed` default), 4 nodes:
+
+| arm | hook | `d` | `disp` | upper bound/req | realized/req |
+|---|---|---|---|---|---|
+| integrated | 0.00 µs | 1.23 | 1.32 | — | — |
+| sidecar (stream reuse) | 32.68 µs | 1.23 | 1.32 | 51.71 µs | **43.97 µs** |
+| sidecar (stream/request) | 61.86 µs | 1.23 | 1.32 | 87.64 µs | **74.97 µs** |
+| sidecar, pluggable policy | 4.0 × 32.68 µs | 1.23 | 1.32 | 172.46 µs | **148.14 µs** |
+
+`d` is decisions per served request — measured, not assumed, and **not 1**: a gang's agents share
+one `decide()` but each tool call is another, so `d` rises with agentic traffic (`d = 1.00` at
+`--fanout 0`, `1.63` at `--fanout 0.30`). `disp` is dispatches per served request, tracked
+separately because it is not always 1 either.
+
+**The upper bound is not tight, and the gap is a finding, not noise.** Two effects pull in opposite
+directions, both scaling with the fan-out rate, so the gap alone cannot separate them. *Dispatch is
+over-counted:* `serve_gang` reports only its slowest agent's cost — every agent runs and
+dispatches, but the orchestrator waits on the one that gates it — so every agent's dispatch is
+counted in `disp` while only the gating agent's reaches the stall that feeds `Cost::total_ns()`.
+*The hook is under-counted:* a gang pays **one** `decide()` for the whole fan-out, not one per
+agent, while `place_agent` runs a separate argmin per agent — so a per-candidate hook that really
+existed would be consulted `agents × candidates` times. **The pluggable-policy row is therefore a
+lower bound**, and its crossover and fleet ceiling below are optimistic in the sidecar's favour. On
+a fan-out-free trace the bound and the realized mean are bit-exact
+(`machine::tests::sidecar_tax_matches_closed_form_without_fanout`); the gap opens only once gangs
+enter the mix. The realized mean is what the crossover below is built from.
+
+**Crossover against the integrated path**, `S* = T × (1/f − 1)` for the realized tax `T` — no
+sweep needed, §1.1 of `phase-8.md`:
+
+| arm | 5% of a request | 1% of a request |
+|---|---|---|
+| sidecar (stream reuse) | **0.84 ms** | **4.35 ms** |
+| sidecar (stream/request) | **1.42 ms** | **7.42 ms** |
+| sidecar, pluggable policy | 2.81 ms | 14.67 ms |
+
+Repeats of the same run land the stream-reuse crossover at 0.83–0.90 ms / 4.34–4.71 ms, the
+stream/request crossover at 1.38–1.43 ms / 7.18–7.43 ms, and the pluggable-policy crossover at
+2.81–3.04 ms / 14.67–15.83 ms — host noise on this machine, not a different result; the *existence* of the crossover is the claim, its position moves with the host
+(`owned-and-observed.md` §7). Against §2.3's prediction of ~1.0–1.6 ms / ~5.2–7.9 ms from a
+borrowed 52–79 µs tax with an unexplained ~6.9 µs parse term folded in: dropping that term
+(`phase-8.md` §1.2) predicted 46.1 / 73.1 µs and 0.88–1.39 ms / 4.56–7.23 ms, and the measured
+43.97–74.97 µs and 0.84–1.42 ms / 4.35–7.42 ms land within a few percent of that correction —
+confirming the correction, not the original estimate.
+
+**Fleet size at which one unsharded scheduler saturates**, `N_max = √(1e9 / (λ·d·c))` for a hook
+costing `c` ns/crossing at 64 B, `λ = 62.5` req/s/node, `d = 1.23` measured:
+
+| hook boundary | ns/crossing | `N_max` |
+|---|---|---|
+| native call | 0 | unbounded |
+| wasm (warm instance) | 13 | ~1000 |
+| shared ring (spin) | 67 | ~440 |
+| ext_proc callout | 32 682 | **~20** |
+| gRPC unary RTT | 47 145 | **~17** |
+
+Assumes one scheduler thread and every active node scored — sharding the scheduler or pruning
+candidates before the hook divides the ceiling by the shard count or the prune ratio instead. An
+out-of-process hook forces one of those at a fleet size two orders of magnitude below where an
+in-process one does (~20 nodes against ~1000), which is `owned-and-observed.md` §2.2's
+expressiveness argument with a number attached rather than a direction.
+
 ## Distributed placement
 
 `Topology::cluster` models separate hosts at `Distance::{Socket, Rack, Zone, Region}` — one
@@ -1000,3 +1070,5 @@ computed.
 | unified control plane beats RPC-queried | rounding error in aggregate; 43–60% of a warm invocation |
 | announce / anticipatory prewarm | 11–18% faster tasks, net work slightly worse |
 | downstream-aware gate | Tier 1 — replicable by a hint API |
+| data path binds below ~1 ms, dissolves an order of magnitude above | holds — crossover 0.84–1.42 ms / 4.35–7.42 ms, measured tax not borrowed |
+| out-of-process hook caps scheduler fleet size | holds — ~20 nodes (`ext_proc`) vs ~1000 (`Wasm`), `d` measured not assumed |

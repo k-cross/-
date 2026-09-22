@@ -60,6 +60,26 @@ impl Control {
     }
 }
 
+/// Where the routing decision runs, relative to the engine it dispatches to.
+///
+/// `Control` prices consulting residency knowledge; this prices the hook itself and the hop
+/// to the engine once a target is chosen -- the two seams `owned-and-observed.md` §2.2 calls
+/// "put the boundary where the rate is low". Independent of `Control`: llm-d's Endpoint
+/// Picker holds its own view of residency (so it can run at `Control::Unified` against that
+/// view) and still pays a callout to reach it, which is `DataPath::Sidecar`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DataPath {
+    /// Scheduler and data plane share a process. The hook is a function call; dispatch is a
+    /// local socket to the engine.
+    Integrated,
+    /// A sidecar's routing hook, paid once per placement -- llm-d as deployed: the Endpoint
+    /// Picker scores its candidates in-process and returns one decision to the gateway.
+    Sidecar,
+    /// What extending the sidecar's policy out of process would cost: the hook runs once per
+    /// candidate, inside the argmin, instead of once per placement. `phase-8.md` §1.3.
+    SidecarPluggable,
+}
+
 #[derive(Debug)]
 pub struct Machine {
     topo: Topology,
@@ -91,6 +111,13 @@ pub struct Machine {
     pub bytes_crossed: u64,
     control: Control,
     crossing: Crossing,
+    data_path: DataPath,
+    /// Routing-hook cost `DataPath::Sidecar` and `DataPath::SidecarPluggable` pay on top of
+    /// `crossing`. Zero under `DataPath::Integrated`.
+    hook: Crossing,
+    /// The dispatch hop once a target is chosen -- reaching the engine. Local-socket cost
+    /// under `Integrated`, a loopback hop under either sidecar arm.
+    dispatch: Crossing,
     /// Co-place a task's downstream stage with its upstream. Orthogonal to residency
     /// placement: the scheduler learns the upstream's location by having placed it, so this
     /// needs no cross-node knowledge and pays no crossing to use.
@@ -110,6 +137,19 @@ pub struct Machine {
     pub decide_ns: u64,
     /// Crossings spent on control traffic, whether or not they sit on the critical path.
     pub control_rpcs: u64,
+    /// Placement decisions made -- one per `decide()` call, so a gang's agents count once
+    /// and each of its tool calls counts again. `decisions / served` is `d`,
+    /// `phase-8.md`'s decisions-per-request multiplier.
+    pub decisions: u64,
+    /// Sum of candidate counts scored, one term per `decide()` call. `candidates_seen /
+    /// decisions` is the mean fleet size a `SidecarPluggable` hook actually pays for --
+    /// `phase-8.md` §1.4's `N`.
+    pub candidates_seen: u64,
+    /// `run_here` calls that reached the dispatch charge -- not one per served request:
+    /// a gang's agents and their tool calls each dispatch separately, while the gang itself
+    /// is one served item. `dispatches / served` is `phase-8.md` §4.5's exact per-request
+    /// dispatch multiplier.
+    pub dispatches: u64,
     /// Decisions where the scheduler's view of the chosen node disagreed with the truth.
     pub stale_decisions: u64,
     /// How many placements each term of the score actually changed. A term that never moves
@@ -208,6 +248,9 @@ impl Machine {
             bytes_crossed: 0,
             control: Control::Unified,
             crossing: Crossing::default(),
+            data_path: DataPath::Integrated,
+            hook: Crossing::default(),
+            dispatch: Crossing::default(),
             flow_aware: false,
             view: vec![HashSet::new(); n_domains],
             staged: vec![HashSet::new(); n_domains],
@@ -216,6 +259,9 @@ impl Machine {
             ops: 0,
             decide_ns: 0,
             control_rpcs: 0,
+            decisions: 0,
+            candidates_seen: 0,
+            dispatches: 0,
             stale_decisions: 0,
             moved_by_displacement: 0,
             moved_by_flow: 0,
@@ -364,6 +410,18 @@ impl Machine {
         }
     }
 
+    /// Install the data-path model. `hook` prices the routing callout `DataPath::Sidecar`
+    /// and `DataPath::SidecarPluggable` pay on top of whatever `Control` already charges for
+    /// residency knowledge; `dispatch` prices reaching the engine once placement is settled.
+    /// Both should come from `boundary::measure` on the host being modelled, not from a
+    /// constant. `DataPath::Integrated` with zero costs is the default, so every experiment
+    /// that never calls this stays byte-identical to before this existed.
+    pub fn set_data_path(&mut self, path: DataPath, hook: Crossing, dispatch: Crossing) {
+        self.data_path = path;
+        self.hook = hook;
+        self.dispatch = dispatch;
+    }
+
     fn refresh_view(&mut self) {
         for (d, h) in self.domains.iter().enumerate() {
             let set: HashSet<BlobId> = h.hot_ids().collect();
@@ -393,10 +451,15 @@ impl Machine {
 
     /// What one placement decision costs, and what it costs the cluster. A fan-out query is
     /// charged one crossing of *latency* because the asks go out in parallel, but N crossings
-    /// of *work*, which is what caps the decision rate.
-    fn decide(&mut self, chain_len: usize) -> u64 {
+    /// of *work*, which is what caps the decision rate. `candidates` is how many nodes this
+    /// decision scores -- `DataPath::SidecarPluggable`'s hook is paid once per candidate,
+    /// because an out-of-process policy term really does run inside the argmin, the way a
+    /// first-party one already does in `best_scored`.
+    fn decide(&mut self, chain_len: usize, candidates: usize) -> u64 {
         self.ops += 1;
-        match self.control {
+        self.decisions += 1;
+        self.candidates_seen += candidates as u64;
+        let control_ns = match self.control {
             Control::Unified => 0,
             Control::Query => {
                 self.control_rpcs += self.active.len() as u64;
@@ -408,6 +471,19 @@ impl Machine {
                 }
                 0
             }
+        };
+        control_ns + self.hook_ns(candidates)
+    }
+
+    /// The routing hook's own cost, on top of whatever `Control` charges for residency
+    /// knowledge. Zero for `Integrated`, where the hook is a function call. `Sidecar` pays
+    /// one `ext_proc`-shaped callout per placement; `SidecarPluggable` prices the same hook
+    /// run once per candidate instead.
+    fn hook_ns(&self, candidates: usize) -> u64 {
+        match self.data_path {
+            DataPath::Integrated => 0,
+            DataPath::Sidecar => self.hook.ns(HOOK_BYTES),
+            DataPath::SidecarPluggable => candidates as u64 * self.hook.ns(HOOK_BYTES),
         }
     }
 
@@ -424,6 +500,16 @@ impl Machine {
             .max_by_key(|&d| Self::rendezvous(root, d))
             .unwrap_or(0);
         self.unit_in(d)
+    }
+
+    /// How many domains `decode_pool` would return, without building the vector for it.
+    fn decode_pool_len(&self) -> usize {
+        let n = self
+            .active
+            .iter()
+            .filter(|&&d| self.domains[d].can_decode())
+            .count();
+        if n == 0 { self.active.len() } else { n }
     }
 
     /// Domains that can serve a decode-bearing request, falling back to every active domain
@@ -821,14 +907,14 @@ impl Machine {
         if let Some(gang) = &req.gang {
             return self.serve_gang(req, gang);
         }
-        let decide_ns = self.decide(req.chain.len());
-        self.decide_ns += decide_ns;
         let decode_needed = Self::needs_decode(req);
         let candidates = if decode_needed {
             self.decode_pool()
         } else {
             self.active.clone()
         };
+        let decide_ns = self.decide(req.chain.len(), candidates.len());
+        self.decide_ns += decide_ns;
         if self.placement != Placement::Blind {
             self.sticky_unit = self.affinity_unit(&req.chain, &candidates);
         }
@@ -956,8 +1042,11 @@ impl Machine {
             cost.recompute_ns += dep.recompute_ns;
             cost.pending |= dep.pending;
         }
-        // Charged only on a request that actually runs: a refusal does no work.
+        // Charged only on a request that actually runs: a refusal does no work, and never
+        // reaches an engine to dispatch to.
         if !cost.pending {
+            cost.dispatch_ns += self.dispatch.ns(DISPATCH_BYTES);
+            self.dispatches += 1;
             let (exec, queue) = self.execute(home, req);
             cost.exec_ns = exec;
             cost.queue_ns = queue;
@@ -1014,7 +1103,11 @@ impl Machine {
     fn serve_gang(&mut self, req: &Request, gang: &Gang) -> Cost {
         let n = gang.agents.len().max(1);
         let blobs: usize = gang.agents.iter().map(|a| a.chain.len()).sum();
-        let decide_ns = self.decide(blobs);
+        // One decide() for the whole gang: per-agent feasibility is resolved below in
+        // `stage_agents`, but the routing hook this charges is the single decision that
+        // dispatches the fan-out, not one per agent -- the same "one crossing of latency"
+        // reasoning `Control::Query` already applies to a fan-out's residency asks.
+        let decide_ns = self.decide(blobs, self.decode_pool_len());
         self.decide_ns += decide_ns;
         let mut cost = Cost {
             decide_ns,
@@ -1090,6 +1183,7 @@ impl Machine {
         cost.queue_ns += worst.queue_ns;
         cost.exec_ns += worst.exec_ns;
         cost.decide_ns += worst.decide_ns;
+        cost.dispatch_ns += worst.dispatch_ns;
         if !cost.pending {
             self.fanouts_admitted += 1;
             self.fanout_service_ns += cost.service_ns();
@@ -1256,6 +1350,7 @@ impl Machine {
             cost.recompute_ns += t.recompute_ns;
             cost.decide_ns += t.decide_ns;
             cost.exec_ns += t.exec_ns;
+            cost.dispatch_ns += t.dispatch_ns;
         }
         cost
     }
@@ -1266,10 +1361,18 @@ impl Machine {
     /// is exactly the trade the score exists to make.
     fn run_tool(&mut self, caller: usize, tool: &ToolCall) -> Cost {
         let probe = Self::tool_request(tool);
-        let decide_ns = self.decide(probe.chain.len());
-        self.decide_ns += decide_ns;
         let flow = [(caller, tool.payload_bytes), (caller, tool.payload_bytes)];
         let candidates = self.active.clone();
+        // A flow-aware unscored policy returns the caller's node without an argmin, so it
+        // scores one candidate, not the fleet. Charging the fleet would bill a per-candidate
+        // hook for comparisons that never happen.
+        let scored = if self.placement == Placement::Scored || !self.flow_aware {
+            candidates.len()
+        } else {
+            1
+        };
+        let decide_ns = self.decide(probe.chain.len(), scored);
+        self.decide_ns += decide_ns;
         let affinity = self.affinity_domain(&probe.chain, &candidates);
         let target = if self.placement == Placement::Scored {
             self.best_scored(&probe, &flow, affinity, &candidates)
@@ -1379,3 +1482,118 @@ type Need = [u64; BlobKind::N];
 
 /// A residency question names a blob by its 32-byte id and its size.
 const QUERY_BYTES_PER_BLOB: u64 = 40;
+
+/// An argmin's per-candidate payload for a routing hook: small, the column Phase 0's hook
+/// table is denominated in. `ext_proc` has no sample at this size -- its floor is a 367 B
+/// header map -- so a `Sidecar` charge here is `boundary::measure`'s fit extrapolated down,
+/// exactly as the published hook table is (`phase-8.md` §4.2).
+pub const HOOK_BYTES: u64 = 64;
+
+/// Dispatch payload once a target is chosen. Both candidate rungs (`UnixSocket`,
+/// `TcpLoopback`) are effectively flat in payload size, so this choice moves the dispatch
+/// charge by under 1% either way (`phase-8.md` §4.3).
+pub const DISPATCH_BYTES: u64 = 1024;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::{NodeMemory, Policy, Quota};
+    use crate::topo::{Distance, Topology};
+    use crate::work::Workload;
+
+    fn machine(nodes: usize) -> Machine {
+        let bands = [0u8; BlobKind::N];
+        let mem = NodeMemory {
+            hbm: 0,
+            ddr: 64 << 30,
+            nvme: 0,
+            hbm_quota: Quota::open(0, bands),
+            ddr_quota: Quota::open(64 << 30, bands),
+            can_decode: true,
+        };
+        let topo = Topology::cluster(nodes, 1, mem.ddr, Distance::Socket, Crossing::default());
+        Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored)
+    }
+
+    /// P1, `phase-8.md` §1.1: on a trace with no gangs, `run_here` is called exactly once per
+    /// served request, so the realized tax must match `hook x decisions + dispatch-delta x
+    /// dispatches` exactly -- there is no mechanism between the charge sites and
+    /// `Cost::total_ns()` for it to be anything else. A gang's worst-agent-wins aggregation is
+    /// what breaks the equality when fan-out is present (`phase-8.md`'s tax-table doc comment);
+    /// this test isolates the claim from that complication.
+    #[test]
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "nanosecond totals over a 500-op trace, nowhere near i64::MAX"
+    )]
+    fn sidecar_tax_matches_closed_form_without_fanout() {
+        let hook = Crossing {
+            fixed_ns: 36_000.0,
+            ns_per_byte: 0.0,
+        };
+        let dispatch_integrated = Crossing {
+            fixed_ns: 6_000.0,
+            ns_per_byte: 0.0,
+        };
+        let dispatch_sidecar = Crossing {
+            fixed_ns: 15_000.0,
+            ns_per_byte: 0.0,
+        };
+        let trace: Vec<_> = Workload::new(1, 500, 1.0).collect();
+
+        let mut base = machine(4);
+        base.set_data_path(
+            DataPath::Integrated,
+            Crossing::default(),
+            dispatch_integrated,
+        );
+        let (mut base_total, mut base_served) = (0i64, 0u64);
+        for req in &trace {
+            let c = base.serve_request(req);
+            if !c.pending {
+                base_total += c.total_ns() as i64;
+                base_served += 1;
+            }
+        }
+
+        let mut side = machine(4);
+        side.set_data_path(DataPath::Sidecar, hook, dispatch_sidecar);
+        let (mut side_total, mut side_served) = (0i64, 0u64);
+        for req in &trace {
+            let c = side.serve_request(req);
+            if !c.pending {
+                side_total += c.total_ns() as i64;
+                side_served += 1;
+            }
+        }
+
+        assert_eq!(
+            base_served, side_served,
+            "no fan-out: admission must not depend on the data path"
+        );
+        assert_eq!(base.decisions, side.decisions);
+        assert_eq!(base.dispatches, side.dispatches);
+        assert_eq!(
+            side.dispatches, side_served,
+            "one dispatch per served request without gangs"
+        );
+        // The closed form sums hooks over *every* decision but totals only served requests,
+        // so a refusal would break the equality for a reason that has nothing to do with the
+        // data path. State the fixture's precondition rather than relying on it.
+        assert_eq!(
+            side.decisions,
+            trace.len() as u64,
+            "fixture must refuse nothing: a refused request is decided but never totalled"
+        );
+
+        let dispatch_delta = dispatch_sidecar.ns(DISPATCH_BYTES) as i64
+            - dispatch_integrated.ns(DISPATCH_BYTES) as i64;
+        let predicted = side.decisions as i64 * hook.ns(HOOK_BYTES) as i64
+            + side.dispatches as i64 * dispatch_delta;
+        let realized = side_total - base_total;
+        assert_eq!(
+            predicted, realized,
+            "closed-form tax must match the simulator's own total exactly outside gangs"
+        );
+    }
+}

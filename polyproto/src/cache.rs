@@ -655,6 +655,11 @@ pub struct Cost {
     /// Time waiting for a slot rather than for state. A residency policy moves this too:
     /// placing work on a saturated engine is a stall the ledger never sees.
     pub queue_ns: u64,
+    /// The hop from wherever placement was settled to the engine that runs the work. Kept out
+    /// of `transfer_ns` because that field answers "did the ledger have to move state", which
+    /// is what classifies a warm invocation; a control hop the request pays either way would
+    /// make every request look cold.
+    pub dispatch_ns: u64,
     /// The work itself, once its state is resident: a function body, a decode loop, a request
     /// handler. Without this a warm invocation costs nothing at all and every overhead looks
     /// infinite beside it.
@@ -669,7 +674,7 @@ impl Cost {
     /// Execution is deliberately excluded: adding a fixed 200 ms decode to every arm would
     /// bury the differences under a constant.
     pub fn total_ns(&self) -> u64 {
-        self.transfer_ns + self.recompute_ns + self.decide_ns + self.queue_ns
+        self.transfer_ns + self.recompute_ns + self.decide_ns + self.queue_ns + self.dispatch_ns
     }
 
     /// End-to-end time for the request. This is the denominator an overhead is a fraction of.

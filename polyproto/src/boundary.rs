@@ -196,6 +196,10 @@ fn batched(iters: usize, batch: usize, mut f: impl FnMut()) -> u64 {
 /// Control-plane message sizes. A scheduling decision is tens to thousands of bytes; the
 /// span is wide enough to separate the fixed crossing cost from the marshalling slope.
 pub const SIZES: [usize; 3] = [64, 1024, 8192];
+
+/// Key of the `extra` entry pricing a callout that has to open its stream first. Named here
+/// so a consumer looks it up by constant rather than by substring of the printed label.
+pub const EXTPROC_STREAM_OPEN: &str = "ext_proc: stream open + first callout";
 const ITERS: usize = 20_000;
 
 /// Run the ladder `reps` times and keep the best observation of each rung. A microbenchmark
@@ -289,7 +293,7 @@ fn measure_once() -> Ladder {
         let (r, stream_open) = extproc::measure(timer_ns);
         rungs.push(r);
         if let Some(ns) = stream_open {
-            extra.push(("ext_proc: stream open + first callout", ns));
+            extra.push((EXTPROC_STREAM_OPEN, ns));
         }
         rungs.push(grpc::measure(timer_ns));
     }

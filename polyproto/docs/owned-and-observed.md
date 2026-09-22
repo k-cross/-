@@ -373,7 +373,7 @@ rule covers every seam:
 |---|---|---|---|---|
 | per connection | TLS, ALPN, protocol normalisation | Envoy listener | commodity edge or own listener | anything |
 | per step, 40-100 Hz | engine telemetry | KV events, scraped metrics | same, step-aligned (§1) | anything; choose for adoptability |
-| per request | dispatch to the engine | sidecar -> localhost HTTP, 15.4 us + parse | direct, UDS today, **6.0-6.6 us** | sockets; a ring for short-request classes |
+| per request | dispatch to the engine | sidecar -> localhost HTTP, 15.4 us + parse | direct, UDS: **5.2-7.5 us** (the ladder's least stable rung -- non-monotone in payload, see `residency-ledger.md`'s *Boundary costs*) | sockets; a ring for short-request classes |
 | **per decision, in an argmin** | **routing and policy hooks** | **`ext_proc` callout, open stream: 36 us (measured)** | **in-process, 0 ns / wasm 13-25 ns / ring 70-180 ns** | **`Native`, `Wasm` and `Ring`** |
 
 The dispatch row is the seam that cannot be removed -- removing it means implementing the engine,
@@ -406,13 +406,19 @@ a sandboxed extension specifically, not just an in-process one.
 ### 2.3 The honest accounting
 
 Removing `ext_proc` and the sidecar saves a tax that depends on how the sidecar's processor stream
-is configured -- `phase-0.md` measured both shapes rather than assuming one. Envoy's documented
-default opens a new `ext_proc` stream per HTTP request, measured at 63 us; a processor that gets to
-keep its stream open instead measures at 36 us. Adjusting the same estimate the two ways gives
-roughly **79 us per request** in the default configuration and roughly **52 us** with stream reuse:
-the callout, the loopback hop at 15 us and its parse, less the ~6 us the integrated path still pays
-to reach the engine. Both figures are from the measured ladder and are the solid half. The
-denominator is not:
+is configured -- `phase-0.md` measured both shapes rather than assuming one, and
+[`phase-8.md`](phase-8.md) turned the estimate into an arm: `data_path: { Integrated, Sidecar,
+SidecarPluggable }`, charged on the same trace through the same scored placement policy, so only
+the data path varies. Envoy's documented default opens a new `ext_proc` stream per HTTP request,
+measured at 63 us; a processor that gets to keep its stream open instead measures at 36 us. The
+first version of this section adjusted a hand-built estimate the two ways and added a ~6.9 us parse
+term with no provenance behind it; `phase-8.md` §1.2 dropped that term for exactly that reason, and
+the arm now reports what the simulator's own `Cost::total_ns()` carries rather than an estimate
+built by hand: **43.97-74.97 us per request** across the two deployment shapes, at `--fanout 0.10`
+(the `distributed` default) with `d = 1.23` decisions per request, *measured, not assumed* -- a
+gang's agents share one decision but each tool call is another, so this multiplier rises with
+agentic traffic rather than staying fixed at the "4 decisions" earlier sections used. Both figures
+are from the measured ladder and are the solid half. The denominator is not:
 
 | work being scheduled | provenance | what the sidecar path adds |
 |---|---|---|
@@ -426,12 +432,31 @@ The bottom two are workload constants, not measurements -- `residency-ledger.md`
 "measured" in one table and lists `exec_ns` as **modelled** four hundred lines later, and the code
 is `FAAS_EXEC_MIN_NS + rng.below(FAAS_EXEC_SPAN_NS)`.
 
-**So argue from the crossover, which needs no denominator.** At a 52-79 us tax -- the range the two
-measured deployment shapes bracket -- the sidecar path costs more than 5% of a request below
-**~1.0-1.6 ms** of service time and less than 1% above **~5.2-7.9 ms**. The claim that survives any
-constant here, and either shape: *the data-path choice binds for sub-millisecond work and dissolves
-an order of magnitude above it.* Whether that matters is then a question about the **request mix**,
-answerable from published FaaS duration distributions rather than polyproto's `exec_ns`.
+**So argue from the crossover, which needs no denominator.** `S* = T x (1/f - 1)` for the realized
+tax `T`, needing no sweep and no simulator beyond producing `T` and `d` -- `phase-8.md` §1.1. Across
+four runs on this host, the sidecar path costs more than 5% of a request below **0.83-0.90 ms**
+with the stream kept open and **1.38-1.43 ms** on Envoy's per-request default, and less than 1%
+above **4.34-4.71 ms** and **7.18-7.43 ms** respectively -- against this section's earlier borrowed
+prediction of ~1.0-1.6 ms / ~5.2-7.9 ms, confirming that dropping the unexplained parse term moved
+the crossover down, as §1.2 predicted it would. The claim that survives any constant here, and
+either shape: *the data-path choice binds for sub-millisecond work and dissolves an order of
+magnitude above it.* Whether that matters is then a question about the **request mix**, answerable
+from published FaaS duration distributions rather than polyproto's `exec_ns`.
+
+**A pluggable sidecar policy is a different, larger number, and conflating the two overstates the
+deployed tax.** `SidecarPluggable` charges the hook once per *candidate* rather than once per
+*placement* -- what extending the sidecar's own scoring logic out of process would cost, not what
+llm-d's Endpoint Picker (which scores in-process and returns one decision) actually pays. At the
+same defaults it measures **148.14 us/request**, crossing at **2.81 ms / 14.67 ms** -- roughly
+3.4x the deployed sidecar's tax, tracking the 4-node candidate count almost exactly. `phase-8.md`
+§1.3 names this the difference between §2's `data_path` arm and §2.2's expressiveness argument, and
+keeps the two arms separate so neither number is quoted for the other's question.
+
+**That figure is a lower bound, and the direction matters.** A fan-out pays one `decide()` for the
+whole gang while `place_agent` runs a separate argmin per agent, so a hook that really ran per
+candidate would be consulted `agents x candidates` times rather than once times candidates. The
+undercount flatters the sidecar, which is the arm this section is least inclined to flatter, so it
+is stated rather than corrected mid-publish.
 
 **For inference alone, killing the sidecar is not worth doing on latency grounds, and this document
 should not claim it is.** A decode-bound turn sits three orders of magnitude above the crossover;
@@ -592,7 +617,7 @@ with the foreign-runtime row, not inside a per-candidate score.
 
 ### 2.7 What to measure
 
-Two numbers. The first no longer needs a simulator -- it is done.
+Two numbers. Both are done, and neither needed the sweep this section originally asked for.
 
 **Extend the ladder. Done in `phase-0.md`.** `boundary.rs` used to measure gRPC unary standing in
 for both an `ext_proc` callout with header-mutation semantics and a WASM sandbox it had no rung for
@@ -601,25 +626,34 @@ now has a warm-instance WASM rung, an `ext_proc` rung in both deployment shapes 
 and a stream per request), and a re-timed `Ring` rung, and publishes the per-decision cost of a
 policy hook at each isolation level (§2.2, §2.6).
 
-**Then an arm.** `data_path: { Sidecar, Integrated }`, charging measured seam costs per request
-across the workload mix. Most of the mechanism exists: `Machine::decide` already charges a
-configurable `Boundary` per placement and scales the work term by candidate count, so
-`Control::Unified` against `Control::Query` over `Boundary::Grpc` *is* the comparison for the
-decision seam. Missing: the dispatch hop, a per-candidate hook rather than per-placement, and the
-sweep below. This is Phase 8, not Phase 0 -- it depends on this measurement and nothing else.
+**Then an arm. Done in `phase-8.md`.** `data_path: { Integrated, Sidecar, SidecarPluggable }`,
+charging measured seam costs per request across the workload mix -- three arms rather than two,
+because charging the pluggable-policy multiplier to the deployed sidecar overstates its tax by the
+candidate count (§2.3 above). `Machine::decide` charges the hook and `run_here` charges the
+dispatch hop; both are counted exactly (`decisions`, `dispatches`, `candidates_seen`), not assumed.
 
-**Report a curve, not a point.** A run charging measured seam costs against modelled `exec_ns`
-returns whatever those constants imply -- predicting "25-50% for warm FaaS" would be predicting
-`FAAS_EXEC_MIN_NS`, which is circular. Sweep the service-time denominator and publish the crossover:
-where control-plane overhead passes 5% and 1% of a request. That is a property of the measured
-ladder alone.
+**A curve turned out not to be the deliverable -- the crossover is a closed form.** This section
+originally asked for a sweep of the service-time denominator because a run charging measured seam
+costs against modelled `exec_ns` "returns whatever those constants imply". That is still true, and
+it is exactly why the crossover needs no sweep to compute: `S* = T x (1/f - 1)` for the realized
+per-request tax `T`, a straight consequence of `overhead share = T / (T + S)`, so a simulator that
+charges `T` on the critical path and divides by service time can only reproduce this arithmetic
+(`phase-8.md` §1.1). The simulated share is still printed beside the closed form as a check, and it
+agrees -- exactly on a fan-out-free trace, and within the amount a gang's worst-agent-wins cost
+aggregation predicts once fan-out is added (§2.3). What the simulator adds that the arithmetic alone
+cannot is `d` -- the measured decisions-per-request multiplier, workload-dependent rather than
+fixed -- and the fleet-size ceiling below.
 
-Predicted, now from a measured tax rather than a borrowed one: **~1.0-1.6 ms and ~5.2-7.9 ms**,
-following §2.3's 52-79 us range across the two `ext_proc` deployment shapes rather than the single
-borrowed 65 us. If the crossover lands an order of magnitude lower -- plausible if seam costs are
-smaller on a datacenter Linux host than on this one -- then almost no real workload sits below it,
-the data-path case rests entirely on §2.2's expressiveness argument, and this section should say so
-rather than reach for a mix that rescues it.
+Measured, now from the simulator's own totals rather than a borrowed or hand-adjusted estimate:
+**0.83-0.90 ms and 4.34-4.71 ms** with the `ext_proc` stream kept open, **1.38-1.43 ms and
+7.18-7.43 ms** on Envoy's per-request default -- against this section's earlier prediction of
+~1.0-1.6 ms / ~5.2-7.9 ms, confirming that dropping the unexplained ~6.9 us parse term
+(`phase-8.md` §1.2) moved the crossover down as predicted, not that the prediction was wrong to
+make. The crossover did not land an order of magnitude lower, so this is not the branch where the
+data-path case would have had to rest on §2.2's expressiveness argument alone -- though that
+argument gets its own, sharper number too: an unsharded scheduler scoring `ext_proc` callouts
+saturates between 19 and 20 nodes at this workload's decision rate, against ~1000 for a warm WASM
+hook (§5).
 
 ---
 
@@ -1035,8 +1069,7 @@ than claimed and this document should say so.
 ## 5. Emergent properties
 
 An advantage is *emergent* if no silo can produce it independently and it is not merely a hint
-away. Five are simulated; two rest on the measured ladder but are not yet run end to end; five are
-proposed.
+away. Five are simulated; two are now measured end to end (`phase-8.md`); five are proposed.
 
 **On the first five:** simulated, not measured, on a model since found wrong in more than one way.
 Treat each as what is expected to survive re-running rather than what has been re-run, and as
@@ -1068,17 +1101,23 @@ the budget stays the orchestrator's whoever fills it.
 5. **One currency for host hints.** A prewarm, a retention directive and an eviction priced in the
    same host DDR units can be traded against each other. A siloed hint is advisory and unpriced.
 
-**Measured at the boundary, not yet end to end (§2).**
+**Measured end to end (§2, `phase-8.md`).**
 
 6. **One data path serving two denominators.** Control-plane overhead is a fraction set by the work
-   being scheduled; the **crossover** is its durable form (§2.3). An inference-only stack buys a
-   proxy out of the decode budget; a FaaS control plane cannot. **Only a unified orchestrator is
-   forced to pick one path for both**, which makes "integrate, do not proxy" a consequence of
-   unification rather than a preference.
-7. **Extension cost as an expressiveness bound.** A hook at 36-63 us (measured, `ext_proc`) must be
-   a constant attached to the request; at 0-180 ns (native through ring) it can be a function of
-   each candidate inside the argmin. The same ladder prices trust. No silo needs this ordering,
-   because no silo is simultaneously a scheduler and a data plane.
+   being scheduled; the **crossover** is its durable form (§2.3), now run as an arm rather than
+   computed by hand: 0.83-0.90 ms / 4.34-4.71 ms with the sidecar's stream kept open, 1.38-1.43 ms /
+   7.18-7.43 ms on Envoy's per-request default. An inference-only stack buys a proxy out of the
+   decode budget; a FaaS control plane cannot. **Only a unified orchestrator is forced to pick one
+   path for both**, which makes "integrate, do not proxy" a consequence of unification rather than a
+   preference.
+7. **Extension cost as an expressiveness bound, and a fleet-size ceiling with a number on it.** A
+   hook at 36-63 us (measured, `ext_proc`) must be a constant attached to the request; at 0-180 ns
+   (native through ring) it can be a function of each candidate inside the argmin. The same ladder
+   prices trust. Run as an arm, this bound turns out to be quadratic in fleet size for a
+   per-candidate hook -- `phase-8.md` §1.4 -- and the ceiling is measured, not asserted: at this
+   workload's decision rate (`d = 1.23`, measured), one unsharded scheduler scoring `ext_proc`
+   callouts saturates between **19 and 20 nodes**; scoring a warm `Wasm` hook, **~1000**. No silo
+   needs this ordering, because no silo is simultaneously a scheduler and a data plane.
 
 **Proposed, and the reason to do §3 and §4.**
 
@@ -1506,14 +1545,17 @@ deployed, and one per candidate, which is what extending its policy would cost -
 the second to the first overstates the deployed tax by the candidate count.
 
 - **Deliverable:** the **crossover** -- the service time at which control-plane overhead passes 5%
-  and 1% of a request -- swept across the denominator rather than read off `exec_ns` (§2.7).
-  Predicted ~1.3 ms and ~6.5 ms. Per-class figures illustrate where each class sits on the curve;
-  they are not the result, because those service times are chosen constants.
-- **Risk:** falsifiable in the direction that matters. If the crossover lands far below a
-  millisecond, almost nothing real is beneath it and the case rests entirely on §2.2's
-  expressiveness argument -- which §2 should then say plainly.
-- **Size:** small given Phase 0. `Machine::decide` already charges a configurable boundary per
-  placement and scales it by candidate count, so the decision seam is new arms, not new mechanism.
+  and 1% of a request -- computed in closed form from the arm's realized tax rather than read off
+  `exec_ns` (§2.7). Measured: 0.83-0.90 ms / 4.34-4.71 ms with the sidecar's stream kept open,
+  1.38-1.43 ms / 7.18-7.43 ms on Envoy's per-request default. Per-class figures illustrate where
+  each class sits on the curve; they are not the result, because those service times are chosen
+  constants.
+- **Risk:** falsifiable in the direction that matters, and did not fall the falsifying way: the
+  crossover sits within a factor of 2 of a millisecond rather than an order of magnitude below it,
+  so it is not the case that almost nothing real is beneath it.
+- **Size:** small given Phase 0, confirmed in the build: `Machine::decide` and `run_here` already
+  charged a configurable boundary and scaled by candidate count, so the decision and dispatch seams
+  were new arms, not new mechanism -- `machine.rs`, `main.rs`, and one test.
 
 ### Ordering
 

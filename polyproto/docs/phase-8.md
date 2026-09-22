@@ -5,9 +5,25 @@ sidecar-versus-integrated question into a `data_path` arm, charge [`phase-0.md`]
 measured seam costs per request, and publish the service time at which control-plane overhead
 passes 5% and 1% of a request.
 
-**Status: planned.** Phase 0 is implemented and measured, which is the only thing this phase
-depends on. Nothing in the memory chain (Phases 1-6) gates it and it gates nothing, so it can run
-alongside them.
+**Status: implemented and measured.** `DataPath { Integrated, Sidecar, SidecarPluggable }` is in
+[`machine.rs`](../src/machine.rs), charged from `decide()` (the hook) and `run_here()` (the
+dispatch hop), and `polyphonic data-path` prints the tax, the crossover and the fleet ceiling. The
+numbers below are from `cargo run --release --features grpc,wasm -- data-path --repeat 10`, four
+runs on this host; they are published in [`residency-ledger.md`](residency-ledger.md)'s *Data
+path* section and folded into `owned-and-observed.md` §2.2, §2.3, §5 and §2.7.
+
+**One correction from implementation, before the numbers are read.** §4.5's tax table assumed a
+single dispatch per served request; it is not one when a gang is in the trace, because
+`serve_gang` reports only its slowest agent's cost (§8's "worst-agent-wins" -- every agent runs and
+dispatches, but the orchestrator waits on the one that gates it, so non-gating agents' charges
+never reach the stall the crossover is computed from). Two new counters, `dispatches` and
+`candidates_seen`, make the per-request dispatch and candidate multipliers exact instead of
+assumed, and the tax table now prints both an *upper bound* (`hook x d + dispatch-delta x
+disp`, additive, what every charge site summed independently would give) and the *realized* mean
+(what `Cost::total_ns()` actually carries) side by side -- P1's check, sharpened rather than
+weakened by finding this. A unit test (`machine::tests::sidecar_tax_matches_closed_form_without_fanout`)
+isolates the claim from gangs entirely and asserts the two are bit-exact on a fan-out-free trace,
+which they are.
 
 **Four findings from reading Phase 0's output against §2, before any prediction below is read.**
 Each one changes what the arm should charge or what the result can claim, and three of them shrink
@@ -175,6 +191,38 @@ mechanism for it to do anything else.
   does not model it. Find it before publishing -- it is a bug in the charge sites far more likely
   than a real effect, and publishing an unexplained gap would be publishing a mistake.
 
+**Measured: confirmed, with two real causes behind the gap rather than a bug.** On a fan-out-free
+trace the realised mean is bit-exact against `hook x decisions + dispatch-delta x dispatches`
+(`machine::tests::sidecar_tax_matches_closed_form_without_fanout`), which is what "there is no
+mechanism for it to be anything else" predicts. With `--fanout 0.10` the two diverge by 15-20% --
+not noise, and not a charge-site bug. Two effects pull in opposite directions, and both scale with
+the fan-out rate, so the gap alone cannot separate them:
+
+- **Dispatch is over-counted.** `serve_gang` reports only its slowest agent's cost -- every agent
+  runs and dispatches, but the orchestrator waits on the one that gates it -- so every agent's
+  dispatch is counted in `disp` while only the gating agent's reaches the stall the crossover is
+  built from. This is the larger term and the direction the gap actually moves.
+- **The hook is under-counted.** A gang pays **one** `decide()` for the whole fan-out, not one per
+  agent (§4.2's deliberate choice, and the "one crossing of latency" reasoning `Control::Query`
+  already applies). But `place_agent` runs a *separate argmin per agent*, so a per-candidate hook
+  that really existed would be consulted `agents x candidates` times. **`SidecarPluggable`'s tax is
+  therefore a lower bound**, and its crossover and fleet ceiling are optimistic in the sidecar's
+  favour -- worth stating, because it is the arm whose number is least flattering to the sidecar
+  already.
+
+The closed form is now printed as an *upper bound* rather than a prediction, and the crossover uses
+the realised mean, which is what the simulator's own `Cost::total_ns()` actually carries.
+
+**One bug this prediction caught on the way.** The dispatch hop was first charged into
+`Cost::transfer_ns`, whose zero-test is what `drive()` uses to classify a *warm* request. A control
+hop every request pays either way made every request look cold, and the `data-path` class table
+reported a 0% warm rate for every class in every arm, including `integrated`. It now has its own
+`Cost::dispatch_ns` field, counted in `total_ns()` but kept out of "did the ledger have to move
+state", and the same run reports 77% warm for `faas` and 100% for `service`. No published tax or
+crossover figure moved -- the two arms' totals differ by the same amount either way -- but a column
+that was being printed as a result was wrong, and it was wrong in the direction of looking like the
+data path had destroyed the warm pool.
+
 **P2 -- `d` is between 1.0 and 1.5 on the `distributed` mix, and materially higher on
 `code-review`.** A gang is one `decide()` covering every agent, which pushes `d` down; each tool
 call is another `decide()`, which pushes it up. At `--fanout 0.10` the first dominates and `d`
@@ -189,6 +237,16 @@ should sit just above 1; at `code-review --tool-fraction 0.70` the second does.
   property, not a fleet one, and §2.3's "answerable from published FaaS duration distributions"
   needs a decisions-per-request distribution too.
 
+**Measured: `d` lands inside the predicted range at the default mix, and moves the right way as
+fan-out grows -- the `code-review`-mix comparison itself was not run.** `polyphonic data-path` at
+`--fanout 0` measures `d = 1.00` exactly (one `decide()` per request, no gangs); at the default
+`--fanout 0.10` it is `1.23`; at `--fanout 0.30` it is `1.63`. `d > 1` holds, and it moves the
+crossover **up**, as predicted -- at `--fanout 0.10` the tax rises with `d` rather than shrinking,
+so a fleet running agentic traffic sits further from the crossover than a single-crossing estimate
+would say. `data-path` shares `distributed`'s knobs (`--fanout`), not `code-review`'s
+(`--tool-fraction`), so the direct code-review-mix figure P2 named is not measured here; the
+`--fanout` sweep is offered as the available evidence for the same direction instead.
+
 **P3 -- the per-candidate arm breaches its own decision-rate ceiling between 16 and 32 nodes, and
 the in-process arms do not breach it at any fleet size the prototype can express.** §1.4's
 arithmetic, with `d` measured rather than assumed.
@@ -199,6 +257,13 @@ arithmetic, with `d` measured rather than assumed.
 - *If wrong* (the ceiling sits above any plausible fleet): the quadratic is real but does not bind,
   §2.2 rests on per-request latency alone, and the `SidecarPluggable` arm should be reported as a
   null result rather than dropped.
+
+**Measured: confirmed, squarely inside the predicted band.** At the `distributed` defaults
+(`lambda = 62.5` req/s/node, `d = 1.23` measured, not assumed) an unsharded scheduler scoring
+`ext_proc` callouts saturates between **19 and 20 nodes** across four runs, and `gRPC` unary
+saturates at **17** -- both inside the predicted 16-32. `Wasm` (~1000 nodes) and `Ring` (~440)
+do not breach at any fleet size a real deployment would reach. §5 now carries this as a measured
+emergent property rather than a projection.
 
 **No prediction is offered for the per-class rows**, and that is deliberate. §2.7 already rules
 them out as the result: `FAAS_EXEC_MIN_NS` and `SERVICE_EXEC_NS` are chosen constants, so
@@ -300,6 +365,14 @@ It lands in `Cost::transfer_ns`, not `decide_ns`: `decide_ns` is documented as "
 `deciding` and `of stall` columns meaning what they say, and it means the tax shows up in
 `service_ns()` either way, which is the denominator the crossover divides by.
 
+*As built, this was wrong and is the one bug the phase shipped and caught.* `transfer_ns` is not a
+free-form "what it cost to do" bucket: its zero-test is what `drive()` uses to decide a request was
+**warm**. A dispatch hop every request pays either way made every request look cold, and the class
+table reported a 0% warm rate for every class in every arm. The charge now has its own
+`Cost::dispatch_ns`, summed into `total_ns()` but kept out of the question "did the ledger have to
+move state" -- the reasoning above was right that a dispatch is doing rather than deciding, and
+wrong that `transfer_ns` was the field for it.
+
 `DISPATCH_BYTES` is 1 KiB, and the report states that both rungs are effectively flat in payload
 (0.000 and 0.048 ns/byte) so the choice moves the tax by under 1%.
 
@@ -313,6 +386,15 @@ and per class. The per-class split needs the class index at the decision site; `
 This also retires a chosen constant hiding in plain sight: `crossover()` currently hardcodes
 `const RPCS: f64 = 4.0` with no provenance and no label. Replacing it with the measured `d` is the
 §7 correction the function has been waiting for.
+
+*As built, two parts of this did not survive contact.* The per-class `d` split was written and then
+removed: nothing reported it, so it was dead state feeding a column that does not exist, and a
+`kind` parameter threaded through `decide()` to populate it went with it. And **`RPCS` was left
+alone deliberately.** It lives in the *old* `crossover()`, which `distributed` and `code-review`
+still call; replacing it would change their published output and forfeit the property that makes
+this phase cheap to trust -- that every pre-existing experiment is byte-identical. `data-path` got
+its own `crossover_table()` instead, built on measured `d` from the start. The §7 correction to
+`RPCS` is still owed, and is now a change to those commands rather than to this one.
 
 ### 4.5 The sweep and the report
 
@@ -344,6 +426,15 @@ Three rules for it:
   visible and a reader can place a workload the prototype does not model.
 - **Per-class rows are printed last and labelled `MODELLED`** at the point of printing, following
   `cluster_header`'s existing habit of naming provenance inline.
+
+*As built, in three respects.* The sketch's single `tax/req` column became **two** -- `upper bound`
+and `realized` -- for P1's sake, plus a `disp` column once dispatches turned out not to be one per
+request; that is the correction in the status header above. **The first rule's formula is wrong as
+written and was not implemented:** `T` realized per request already has `d` folded into it, so
+multiplying by `d` again would double-count the multiplier. The implementation divides the realized
+per-request tax directly, and `d` is printed with the table rather than applied twice. The class
+table is the shared `class_table()` helper, which does not print `MODELLED` inline; the provenance
+line in the run header carries it instead.
 
 A `--tax` override that substitutes a hand-supplied `T` in microseconds makes the datacenter-Linux
 question answerable without a Linux host, which is the concrete form of §7's "publish the range
