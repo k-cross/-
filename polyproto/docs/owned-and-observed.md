@@ -1497,9 +1497,13 @@ class, durable retention, and authority-driven speculative scheduling (`ReadOnly
 
 ### Phase 8 -- The data path as an arm
 
+Implementation plan: [`phase-8.md`](phase-8.md), which states its predictions before the run.
+
 `data_path: { Sidecar, Integrated }`, charging Phase 0's seam costs per request across the workload
 mix, with the sidecar arm paying an `ext_proc` callout per placement and a loopback hop per
-dispatch.
+dispatch. The plan splits the sidecar in two -- one callout per placement, which is llm-d as
+deployed, and one per candidate, which is what extending its policy would cost -- because charging
+the second to the first overstates the deployed tax by the candidate count.
 
 - **Deliverable:** the **crossover** -- the service time at which control-plane overhead passes 5%
   and 1% of a request -- swept across the denominator rather than read off `exec_ns` (§2.7).
