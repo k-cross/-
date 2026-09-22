@@ -1,3 +1,12 @@
+/// Declared in eviction order, so `own.rs` can key its authority table on `(kind, tier)`
+/// without that pair also having to name a node.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    Hbm,
+    Ddr,
+    Nvme,
+}
+
 // Constants fitted from `polyphonic calibrate` on darwin/arm64 with direct I/O; re-derive per host.
 #[derive(Clone, Copy, Debug)]
 pub struct TierSpec {

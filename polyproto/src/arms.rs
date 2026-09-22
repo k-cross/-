@@ -40,6 +40,8 @@ pub struct Report {
     pub flow_e2e_ns: u64,
     pub prewarmed_bytes: u64,
     pub prewarm_ns: u64,
+    /// `phase-1.md` §4.4's dynamic census, per census-marked entry point.
+    pub engine_ops: crate::cache::EngineOps,
 }
 
 impl Report {
@@ -324,6 +326,7 @@ fn finish(label: &str, h: &Hierarchy, costs: &[u64], t: &Tally) -> Report {
         flow_e2e_ns: t.flow_e2e,
         prewarmed_bytes: h.prewarmed_bytes,
         prewarm_ns: h.prewarm_ns,
+        engine_ops: h.engine_ops,
     }
 }
 

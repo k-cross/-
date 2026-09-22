@@ -3,6 +3,8 @@ use polyphonic::arms::{Budget, Report, Trial, mean_ms, run, run_on, trace};
 use polyphonic::blob::BlobKind;
 use polyphonic::cache::{NodeMemory, Policy, Quota};
 use polyphonic::flow::FlowMode;
+use polyphonic::own::{Authority, Question, authority};
+use polyphonic::tier::Tier;
 
 #[derive(Parser, Debug)]
 #[command(name = "polyphonic", about = "state-residency scheduler experiments")]
@@ -271,6 +273,24 @@ enum Cmd {
         seed: u64,
         #[arg(long, default_value_t = 0.125)]
         step: f64,
+    },
+
+    /// Print the ownership predicate `own.rs` computes (owned-and-observed.md §1's table,
+    /// executable) and the dynamic census: how many engine-authority allocations a trace
+    /// under this config actually makes. See docs/phase-1.md.
+    Ownership {
+        #[arg(long, default_value = "4GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
+        dram: u64,
+        #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
+        nvme: u64,
+        #[arg(long, default_value_t = 15_000)]
+        ops: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value = "0,1,2,1", value_parser = parse_bands)]
+        bands: String,
     },
 }
 
@@ -847,6 +867,97 @@ fn volatility_sweep(hbm: u64, dram: u64, nvme: u64, ops: u64, seed: u64, step: f
     }
 }
 
+/// `phase-1.md` §4.5: print the ownership predicate and the census, so both are
+/// reproducible from a single command rather than quoted from a build log or a table in
+/// a doc.
+fn ownership_report(hbm: u64, dram: u64, nvme: u64, ops: u64, seed: u64, bands: [u8; BlobKind::N]) {
+    println!(
+        "own.rs's authority table -- owned-and-observed.md \u{a7}1, executable (phase-1.md \u{a7}4.2)\n"
+    );
+    println!(
+        "{:<13} {:<5} {:<13} {:<13}",
+        "kind", "tier", "capacity", "allocation"
+    );
+    for kind in BlobKind::ALL {
+        for tier in [Tier::Hbm, Tier::Ddr, Tier::Nvme] {
+            let cap = authority(kind, tier, Question::Capacity);
+            let alloc = authority(kind, tier, Question::Allocation);
+            println!(
+                "{:<13} {:<5} {:<13} {:<13}",
+                format!("{kind:?}"),
+                format!("{tier:?}"),
+                format!("{cap:?}"),
+                format!("{alloc:?}"),
+            );
+        }
+    }
+    debug_assert!(
+        BlobKind::ALL
+            .iter()
+            .all(|&k| authority(k, Tier::Hbm, Question::Capacity) == Authority::Orchestrator),
+        "P1 (phase-1.md \u{a7}2): capacity authority is uniformly Orchestrator"
+    );
+
+    println!(
+        "\nstatic census (phase-1.md \u{a7}4.4): the count of authority-split entry points -- \
+         bodies Phase 3 replaces -- not of call sites into them, which the lint cannot see. \
+         Run:\n\n  cargo build --release --features census 2>&1 | grep -c 'use of deprecated'\n"
+    );
+
+    println!(
+        "dynamic census: how many of those decisions a {ops}-op trace (seed={seed}) actually \
+         made, {}, Budget::Open, flows=announce\n",
+        memory_label(hbm, dram)
+    );
+    println!(
+        "one column per engine-authority operation. the four census-marked Quota reads have \
+         no column -- they are reads on the eviction path, not decisions. drain fires only \
+         when a domain retires, which a single-node trace never does"
+    );
+    let t = Trial {
+        bands,
+        flows: FlowMode::Announce,
+        hbm,
+        dram,
+        nvme,
+        policy: Policy::Gdsf,
+        seed,
+        ops,
+        vol: 1.0,
+    };
+    let r = run("", t, Budget::Open);
+    let ops = r.engine_ops;
+    println!(
+        "{:<13} {:>8} {:>7} {:>10} {:>8} {:>11} {:>10} {:>8} {:>6} {:>9}",
+        "class",
+        "admit",
+        "touch",
+        "anticipate",
+        "demote",
+        "forget_cold",
+        "superseded",
+        "spill",
+        "drain",
+        "total"
+    );
+    for kind in BlobKind::ALL {
+        let k = kind.idx();
+        println!(
+            "{:<13} {:>8} {:>7} {:>10} {:>8} {:>11} {:>10} {:>8} {:>6} {:>9}",
+            CLASS_NAME[k],
+            ops.admit[k],
+            ops.touch[k],
+            ops.anticipate[k],
+            ops.demote[k],
+            ops.forget_cold[k],
+            ops.superseded[k],
+            ops.spill[k],
+            ops.drain[k],
+            ops.total(kind),
+        );
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "experiment knobs, all independent"
@@ -1130,6 +1241,16 @@ fn main() {
             step,
         } => {
             volatility_sweep(hbm, dram, nvme, ops, seed, step);
+        }
+        Cmd::Ownership {
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            bands,
+        } => {
+            ownership_report(hbm, dram, nvme, ops, seed, bands_of(&bands));
         }
     }
 }

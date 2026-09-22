@@ -9,6 +9,7 @@ use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::boundary::Cost as Crossing;
 use crate::cache::{Cost, Hierarchy, NodeMemory, Policy};
 use crate::engine::{Engine, MAX_BATCH};
+use crate::tele::Telemetry;
 use crate::topo::Topology;
 use crate::work::{Agent, Gang, Request, ToolCall};
 use std::collections::{HashMap, HashSet};
@@ -430,12 +431,14 @@ impl Machine {
         self.control_rpcs += self.domains.len() as u64;
     }
 
-    /// Residency as the scheduler sees it, which is not always residency as it is.
+    /// Residency as the scheduler sees it, which is not always residency as it is. The
+    /// `Unified`/`Query` branch reads through `Telemetry`, which is exact today -- Phase 4
+    /// is what makes this a belief rather than a wrapper around the truth.
     fn believes_resident(&self, d: usize, id: &BlobId, kind: BlobKind) -> bool {
         self.staged[d].contains(id)
             || match self.control {
                 Control::Gossip { .. } => self.view[d].contains(id),
-                Control::Unified | Control::Query => self.domains[d].is_hot(id, kind),
+                Control::Unified | Control::Query => self.telemetry(d).resident(id, kind),
             }
     }
 
@@ -445,8 +448,19 @@ impl Machine {
     fn believes_held(&self, p: usize, id: &BlobId, kind: BlobKind) -> bool {
         match self.control {
             Control::Gossip { .. } => self.view[p].contains(id),
-            Control::Unified | Control::Query => self.domains[p].holds(id, kind),
+            Control::Unified | Control::Query => self.telemetry(p).held(id, kind),
         }
+    }
+
+    /// The engine's actual state on domain `p`, asked directly rather than through
+    /// `Telemetry`. `plan` scores candidates against `believes_held`'s *belief*;
+    /// `apply_chain` and `apply_deps` must check the *truth* when the transfer actually
+    /// happens, or a stale view would cost nothing instead of falling back to a rebuild --
+    /// `phase-1.md` §1.4. The gap between this and `believes_held` for the same `(p, id,
+    /// kind)` is `owned-and-observed.md` §3.6's divergence, once there is a real belief to
+    /// diverge from.
+    fn ground_truth_holds(&self, p: usize, id: &BlobId, kind: BlobKind) -> bool {
+        self.domains[p].holds(id, kind)
     }
 
     /// What one placement decision costs, and what it costs the cluster. A fan-out query is
@@ -623,7 +637,13 @@ impl Machine {
     /// What it costs domain `d` to make one blob hot without leaving the node: promote it
     /// from host memory, read it off the spill tier, or rebuild it.
     fn local_ns(&self, d: usize, id: &BlobId, m: &BlobMeta) -> u64 {
-        self.domains[d].local_ns(id, m)
+        self.telemetry(d).local_ns(id, m)
+    }
+
+    /// The scheduler's view of domain `d`. Constructing one costs two references, so a
+    /// per-read construction is cheaper than threading a borrow through `plan`'s loops.
+    fn telemetry(&self, d: usize) -> Telemetry<'_> {
+        Telemetry::new(&self.domains[d], &self.engines[d])
     }
 
     fn local_run_ns(&self, d: usize, blobs: &[(BlobId, BlobMeta)]) -> u64 {
@@ -721,7 +741,7 @@ impl Machine {
         if let Some(p) = plan.chain_src {
             let truth = req
                 .chain
-                .partition_point(|(id, m)| self.domains[p].holds(id, m.kind));
+                .partition_point(|(id, m)| self.ground_truth_holds(p, id, m.kind));
             let cut = plan.chain_cut.min(truth);
             if cut <= plan.local_depth {
                 self.stale_fetches += 1;
@@ -748,7 +768,7 @@ impl Machine {
         let mut cost = Cost::default();
         for &(i, p) in &plan.deps {
             let (id, m) = req.requires[i];
-            if !self.domains[p].holds(&id, m.kind) {
+            if !self.ground_truth_holds(p, &id, m.kind) {
                 self.stale_fetches += 1;
                 continue;
             }
@@ -772,7 +792,8 @@ impl Machine {
     /// can be the slower node, and nothing that scores residency alone can see it.
     fn placement_terms(&self, d: usize, req: &Request, flow: &[(usize, u64)]) -> Terms {
         let plan = self.plan(d, req);
-        let displaced = self.domains[d].displacement(&plan.need, &self.staged_bytes[d]);
+        let tele = self.telemetry(d);
+        let displaced = tele.displacement(&plan.need, &self.staged_bytes[d]);
         let unit = self.unit_in(d);
         let handoff: f64 = flow
             .iter()
@@ -782,12 +803,12 @@ impl Machine {
         let decoding = req.tokens > 0 && self.interval_ns > 0;
         let reserved = self.staged_seqs[d];
         let engine = if decoding {
-            self.engines[d].projected_ns(self.arrival_ns, req.tokens, reserved) as f64
+            tele.projected_ns(self.arrival_ns, req.tokens, reserved) as f64
         } else {
             0.0
         };
         let congestion = if decoding {
-            self.engines[d].congestion_ns(self.arrival_ns, req.tokens, reserved) as f64
+            tele.congestion_ns(self.arrival_ns, req.tokens, reserved) as f64
         } else {
             0.0
         };
@@ -1259,7 +1280,7 @@ impl Machine {
             .iter()
             .filter_map(|&d| {
                 let need = self.plan(d, probe).need;
-                self.domains[d]
+                self.telemetry(d)
                     .could_admit(&need, &self.staged_bytes[d])
                     .then_some((d, need))
             })
@@ -1409,7 +1430,7 @@ impl Machine {
         let used: Vec<u64> = self
             .active
             .iter()
-            .map(|&d| self.domains[d].used())
+            .map(|&d| self.telemetry(d).used())
             .collect();
         let hi = used.iter().copied().max().unwrap_or(0) as f64;
         let lo = used.iter().copied().min().unwrap_or(0).max(1) as f64;
@@ -1478,7 +1499,7 @@ struct Plan {
     need: Need,
 }
 
-type Need = [u64; BlobKind::N];
+use crate::tele::Need;
 
 /// A residency question names a blob by its 32-byte id and its size.
 const QUERY_BYTES_PER_BLOB: u64 = 40;

@@ -222,7 +222,7 @@ fn decision_rates(h: &Hierarchy, access_ns: &[u64], p50_rpc: u64) {
     let mut sorted = access_ns.to_vec();
     sorted.sort_unstable();
     let p50_access = percentile(&sorted, 0.50);
-    let evictions: u64 = h.hbm.evicted.iter().chain(&h.ddr.evicted).sum();
+    let evictions: u64 = h.evicted().iter().sum();
     let per_req = evictions as f64 / access_ns.len() as f64 + 1.0;
 
     println!(

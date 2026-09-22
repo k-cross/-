@@ -165,6 +165,100 @@ by band. Two consequences survive the split:
 `freq` still cuts the other way. A hot function is reused hard, so the outcome is contested
 per function rather than settled per class.
 
+## Ownership
+
+Phase 1 ([`phase-1.md`](phase-1.md)) names `owned-and-observed.md` §1's ownership table as a type,
+`own::authority(kind, tier, question)` in [`own.rs`](../src/own.rs), and puts a census behind it: a
+compiler-generated count of call sites that assume allocation authority over engine-owned state
+today. No architectural change -- the deliverable is that nothing changed, checked, plus a number.
+
+**The table.** Total over four classes, three tiers, two questions -- twenty-four cells, all
+`Orchestrator` on the capacity question, `Engine` on allocation for `KvBlock` and `WeightShard` in
+every tier, `Orchestrator` throughout for `Snapshot` and `ServiceHeap`:
+
+| kind | tier | capacity | allocation |
+|---|---|---|---|
+| `KvBlock` | Hbm / Ddr / Nvme | Orchestrator | Engine |
+| `WeightShard` | Hbm / Ddr / Nvme | Orchestrator | Engine |
+| `Snapshot` | Hbm / Ddr / Nvme | Orchestrator | Orchestrator |
+| `ServiceHeap` | Hbm / Ddr / Nvme | Orchestrator | Orchestrator |
+
+Reproducible with `polyphonic ownership`, which prints the full table and the census below rather
+than requiring either to be read off this file.
+
+**Static census: 12.** `cargo build --release --features census 2>&1 | grep -c 'use of deprecated'`
+-- every one of them in `cache.rs`, none in `machine.rs`. The twelve are the allocation-split entry
+points `phase-1.md` §1.5 and §1.6 name:
+`Hierarchy::{admit,anticipate,touch,demote,forget_cold,drop_superseded,spill_displaced,drain}_engine`,
+`Quota::{floor,limit,band}_of_engine`, and `Quota::set_band_engine` — the one place the orchestrator
+*writes* an engine class's eviction band rather than reading it. This is below the 10–25 predicted
+in `phase-1.md` §2 (P2), and the reason is the counting mechanism rather than the ledger being
+simpler than expected: `#[deprecated]` fires once per named item, so a dispatcher's one call to its
+census-marked sibling is one warning no matter how many external callers route through the
+dispatcher. Twelve is a count of *split entry points*, not of call sites into them.
+
+**`machine.rs`'s share is 0, and this is a real finding, not an artifact of the counting
+mechanism.** Every ledger read the scheduler makes is a residency or cost *query* --
+`is_hot`/`holds` (now `Telemetry::resident`/`held`, or `ground_truth_holds` on the execution path),
+`local_ns`, `displacement`, `could_admit` -- never an allocation *decision*. `owned-and-observed.md`
+§8 called `machine.rs`'s share of the Phase 3 correction "moderate, mechanical"; the census confirms
+the "moderate" more precisely than §8 asserted it: there is no allocation authority in this file to
+begin with, so there is nothing here for Phase 1 to have found.
+
+**Dynamic census: four to five orders of magnitude above the static count.** `polyphonic ownership`
+on its default 15,000-op trace (4 GiB HBM / 8 GiB DDR, `Budget::Open`, announce flows, seed 1), one
+counter per census-marked entry point:
+
+| class | admit | touch | anticipate | demote | forget_cold | superseded | spill | total |
+|---|---|---|---|---|---|---|---|---|
+| inference-kv | 93,921 | 5,011 | 13,100 | 86,753 | 2,474 | 59,904 | 86,753 | **347,916** |
+| weights | 11,206 | 936 | 0 | 13,759 | 0 | 11,198 | 11,140 | **48,239** |
+| faas / service | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
+
+`forget_cold` and `superseded` are the same removal from two directions — after an admission
+(`announce`, `supply`) and after a promotion (`materialise`) — and the 2,474 : 59,904 split is
+exactly the shape of the bug described below: the small column is the path that was counted, the
+large one the path that was not.
+
+The static count says how much *code* Phase 3 has to change; this says how much of the simulator's
+*behaviour*, today, rests on the authority Phase 3 disclaims. `drain` is an eighth counter, zero
+here because a single-node trace never retires a domain; it fires from `Machine::retire`, which is
+the largest single assumption of the disclaimed authority in the simulator — it relocates an entire
+engine's KV cache by orchestrator fiat.
+
+**The split by entry point is a Phase 3 finding in its own right: admission is under a third of
+it.** Demotion matches admission one for one, the cascade spill matches it again, and
+superseded-copy removal — dropping the DDR or NVMe copy once a blob is promoted back — is
+two-thirds of it. An engine-cache model that replaces admission and leaves the offload and promote
+paths alone would cover well under half of what this ledger does on the engine's behalf.
+
+**This number was wrong twice before it was right, and neither error was visible from inside the
+census.** The first version counted only admissions (20,139 for `KvBlock`). The second split five
+entry points and reported 201,259 — but `materialise` was still dropping superseded copies inline
+rather than through the dispatcher, so every offload and spill *hit* went uncounted and
+`forget_cold` read 2,474 against its true 62,378; and `demote_body` was spilling DDR victims past
+its own dispatcher, leaving the whole eviction cascade unattributed. Both gaps were found by
+walking the call graph against the dispatcher list, not by any check failing. `phase-1.md` §4.4
+records the pattern, since Phase 3 will be adding engine-state paths under the same conditions.
+
+**A pre-existing defect this surfaced and deliberately did not fix.** `Hierarchy::drain_all` empties
+`hbm` and `ddr` and returns what it took; it does not touch `nvme`. So when `Machine::retire` drains
+a domain, anything that had been spilled to that node's spill tier is neither returned to the
+caller nor migrated — the domain leaves `active` still holding it, and no `holds()` or `is_hot()`
+will ever report it again. `machine.rs`'s "The bytes survive" comment on `drain` is false for
+spilled state. This predates Phase 1 and fixing it would change `drain_at` results, which Phase 1
+may not do; it belongs to Phase 2, where the oracle makes a corrected baseline measurable. Recorded
+here rather than in a code comment because it is a finding, not an explanation of what the code does.
+
+**Byte-identity.** `residency`, `flows`, `placement` (split and unified memory) and `volatility`
+diff byte-for-byte before and after, at a reduced `--ops` and at a second seed, checked after each
+of `phase-1.md` §4's four work items rather than only once at the end. `distributed`, `code-review`
+and `data-path` cannot be part of this set at all -- each prints `boundary::measure`'s live host
+timing inline with its served-request numbers, so two back-to-back runs of any of them differ before
+this phase touches a line, confirmed by running the baseline capture against itself before any code
+changed. They still get a structural smoke run (same node/served/refused counts, same arm labels)
+after each work item.
+
 ## Serving engines
 
 A decode step reads the weights once whatever the batch size, so a second sequence is nearly

@@ -3,7 +3,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::flow::FlowHint;
-use crate::tier::TierSpec;
+use crate::tier::{Tier, TierSpec};
 
 const FREQ_CAP: u32 = 16;
 
@@ -37,12 +37,16 @@ pub struct Quota {
     /// Priority band per class: 0 is latency-critical, higher is more sacrificial. Operator
     /// configuration, not a property of the workload kind -- the control plane does not know
     /// which of a user's workloads matters most.
-    pub band: [u8; BlobKind::N],
-    pub floor: [u64; BlobKind::N],
+    ///
+    /// These three are private so the per-class accessors are the only way in. `phase-1.md`
+    /// §1.6's census can only see reads that go through them, and a `pub` array would make
+    /// that a convention rather than an invariant.
+    band: [u8; BlobKind::N],
+    floor: [u64; BlobKind::N],
     /// Soft ceiling: `floor[k] + slack`. A class may grow past it into free space, but may not
     /// *preempt* a more-sacrificial band to get there, so it can never consume another
     /// workload's guaranteed floor.
-    pub limit: [u64; BlobKind::N],
+    limit: [u64; BlobKind::N],
     pub hard: bool,
 }
 
@@ -65,10 +69,22 @@ impl Quota {
         let last = self.max_band();
         for k in BlobKind::ALL {
             if accelerated(k) {
-                self.band[k.idx()] = last;
+                self.set_band_engine(k, last);
             }
         }
         self
+    }
+
+    /// The only place the orchestrator *writes* an engine-allocated class's eviction
+    /// priority, rather than reading one. Needs no authority dispatch -- the caller has
+    /// already filtered to `accelerated` -- but it is the strongest assumption in the
+    /// quota layer and would be invisible to a census that only marked reads.
+    #[cfg_attr(
+        feature = "census",
+        deprecated(note = "assumes allocation authority over engine state (band assignment)")
+    )]
+    fn set_band_engine(&mut self, kind: BlobKind, band: u8) {
+        self.band[kind.idx()] = band;
     }
 
     #[must_use]
@@ -98,6 +114,87 @@ impl Quota {
             limit,
             hard,
         }
+    }
+
+    /// `phase-1.md` §1.6's census target: a per-class floor over an engine-allocated class
+    /// stops being representable once Phase 3's engine cache is a class-blind LRU. Splits
+    /// on `accelerated` rather than `authority` because `Quota` carries no `Tier` to ask
+    /// with; `own::tests::accelerated_is_exactly_engine_allocation_authority` is what keeps
+    /// the two answers the same.
+    #[must_use]
+    pub fn floor_of(&self, kind: BlobKind) -> u64 {
+        if accelerated(kind) {
+            self.floor_of_engine(kind)
+        } else {
+            self.floor_of_owned(kind)
+        }
+    }
+
+    fn floor_of_owned(&self, kind: BlobKind) -> u64 {
+        self.floor[kind.idx()]
+    }
+
+    #[cfg_attr(
+        feature = "census",
+        deprecated(
+            note = "a per-class floor over an engine-allocated class is unrepresentable \
+                     once Phase 3's engine cache has no floors"
+        )
+    )]
+    fn floor_of_engine(&self, kind: BlobKind) -> u64 {
+        self.floor[kind.idx()]
+    }
+
+    /// A class's soft ceiling. Same split and same reasoning as `floor_of`.
+    #[must_use]
+    pub fn limit_of(&self, kind: BlobKind) -> u64 {
+        if accelerated(kind) {
+            self.limit_of_engine(kind)
+        } else {
+            self.limit_of_owned(kind)
+        }
+    }
+
+    fn limit_of_owned(&self, kind: BlobKind) -> u64 {
+        self.limit[kind.idx()]
+    }
+
+    #[cfg_attr(
+        feature = "census",
+        deprecated(
+            note = "a per-class limit over an engine-allocated class is unrepresentable \
+                     once Phase 3's engine cache has no limits"
+        )
+    )]
+    fn limit_of_engine(&self, kind: BlobKind) -> u64 {
+        self.limit[kind.idx()]
+    }
+
+    /// A class's priority band. Same split and same reasoning as `floor_of`: a
+    /// class-blind engine cache cannot honour a band either, since bands are what
+    /// `pick_class` uses to decide *which* class gives way first.
+    #[must_use]
+    pub fn band_of(&self, kind: BlobKind) -> u8 {
+        if accelerated(kind) {
+            self.band_of_engine(kind)
+        } else {
+            self.band_of_owned(kind)
+        }
+    }
+
+    fn band_of_owned(&self, kind: BlobKind) -> u8 {
+        self.band[kind.idx()]
+    }
+
+    #[cfg_attr(
+        feature = "census",
+        deprecated(
+            note = "a per-class band over an engine-allocated class is unrepresentable \
+                     once Phase 3's engine cache has no bands"
+        )
+    )]
+    fn band_of_engine(&self, kind: BlobKind) -> u8 {
+        self.band[kind.idx()]
     }
 }
 
@@ -317,7 +414,7 @@ impl TierPool {
     pub fn reclaimable(&self) -> u64 {
         let burst: u64 = (0..BlobKind::N)
             .filter(|&k| BlobKind::ALL[k] != BlobKind::ServiceHeap)
-            .map(|k| self.by_kind[k].saturating_sub(self.quota.floor[k]))
+            .map(|k| self.by_kind[k].saturating_sub(self.quota.floor_of(BlobKind::ALL[k])))
             .sum();
         self.free_bytes() + burst
     }
@@ -345,7 +442,9 @@ impl TierPool {
         let mut best: Option<f64> = None;
         for b in (0..=self.quota.max_band()).rev() {
             for k in 0..BlobKind::N {
-                if self.quota.band[k] != b || self.by_kind[k] <= self.quota.floor[k] {
+                if self.quota.band_of(BlobKind::ALL[k]) != b
+                    || self.by_kind[k] <= self.quota.floor_of(BlobKind::ALL[k])
+                {
                     continue;
                 }
                 let Some(Reverse(r)) = self.evictable[k].peek() else {
@@ -469,10 +568,10 @@ impl TierPool {
     ) -> Option<usize> {
         let mut best: Option<(usize, f64)> = None;
         for k in 0..BlobKind::N {
-            if self.quota.band[k] != band {
+            if self.quota.band_of(BlobKind::ALL[k]) != band {
                 continue;
             }
-            if above_floor && self.by_kind[k] <= self.quota.floor[k] {
+            if above_floor && self.by_kind[k] <= self.quota.floor_of(BlobKind::ALL[k]) {
                 continue;
             }
             if let Some(p) = self.clean_top(k, parked)
@@ -506,7 +605,7 @@ impl TierPool {
         // At or over its soft limit a class may recycle its own bytes and take free space,
         // but may not preempt anyone else -- otherwise one class pushes every other down to
         // its floor and holds there.
-        if self.by_kind[want] >= self.quota.limit[want] {
+        if self.by_kind[want] >= self.quota.limit_of(BlobKind::ALL[want]) {
             return self.clean_top(want, parked).map(|_| want);
         }
         // Every class above its floor is a candidate, most-sacrificial band first. Protecting
@@ -550,7 +649,7 @@ impl TierPool {
             self.regrets[k] += 1;
         }
         let ceiling = if self.quota.hard {
-            self.quota.floor[k].min(self.spec.capacity)
+            self.quota.floor_of(meta.kind).min(self.spec.capacity)
         } else {
             self.spec.capacity
         };
@@ -737,6 +836,44 @@ pub struct Hierarchy {
     pub remote_hits: [u64; BlobKind::N],
     pub prewarmed_bytes: u64,
     pub prewarm_ns: u64,
+    pub engine_ops: EngineOps,
+}
+
+/// The *dynamic* census (`phase-1.md` §4.4). One counter per census-marked entry point,
+/// because counting admissions alone would understate it: `touch_engine` runs on every
+/// `KvBlock` hit and `demote_engine` is the only one that moves bytes, so an
+/// admissions-only figure answers a narrower question than the one Phase 3 has to budget
+/// for.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct EngineOps {
+    pub admit: [u64; BlobKind::N],
+    pub touch: [u64; BlobKind::N],
+    pub anticipate: [u64; BlobKind::N],
+    pub demote: [u64; BlobKind::N],
+    /// Colder copies dropped after an admission, from `announce` and `supply`.
+    pub forget_cold: [u64; BlobKind::N],
+    /// Colder copies dropped after a *promotion*, from `materialise`. Kept apart from
+    /// `forget_cold` because it is the offload/spill hit path -- far the larger of the two,
+    /// and the one that was invisible until `materialise` stopped removing inline.
+    pub superseded: [u64; BlobKind::N],
+    /// Evicted from DDR by *another* blob's demotion, not its own.
+    pub spill: [u64; BlobKind::N],
+    pub drain: [u64; BlobKind::N],
+}
+
+impl EngineOps {
+    #[must_use]
+    pub fn total(&self, kind: BlobKind) -> u64 {
+        let k = kind.idx();
+        self.admit[k]
+            + self.touch[k]
+            + self.anticipate[k]
+            + self.demote[k]
+            + self.forget_cold[k]
+            + self.superseded[k]
+            + self.spill[k]
+            + self.drain[k]
+    }
 }
 
 impl Hierarchy {
@@ -768,6 +905,7 @@ impl Hierarchy {
             remote_hits: [0; BlobKind::N],
             prewarmed_bytes: 0,
             prewarm_ns: 0,
+            engine_ops: EngineOps::default(),
         }
     }
 
@@ -786,26 +924,55 @@ impl Hierarchy {
         self.can_decode
     }
 
+    /// Which of the two hot pools a class's home lives in on this node. `Nvme` is never
+    /// returned here: it is the spill tier reached by demotion, not a class's resting home,
+    /// so `own.rs`'s `NVMe` rows are asked about by name rather than resolved through this.
+    pub(crate) fn tier_of(&self, kind: BlobKind) -> Tier {
+        if self.split && accelerated(kind) {
+            Tier::Hbm
+        } else {
+            Tier::Ddr
+        }
+    }
+
     fn on_accelerator(&self, kind: BlobKind) -> bool {
-        self.split && accelerated(kind)
+        self.tier_of(kind) == Tier::Hbm
+    }
+
+    /// Takes a tier rather than a class, which is what lets a caller reach `Nvme` at all --
+    /// `home` cannot, since no class rests there. `pub(crate)` for `tele.rs`.
+    pub(crate) fn pool(&self, tier: Tier) -> &TierPool {
+        match tier {
+            Tier::Hbm => &self.hbm,
+            Tier::Ddr => &self.ddr,
+            Tier::Nvme => &self.nvme,
+        }
+    }
+
+    fn pool_mut(&mut self, tier: Tier) -> &mut TierPool {
+        match tier {
+            Tier::Hbm => &mut self.hbm,
+            Tier::Ddr => &mut self.ddr,
+            Tier::Nvme => &mut self.nvme,
+        }
     }
 
     /// The pool a class is usable from.
     #[must_use]
     pub fn home(&self, kind: BlobKind) -> &TierPool {
-        if self.on_accelerator(kind) {
-            &self.hbm
-        } else {
-            &self.ddr
-        }
+        self.pool(self.tier_of(kind))
     }
 
     fn home_mut(&mut self, kind: BlobKind) -> &mut TierPool {
-        if self.on_accelerator(kind) {
-            &mut self.hbm
-        } else {
-            &mut self.ddr
-        }
+        self.pool_mut(self.tier_of(kind))
+    }
+
+    /// `own::authority`, with this node's tier resolved so a caller does not have to. Only
+    /// ever asks about `Hbm` or `Ddr`, since `tier_of` never resolves to `Nvme` -- an
+    /// `Nvme` question is asked directly against `crate::own::authority`.
+    #[must_use]
+    pub fn authority(&self, kind: BlobKind, q: crate::own::Question) -> crate::own::Authority {
+        crate::own::authority(kind, self.tier_of(kind), q)
     }
 
     /// Usable right now, with no copy.
@@ -896,6 +1063,23 @@ impl Hierarchy {
         std::array::from_fn(|k| self.hbm.refused[k] + self.ddr.refused[k])
     }
 
+    /// Includes `nvme`, unlike `refused`. Eviction from HBM or DDR is a demotion -- the
+    /// blob moves down a tier and can be promoted back -- while eviction from the spill
+    /// tier is the only one that destroys state. A count that left it out would report
+    /// every move and no loss, which is the opposite of what Phase 4 validates an
+    /// engine-reported eviction metric against.
+    #[must_use]
+    pub fn evicted(&self) -> [u64; BlobKind::N] {
+        std::array::from_fn(|k| self.hbm.evicted[k] + self.ddr.evicted[k] + self.nvme.evicted[k])
+    }
+
+    /// Spares a caller from knowing the tier: `TierPool::regret_rate` is keyed by index
+    /// within one pool, and which pool that is depends on `split`.
+    #[must_use]
+    pub fn regret_rate(&self, kind: BlobKind) -> f64 {
+        self.home(kind).regret_rate(kind.idx())
+    }
+
     #[must_use]
     pub fn pinned_skips(&self) -> u64 {
         self.hbm.pinned_skips + self.ddr.pinned_skips
@@ -914,7 +1098,41 @@ impl Hierarchy {
     /// Where evicted state goes next. Off the accelerator it is offloaded to host DDR, and
     /// whatever *that* displaces falls to the spill tier; off the host it spills directly.
     /// Demotion is background work and is not charged to the request that caused it.
+    ///
+    /// Dispatches on the *evicted* blob's own authority, not on whatever admission
+    /// triggered it: under unified memory every class shares one pool, so admitting a
+    /// `KvBlock` can evict a `ServiceHeap`, and the census has to attribute the demotion
+    /// to the victim rather than to whatever caused it (`phase-1.md` §4.4).
     fn demote(&mut self, id: BlobId, meta: BlobMeta) {
+        match self.authority(meta.kind, crate::own::Question::Allocation) {
+            crate::own::Authority::Engine => self.demote_engine(id, meta),
+            crate::own::Authority::Orchestrator => self.demote_owned(id, meta),
+        }
+    }
+
+    fn demote_owned(&mut self, id: BlobId, meta: BlobMeta) {
+        self.demote_body(id, meta);
+    }
+
+    /// The allocation this code performs today on the engine's behalf: a `KvBlock` or
+    /// `WeightShard` evicted from HBM is offloaded and, if that too is full, spilled --
+    /// this ledger's own GDSF policy end to end, the same as an owned class's demotion.
+    /// `owned-and-observed.md` §1's disclaimed authority, census-marked per
+    /// `phase-1.md` §4.4: Phase 3 replaces this body with an engine cache model that
+    /// demotes, if at all, by its own rules instead.
+    #[cfg_attr(
+        feature = "census",
+        deprecated(note = "assumes allocation authority over engine state (demotion)")
+    )]
+    fn demote_engine(&mut self, id: BlobId, meta: BlobMeta) {
+        self.engine_ops.demote[meta.kind.idx()] += 1;
+        self.demote_body(id, meta);
+    }
+
+    /// The one demotion body both `demote_owned` and `demote_engine` run today -- kept as
+    /// a single implementation so Phase 1 cannot drift the two behaviours apart by
+    /// accident. Phase 3 is what gives `demote_engine` its own body.
+    fn demote_body(&mut self, id: BlobId, meta: BlobMeta) {
         if !self.on_accelerator(meta.kind) {
             self.spill(id, meta);
             return;
@@ -924,11 +1142,62 @@ impl Hierarchy {
             self.spill(id, meta);
         }
         for (vid, vmeta) in out {
-            self.spill(vid, vmeta);
+            self.spill_displaced(vid, vmeta);
         }
     }
 
+    /// A blob evicted from DDR to make room for someone else's demotion. `demote`'s own
+    /// rule -- attribute to the victim, not to whatever caused it -- applies here and was
+    /// the one place inside `demote` not honouring it: a `KvBlock` pushed to `NVMe` by a
+    /// `ServiceHeap` demotion is an engine-state decision the outer dispatch has already
+    /// resolved to `Orchestrator`, so it can only be counted here.
+    fn spill_displaced(&mut self, id: BlobId, meta: BlobMeta) {
+        match self.authority(meta.kind, crate::own::Question::Allocation) {
+            crate::own::Authority::Engine => self.spill_displaced_engine(id, meta),
+            crate::own::Authority::Orchestrator => self.spill(id, meta),
+        }
+    }
+
+    #[cfg_attr(
+        feature = "census",
+        deprecated(note = "assumes allocation authority over engine state (cascade spill)")
+    )]
+    fn spill_displaced_engine(&mut self, id: BlobId, meta: BlobMeta) {
+        self.engine_ops.spill[meta.kind.idx()] += 1;
+        self.spill(id, meta);
+    }
+
     fn admit_hot(&mut self, id: BlobId, meta: BlobMeta) -> Admission {
+        match self.authority(meta.kind, crate::own::Question::Allocation) {
+            crate::own::Authority::Engine => self.admit_engine(id, meta),
+            crate::own::Authority::Orchestrator => self.admit_owned(id, meta),
+        }
+    }
+
+    /// Allocation the orchestrator itself decides -- `Snapshot`, `ServiceHeap` -- admitted
+    /// outright into whichever pool `home_mut` resolves. Not census-marked: this
+    /// authority is not disclaimed, so there is nothing here for Phase 3 to change.
+    fn admit_owned(&mut self, id: BlobId, meta: BlobMeta) -> Admission {
+        self.admit_hot_body(id, meta)
+    }
+
+    /// The allocation this code performs today on the engine's behalf -- `KvBlock` and
+    /// `WeightShard` admission, GDSF-scored and evicted by this ledger rather than by
+    /// vLLM's own block manager. `owned-and-observed.md` §1's disclaimed authority,
+    /// census-marked per `phase-1.md` §4.4: Phase 3 replaces this body with an engine
+    /// cache model.
+    #[cfg_attr(
+        feature = "census",
+        deprecated(note = "assumes allocation authority over engine state (KvBlock/WeightShard)")
+    )]
+    fn admit_engine(&mut self, id: BlobId, meta: BlobMeta) -> Admission {
+        self.engine_ops.admit[meta.kind.idx()] += 1;
+        self.admit_hot_body(id, meta)
+    }
+
+    /// Shared so Phase 1 cannot drift the owned and engine paths apart by accident; Phase
+    /// 3 is what gives `admit_engine` a body of its own.
+    fn admit_hot_body(&mut self, id: BlobId, meta: BlobMeta) -> Admission {
         let mut out = Vec::new();
         let a = self.home_mut(meta.kind).admit(id, meta, &mut out);
         for (vid, vmeta) in out {
@@ -948,7 +1217,7 @@ impl Hierarchy {
         }
         if offloaded {
             cost.transfer_ns += self.link.fetch_ns(meta.bytes);
-            self.ddr.remove(&id);
+            self.drop_superseded(&id, meta.kind, Tier::Ddr);
             self.offload_hits[k] += 1;
         } else if staged {
             let lift = if up {
@@ -957,7 +1226,7 @@ impl Hierarchy {
                 0
             };
             cost.transfer_ns += self.nvme.spec().fetch_ns(meta.bytes) + lift;
-            self.nvme.remove(&id);
+            self.drop_superseded(&id, meta.kind, Tier::Nvme);
             self.nvme_hits[k] += 1;
         } else {
             cost.recompute_ns += meta.recompute_ns;
@@ -967,13 +1236,112 @@ impl Hierarchy {
         Admission::Admitted
     }
 
+    /// The same removal `forget_cold` performs, reached from the other direction: that one
+    /// runs after an admission, this one after a promotion has already superseded the
+    /// copy. Separate entry point because it targets one named tier rather than every
+    /// colder one, and because `materialise` is the hot path -- leaving it uncounted put
+    /// every offload and spill hit outside the census, which is most of them.
+    fn drop_superseded(&mut self, id: &BlobId, kind: BlobKind, tier: Tier) {
+        match self.authority(kind, crate::own::Question::Allocation) {
+            crate::own::Authority::Engine => self.drop_superseded_engine(id, kind, tier),
+            crate::own::Authority::Orchestrator => self.drop_superseded_owned(id, tier),
+        }
+    }
+
+    fn drop_superseded_owned(&mut self, id: &BlobId, tier: Tier) {
+        self.pool_mut(tier).remove(id);
+    }
+
+    #[cfg_attr(
+        feature = "census",
+        deprecated(
+            note = "assumes allocation authority over engine state (superseded-copy removal)"
+        )
+    )]
+    fn drop_superseded_engine(&mut self, id: &BlobId, kind: BlobKind, tier: Tier) {
+        self.engine_ops.superseded[kind.idx()] += 1;
+        self.pool_mut(tier).remove(id);
+    }
+
     /// Drop any colder copies of a blob that has just become hot, so a node never holds the
-    /// same state twice.
+    /// same state twice. `phase-1.md` §1.5's "remove": splits the same way `admit_hot` and
+    /// `demote` do.
     fn forget_cold(&mut self, id: &BlobId, kind: BlobKind) {
+        match self.authority(kind, crate::own::Question::Allocation) {
+            crate::own::Authority::Engine => self.forget_cold_engine(id, kind),
+            crate::own::Authority::Orchestrator => self.forget_cold_owned(id, kind),
+        }
+    }
+
+    fn forget_cold_owned(&mut self, id: &BlobId, kind: BlobKind) {
+        self.forget_cold_body(id, kind);
+    }
+
+    /// Removing a `KvBlock`/`WeightShard`'s colder copy under this ledger's own
+    /// bookkeeping -- allocation authority an engine-side connector (`LMCache`, NIXL)
+    /// should hold instead. Census-marked per `phase-1.md` §4.4.
+    #[cfg_attr(
+        feature = "census",
+        deprecated(note = "assumes allocation authority over engine state (colder-copy removal)")
+    )]
+    fn forget_cold_engine(&mut self, id: &BlobId, kind: BlobKind) {
+        self.engine_ops.forget_cold[kind.idx()] += 1;
+        self.forget_cold_body(id, kind);
+    }
+
+    fn forget_cold_body(&mut self, id: &BlobId, kind: BlobKind) {
         if self.on_accelerator(kind) {
             self.ddr.remove(id);
         }
         self.nvme.remove(id);
+    }
+
+    /// Raise a blob's value at its home pool because a flow says it is about to be
+    /// needed. Dispatches on `kind`'s allocation authority the way `admit_hot` does.
+    fn anticipate(&mut self, id: BlobId, kind: BlobKind, weight: f64) {
+        match self.authority(kind, crate::own::Question::Allocation) {
+            crate::own::Authority::Engine => self.anticipate_engine(id, kind, weight),
+            crate::own::Authority::Orchestrator => self.anticipate_owned(id, kind, weight),
+        }
+    }
+
+    fn anticipate_owned(&mut self, id: BlobId, kind: BlobKind, weight: f64) {
+        self.home_mut(kind).anticipate(id, weight);
+    }
+
+    /// Prewarming a `KvBlock`/`WeightShard` by raising its priority in this ledger's own
+    /// GDSF ranking -- a value judgement over engine-allocated state the engine's own
+    /// prefetcher should be making instead. Census-marked per `phase-1.md` §4.4.
+    #[cfg_attr(
+        feature = "census",
+        deprecated(note = "assumes allocation authority over engine state (prewarm priority)")
+    )]
+    fn anticipate_engine(&mut self, id: BlobId, kind: BlobKind, weight: f64) {
+        self.engine_ops.anticipate[kind.idx()] += 1;
+        self.home_mut(kind).anticipate(id, weight);
+    }
+
+    fn touch(&mut self, id: BlobId, kind: BlobKind) {
+        match self.authority(kind, crate::own::Question::Allocation) {
+            crate::own::Authority::Engine => self.touch_engine(id, kind),
+            crate::own::Authority::Orchestrator => self.touch_owned(id, kind),
+        }
+    }
+
+    fn touch_owned(&mut self, id: BlobId, kind: BlobKind) {
+        self.home_mut(kind).touch(id);
+    }
+
+    /// Recording a `KvBlock`/`WeightShard` hit in this ledger's own recency/frequency
+    /// bookkeeping -- allocation authority the engine's own block manager should hold.
+    /// Census-marked per `phase-1.md` §4.4.
+    #[cfg_attr(
+        feature = "census",
+        deprecated(note = "assumes allocation authority over engine state (hit accounting)")
+    )]
+    fn touch_engine(&mut self, id: BlobId, kind: BlobKind) {
+        self.engine_ops.touch[kind.idx()] += 1;
+        self.home_mut(kind).touch(id);
     }
 
     /// Value the downstream working set of a task before it is requested, and prewarm any of
@@ -982,7 +1350,7 @@ impl Hierarchy {
     pub fn announce(&mut self, hint: &FlowHint) {
         for &(id, meta) in &hint.downstream {
             if self.is_hot(&id, meta.kind) {
-                self.home_mut(meta.kind).anticipate(id, hint.probability);
+                self.anticipate(id, meta.kind, hint.probability);
                 continue;
             }
             if meta.bytes > self.home(meta.kind).free_bytes() {
@@ -996,7 +1364,7 @@ impl Hierarchy {
             // Prewarming moves materialization off the critical path; it does not make it
             // free. Charged to a background budget so the two are never conflated.
             self.prewarm_ns += ns;
-            self.home_mut(meta.kind).anticipate(id, hint.probability);
+            self.anticipate(id, meta.kind, hint.probability);
             self.prewarmed_bytes += meta.bytes;
         }
     }
@@ -1021,10 +1389,32 @@ impl Hierarchy {
     }
 
     /// Empty the node's memory, handing back everything it held, hot or offloaded.
+    ///
+    /// Unlike the other entry points this one cannot dispatch on authority *before* acting
+    /// -- it drains whole pools, and a pool holds whatever mix of classes the node was
+    /// running. So it drains first and attributes afterwards, one census hit per
+    /// engine-owned blob it took. This is the largest single assumption of allocation
+    /// authority in the simulator: `Machine::retire` relocates an entire engine's KV cache
+    /// by orchestrator fiat, which no engine interface in §8 would permit.
     pub fn drain_all(&mut self) -> Vec<(BlobId, BlobMeta)> {
         let mut out = self.hbm.drain_all();
         out.extend(self.ddr.drain_all());
+        for &(_, meta) in &out {
+            if self.authority(meta.kind, crate::own::Question::Allocation)
+                == crate::own::Authority::Engine
+            {
+                self.drain_engine(meta.kind);
+            }
+        }
         out
+    }
+
+    #[cfg_attr(
+        feature = "census",
+        deprecated(note = "assumes allocation authority over engine state (bulk drain)")
+    )]
+    fn drain_engine(&mut self, kind: BlobKind) {
+        self.engine_ops.drain[kind.idx()] += 1;
     }
 
     /// Install state that arrived over a link. The caller has already paid for the traversal,
@@ -1035,7 +1425,7 @@ impl Hierarchy {
     pub fn supply(&mut self, chain: &[(BlobId, BlobMeta)]) -> usize {
         for (n, &(id, meta)) in chain.iter().enumerate() {
             if self.is_hot(&id, meta.kind) {
-                self.home_mut(meta.kind).touch(id);
+                self.touch(id, meta.kind);
                 continue;
             }
             if self.admit_hot(id, meta) == Admission::Pending {
@@ -1053,7 +1443,7 @@ impl Hierarchy {
         let mut cost = Cost::default();
         for &(id, meta) in blobs {
             if self.is_hot(&id, meta.kind) {
-                self.home_mut(meta.kind).touch(id);
+                self.touch(id, meta.kind);
                 self.hits[meta.kind.idx()] += 1;
                 continue;
             }
@@ -1069,7 +1459,7 @@ impl Hierarchy {
         let hit = chain.partition_point(|(id, m)| self.is_hot(id, m.kind));
         if hit > 0 {
             let (id, meta) = chain[hit - 1];
-            self.home_mut(meta.kind).touch(id);
+            self.touch(id, meta.kind);
             self.hits[meta.kind.idx()] += hit as u64;
         }
         for &(id, meta) in &chain[hit..] {
@@ -1079,5 +1469,59 @@ impl Hierarchy {
             }
         }
         cost
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hierarchy(split: bool) -> Hierarchy {
+        let bands = [0u8; BlobKind::N];
+        let hbm = if split { 4 << 30 } else { 0 };
+        let mem = NodeMemory {
+            hbm,
+            ddr: 8 << 30,
+            nvme: 64 << 30,
+            hbm_quota: Quota::open(hbm, bands),
+            ddr_quota: Quota::open(8 << 30, bands),
+            can_decode: true,
+        };
+        Hierarchy::new(mem, Policy::Gdsf)
+    }
+
+    /// `phase-1.md` §5: `tier_of` must agree with the pre-refactor `on_accelerator` body
+    /// (`self.split && accelerated(kind)`) on every input. `on_accelerator` now calls
+    /// `tier_of` directly, so this pins the *semantics* against an independent
+    /// restatement rather than the two functions trivially agreeing by construction.
+    #[test]
+    fn tier_of_agrees_with_accelerated_and_split_on_every_input() {
+        for split in [false, true] {
+            let h = hierarchy(split);
+            for kind in BlobKind::ALL {
+                let expect_hbm = split && accelerated(kind);
+                let got = h.tier_of(kind);
+                assert_eq!(
+                    got == Tier::Hbm,
+                    expect_hbm,
+                    "kind={kind:?} split={split}: tier_of={got:?}"
+                );
+                // Nvme is never a class's resting home -- only Hbm or Ddr.
+                assert_ne!(got, Tier::Nvme);
+            }
+        }
+    }
+
+    #[test]
+    fn hierarchy_authority_resolves_the_same_tier_as_home() {
+        for split in [false, true] {
+            let h = hierarchy(split);
+            for kind in BlobKind::ALL {
+                let tier = h.tier_of(kind);
+                let direct = crate::own::authority(kind, tier, crate::own::Question::Allocation);
+                let via_hierarchy = h.authority(kind, crate::own::Question::Allocation);
+                assert_eq!(direct, via_hierarchy, "kind={kind:?} split={split}");
+            }
+        }
     }
 }
