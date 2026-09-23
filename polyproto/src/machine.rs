@@ -1999,6 +1999,60 @@ mod tests {
         }
     }
 
+    /// P3's identity holds exactly under the ample-capacity fixture every other regret test
+    /// uses (`execution_gap_is_zero_under_unified_and_non_saturated`). Under a *deliberately*
+    /// tight pool it does not, and the reason is real rather than a mechanical bug: `plan`
+    /// prices `req.chain` and `req.requires` independently against one snapshot of residency,
+    /// while `run_here` materialises the chain first and the dependencies second, so an
+    /// admission on one side can evict state the other side's price assumed would still be
+    /// there when eviction pressure is high enough for that to happen. This is not the belief
+    /// staleness `phase-2.md` names -- both reads still see the same, current, true state --
+    /// it is a same-request ordering effect `plan`'s independent-pricing shape cannot see, and
+    /// it is new enough that this phase does not attempt to close it (`phase-2.md` rule 1:
+    /// measure, do not repair). The identity's scope is therefore "ample capacity", stated
+    /// here as a boundary rather than left to be found the expensive way.
+    #[test]
+    fn execution_gap_has_a_bounded_residual_under_a_deliberately_tight_pool() {
+        let bands = [0u8; BlobKind::N];
+        let mem = NodeMemory {
+            hbm: 0,
+            ddr: 2 << 30,
+            nvme: 64 << 30,
+            hbm_quota: Quota::open(0, bands),
+            ddr_quota: Quota::open(2 << 30, bands),
+            can_decode: true,
+        };
+        let topo = Topology::cluster(4, 1, mem.ddr, Distance::Socket, Crossing::default());
+        let mut mach = Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored);
+        mach.set_regret(true);
+        mach.set_arrival_rate(250.0);
+        for req in &regret_fixture(2, 3000) {
+            mach.serve_request(req);
+        }
+        assert!(!mach.spans.is_empty());
+        let nonzero = mach
+            .spans
+            .iter()
+            .filter(|s| s.regret.execution != 0)
+            .count();
+        let share = nonzero as f64 / mach.spans.len() as f64;
+        assert!(
+            share < 0.20,
+            "residual grew past its measured band ({share:.2} of spans); re-examine \
+             whether this is still the same-request ordering effect or a new one"
+        );
+        for s in &mach.spans {
+            // Even where it fires, execution is the whole gap: heuristic, belief and model
+            // stay exactly as the identity predicts, so the residual is isolated to the one
+            // mechanism named above and does not leak into the other three.
+            if s.regret.execution != 0 {
+                assert_eq!(s.regret.heuristic, 0, "{s:?}");
+                assert_eq!(s.regret.belief, 0, "{s:?}");
+                assert_eq!(s.regret.model, 0, "{s:?}");
+            }
+        }
+    }
+
     /// `phase-2.md` §1.2: `execution + heuristic + belief + model == total` on every decision,
     /// not just on the pure `oracle::decompose` unit tests -- this is the same claim proven
     /// through `Machine`'s own wiring rather than the function in isolation.
