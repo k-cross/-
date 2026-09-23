@@ -165,6 +165,13 @@ impl<'a> Telemetry<'a> {
         self.hierarchy.displacement(need, reserved)
     }
 
+    /// `displacement`, restricted to one pool -- `phase-2.md` §1.8, §4.6's locality-coupling
+    /// silo, which does not see the pool it does not own.
+    #[must_use]
+    pub fn displacement_in(&self, tier: Tier, need: &Need, reserved: &Need) -> f64 {
+        self.hierarchy.displacement_in(tier, need, reserved)
+    }
+
     #[must_use]
     pub fn could_admit(&self, need: &Need, reserved: &Need) -> bool {
         self.hierarchy.could_admit(need, reserved)

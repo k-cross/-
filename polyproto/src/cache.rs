@@ -266,6 +266,13 @@ pub struct TierPool {
     /// Expected loss per byte of the last blob actually evicted, in the same units as
     /// `marginal_price`. The fallback when nothing is currently reclaimable.
     last_price: f64,
+    /// `phase-2.md` §1.8, §4.6: evictions where the class evicted differs from the class being
+    /// admitted -- a cross-class trade a siloed, per-class quota could never make, since
+    /// `Quota::hard`'s `pick_class` always returns the admitting class itself. Counted here,
+    /// unconditionally and at zero cost to the eviction it observes: the comparison is a
+    /// byproduct of `pick_class`'s own already-computed answer, not a second simulation.
+    pub coupled: u64,
+    pub coupled_decisions: u64,
 }
 
 impl TierPool {
@@ -292,6 +299,8 @@ impl TierPool {
             regrets: [0; BlobKind::N],
             recovery: None,
             last_price: 0.0,
+            coupled: 0,
+            coupled_decisions: 0,
         }
     }
 
@@ -676,6 +685,14 @@ impl TierPool {
                 self.refused[k] += 1;
                 return Admission::Pending;
             };
+            // `phase-2.md` §4.6: `c != k` is exactly the trade `Quota::hard`'s own `pick_class`
+            // branch can never make -- it always returns `k`, the admitting class itself. So
+            // this is the unified arbiter's choice compared against the silo's only possible
+            // choice, read off `pick_class`'s answer rather than computed a second time.
+            self.coupled_decisions += 1;
+            if c != k {
+                self.coupled += 1;
+            }
             if let Some((vid, v)) = self.take_victim(c) {
                 out.push((vid, v.meta));
             }
@@ -1048,6 +1065,28 @@ impl Hierarchy {
         short(&self.hbm, nh, rh) + short(&self.ddr, nd, rd)
     }
 
+    /// `displacement`, restricted to one pool -- `phase-2.md` §1.8's locality-coupling silo.
+    /// An inference router does not know host DDR is under pressure, and a `FaaS` control
+    /// plane does not know HBM is; this is what either would price on its own.
+    #[must_use]
+    pub fn displacement_in(
+        &self,
+        tier: Tier,
+        need: &[u64; BlobKind::N],
+        reserved: &[u64; BlobKind::N],
+    ) -> f64 {
+        let (nh, nd) = self.by_pool(need);
+        let (rh, rd) = self.by_pool(reserved);
+        let short = |pool: &TierPool, n: u64, r: u64| {
+            n.saturating_sub(pool.free_bytes().saturating_sub(r)) as f64 * pool.marginal_price()
+        };
+        match tier {
+            Tier::Hbm => short(&self.hbm, nh, rh),
+            Tier::Ddr => short(&self.ddr, nd, rd),
+            Tier::Nvme => 0.0,
+        }
+    }
+
     #[must_use]
     pub fn used(&self) -> u64 {
         self.hbm.used() + self.ddr.used()
@@ -1088,6 +1127,14 @@ impl Hierarchy {
     #[must_use]
     pub fn over_capacity(&self) -> bool {
         self.hbm.over_capacity() || self.ddr.over_capacity()
+    }
+
+    /// `phase-2.md` §1.8's memory-coupling axis: `(cross-class evictions, evictions)` in host
+    /// DDR, the pool the axis is scoped to -- `TierPool::coupled`'s own doc comment says why
+    /// HBM's copy of the same counters is not part of this question.
+    #[must_use]
+    pub fn ddr_memory_coupled(&self) -> (u64, u64) {
+        (self.ddr.coupled, self.ddr.coupled_decisions)
     }
 
     fn spill(&mut self, id: BlobId, meta: BlobMeta) {
@@ -1475,6 +1522,82 @@ impl Hierarchy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `phase-2.md` §1.8, §4.6: admitting a class that must evict a *different* class is
+    /// exactly the trade a per-class quota cannot make, so a soft-quota pool with no floors
+    /// records it as coupled and a hard-quota pool -- whose `pick_class` never leaves its own
+    /// class -- never does, on the same sequence of admissions.
+    #[test]
+    fn cross_class_eviction_is_coupled_under_soft_quota_and_never_under_hard() {
+        let bands = [0u8; BlobKind::N];
+        let capacity = 3_000u64;
+        let snapshot = |tag: &[u8], bytes: u64| {
+            (
+                BlobId::leaf(tag),
+                BlobMeta {
+                    kind: BlobKind::Snapshot,
+                    bytes,
+                    parent: None,
+                    recompute_ns: 1_000,
+                },
+            )
+        };
+        let service = |tag: &[u8], bytes: u64| {
+            (
+                BlobId::leaf(tag),
+                BlobMeta {
+                    kind: BlobKind::ServiceHeap,
+                    bytes,
+                    parent: None,
+                    recompute_ns: 1_000,
+                },
+            )
+        };
+
+        let mut soft = TierPool::new(
+            TierSpec::dram(capacity),
+            Policy::Gdsf,
+            false,
+            Quota::open(capacity, bands),
+        );
+        let mut out = Vec::new();
+        let (id_a, meta_a) = snapshot(b"soft-a", 2_000);
+        assert_eq!(soft.admit(id_a, meta_a, &mut out), Admission::Admitted);
+        // The pool now holds 2,000 of its 3,000 bytes as Snapshot. Admitting 2,000 bytes of
+        // ServiceHeap cannot fit beside it, so the only way to make room is to evict the
+        // Snapshot entry -- a cross-class trade a per-class floor would have refused instead.
+        let (id_b, meta_b) = service(b"soft-b", 2_000);
+        out.clear();
+        assert_eq!(soft.admit(id_b, meta_b, &mut out), Admission::Admitted);
+        assert_eq!(soft.coupled_decisions, 1);
+        assert_eq!(
+            soft.coupled, 1,
+            "the only evictable byte here is a different class"
+        );
+
+        // Floors of 1,500 each, so a 1,000-byte blob is admitted freely but a second one of
+        // the same class (2,000 > 1,500) must evict -- from its own class only, since a hard
+        // quota's `pick_class` never leaves the class it was asked about.
+        let hard = Quota::from_split(capacity, [0.0, 0.5, 0.0, 0.5], bands, true);
+        let mut pool = TierPool::new(TierSpec::dram(capacity), Policy::Gdsf, false, hard);
+        let mut out = Vec::new();
+        for i in 0..3 {
+            let (id, meta) = snapshot(format!("hard-s{i}").as_bytes(), 1_000);
+            let _ = pool.admit(id, meta, &mut out);
+        }
+        for i in 0..3 {
+            let (id, meta) = service(format!("hard-h{i}").as_bytes(), 1_000);
+            let _ = pool.admit(id, meta, &mut out);
+        }
+        assert!(
+            pool.coupled_decisions > 0,
+            "the fixture must actually exercise eviction on both sides of the floor"
+        );
+        assert_eq!(
+            pool.coupled, 0,
+            "a hard quota's pick_class never leaves the admitting class"
+        );
+    }
 
     fn hierarchy(split: bool) -> Hierarchy {
         let bands = [0u8; BlobKind::N];

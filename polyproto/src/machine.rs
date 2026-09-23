@@ -892,6 +892,7 @@ impl Machine {
             handoff,
             engine,
             congestion,
+            need: plan.need,
         }
     }
 
@@ -939,6 +940,26 @@ impl Machine {
                 .map_or(f64::MAX, Terms::full)
         };
         let top = pick(&Terms::full);
+        if self.regret {
+            self.locality_coupled_decisions += 1;
+            let class = BlobKind::ALL[req.kind_idx()];
+            let silo = |t: &Terms| -> f64 {
+                let tier = self.domains[t.domain].tier_of(class);
+                let disp = self.telemetry(t.domain).displacement_in(
+                    tier,
+                    &t.need,
+                    &self.staged_bytes[t.domain],
+                );
+                t.acquire + disp + t.engine + t.congestion
+            };
+            let silo_pick = terms
+                .iter()
+                .min_by(|a, b| silo(a).total_cmp(&silo(b)))
+                .map_or(0, |t| t.domain);
+            if silo_pick != top {
+                self.locality_coupled += 1;
+            }
+        }
         // Never move without a reason. With nothing resident anywhere every cost is equal,
         // and an argmin over ties would send every cold request to the same node; falling
         // back to content affinity spreads them the way a hash does.
@@ -1725,6 +1746,17 @@ impl Machine {
         let lo = used.iter().copied().min().unwrap_or(0).max(1) as f64;
         hi / lo
     }
+
+    /// `phase-2.md` §1.8, §4.6: `(cross-class evictions, evictions)` in host DDR, summed
+    /// across every domain -- `Hierarchy::ddr_memory_coupled` counts unconditionally, so this
+    /// needs no `self.regret` gate and is cheap to read even when it is off.
+    #[must_use]
+    pub fn memory_coupled(&self) -> (u64, u64) {
+        self.domains.iter().fold((0, 0), |(c, n), h| {
+            let (hc, hn) = h.ddr_memory_coupled();
+            (c + hc, n + hn)
+        })
+    }
 }
 
 /// The terms of a placement cost, all in nanoseconds: getting the state here by the cheapest
@@ -1740,6 +1772,10 @@ struct Terms {
     handoff: f64,
     engine: f64,
     congestion: f64,
+    /// Per-class bytes this candidate would have to admit -- `Plan::need`, carried through so
+    /// `phase-2.md` §4.6's locality-coupling silo can price displacement in one pool without
+    /// recomputing `plan` a second time.
+    need: Need,
 }
 
 pub const TERM_COUNT: usize = 5;
@@ -2058,5 +2094,31 @@ mod tests {
         }
         assert!(refused > 0, "fixture must refuse with a 1-byte pool");
         assert_eq!(mach.feasibility_regret, 0);
+    }
+
+    /// `phase-2.md` §1.8, §4.6: `locality_coupled_decisions` is one per scored decision (the
+    /// same denominator `scored_decisions` counts), and on a flow-aware, multi-node fixture at
+    /// least one decision must be one the handoff term alone moves -- the mechanism has
+    /// something to find, not merely somewhere to record a zero.
+    #[test]
+    fn locality_coupled_counts_match_scored_decisions_and_can_be_nonzero() {
+        let mut mach = machine(4);
+        mach.set_regret(true);
+        mach.set_flow_aware(true);
+        mach.set_state_transfer(true);
+        for req in &regret_fixture(7, 1500) {
+            mach.serve_request(req);
+        }
+        assert_eq!(mach.locality_coupled_decisions, mach.scored_decisions);
+        assert!(mach.locality_coupled_decisions > 0);
+        assert!(
+            mach.locality_coupled <= mach.locality_coupled_decisions,
+            "a count can never exceed its own denominator"
+        );
+        assert!(
+            mach.locality_coupled > 0,
+            "a flow-aware scored arm over a multi-node fixture must find at least one decision \
+             the handoff term alone moved"
+        );
     }
 }
