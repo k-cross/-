@@ -22,6 +22,11 @@ pub enum Policy {
     Gdsf,
     #[allow(dead_code, reason = "baseline policy retained for arm comparison")]
     Lru,
+    /// Furthest-next-use, `phase-2.md` §1.7, §4.5: a diagnostic baseline, not a candidate for
+    /// deployment. It needs the full reference stream ahead of time
+    /// (`Hierarchy::set_clairvoyant_index`), so it exists to separate *eviction* quality from
+    /// *routing* quality on a single ledger, never to be scored as an arm alongside `Gdsf`.
+    Clairvoyant,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -378,12 +383,17 @@ impl TierPool {
         self.used > self.spec.capacity
     }
 
+    /// `Policy::Clairvoyant`'s branch is a placeholder, immediately overwritten by
+    /// `Hierarchy::clairvoyant_touch`'s `set_priority` the moment this entry's own reference
+    /// is processed -- `score` has no reference-stream index to consult, only `Hierarchy`
+    /// does, so it cannot compute the real furthest-next-use priority itself.
     fn score(&self, meta: &BlobMeta, freq: u32, expect: f64) -> f64 {
         match self.policy {
             Policy::Gdsf => {
                 self.inflation + (f64::from(freq.min(FREQ_CAP)) + expect) * meta.value_per_byte()
             }
             Policy::Lru => self.clock as f64,
+            Policy::Clairvoyant => 0.0,
         }
     }
 
@@ -406,6 +416,10 @@ impl TierPool {
                 inflation + (f64::from(e.freq.min(FREQ_CAP)) + expect) * e.meta.value_per_byte()
             }
             Policy::Lru => clock as f64,
+            // A speculative bump is not a real reference, so it must not consume from the
+            // reference-stream index -- see `Hierarchy::clairvoyant_touch`'s own doc comment.
+            // The entry's real furthest-next-use priority is left exactly as it was.
+            Policy::Clairvoyant => return,
         };
         self.reheap(id);
     }
@@ -515,6 +529,19 @@ impl TierPool {
         if let Some(e) = self.entries.get_mut(&id) {
             e.priority = p;
         }
+        self.reheap(id);
+    }
+
+    /// Override one resident entry's priority directly, for a policy whose ranking is not a
+    /// function of `score()`'s inputs -- `Policy::Clairvoyant`'s furthest-next-use, set from
+    /// outside by `Hierarchy::clairvoyant_touch` once per real reference. A no-op if the
+    /// entry is not resident here, which happens whenever the reference just landed in a
+    /// different pool than the one holding the id's earlier occurrence.
+    pub fn set_priority(&mut self, id: BlobId, priority: f64) {
+        let Some(e) = self.entries.get_mut(&id) else {
+            return;
+        };
+        e.priority = priority;
         self.reheap(id);
     }
 
@@ -854,6 +881,11 @@ pub struct Hierarchy {
     pub prewarmed_bytes: u64,
     pub prewarm_ns: u64,
     pub engine_ops: EngineOps,
+    /// `Policy::Clairvoyant`'s reference-stream index (`phase-2.md` §4.5): for each blob, its
+    /// remaining occurrences' absolute trace positions, front-to-back. Empty unless
+    /// `set_clairvoyant_index` was called, and every touch site below skips the work when it
+    /// is, so a run that never installs one pays nothing for the check.
+    clairvoyant: HashMap<BlobId, VecDeque<u64>>,
 }
 
 /// The *dynamic* census (`phase-1.md` §4.4). One counter per census-marked entry point,
@@ -923,7 +955,34 @@ impl Hierarchy {
             prewarmed_bytes: 0,
             prewarm_ns: 0,
             engine_ops: EngineOps::default(),
+            clairvoyant: HashMap::new(),
         }
+    }
+
+    /// Install `Policy::Clairvoyant`'s reference-stream index: for each blob, the absolute
+    /// trace position of every occurrence, in order. Built once from the full trace before a
+    /// run starts (`arms.rs`), because the whole point of the arm is that it is *not* learned
+    /// online. `phase-2.md` §4.5.
+    pub fn set_clairvoyant_index(&mut self, index: HashMap<BlobId, VecDeque<u64>>) {
+        self.clairvoyant = index;
+    }
+
+    /// Pop the occurrence that just happened off `id`'s schedule and, if `Policy::Clairvoyant`
+    /// is running, push the resulting furthest-next-use priority into whichever pool now holds
+    /// it -- `-inf` when nothing remains, so a blob referenced for the last time is evicted
+    /// first. Called once per genuine reference (`access`, `access_set`, `supply`), never from
+    /// `announce`'s speculative prewarm (`TierPool::anticipate`'s own `Clairvoyant` arm does
+    /// not call this). A no-op, at the cost of one hash lookup, when no index was installed.
+    fn clairvoyant_touch(&mut self, id: BlobId, kind: BlobKind) {
+        if self.clairvoyant.is_empty() {
+            return;
+        }
+        let Some(q) = self.clairvoyant.get_mut(&id) else {
+            return;
+        };
+        q.pop_front();
+        let priority = q.front().map_or(f64::NEG_INFINITY, |&pos| -(pos as f64));
+        self.home_mut(kind).set_priority(id, priority);
     }
 
     #[must_use]
@@ -1473,6 +1532,7 @@ impl Hierarchy {
         for (n, &(id, meta)) in chain.iter().enumerate() {
             if self.is_hot(&id, meta.kind) {
                 self.touch(id, meta.kind);
+                self.clairvoyant_touch(id, meta.kind);
                 continue;
             }
             if self.admit_hot(id, meta) == Admission::Pending {
@@ -1480,6 +1540,7 @@ impl Hierarchy {
             }
             self.forget_cold(&id, meta.kind);
             self.remote_hits[meta.kind.idx()] += 1;
+            self.clairvoyant_touch(id, meta.kind);
         }
         chain.len()
     }
@@ -1492,10 +1553,13 @@ impl Hierarchy {
             if self.is_hot(&id, meta.kind) {
                 self.touch(id, meta.kind);
                 self.hits[meta.kind.idx()] += 1;
+                self.clairvoyant_touch(id, meta.kind);
                 continue;
             }
             if self.materialise(id, meta, &mut cost) == Admission::Pending {
                 cost.pending = true;
+            } else {
+                self.clairvoyant_touch(id, meta.kind);
             }
         }
         cost
@@ -1509,11 +1573,19 @@ impl Hierarchy {
             self.touch(id, meta.kind);
             self.hits[meta.kind.idx()] += hit as u64;
         }
+        // The clairvoyant schedule advances for every blob this request actually touched,
+        // not only the one `touch()` bumped: it was built from every blob in the chain, and
+        // leaving the rest of the hit prefix unadvanced would leave their next-use position
+        // pointing at an occurrence already in the past.
+        for &(id, meta) in &chain[..hit] {
+            self.clairvoyant_touch(id, meta.kind);
+        }
         for &(id, meta) in &chain[hit..] {
             if self.materialise(id, meta, &mut cost) == Admission::Pending {
                 cost.pending = true;
                 return cost;
             }
+            self.clairvoyant_touch(id, meta.kind);
         }
         cost
     }
@@ -1522,6 +1594,58 @@ impl Hierarchy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `phase-2.md` §1.7, §4.5: with only two resident entries and a third arriving, the one
+    /// with no scheduled future use must go before the one that does, regardless of recency or
+    /// frequency -- the property `Policy::Gdsf`/`Policy::Lru` cannot express by construction.
+    #[test]
+    fn clairvoyant_evicts_the_entry_with_the_furthest_next_use() {
+        let bands = [0u8; BlobKind::N];
+        let mem = NodeMemory {
+            hbm: 0,
+            ddr: 200,
+            nvme: 0,
+            hbm_quota: Quota::open(0, bands),
+            ddr_quota: Quota::open(200, bands),
+            can_decode: true,
+        };
+        let mut h = Hierarchy::new(mem, Policy::Clairvoyant);
+        // Snapshot, not ServiceHeap: a ServiceHeap entry is pinned while "serving" (unevictable
+        // at any price for `SERVING_WINDOW` clock ticks), which this test's few admissions
+        // never age out of -- an unrelated mechanism this test must not exercise by accident.
+        let meta = || BlobMeta {
+            kind: BlobKind::Snapshot,
+            bytes: 100,
+            parent: None,
+            recompute_ns: 1_000,
+        };
+        let (a, b, c) = (BlobId::leaf(b"a"), BlobId::leaf(b"b"), BlobId::leaf(b"c"));
+
+        // a is referenced again at op 5; b never is; c is referenced once more, later than
+        // either. Filling the pool with a and b and then admitting c must evict b -- the one
+        // with no future in its own schedule -- and never a, which still has one.
+        let mut index = HashMap::new();
+        index.insert(a, VecDeque::from([0u64, 5]));
+        index.insert(b, VecDeque::from([1u64]));
+        index.insert(c, VecDeque::from([2u64, 9]));
+        h.set_clairvoyant_index(index);
+
+        assert!(!h.access(&[(a, meta())]).pending);
+        assert!(!h.access(&[(b, meta())]).pending);
+        assert!(h.is_hot(&a, BlobKind::Snapshot));
+        assert!(h.is_hot(&b, BlobKind::Snapshot));
+
+        assert!(!h.access(&[(c, meta())]).pending);
+        assert!(
+            h.is_hot(&a, BlobKind::Snapshot),
+            "a has a scheduled future use and must survive"
+        );
+        assert!(
+            !h.is_hot(&b, BlobKind::Snapshot),
+            "b has no future use and must be evicted first"
+        );
+        assert!(h.is_hot(&c, BlobKind::Snapshot));
+    }
 
     /// `phase-2.md` §1.8, §4.6: admitting a class that must evict a *different* class is
     /// exactly the trade a per-class quota cannot make, so a soft-quota pool with no floors

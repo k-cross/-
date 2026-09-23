@@ -1,7 +1,7 @@
-use crate::blob::BlobKind;
+use crate::blob::{BlobId, BlobKind};
 use crate::cache::{Hierarchy, NodeMemory, Policy, Quota, accelerated};
 use crate::flow::FlowMode;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Trial {
@@ -99,6 +99,27 @@ pub fn trace(t: Trial) -> Vec<crate::work::Request> {
     crate::work::Workload::new(t.seed, t.ops, t.vol).collect()
 }
 
+/// `Policy::Clairvoyant`'s reference-stream index, built once from the full trace before a run
+/// starts: for every blob referenced in a chain or a dependency set, the ops at which it is
+/// referenced, in order. Positions are counted the same way `run_on`'s own loop counts --
+/// skipping gang requests, which a single ledger never processes -- so they stay aligned with
+/// the sequence of `Hierarchy::access`/`access_set` calls the index is consumed by.
+#[must_use]
+fn clairvoyant_index(trace: &[crate::work::Request]) -> HashMap<BlobId, VecDeque<u64>> {
+    let mut index: HashMap<BlobId, VecDeque<u64>> = HashMap::new();
+    let mut op = 0u64;
+    for req in trace {
+        if req.gang.is_some() {
+            continue;
+        }
+        for (id, _) in req.chain.iter().chain(&req.requires) {
+            index.entry(*id).or_default().push_back(op);
+        }
+        op += 1;
+    }
+    index
+}
+
 /// How a trial budgets memory between classes.
 #[derive(Clone, Copy, Debug)]
 pub enum Budget {
@@ -172,6 +193,9 @@ pub fn run(label: &str, t: Trial, budget: Budget) -> Report {
 /// it sets function cells and service heaps against what the accelerator has offloaded.
 pub fn run_on(label: &str, t: Trial, budget: Budget, trace: &[crate::work::Request]) -> Report {
     let mut h = Hierarchy::new(memory_for(t, budget), t.policy);
+    if t.policy == Policy::Clairvoyant {
+        h.set_clairvoyant_index(clairvoyant_index(trace));
+    }
     let mut costs: Vec<u64> = Vec::with_capacity(t.ops as usize);
     let (mut total, mut transfer) = (0u64, 0u64);
     let mut phase_ns = [0u64; crate::work::PHASES];
