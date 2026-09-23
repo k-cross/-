@@ -41,6 +41,11 @@ enum Cmd {
         /// Priority bands as inference,faas,weights,service (0 = highest)
         #[arg(long, default_value = "0,1,2,1", value_parser = parse_bands)]
         bands: String,
+        /// Add a furthest-next-use eviction baseline (phase-2.md §1.7, §4.5): a diagnostic,
+        /// not an arm competing with hard-partition/soft-floor. It needs the whole trace ahead
+        /// of time, so it exists to separate eviction quality from budget policy
+        #[arg(long)]
+        clairvoyant: bool,
     },
 
     /// Do cross-workload flows pay: blind vs. anticipatory value vs. downstream-aware admission
@@ -61,6 +66,10 @@ enum Cmd {
         step: f64,
         #[arg(long, default_value = "0,1,2,1", value_parser = parse_bands)]
         bands: String,
+        /// Add a furthest-next-use eviction baseline (phase-2.md §1.7, §4.5), blind to flows
+        /// so it is not confounded with the prewarm effect
+        #[arg(long)]
+        clairvoyant: bool,
     },
 
     /// State-blind vs state-aware placement over a synthetic multi-domain machine
@@ -136,6 +145,15 @@ enum Cmd {
         /// Boundary-ladder repetitions
         #[arg(long, default_value_t = 3)]
         repeat: usize,
+        /// Print the regret decomposition, feasibility regret, and coupled % on both axes
+        /// (owned-and-observed.md §3.4, phase-2.md). Prices every candidate a second time
+        /// against truth, so it costs real wall time and is off by default
+        #[arg(long)]
+        regret: bool,
+        /// Override the `FaaS` -> inference handoff payload (bytes). phase-2.md §4.7's knob for
+        /// re-running residency-ledger.md's flow-payload sweep under --regret
+        #[arg(long, value_parser = parse_bytes)]
+        flow_payload: Option<u64>,
     },
 
     /// One model host and one agent-framework host, swept from same-socket to cross-region.
@@ -273,6 +291,10 @@ enum Cmd {
         seed: u64,
         #[arg(long, default_value_t = 0.125)]
         step: f64,
+        /// Add a furthest-next-use eviction baseline at each volatility level
+        /// (phase-2.md §1.7, §4.5)
+        #[arg(long)]
+        clairvoyant: bool,
     },
 
     /// Print the ownership predicate `own.rs` computes (owned-and-observed.md §1's table,
@@ -780,6 +802,10 @@ fn topology(bytes: u64, iters: u32) {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one flag per experiment knob, all independent"
+)]
 fn flows_report(
     hbm: u64,
     dram: u64,
@@ -788,6 +814,7 @@ fn flows_report(
     seed: u64,
     step: f64,
     bands: [u8; BlobKind::N],
+    clairvoyant: bool,
 ) {
     println!(
         "{} ops={ops} seed={seed} bands={bands:?}\n",
@@ -834,15 +861,47 @@ fn flows_report(
             100.0 * r.goodput(),
         );
     }
+    // `phase-2.md` §1.7, §4.5: eviction quality alone, blind to flows so it is not confounded
+    // with prewarm's own effect -- a signed difference against `blind`, not a regret.
+    if clairvoyant {
+        let trial = Trial {
+            flows: FlowMode::Blind,
+            policy: Policy::Clairvoyant,
+            ..cfg
+        };
+        let r = run("", trial, budget);
+        let stall_s = r.total_ns as f64 / 1e9;
+        let prewarm_s = r.prewarm_ns as f64 / 1e9;
+        println!(
+            "{:<10} {:>13.2} {stall_s:>12.2}s {prewarm_s:>13.2}s {:>10.2}s {:>10.2} {:>9.1}%",
+            "clairvoy.",
+            r.flow_e2e_ms(),
+            stall_s + prewarm_s,
+            mean_ms(r.kind_ns[0], r.kind_ops[0]),
+            100.0 * r.goodput(),
+        );
+    }
 }
 
-fn volatility_sweep(hbm: u64, dram: u64, nvme: u64, ops: u64, seed: u64, step: f64) {
+fn volatility_sweep(
+    hbm: u64,
+    dram: u64,
+    nvme: u64,
+    ops: u64,
+    seed: u64,
+    step: f64,
+    clairvoyant: bool,
+) {
     let bands = [0u8, 1, 2, 1];
     println!("{} ops={ops} seed={seed}\n", memory_label(hbm, dram));
-    println!(
+    print!(
         "{:>10} {:>18} {:>16} {:>12}",
         "volatility", "hard-partition (ms)", "soft-floor (ms)", "advantage"
     );
+    if clairvoyant {
+        print!(" {:>16} {:>12}", "clairvoyant (ms)", "vs soft");
+    }
+    println!();
     for i in 0..=5 {
         let v = f64::from(i) / 5.0;
         let t = Trial {
@@ -860,10 +919,22 @@ fn volatility_sweep(hbm: u64, dram: u64, nvme: u64, ops: u64, seed: u64, step: f
         let (soft, _) = best_split(t, false, step);
         let hm = mean_ms(hard.total_ns, hard.served.iter().sum());
         let sm = mean_ms(soft.total_ns, soft.served.iter().sum());
-        println!(
+        print!(
             "{v:>10.1} {hm:>18.3} {sm:>16.3} {:>11.1}%",
             100.0 * (hm - sm) / hm
         );
+        // `phase-2.md` §1.7: same open budget as `open` elsewhere, so only eviction quality
+        // -- not admission policy -- differs from the two arms already printed.
+        if clairvoyant {
+            let t_clair = Trial {
+                policy: Policy::Clairvoyant,
+                ..t
+            };
+            let clair = run("", t_clair, Budget::Open);
+            let cm = mean_ms(clair.total_ns, clair.served.iter().sum());
+            print!(" {cm:>16.3} {:>11.1}%", 100.0 * (cm - sm) / sm);
+        }
+        println!();
     }
 }
 
@@ -962,6 +1033,10 @@ fn ownership_report(hbm: u64, dram: u64, nvme: u64, ops: u64, seed: u64, bands: 
     clippy::too_many_arguments,
     reason = "experiment knobs, all independent"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table per published comparison, printed in sequence"
+)]
 fn residency_report(
     hbm: u64,
     dram: u64,
@@ -971,6 +1046,7 @@ fn residency_report(
     step: f64,
     volatility: f64,
     bands: [u8; BlobKind::N],
+    clairvoyant: bool,
 ) {
     println!(
         "{} nvme={:.1}GiB ops={ops} seed={seed} volatility={volatility}\n",
@@ -1003,16 +1079,34 @@ fn residency_report(
     let mut open = run("", t, Budget::Open);
     open.label = "no-floor       [open]".to_string();
 
+    // `phase-2.md` §1.7, §4.5: furthest-next-use, at the same open budget as `open` so only
+    // eviction quality differs. Never called an oracle and never scored as regret -- §1.7's
+    // reasoning is that variable size and cost make offline caching here NP-hard, so this is a
+    // clairvoyant *heuristic*, and its column below is a signed difference, not a bound.
+    let clair = clairvoyant.then(|| {
+        let t_clair = Trial {
+            policy: Policy::Clairvoyant,
+            ..t
+        };
+        let mut c = run("", t_clair, Budget::Open);
+        c.label = "clairvoyant    [open]".to_string();
+        c
+    });
+    let mut rows: Vec<&Report> = vec![&hard, &soft, &open];
+    if let Some(c) = &clair {
+        rows.push(c);
+    }
+
     println!(
         "{:<32} {:>11} {:>9} {:>9} {:>10} {:>20} {:>21}",
         "arm", "stall/req", "p99 (ms)", "goodput", "from tier", "hit kv/sn/wt/svc", "resident GiB"
     );
-    for r in [&hard, &soft, &open] {
+    for r in &rows {
         arm_row(r);
     }
 
     println!("\nadmission integrity");
-    for r in [&hard, &soft, &open] {
+    for r in &rows {
         println!(
             "{:<32} over-capacity={:<7} refused={:?} pinned-skips={}",
             r.label, r.over_capacity, r.refused, r.pinned_skips
@@ -1024,7 +1118,7 @@ fn residency_report(
         "{:<32} {:>16} {:>16} {:>16} {:>16}",
         "arm", CLASS_NAME[0], CLASS_NAME[1], CLASS_NAME[2], CLASS_NAME[3]
     );
-    for r in [&hard, &soft, &open] {
+    for r in &rows {
         print!("{:<32}", r.label);
         for k in 0..BlobKind::N {
             let cell = format!(
@@ -1038,7 +1132,7 @@ fn residency_report(
     }
 
     println!("\nshare of total stall by class (policy can only move what dominates)");
-    for r in [&hard, &soft, &open] {
+    for r in &rows {
         print!("{:<32}", r.label);
         for k in 0..BlobKind::N {
             print!(
@@ -1054,7 +1148,7 @@ fn residency_report(
         "{:<32} {:>16} {:>16} {:>16} {:>16}",
         "arm", PHASE_NAME[0], PHASE_NAME[1], PHASE_NAME[2], PHASE_NAME[3]
     );
-    for r in [&hard, &soft, &open] {
+    for r in &rows {
         print!("{:<32}", r.label);
         for p in r.phase_ns {
             print!("{:>16.2}", p as f64 / 1e9);
@@ -1069,6 +1163,15 @@ fn residency_report(
         100.0 * (hm - sm) / hm,
         100.0 * (soft.goodput() - hard.goodput())
     );
+    if let Some(c) = &clair {
+        let cm = mean_ms(c.total_ns, c.served.iter().sum());
+        println!(
+            "clairvoyant vs soft-floor: {:+.1}% stall/req at {:+.1}pp hit rate (kv) -- a \
+             signed difference against a heuristic baseline, not a regret (phase-2.md §1.7)",
+            100.0 * (cm - sm) / sm.max(f64::MIN_POSITIVE),
+            100.0 * (c.hit[0] - soft.hit[0])
+        );
+    }
 }
 
 #[allow(
@@ -1086,6 +1189,7 @@ fn main() {
             step,
             volatility,
             bands,
+            clairvoyant,
         } => {
             residency_report(
                 hbm,
@@ -1096,6 +1200,7 @@ fn main() {
                 step,
                 volatility,
                 bands_of(&bands),
+                clairvoyant,
             );
         }
         Cmd::Calibrate { path, iters } => calibrate(&path, iters),
@@ -1115,6 +1220,8 @@ fn main() {
             rate,
             fanout,
             repeat,
+            regret,
+            flow_payload,
         } => distributed(
             nodes,
             units_per_node,
@@ -1130,6 +1237,8 @@ fn main() {
             rate,
             fanout,
             repeat,
+            regret,
+            flow_payload,
         ),
         Cmd::CodeReview {
             hbm,
@@ -1229,8 +1338,18 @@ fn main() {
             seed,
             step,
             bands,
+            clairvoyant,
         } => {
-            flows_report(hbm, dram, nvme, ops, seed, step, bands_of(&bands));
+            flows_report(
+                hbm,
+                dram,
+                nvme,
+                ops,
+                seed,
+                step,
+                bands_of(&bands),
+                clairvoyant,
+            );
         }
         Cmd::Volatility {
             hbm,
@@ -1239,8 +1358,9 @@ fn main() {
             ops,
             seed,
             step,
+            clairvoyant,
         } => {
-            volatility_sweep(hbm, dram, nvme, ops, seed, step);
+            volatility_sweep(hbm, dram, nvme, ops, seed, step, clairvoyant);
         }
         Cmd::Ownership {
             hbm,
@@ -1661,6 +1781,78 @@ fn score_terms(mach: &polyphonic::machine::Machine, served: u64) {
     );
 }
 
+/// `phase-2.md` §4.8: the regret decomposition, feasibility regret, and coupled % on both
+/// axes. Only meaningful when `Machine::set_regret(true)` was on for this run -- `mach.spans`
+/// is empty otherwise, and this prints a line saying so rather than a table of zeros that
+/// would read as a real measurement.
+fn regret_report(mach: &polyphonic::machine::Machine) {
+    if mach.spans.is_empty() {
+        println!(
+            "{:<22} regret: no spans (pass --regret, and at least one non-gang request must \
+             be served)",
+            ""
+        );
+        return;
+    }
+    let n = mach.spans.len() as f64;
+    let mut total = 0i64;
+    let mut execution = 0i64;
+    let mut heuristic = 0i64;
+    let mut belief = 0i64;
+    let mut model = 0i64;
+    let mut total_disp = 0i64;
+    let mut by_class = [(0i64, 0u64); BlobKind::N];
+    for s in &mach.spans {
+        let r = s.regret;
+        total += r.total;
+        execution += r.execution;
+        heuristic += r.heuristic;
+        belief += r.belief;
+        model += r.model;
+        total_disp += r.total_with_displacement;
+        let (t, c) = &mut by_class[s.class.idx()];
+        *t += r.total;
+        *c += 1;
+    }
+    println!(
+        "{:<22} regret (mean ns/decision, {} spans): total {:>9.0} = execution {:>8.0} + \
+         heuristic {:>8.0} + belief {:>8.0} + model {:>8.0}; total w/ displacement {:>9.0}",
+        "",
+        mach.spans.len(),
+        total as f64 / n,
+        execution as f64 / n,
+        heuristic as f64 / n,
+        belief as f64 / n,
+        model as f64 / n,
+        total_disp as f64 / n,
+    );
+    print!("{:<22} regret by class (mean ns/decision):", "");
+    for k in BlobKind::ALL {
+        let (t, c) = by_class[k.idx()];
+        print!(
+            " {}: {:.0} (n={c})",
+            CLASS_NAME[k.idx()],
+            t as f64 / (c.max(1) as f64)
+        );
+    }
+    println!();
+    println!(
+        "{:<22} feasibility regret: {} refusals where another candidate, priced against \
+         truth, could have served",
+        "", mach.feasibility_regret,
+    );
+    let (mc, mcd) = mach.memory_coupled();
+    println!(
+        "{:<22} coupled %: memory (host DDR) {:.1}% of {} evictions, locality {:.1}% of {} \
+         scored decisions",
+        "",
+        100.0 * mc as f64 / mcd.max(1) as f64,
+        mcd,
+        100.0 * mach.locality_coupled as f64 / mach.locality_coupled_decisions.max(1) as f64,
+        mach.locality_coupled_decisions,
+    );
+}
+
 fn cluster_header(
     nodes: usize,
     units_per_node: usize,
@@ -1729,6 +1921,8 @@ fn distributed(
     rate: f64,
     fanout: f64,
     repeat: usize,
+    regret: bool,
+    flow_payload: Option<u64>,
 ) {
     use polyphonic::machine::Machine;
     use polyphonic::topo::{Distance, Topology};
@@ -1791,11 +1985,13 @@ fn distributed(
             mach.set_state_transfer(a.transfer);
             mach.set_arrival_rate(rate);
             mach.set_fanout_atomic(true);
-            let (t, total, served, offered) = drive(
-                &mut mach,
-                rate,
-                polyphonic::work::Workload::with_fanout(seed, ops, 1.0, fanout),
-            );
+            mach.set_regret(regret);
+            let workload = polyphonic::work::Workload::with_fanout(seed, ops, 1.0, fanout);
+            let workload = match flow_payload {
+                Some(bytes) => workload.with_flow_payload(bytes),
+                None => workload,
+            };
+            let (t, total, served, offered) = drive(&mut mach, rate, workload);
             let stall = mean_ms(total, served);
             let service = mean_ms(t.service.iter().sum(), served);
             println!(
@@ -1815,6 +2011,9 @@ fn distributed(
             if a.placement == Placement::Scored {
                 score_terms(&mach, served);
                 term_spread(&mach);
+            }
+            if regret {
+                regret_report(&mach);
             }
             for (seen, (ns, n)) in warm_seen.iter_mut().zip(t.warm_ns.iter().zip(&t.warm)) {
                 seen.0 += ns;

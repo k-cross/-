@@ -235,6 +235,11 @@ pub struct Workload {
     /// file-sized payloads.
     tool_fraction: f64,
     tool_payload_bytes: u64,
+    /// Bytes crossing the link on a `FaaS` -> inference handoff. `phase-2.md` §4.7's knob for
+    /// P6's re-run of `residency-ledger.md`'s "falsification test that fails": the published
+    /// sweep is the only available test of the regret metric's known blind spot (§1.1), and
+    /// `FLOW_PAYLOAD_BYTES` is otherwise a compile-time constant.
+    flow_payload_bytes: u64,
 }
 
 fn kv(parent: BlobId, tag: &[u8]) -> (BlobId, BlobMeta) {
@@ -278,6 +283,7 @@ impl Workload {
             fanout_fraction: 0.0,
             tool_fraction: TOOL_FRACTION,
             tool_payload_bytes: TOOL_PAYLOAD_BYTES,
+            flow_payload_bytes: FLOW_PAYLOAD_BYTES,
         };
         for _ in 0..SESSIONS {
             let s = w.fresh_session();
@@ -302,6 +308,13 @@ impl Workload {
     pub fn with_tool_profile(mut self, fraction: f64, payload_bytes: u64) -> Self {
         self.tool_fraction = fraction;
         self.tool_payload_bytes = payload_bytes;
+        self
+    }
+
+    /// Override the `FaaS` -> inference handoff payload. `phase-2.md` §4.7.
+    #[must_use]
+    pub fn with_flow_payload(mut self, payload_bytes: u64) -> Self {
+        self.flow_payload_bytes = payload_bytes;
         self
     }
 
@@ -697,7 +710,7 @@ impl Workload {
                 requires,
                 tokens * DECODE_NS_PER_TOKEN,
                 tokens,
-                FLOW_PAYLOAD_BYTES,
+                self.flow_payload_bytes,
             ))
         } else {
             None
