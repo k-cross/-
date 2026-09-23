@@ -1431,6 +1431,8 @@ wrong here is what would leave Phase 3 ambiguous about what changes hands.
 
 ### Phase 2 -- Oracle, regret, coupling
 
+Implementation plan: [`phase-2.md`](phase-2.md), which states its predictions before the run.
+
 The routing oracle, a clairvoyant eviction baseline, per-request regret on the policy's own state,
 the wait regime (§3.5), per-request tracing spans (§3.11), and coupled % **on both axes §3.4
 defines**. No architectural change.
