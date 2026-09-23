@@ -1464,6 +1464,9 @@ struct ClassTally {
     /// Service time of warm requests only. A warm invocation is the regime where an overhead
     /// measured in tens of microseconds stops being a rounding error.
     warm_ns: [u64; BlobKind::N],
+    /// `owned-and-observed.md` §3.5's acquisition regime, over every served request
+    /// regardless of class -- `Regime::idx`'s four exclusive buckets, summing to `served`.
+    regime: [u64; polyphonic::oracle::REGIME_COUNT],
 }
 
 type ClassRow<'a> = (&'a str, ClassTally);
@@ -1487,6 +1490,34 @@ fn class_table(rows: &ClassRows<'_>) {
                 mean_ms(t.service[i], t.ops[i]),
                 100.0 * t.decide[i] as f64 / t.service[i].max(1) as f64,
                 100.0 * t.warm[i] as f64 / t.ops[i].max(1) as f64,
+            );
+        }
+        println!();
+    }
+    println!();
+    regime_table(rows);
+}
+
+/// `owned-and-observed.md` §3.5: how a served request's state was actually acquired -- resident
+/// already, waited for a decode slot, fetched over a link, or rebuilt locally. Exclusive and
+/// exhaustive over the same requests `class_table` reports, so the four shares sum to 100%
+/// (modulo rounding), unlike the materialisation counters `state_terms` prints, which are per
+/// blob and can exceed the request count.
+fn regime_table(rows: &ClassRows<'_>) {
+    use polyphonic::oracle::Regime;
+    println!("  acquisition regime (share of served requests):");
+    print!("  {:<18}", "arm");
+    for r in Regime::ALL {
+        print!("{:>12}", r.label());
+    }
+    println!();
+    for (label, t) in rows {
+        let served: u64 = t.regime.iter().sum();
+        print!("  {label:<18}");
+        for r in Regime::ALL {
+            print!(
+                "{:>11.1}%",
+                100.0 * t.regime[r.idx()] as f64 / served.max(1) as f64
             );
         }
         println!();
@@ -1987,6 +2018,7 @@ fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
             t.warm[k] += 1;
             t.warm_ns[k] += c.service_ns();
         }
+        t.regime[polyphonic::oracle::classify(&c).idx()] += 1;
         served += 1;
     }
     (t, total, served, offered)

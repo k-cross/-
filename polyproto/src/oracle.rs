@@ -82,7 +82,12 @@ pub enum Regime {
     Recompute,
 }
 
+pub const REGIME_COUNT: usize = 4;
+
 impl Regime {
+    pub const ALL: [Self; REGIME_COUNT] =
+        [Self::Resident, Self::Wait, Self::Transfer, Self::Recompute];
+
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
@@ -90,6 +95,16 @@ impl Regime {
             Self::Wait => "wait",
             Self::Transfer => "transfer",
             Self::Recompute => "recompute",
+        }
+    }
+
+    #[must_use]
+    pub fn idx(self) -> usize {
+        match self {
+            Self::Resident => 0,
+            Self::Wait => 1,
+            Self::Transfer => 2,
+            Self::Recompute => 3,
         }
     }
 }
