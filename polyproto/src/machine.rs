@@ -9,6 +9,8 @@ use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::boundary::Cost as Crossing;
 use crate::cache::{Cost, Hierarchy, NodeMemory, Policy};
 use crate::engine::{Engine, MAX_BATCH};
+use crate::oracle;
+use crate::span::Span;
 use crate::tele::Telemetry;
 use crate::topo::Topology;
 use crate::work::{Agent, Gang, Request, ToolCall};
@@ -61,6 +63,18 @@ impl Control {
     }
 }
 
+/// Which residency `plan` consults. `Belief` is the scheduler's own view -- staged reservations
+/// included, gossiped or telemetry-read per `Control` -- and is what every placement decision
+/// runs against; it is what makes a decision replayable exactly as made. `Truth` substitutes
+/// `ground_truth_resident`/`ground_truth_holds` at the same two call sites and is `oracle.rs`'s
+/// only consumer (`phase-2.md` §1.3, §4.1): the oracle prices what the simulator would actually
+/// charge, which needs the real state, not the belief the policy acted on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum View {
+    Belief,
+    Truth,
+}
+
 /// Where the routing decision runs, relative to the engine it dispatches to.
 ///
 /// `Control` prices consulting residency knowledge; this prices the hook itself and the hop
@@ -82,6 +96,11 @@ pub enum DataPath {
 }
 
 #[derive(Debug)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "four independent experiment toggles (flow_aware, state_transfer, \
+              fanout_atomic, regret), not a state machine -- any subset can be on at once"
+)]
 pub struct Machine {
     topo: Topology,
     domains: Vec<Hierarchy>,
@@ -212,6 +231,28 @@ pub struct Machine {
     pub tool_coplaced: u64,
     pub tool_refused: u64,
     pub tool_ns: u64,
+    /// `phase-2.md`'s apparatus, on when `set_regret(true)` is called. Off by default and
+    /// checked first at every hook site, so an unflagged run does none of this work and stays
+    /// byte-identical to a build that never had it.
+    regret: bool,
+    /// One record per decision, populated only while `regret` is on. `oracle.rs`'s
+    /// per-candidate work stays inside `Machine`; only its conclusion is kept.
+    pub spans: Vec<Span>,
+    /// Decisions where the policy's chosen node refused but at least one candidate, priced
+    /// against truth, would not have -- `phase-2.md` §1.5. A count, never a duration: refusal
+    /// has no realized cost to decompose, so it is reported beside regret and never folded in.
+    pub feasibility_regret: u64,
+    /// Host-DDR admissions where the unified arbiter's eviction victim differs from what
+    /// `Quota::hard` semantics would choose, or where one admits and the other refuses --
+    /// `phase-2.md` §1.8, §4.6. Only meaningful beside `memory_coupled_decisions` and the
+    /// regime it was measured in.
+    pub memory_coupled: u64,
+    pub memory_coupled_decisions: u64,
+    /// Placement decisions where the score's argmin over the full model differs from the
+    /// argmin a silo (no handoff term, displacement restricted to the deciding class's own
+    /// pool) would reach -- `phase-2.md` §1.8, §4.6.
+    pub locality_coupled: u64,
+    pub locality_coupled_decisions: u64,
 }
 
 impl Machine {
@@ -298,6 +339,13 @@ impl Machine {
             tool_coplaced: 0,
             tool_refused: 0,
             tool_ns: 0,
+            regret: false,
+            spans: Vec::new(),
+            feasibility_regret: 0,
+            memory_coupled: 0,
+            memory_coupled_decisions: 0,
+            locality_coupled: 0,
+            locality_coupled_decisions: 0,
         }
     }
 
@@ -318,6 +366,13 @@ impl Machine {
 
     pub fn set_fanout_atomic(&mut self, on: bool) {
         self.fanout_atomic = on;
+    }
+
+    /// Turn on `phase-2.md`'s regret decomposition, coupled %, and per-decision spans. Off by
+    /// default: the apparatus is read-only and changes no policy, but it prices every
+    /// candidate a second time against truth, so it is opt-in rather than always-on.
+    pub fn set_regret(&mut self, on: bool) {
+        self.regret = on;
     }
 
     /// Anchor the recorded origin of every downstream flow to a fixed domain, rather than
@@ -461,6 +516,15 @@ impl Machine {
     /// diverge from.
     fn ground_truth_holds(&self, p: usize, id: &BlobId, kind: BlobKind) -> bool {
         self.domains[p].holds(id, kind)
+    }
+
+    /// The engine's actual usable-now state on domain `d`, asked directly. `believes_resident`
+    /// is `ground_truth_holds`'s counterpart on the *residency* predicate rather than the
+    /// *held* one: this is `plan`'s `View::Truth` arm, and `oracle.rs`'s only route to a
+    /// candidate's real depth. `phase-2.md` §1.3 -- read-only, so the oracle can consult it at
+    /// every candidate without mutating anything.
+    fn ground_truth_resident(&self, d: usize, id: &BlobId, kind: BlobKind) -> bool {
+        self.domains[d].is_hot(id, kind)
     }
 
     /// What one placement decision costs, and what it costs the cluster. A fan-out query is
@@ -662,10 +726,20 @@ impl Machine {
     /// Peers are scanned rather than assumed, because the deepest peer is only the cheapest
     /// peer when every link is identical, and the whole point of the topology is that they
     /// are not.
-    fn plan(&self, d: usize, req: &Request) -> Plan {
-        let depth = req
-            .chain
-            .partition_point(|(id, m)| self.believes_resident(d, id, m.kind));
+    ///
+    /// `view` selects which residency predicate the two closures below consult; every branch
+    /// of `plan`'s own logic is unchanged by it, which is what makes `View::Truth` a read of
+    /// the same plan rather than a second one.
+    fn plan(&self, d: usize, req: &Request, view: View) -> Plan {
+        let resident = |dom: usize, id: &BlobId, kind: BlobKind| match view {
+            View::Belief => self.believes_resident(dom, id, kind),
+            View::Truth => self.ground_truth_resident(dom, id, kind),
+        };
+        let held = |dom: usize, id: &BlobId, kind: BlobKind| match view {
+            View::Belief => self.believes_held(dom, id, kind),
+            View::Truth => self.ground_truth_holds(dom, id, kind),
+        };
+        let depth = req.chain.partition_point(|(id, m)| resident(d, id, m.kind));
         let mut need = [0u64; BlobKind::N];
         for (_, m) in &req.chain[depth..] {
             need[m.kind.idx()] += m.bytes;
@@ -685,9 +759,7 @@ impl Machine {
                 if p == d {
                     continue;
                 }
-                let far = req
-                    .chain
-                    .partition_point(|(id, m)| self.believes_held(p, id, m.kind));
+                let far = req.chain.partition_point(|(id, m)| held(p, id, m.kind));
                 if far <= depth {
                     continue;
                 }
@@ -703,7 +775,7 @@ impl Machine {
             }
         }
         for (i, (id, m)) in req.requires.iter().enumerate() {
-            if self.believes_resident(d, id, m.kind) {
+            if resident(d, id, m.kind) {
                 continue;
             }
             plan.need[m.kind.idx()] += m.bytes;
@@ -712,7 +784,7 @@ impl Machine {
             if self.state_transfer {
                 let unit = self.unit_in(d);
                 for &p in &self.active {
-                    if p == d || !self.believes_held(p, id, m.kind) {
+                    if p == d || !held(p, id, m.kind) {
                         continue;
                     }
                     let cand = self.topo.fetch_ns(unit, p, m.bytes);
@@ -790,8 +862,8 @@ impl Machine {
     /// the wait an already-full engine imposes. The last is why a cache hit is not
     /// automatically the right answer -- a node holding the prefix but running a full batch
     /// can be the slower node, and nothing that scores residency alone can see it.
-    fn placement_terms(&self, d: usize, req: &Request, flow: &[(usize, u64)]) -> Terms {
-        let plan = self.plan(d, req);
+    fn placement_terms(&self, d: usize, req: &Request, flow: &[(usize, u64)], view: View) -> Terms {
+        let plan = self.plan(d, req, view);
         let tele = self.telemetry(d);
         let displaced = tele.displacement(&plan.need, &self.staged_bytes[d]);
         let unit = self.unit_in(d);
@@ -826,16 +898,23 @@ impl Machine {
     /// Argmin of the cost, plus what each term changed. Reported rather than assumed: a term
     /// worth four orders of magnitude less than another one cannot move an argmin, and saying
     /// so is more useful than shipping it and believing otherwise.
+    ///
+    /// Returns the picked node and, alongside it, `decided_by`: the index into `TERM_LABELS`
+    /// of the last term whose addition changed the pick between `raw` (acquire alone) and
+    /// `top` (every term) -- `phase-2.md` §4.4's per-request form of the `moved_by_*`
+    /// counters below, which it must reduce to exactly. `None` when nothing after `acquire`
+    /// moved it. The affinity tie-break (`top` vs `full`) is deliberately excluded: that is
+    /// `held_by_affinity`'s own, separately tracked, phenomenon.
     fn best_scored(
         &mut self,
         req: &Request,
         flow: &[(usize, u64)],
         affinity: usize,
         candidates: &[usize],
-    ) -> usize {
+    ) -> (usize, Option<usize>) {
         let terms: Vec<Terms> = candidates
             .iter()
-            .map(|&d| self.placement_terms(d, req, flow))
+            .map(|&d| self.placement_terms(d, req, flow, View::Belief))
             .collect();
         let pick = |f: &dyn Fn(&Terms) -> f64| -> usize {
             terms
@@ -868,9 +947,22 @@ impl Machine {
         } else {
             affinity
         };
+        let mut decided_by = None;
+        if net != raw {
+            decided_by = Some(1);
+        }
         self.moved_by_displacement += u64::from(net != raw);
+        if placed != net {
+            decided_by = Some(2);
+        }
         self.moved_by_flow += u64::from(placed != net);
+        if loaded != placed {
+            decided_by = Some(3);
+        }
         self.moved_by_load += u64::from(loaded != placed);
+        if top != loaded {
+            decided_by = Some(4);
+        }
         self.moved_by_congestion += u64::from(top != loaded);
         self.held_by_affinity += u64::from(full != top);
         if terms.iter().any(|t| t.domain == full && t.fetched) {
@@ -882,7 +974,193 @@ impl Machine {
                 self.flow_coplaced += 1;
             }
         }
-        full
+        (full, decided_by)
+    }
+
+    /// `reach`'s own arithmetic, read-only: the origin round trip a candidate would pay,
+    /// without charging it. `oracle.rs`'s realized cost needs every candidate's price, not
+    /// only the chosen one's, and `reach` itself must stay the single place that actually
+    /// bills it -- so this is a second, independent statement of the same four lines rather
+    /// than a refactor of `reach`, which is on the critical path of a published number.
+    fn reach_ns(&self, home: usize, req: &Request, decode_needed: bool) -> u64 {
+        let Some((origin, payload)) = self.origin else {
+            return 0;
+        };
+        if origin == home || !decode_needed || req.completes.is_some() {
+            return 0;
+        }
+        2 * self.topo.fetch_ns(self.unit_in(origin), home, payload)
+    }
+
+    /// What the simulator would actually charge, read against truth, to serve `req` at
+    /// candidate `d` right now -- `oracle.rs`'s `R(d)`, `phase-2.md` §1.3. Read-only: peeks
+    /// `self.upstream` instead of draining it and reads the engine's `projected_ns` instead of
+    /// admitting into it, so every candidate can be priced without disturbing what the chosen
+    /// node's own execution does a moment later.
+    ///
+    /// `decide_ns` is the decision's own cost -- identical at every candidate, computed once
+    /// above the candidate loop by `Machine::decide` -- included only so this equals
+    /// `Cost::service_ns()` exactly at the policy's own node (`phase-2.md`'s execution gap,
+    /// P3). Returns `(without displacement, with displacement)`: `Terms::displaced` is billed
+    /// to nobody, so it is not part of a realized cost, and `phase-2.md` §1.3 reports both
+    /// rather than choosing one.
+    ///
+    /// Models `collect`'s handoff charge (a task's upstream sources, read from
+    /// `self.upstream`), not `run_tool`'s separate caller-and-back charge -- the oracle is
+    /// wired to `serve_request` only for now, and `run_tool` stays outside `self.spans`.
+    fn realized_ns(
+        &self,
+        d: usize,
+        req: &Request,
+        decode_needed: bool,
+        decide_ns: u64,
+    ) -> (u64, u64) {
+        let plan = self.plan(d, req, View::Truth);
+        let unit = self.unit_in(d);
+        let mut ns = decide_ns + self.dispatch.ns(DISPATCH_BYTES) + plan.ns;
+        if let Some(sources) = req.completes.and_then(|t| self.upstream.get(&t)) {
+            for &(src, payload) in sources {
+                if src != d {
+                    ns += self.topo.fetch_ns(unit, src, payload);
+                }
+            }
+        }
+        ns += self.reach_ns(d, req, decode_needed);
+        let decoding = req.tokens > 0 && self.interval_ns > 0;
+        ns += if decoding {
+            self.telemetry(d)
+                .projected_ns(self.arrival_ns, req.tokens, self.staged_seqs[d])
+        } else {
+            req.exec_ns
+        };
+        let displaced = self
+            .telemetry(d)
+            .displacement(&plan.need, &self.staged_bytes[d]);
+        (ns, ns + displaced as u64)
+    }
+
+    /// The model's argmin over `candidates`, evaluated under `view` -- `phase-2.md` §1.2's
+    /// `m_b` (`View::Belief`) and `m_t` (`View::Truth`). Reuses `placement_terms`'s own
+    /// `Terms::full`, the same cost model `best_scored` scores, so this is not a second model
+    /// of the score -- and unlike `best_scored` it never falls back to affinity on a tie,
+    /// because it is meant to be the model's own recommendation rather than the policy's.
+    fn score_argmin(
+        &self,
+        req: &Request,
+        flow: &[(usize, u64)],
+        candidates: &[usize],
+        view: View,
+    ) -> usize {
+        candidates
+            .iter()
+            .map(|&d| self.placement_terms(d, req, flow, view))
+            .min_by(|a, b| a.full().total_cmp(&b.full()))
+            .map_or_else(|| candidates.first().copied().unwrap_or(0), |t| t.domain)
+    }
+
+    /// The four-gap decomposition's raw inputs (`phase-2.md` §1.2, §4.2), computed once per
+    /// decision *before* `run_here` mutates the state `realized_ns` reads -- the identity in
+    /// P3 depends on reading truth before this request's own execution changes it. `p` is the
+    /// node the policy actually chose; `Machine::finish_regret` combines this with the charged
+    /// cost, known only after `run_here` returns.
+    #[allow(
+        clippy::similar_names,
+        reason = "r_p/r_mb/r_mt/r_o are phase-2.md §1.2's own notation -- renaming them apart \
+                  from the design doc's math would cost more clarity than it buys"
+    )]
+    fn oracle_pick(
+        &self,
+        req: &Request,
+        flow: &[(usize, u64)],
+        candidates: &[usize],
+        decode_needed: bool,
+        decide_ns: u64,
+        p: usize,
+    ) -> OraclePick {
+        let m_b = self.score_argmin(req, flow, candidates, View::Belief);
+        let m_t = self.score_argmin(req, flow, candidates, View::Truth);
+        let (r_p, _) = self.realized_ns(p, req, decode_needed, decide_ns);
+        let (r_mb, _) = self.realized_ns(m_b, req, decode_needed, decide_ns);
+        let (r_mt, _) = self.realized_ns(m_t, req, decode_needed, decide_ns);
+        let mut r_o = r_p;
+        let mut r_o_disp = r_p;
+        let mut oracle_node = p;
+        for &d in candidates {
+            let (ns, ns_disp) = self.realized_ns(d, req, decode_needed, decide_ns);
+            if ns < r_o {
+                r_o = ns;
+                oracle_node = d;
+            }
+            if ns_disp < r_o_disp {
+                r_o_disp = ns_disp;
+            }
+        }
+        OraclePick {
+            oracle_node,
+            r_p,
+            r_mb,
+            r_mt,
+            r_o,
+            r_o_disp,
+        }
+    }
+
+    /// Whether some candidate other than `p`, priced against truth, could have admitted this
+    /// request's state right now -- `phase-2.md` §1.5's feasibility regret. A refused request
+    /// has no realized cost the oracle can price (`plan` never models refusal), so this is a
+    /// separate, read-only admission check rather than a reading of `oracle_pick`.
+    fn feasible_elsewhere(&self, req: &Request, candidates: &[usize], p: usize) -> bool {
+        candidates.iter().any(|&d| {
+            if d == p {
+                return false;
+            }
+            let plan = self.plan(d, req, View::Truth);
+            self.telemetry(d)
+                .could_admit(&plan.need, &self.staged_bytes[d])
+        })
+    }
+
+    /// Finish one decision's regret bookkeeping once `run_here` has returned the charged
+    /// `Cost`: combine `pick`'s truth-read picks with `cost.service_ns()` into a `Regret`, and
+    /// record a `Span`. Feasibility regret is counted separately here on the refusal branch,
+    /// where there is no charged cost to decompose. Called only when `self.regret` is on.
+    #[allow(clippy::too_many_arguments, reason = "one decision's full context")]
+    fn finish_regret(
+        &mut self,
+        req: &Request,
+        class: BlobKind,
+        p: usize,
+        candidates: &[usize],
+        pick: OraclePick,
+        cost: &Cost,
+        decided_by: Option<usize>,
+    ) {
+        if cost.pending {
+            if self.feasible_elsewhere(req, candidates, p) {
+                self.feasibility_regret += 1;
+            }
+            return;
+        }
+        let charged = cost.service_ns();
+        let regret = oracle::decompose(
+            charged,
+            pick.r_p,
+            pick.r_mb,
+            pick.r_mt,
+            pick.r_o,
+            pick.r_o_disp,
+        );
+        let regime = oracle::classify(cost);
+        self.spans.push(Span {
+            op: self.ops,
+            class,
+            node: p,
+            oracle_node: pick.oracle_node,
+            regret,
+            regime,
+            decided_by,
+            service_ns: charged,
+        });
     }
 
     /// Where a residency-greedy policy would run this: the node holding the most of it.
@@ -946,10 +1224,10 @@ impl Machine {
             .unwrap_or_default();
         let scored = self.placement == Placement::Scored;
         let affinity = self.topo.units[self.sticky_unit].home as usize;
-        let best = if scored {
+        let (best, decided_by) = if scored {
             self.best_scored(req, &flow, affinity, &candidates)
         } else {
-            self.greedy_best(req, &candidates)
+            (self.greedy_best(req, &candidates), None)
         };
         let value = self.resident_value(best, req);
 
@@ -981,6 +1259,13 @@ impl Machine {
             self.stale_decisions += 1;
         }
 
+        // `phase-2.md` §1.3: computed before `collect`/`reach`/`run_here` touch anything --
+        // `oracle_pick` peeks `self.upstream` for the same task `collect` is about to drain,
+        // and reads every candidate's truth before `run_here` changes what is true at `home`.
+        let pick = self
+            .regret
+            .then(|| self.oracle_pick(req, &flow, &candidates, decode_needed, decide_ns, home));
+
         if let Some(hint) = &req.hint {
             let recorded = self.tool_anchor.unwrap_or(home);
             self.upstream
@@ -996,6 +1281,10 @@ impl Machine {
         let mut cost = self.run_here(home, req);
         cost.decide_ns = decide_ns;
         cost.transfer_ns += handoff + arrival;
+        if let Some(pick) = pick {
+            let class = BlobKind::ALL[req.kind_idx()];
+            self.finish_regret(req, class, home, &candidates, pick, &cost, decided_by);
+        }
         cost
     }
 
@@ -1038,7 +1327,7 @@ impl Machine {
         // Ship first, then read. Whatever a peer supplied is resident by the time `access`
         // walks the chain, so it costs the link once and never a rebuild; whatever no peer
         // could supply falls through to the ledger's own spill-or-rebuild choice.
-        let plan = self.plan(home, req);
+        let plan = self.plan(home, req, View::Belief);
         let fetch = self.apply_chain(home, req, &plan);
         let mut cost = self.domains[home].access(&req.chain);
         cost.transfer_ns += fetch.transfer_ns;
@@ -1279,7 +1568,7 @@ impl Machine {
             .decode_pool()
             .iter()
             .filter_map(|&d| {
-                let need = self.plan(d, probe).need;
+                let need = self.plan(d, probe, View::Belief).need;
                 self.telemetry(d)
                     .could_admit(&need, &self.staged_bytes[d])
                     .then_some((d, need))
@@ -1291,7 +1580,7 @@ impl Machine {
         let target = if self.placement == Placement::Scored {
             let terms: Vec<Terms> = feasible
                 .iter()
-                .map(|&(d, _)| self.placement_terms(d, probe, flow))
+                .map(|&(d, _)| self.placement_terms(d, probe, flow, View::Belief))
                 .collect();
             let top = terms
                 .iter()
@@ -1396,7 +1685,7 @@ impl Machine {
         self.decide_ns += decide_ns;
         let affinity = self.affinity_domain(&probe.chain, &candidates);
         let target = if self.placement == Placement::Scored {
-            self.best_scored(&probe, &flow, affinity, &candidates)
+            self.best_scored(&probe, &flow, affinity, &candidates).0
         } else if self.flow_aware {
             caller
         } else {
@@ -1481,6 +1770,19 @@ impl Terms {
     fn full(&self) -> f64 {
         self.loaded() + self.congestion
     }
+}
+
+/// `oracle_pick`'s four realized-cost picks for one decision -- `phase-2.md` §1.2's `m_b`,
+/// `m_t`, `R(p)`, `R(m_b)`, `R(m_t)`, and the oracle argmin `R(o)` in both its displacement
+/// variants. Plain data, combined with the charged cost by `finish_regret`.
+#[derive(Clone, Copy, Debug)]
+struct OraclePick {
+    oracle_node: usize,
+    r_p: u64,
+    r_mb: u64,
+    r_mt: u64,
+    r_o: u64,
+    r_o_disp: u64,
 }
 
 /// The cheapest route to everything a request needs at one node: how deep its chain already
@@ -1616,5 +1918,145 @@ mod tests {
             predicted, realized,
             "closed-form tax must match the simulator's own total exactly outside gangs"
         );
+    }
+
+    /// A fan-out-free, tool-call-free, non-saturated trace: no gang ever reaches
+    /// `serve_gang`, no `run_tool` call ever perturbs `moved_by_congestion` behind the
+    /// spans' backs, and the `machine()` fixture never calls `set_arrival_rate`, so the
+    /// engine model is off and no decode can saturate. The one fixture every regret test
+    /// below needs, so its preconditions are named once.
+    fn regret_fixture(seed: u64, ops: u64) -> Vec<Request> {
+        Workload::new(seed, ops, 1.0)
+            .with_tool_profile(0.0, 0)
+            .collect()
+    }
+
+    /// P3, `phase-2.md` §1.3, §4.2: on `regret_fixture`, under `Control::Unified`, `R(p)` must
+    /// equal `Cost::service_ns()` exactly at the policy's own node -- there is no mechanism for
+    /// it to be otherwise, since both walk the same plan against the same truth and
+    /// displacement is billed to nobody. Equivalently: the execution gap is zero on every span.
+    #[test]
+    fn execution_gap_is_zero_under_unified_and_non_saturated() {
+        let mut mach = machine(4);
+        mach.set_regret(true);
+        let trace = regret_fixture(2, 600);
+        let mut served = 0u64;
+        for req in &trace {
+            if !mach.serve_request(req).pending {
+                served += 1;
+            }
+        }
+        assert!(
+            !mach.spans.is_empty(),
+            "fixture must serve at least one request"
+        );
+        assert_eq!(
+            mach.spans.len() as u64,
+            served,
+            "one span per served, non-gang request"
+        );
+        for span in &mach.spans {
+            assert_eq!(
+                span.regret.execution, 0,
+                "execution gap must be zero under Control::Unified with no gangs: {span:?}"
+            );
+        }
+    }
+
+    /// `phase-2.md` §1.2: `execution + heuristic + belief + model == total` on every decision,
+    /// not just on the pure `oracle::decompose` unit tests -- this is the same claim proven
+    /// through `Machine`'s own wiring rather than the function in isolation.
+    #[test]
+    fn regret_decomposition_sums_to_total_on_every_span() {
+        let mut mach = machine(4);
+        mach.set_regret(true);
+        for req in &regret_fixture(3, 600) {
+            mach.serve_request(req);
+        }
+        assert!(!mach.spans.is_empty());
+        for span in &mach.spans {
+            let r = span.regret;
+            assert_eq!(
+                r.execution + r.heuristic + r.belief + r.model,
+                r.total,
+                "{span:?}"
+            );
+        }
+    }
+
+    /// `phase-2.md` §1.2: the belief gap is `R(m_b) - R(m_t)`, zero exactly when the argmin
+    /// taken over belief agrees with the argmin taken over truth -- which `Control::Unified`
+    /// and `Control::Query` both guarantee, since neither ever hands the scheduler a stale
+    /// view. `Control::Gossip` is what first makes this nonzero, and that is Phase 4's slot to
+    /// fill, not this test's to assert on -- a snapshot view a few requests old need not
+    /// actually diverge from truth on any given decision in a small trace, so asserting
+    /// nonzero here would be asserting a property of the trace, not of the mechanism.
+    #[test]
+    fn belief_gap_is_zero_under_unified_and_query() {
+        let trace = regret_fixture(4, 600);
+        for control in [Control::Unified, Control::Query] {
+            let mut mach = machine(4);
+            mach.set_control(control, Crossing::default());
+            mach.set_regret(true);
+            for req in &trace {
+                mach.serve_request(req);
+            }
+            assert!(!mach.spans.is_empty(), "{control:?}");
+            for span in &mach.spans {
+                assert_eq!(
+                    span.regret.belief, 0,
+                    "{control:?}: belief gap must be zero with no stale view: {span:?}"
+                );
+            }
+        }
+    }
+
+    /// `phase-2.md` §4.4: `decided_by`'s one exact reduction, per `span.rs`'s doc comment --
+    /// the count of spans decided by the last rung must equal `moved_by_congestion` itself,
+    /// computed the ordinary way. `regret_fixture` excludes tool calls so `run_tool`'s own
+    /// `best_scored` calls cannot move `moved_by_congestion` behind the spans' backs.
+    #[test]
+    fn decided_by_reduces_to_moved_by_congestion() {
+        let mut mach = machine(4);
+        mach.set_regret(true);
+        for req in &regret_fixture(5, 600) {
+            mach.serve_request(req);
+        }
+        assert!(!mach.spans.is_empty());
+        let from_spans = mach
+            .spans
+            .iter()
+            .filter(|s| s.decided_by == Some(4))
+            .count() as u64;
+        assert_eq!(from_spans, mach.moved_by_congestion);
+    }
+
+    /// `phase-2.md` §1.5: a refused request is counted as feasibility regret only when some
+    /// other candidate, priced against truth, could actually have admitted it -- not simply
+    /// because the request was refused.
+    #[test]
+    fn feasible_elsewhere_requires_a_genuinely_admitting_candidate() {
+        let bands = [0u8; BlobKind::N];
+        // Every candidate is equally, uniformly too small: no candidate can ever admit
+        // anything, so a refusal must never be counted as feasibility regret.
+        let mem = NodeMemory {
+            hbm: 0,
+            ddr: 1,
+            nvme: 0,
+            hbm_quota: Quota::open(0, bands),
+            ddr_quota: Quota::open(1, bands),
+            can_decode: true,
+        };
+        let topo = Topology::cluster(4, 1, mem.ddr, Distance::Socket, Crossing::default());
+        let mut mach = Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored);
+        mach.set_regret(true);
+        let mut refused = 0u64;
+        for req in &regret_fixture(6, 300) {
+            if mach.serve_request(req).pending {
+                refused += 1;
+            }
+        }
+        assert!(refused > 0, "fixture must refuse with a 1-byte pool");
+        assert_eq!(mach.feasibility_regret, 0);
     }
 }
