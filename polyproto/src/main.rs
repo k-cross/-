@@ -207,6 +207,11 @@ enum Cmd {
         hard_pools: bool,
         #[arg(long, default_value_t = 3)]
         repeat: usize,
+        /// Print the regret decomposition, feasibility regret, and coupled % on both axes
+        /// (phase-2.md). Prices every candidate a second time against truth, so it costs real
+        /// wall time and is off by default
+        #[arg(long)]
+        regret: bool,
     },
 
     /// The data path as an arm: integrated vs. sidecar, charging Phase 0's measured seam
@@ -1257,6 +1262,7 @@ fn main() {
             tool_payload,
             hard_pools,
             repeat,
+            regret,
         } => code_review(
             hbm,
             model_ddr,
@@ -1274,6 +1280,7 @@ fn main() {
             tool_payload,
             hard_pools,
             repeat,
+            regret,
         ),
         Cmd::DataPath {
             nodes,
@@ -2063,6 +2070,7 @@ fn code_review(
     tool_payload: u64,
     hard_pools: bool,
     repeat: usize,
+    regret: bool,
 ) {
     use polyphonic::machine::Machine;
     use polyphonic::topo::{Distance, Topology};
@@ -2148,6 +2156,7 @@ fn code_review(
             mach.set_state_transfer(a.transfer);
             mach.set_fanout_atomic(true);
             mach.set_tool_anchor(Some(AGENT));
+            mach.set_regret(regret);
             // Every reasoning request starts at the agent host and its answer returns there.
             // The context delta going in is dominated by the last tool result the agent
             // gathered, so that is what sizes the trip.
@@ -2176,6 +2185,9 @@ fn code_review(
             state_terms(&mach, served);
             if a.placement == Placement::Scored {
                 score_terms(&mach, served);
+            }
+            if regret {
+                regret_report(&mach);
             }
             for (seen, (ns, n)) in warm_seen.iter_mut().zip(t.warm_ns.iter().zip(&t.warm)) {
                 seen.0 += ns;
