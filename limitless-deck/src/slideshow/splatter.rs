@@ -1,4 +1,5 @@
 use bevy::prelude::*;
+use crate::theme::ink::*;
 
 #[derive(Component)]
 pub struct InkSplatterRoot;
@@ -23,31 +24,31 @@ pub fn spawn_ink_blotch(
         blotch.spawn((
             Sprite {
                 color,
-                custom_size: Some(Vec2::new(radius * 1.9, radius * 1.4)),
+                custom_size: Some(Vec2::new(radius * NUCLEUS_A.0, radius * NUCLEUS_A.1)),
                 ..default()
             },
             Transform::from_xyz(0.0, 0.0, 0.0)
-                .with_rotation(Quat::from_rotation_z(0.35)),
+                .with_rotation(Quat::from_rotation_z(NUCLEUS_ROT_A)),
         ));
 
         blotch.spawn((
             Sprite {
                 color,
-                custom_size: Some(Vec2::new(radius * 1.5, radius * 1.8)),
+                custom_size: Some(Vec2::new(radius * NUCLEUS_B.0, radius * NUCLEUS_B.1)),
                 ..default()
             },
-            Transform::from_xyz(radius * 0.15, -radius * 0.1, 0.1)
-                .with_rotation(Quat::from_rotation_z(-0.45)),
+            Transform::from_xyz(radius * NUCLEUS_B_OFFSET.0, radius * NUCLEUS_B_OFFSET.1, 0.1)
+                .with_rotation(Quat::from_rotation_z(NUCLEUS_ROT_B)),
         ));
 
         blotch.spawn((
             Sprite {
                 color,
-                custom_size: Some(Vec2::new(radius * 1.2, radius * 1.2)),
+                custom_size: Some(Vec2::new(radius * NUCLEUS_C.0, radius * NUCLEUS_C.1)),
                 ..default()
             },
-            Transform::from_xyz(-radius * 0.2, radius * 0.15, 0.2)
-                .with_rotation(Quat::from_rotation_z(0.78)), // 45 deg diamond point
+            Transform::from_xyz(radius * NUCLEUS_C_OFFSET.0, radius * NUCLEUS_C_OFFSET.1, 0.2)
+                .with_rotation(Quat::from_rotation_z(NUCLEUS_ROT_C)), // 45 deg diamond point
         ));
 
         // 2. High-velocity radiating droplets and spray specks
@@ -80,7 +81,7 @@ pub fn spawn_ink_blotch(
                     custom_size: Some(Vec2::new(size, size)),
                     ..default()
                 },
-                Transform::from_xyz(pos.x, pos.y, 0.3)
+                Transform::from_xyz(pos.x, pos.y, DROPLET_Z)
                     .with_rotation(Quat::from_rotation_z(rot)),
             ));
         }

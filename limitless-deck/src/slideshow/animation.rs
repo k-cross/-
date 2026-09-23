@@ -1,8 +1,9 @@
 use bevy::prelude::*;
+use crate::theme::motion::*;
 
 /// Fast spring easing function (~15 frames / 0.25s) with snappy overshoot
 pub fn ease_out_back(t: f32) -> f32 {
-    let c1 = 1.70158;
+    let c1 = SLAM_OVERSHOOT;
     let c3 = c1 + 1.0;
     1.0 + c3 * (t - 1.0).powi(3) + c1 * (t - 1.0).powi(2)
 }
@@ -30,7 +31,7 @@ impl SlamEntrance {
             target_rotation: Quat::IDENTITY,
             target_scale: Vec3::ONE,
             delay,
-            duration: 0.28, // ~17 frames at 60fps - ultra snappy!
+            duration: SLAM_DURATION, // ~17 frames at 60fps - ultra snappy!
             elapsed: 0.0,
             initialized: false,
         }
@@ -53,9 +54,9 @@ impl PunkJitter {
         Self {
             base_rotation,
             amplitude,
-            frequency: 6.0,
+            frequency: JITTER_FREQUENCY,
             phase: 0.0,
-            twitch_timer: 0.5,
+            twitch_timer: JITTER_TWITCH_INTERVAL,
             current_twitch: 0.0,
         }
     }
@@ -71,8 +72,8 @@ pub struct BobbingCursor {
 impl Default for BobbingCursor {
     fn default() -> Self {
         Self {
-            speed: 8.0,
-            distance: 5.0,
+            speed: BOBBING_SPEED,
+            distance: BOBBING_DISTANCE,
         }
     }
 }
@@ -118,7 +119,7 @@ fn animate_slam_entrances(
             // Start far off along the violent slam trajectory
             transform.translation += Vec3::new(slam.initial_offset.x, slam.initial_offset.y, 0.0);
             transform.rotation = slam.target_rotation * Quat::from_rotation_z(slam.initial_rot_offset);
-            transform.scale = slam.target_scale * 0.4; // burst up from compact scale
+            transform.scale = slam.target_scale * SLAM_INITIAL_SCALE; // burst up from compact scale
 
             slam.initialized = true;
         }
@@ -142,7 +143,7 @@ fn animate_slam_entrances(
         transform.rotation = slam.target_rotation * Quat::from_rotation_z(remaining_rot);
 
         // Interpolate scale
-        let current_scale = 0.4 + 0.6 * factor;
+        let current_scale = SLAM_INITIAL_SCALE + (1.0 - SLAM_INITIAL_SCALE) * factor;
         transform.scale = slam.target_scale * current_scale;
 
         if progress >= 1.0 {
@@ -165,14 +166,14 @@ fn animate_punk_jitter(
         jitter.phase += dt * jitter.frequency;
         jitter.twitch_timer -= dt;
 
-        // Occasional sharp twitch every 0.4 - 0.9s
+        // Rapid-fire erratic twitch every 0.15 - 0.45s
         if jitter.twitch_timer <= 0.0 {
-            jitter.twitch_timer = 0.4 + (jitter.phase.sin().abs() * 0.5);
-            // Erratic micro-twitch
-            jitter.current_twitch = (jitter.phase * 3.14).sin() * 0.015;
+            jitter.twitch_timer = 0.15 + (jitter.phase.sin().abs() * 0.3);
+            // Aggressive punk twitch
+            jitter.current_twitch = (jitter.phase * 3.14).sin() * 0.045;
         } else {
             // Decay twitch back towards zero
-            jitter.current_twitch *= (1.0 - dt * 8.0).max(0.0);
+            jitter.current_twitch *= (1.0 - dt * JITTER_TWITCH_DECAY).max(0.0);
         }
 
         let organic_sine = (jitter.phase).sin() * jitter.amplitude;
@@ -180,7 +181,7 @@ fn animate_punk_jitter(
         transform.rotation = Quat::from_rotation_z(total_rot);
 
         // Micro-pulse scale (1.0 to 1.015)
-        let pulse = 1.0 + (jitter.phase * 1.5).sin().abs() * 0.015;
+        let pulse = 1.0 + (jitter.phase * 1.5).sin().abs() * JITTER_PULSE_SCALE;
         transform.scale = Vec3::splat(pulse);
     }
 }
@@ -228,10 +229,10 @@ pub fn spawn_screen_slash(commands: &mut Commands) {
             ..default()
         },
         Transform::from_xyz(-1800.0, 0.0, 90.0)
-            .with_rotation(Quat::from_rotation_z(-0.40)),
+            .with_rotation(Quat::from_rotation_z(SLASH_BLADE_ANGLE)),
         ScreenSlashBlade {
             timer: 0.0,
-            duration: 0.22,
+            duration: SLASH_BLADE_DURATION,
             start_x: -1800.0,
             end_x: 1800.0,
         },
@@ -245,10 +246,10 @@ pub fn spawn_screen_slash(commands: &mut Commands) {
             ..default()
         },
         Transform::from_xyz(-1850.0, 40.0, 91.0)
-            .with_rotation(Quat::from_rotation_z(-0.40)),
+            .with_rotation(Quat::from_rotation_z(SLASH_BLADE_ANGLE)),
         ScreenSlashBlade {
             timer: 0.0,
-            duration: 0.20,
+            duration: SLASH_EDGE_DURATION,
             start_x: -1850.0,
             end_x: 1850.0,
         },
@@ -262,10 +263,10 @@ pub fn spawn_screen_slash(commands: &mut Commands) {
             ..default()
         },
         Transform::from_xyz(-1900.0, -30.0, 92.0)
-            .with_rotation(Quat::from_rotation_z(-0.40)),
+            .with_rotation(Quat::from_rotation_z(SLASH_BLADE_ANGLE)),
         ScreenSlashBlade {
             timer: 0.0,
-            duration: 0.18,
+            duration: SLASH_FRACTURE_DURATION,
             start_x: -1900.0,
             end_x: 1900.0,
         },

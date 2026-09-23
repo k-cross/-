@@ -1504,6 +1504,8 @@ one and hide which is carrying the result -- which is exactly what Phase 3 chang
 
 ### Phase 3 -- The engine allocates; the orchestrator sizes the partition
 
+Implementation plan: [`phase-3.md`](phase-3.md), which states its predictions before the run.
+
 The HBM pool splits in two rather than changing hands, along §1's macro/micro seam. The
 orchestrator keeps **capacity authority** -- how many bytes a replica gets -- and hands
 **allocation authority** to the engine: LRU over block hashes, bounded by the partition, **never

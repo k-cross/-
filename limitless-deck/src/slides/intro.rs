@@ -5,6 +5,9 @@ use crate::theme::geometry::*;
 use crate::slideshow::SlideState;
 use crate::slideshow::animation::{SlamEntrance, PunkJitter, BobbingCursor};
 use crate::slideshow::splatter::spawn_ink_blotch;
+use crate::theme::cutout;
+use crate::theme::starburst;
+use crate::theme::typography::*;
 
 pub struct CutoutLetter {
     pub ch: &'static str,
@@ -26,7 +29,7 @@ pub fn spawn_cutout_letter(builder: &mut ChildSpawnerCommands, letter: CutoutLet
         Node {
             padding: UiRect::axes(Val::Px(letter.pad_h), Val::Px(letter.pad_v)),
             border: letter.border,
-            margin: UiRect::axes(Val::Px(1.5), Val::Px(0.0)),
+            margin: UiRect::axes(Val::Px(cutout::SCRAP_MARGIN), Val::Px(0.0)),
             ..default()
         },
         BackgroundColor(letter.bg),
@@ -35,7 +38,7 @@ pub fn spawn_cutout_letter(builder: &mut ChildSpawnerCommands, letter: CutoutLet
         Visibility::default(),
         InheritedVisibility::default(),
         SlamEntrance::new(letter.slam_offset, letter.slam_rot, letter.delay),
-        PunkJitter::new(letter.tilt, 0.018),
+        PunkJitter::new(letter.tilt, 0.055),
     )).with_children(|scrap| {
         scrap.spawn((
             Text::new(letter.ch),
@@ -123,13 +126,8 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                 top_action.spawn((
                     Node {
                         position_type: PositionType::Relative,
-                        padding: UiRect::axes(Val::Px(16.0), Val::Px(5.0)),
-                        border: UiRect {
-                            left: Val::Px(3.5),
-                            top: Val::Px(1.5),
-                            right: Val::Px(4.5),
-                            bottom: Val::Px(4.5),
-                        },
+                        padding: UiRect::axes(Val::Px(starburst::STARBURST_PAD.0), Val::Px(starburst::STARBURST_PAD.1)),
+                        border: starburst::starburst_border(),
                         ..default()
                     },
                     BackgroundColor(P5_WHITE),
@@ -139,11 +137,11 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                         right: P5_RED,
                         bottom: P5_RED,
                     },
-                    Transform::from_rotation(Quat::from_rotation_z(0.10)), // +5.7 deg
+                    Transform::from_rotation(Quat::from_rotation_z(starburst::STARBURST_TILT)), // +5.7 deg
                     Visibility::default(),
                     InheritedVisibility::default(),
                     SlamEntrance::new(Vec2::new(-250.0, 120.0), -0.3, 0.0),
-                    PunkJitter::new(0.10, 0.015),
+                    PunkJitter::new(starburst::STARBURST_TILT, 0.015),
                 )).with_children(|hold_up| {
                     // Jagged explosive comic spikes behind text
                     hold_up.spawn((
@@ -157,7 +155,7 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                     ));
                     hold_up.spawn((
                         Text::new("HOLD UP!"),
-                        TextFont::from_font_size(14.0),
+                        TextFont::from_font_size(FONT_BODY_ICON),
                         TextColor(P5_BLACK),
                     ));
                     hold_up.spawn((
@@ -197,7 +195,7 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                 )).with_children(|tag| {
                     tag.spawn((
                         Text::new("/// CONCURRENCY ARCHITECTURE // PALACE 01 ///"),
-                        TextFont::from_font_size(12.0),
+                        TextFont::from_font_size(FONT_CAPTION),
                         TextColor(P5_OFF_WHITE),
                     ));
                 });
@@ -235,33 +233,33 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                     // --- WORD: "ON" ---
                     spawn_cutout_letter(row1, CutoutLetter {
                         ch: "O",
-                        font_size: 48.0,
+                        font_size: 58.0,
                         bg: P5_WHITE,
                         fg: P5_BLACK,
-                        border: UiRect { left: Val::Px(2.5), top: Val::Px(2.5), right: Val::Px(5.0), bottom: Val::Px(5.0) },
+                        border: UiRect { left: Val::Px(3.0), top: Val::Px(1.5), right: Val::Px(6.0), bottom: Val::Px(6.0) },
                         border_color: BorderColor { left: P5_BLACK, top: P5_BLACK, right: P5_RED, bottom: P5_RED },
-                        tilt: 0.12, // +6.9 deg
-                        pad_h: 12.0, pad_v: 4.0,
-                        slam_offset: Vec2::new(-340.0, 160.0), slam_rot: -0.4, delay: 0.00,
+                        tilt: 0.18, // +10.3 deg
+                        pad_h: 14.0, pad_v: 3.0,
+                        slam_offset: Vec2::new(-340.0, 160.0), slam_rot: -0.5, delay: 0.00,
                     });
                     spawn_cutout_letter(row1, CutoutLetter {
                         ch: "N",
-                        font_size: 42.0,
+                        font_size: 36.0,
                         bg: P5_BLACK,
                         fg: P5_WHITE,
-                        border: UiRect::all(Val::Px(2.0)),
-                        border_color: BorderColor::all(P5_WHITE),
-                        tilt: -0.09, // -5.2 deg
-                        pad_h: 10.0, pad_v: 5.0,
-                        slam_offset: Vec2::new(-300.0, 140.0), slam_rot: 0.3, delay: 0.03,
+                        border: UiRect { left: Val::Px(4.0), top: Val::Px(1.0), right: Val::Px(1.5), bottom: Val::Px(3.0) },
+                        border_color: BorderColor { left: P5_RED, top: P5_WHITE, right: P5_WHITE, bottom: P5_RED },
+                        tilt: -0.14, // -8.0 deg
+                        pad_h: 8.0, pad_v: 7.0,
+                        slam_offset: Vec2::new(-300.0, 140.0), slam_rot: 0.4, delay: 0.03,
                     });
 
                     // Word Gap Spacer with Torn Masking Tape Scrap
                     row1.spawn((
                         Node {
-                            width: Val::Px(20.0),
-                            height: Val::Px(12.0),
-                            margin: UiRect::axes(Val::Px(8.0), Val::Px(0.0)),
+                            width: Val::Px(cutout::TAPE_WIDTH),
+                            height: Val::Px(cutout::TAPE_HEIGHT),
+                            margin: UiRect::axes(Val::Px(cutout::TAPE_MARGIN), Val::Px(0.0)),
                             border: UiRect::all(Val::Px(1.0)),
                             ..default()
                         },
@@ -275,44 +273,44 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                     // --- WORD: "THE" ---
                     spawn_cutout_letter(row1, CutoutLetter {
                         ch: "T",
-                        font_size: 44.0,
+                        font_size: 40.0,
                         bg: P5_BLACK,
                         fg: P5_WHITE,
-                        border: UiRect { left: Val::Px(5.0), top: Val::Px(2.0), right: Val::Px(2.0), bottom: Val::Px(2.0) },
+                        border: UiRect { left: Val::Px(6.0), top: Val::Px(2.0), right: Val::Px(1.5), bottom: Val::Px(1.5) },
                         border_color: BorderColor { left: P5_RED, top: P5_WHITE, right: P5_WHITE, bottom: P5_WHITE },
-                        tilt: 0.07, // +4.0 deg
-                        pad_h: 10.0, pad_v: 4.0,
-                        slam_offset: Vec2::new(-260.0, 120.0), slam_rot: -0.2, delay: 0.06,
+                        tilt: 0.12, // +6.9 deg
+                        pad_h: 8.0, pad_v: 5.0,
+                        slam_offset: Vec2::new(-260.0, 120.0), slam_rot: -0.3, delay: 0.06,
                     });
                     spawn_cutout_letter(row1, CutoutLetter {
                         ch: "H",
-                        font_size: 38.0,
+                        font_size: 34.0,
                         bg: P5_WHITE,
                         fg: P5_BLACK,
-                        border: UiRect::all(Val::Px(2.0)),
-                        border_color: BorderColor::all(P5_BLACK),
-                        tilt: -0.13, // -7.5 deg
-                        pad_h: 9.0, pad_v: 6.0,
-                        slam_offset: Vec2::new(-240.0, 110.0), slam_rot: 0.35, delay: 0.08,
+                        border: UiRect { left: Val::Px(1.5), top: Val::Px(3.5), right: Val::Px(3.5), bottom: Val::Px(1.5) },
+                        border_color: BorderColor { left: P5_BLACK, top: P5_RED, right: P5_BLACK, bottom: P5_BLACK },
+                        tilt: -0.22, // -12.6 deg — extreme lean!
+                        pad_h: 6.0, pad_v: 8.0,
+                        slam_offset: Vec2::new(-240.0, 110.0), slam_rot: 0.45, delay: 0.08,
                     });
                     spawn_cutout_letter(row1, CutoutLetter {
                         ch: "E",
-                        font_size: 42.0,
+                        font_size: 50.0,
                         bg: P5_OFF_BLACK,
                         fg: P5_OFF_WHITE,
-                        border: UiRect::all(Val::Px(2.0)),
+                        border: UiRect { left: Val::Px(2.0), top: Val::Px(2.0), right: Val::Px(5.0), bottom: Val::Px(5.0) },
                         border_color: BorderColor::all(P5_RED),
-                        tilt: 0.10, // +5.7 deg
-                        pad_h: 10.0, pad_v: 4.0,
-                        slam_offset: Vec2::new(-220.0, 100.0), slam_rot: -0.25, delay: 0.10,
+                        tilt: 0.16, // +9.2 deg
+                        pad_h: 12.0, pad_v: 3.0,
+                        slam_offset: Vec2::new(-220.0, 100.0), slam_rot: -0.35, delay: 0.10,
                     });
 
                     // Word Gap Spacer
                     row1.spawn((
                         Node {
-                            width: Val::Px(20.0),
-                            height: Val::Px(12.0),
-                            margin: UiRect::axes(Val::Px(8.0), Val::Px(0.0)),
+                            width: Val::Px(cutout::TAPE_WIDTH),
+                            height: Val::Px(cutout::TAPE_HEIGHT),
+                            margin: UiRect::axes(Val::Px(cutout::TAPE_MARGIN), Val::Px(0.0)),
                             border: UiRect::all(Val::Px(1.0)),
                             ..default()
                         },
@@ -326,47 +324,47 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                     // --- WORD: "ROAD" ---
                     spawn_cutout_letter(row1, CutoutLetter {
                         ch: "R",
-                        font_size: 50.0,
+                        font_size: 62.0,
                         bg: P5_BLACK,
                         fg: P5_WHITE,
-                        border: UiRect { left: Val::Px(6.0), top: Val::Px(2.0), right: Val::Px(2.0), bottom: Val::Px(4.0) },
-                        border_color: BorderColor { left: P5_RED, top: P5_WHITE, right: P5_WHITE, bottom: P5_WHITE },
-                        tilt: -0.06, // -3.4 deg
-                        pad_h: 13.0, pad_v: 5.0,
-                        slam_offset: Vec2::new(-190.0, 90.0), slam_rot: 0.2, delay: 0.12,
+                        border: UiRect { left: Val::Px(7.0), top: Val::Px(1.5), right: Val::Px(2.0), bottom: Val::Px(5.0) },
+                        border_color: BorderColor { left: P5_RED, top: P5_WHITE, right: P5_WHITE, bottom: P5_RED },
+                        tilt: -0.08, // -4.6 deg
+                        pad_h: 15.0, pad_v: 4.0,
+                        slam_offset: Vec2::new(-190.0, 90.0), slam_rot: 0.25, delay: 0.12,
                     });
                     spawn_cutout_letter(row1, CutoutLetter {
                         ch: "O",
-                        font_size: 40.0,
+                        font_size: 38.0,
                         bg: P5_WHITE,
                         fg: P5_BLACK,
-                        border: UiRect { left: Val::Px(2.0), top: Val::Px(2.0), right: Val::Px(4.0), bottom: Val::Px(4.0) },
+                        border: UiRect { left: Val::Px(1.5), top: Val::Px(1.5), right: Val::Px(4.5), bottom: Val::Px(4.5) },
                         border_color: BorderColor { left: P5_BLACK, top: P5_BLACK, right: P5_RED, bottom: P5_RED },
-                        tilt: 0.14, // +8.0 deg
-                        pad_h: 9.0, pad_v: 4.0,
-                        slam_offset: Vec2::new(-170.0, 80.0), slam_rot: -0.3, delay: 0.14,
+                        tilt: 0.20, // +11.5 deg
+                        pad_h: 7.0, pad_v: 6.0,
+                        slam_offset: Vec2::new(-170.0, 80.0), slam_rot: -0.4, delay: 0.14,
                     });
                     spawn_cutout_letter(row1, CutoutLetter {
                         ch: "A",
-                        font_size: 46.0,
+                        font_size: 54.0,
                         bg: P5_BLACK,
                         fg: P5_WHITE,
-                        border: UiRect::all(Val::Px(2.0)),
-                        border_color: BorderColor::all(P5_WHITE),
-                        tilt: -0.08, // -4.6 deg
-                        pad_h: 11.0, pad_v: 5.0,
-                        slam_offset: Vec2::new(-150.0, 70.0), slam_rot: 0.25, delay: 0.16,
+                        border: UiRect { left: Val::Px(2.0), top: Val::Px(5.0), right: Val::Px(2.0), bottom: Val::Px(2.0) },
+                        border_color: BorderColor { left: P5_WHITE, top: P5_RED, right: P5_WHITE, bottom: P5_WHITE },
+                        tilt: -0.13, // -7.5 deg
+                        pad_h: 13.0, pad_v: 4.0,
+                        slam_offset: Vec2::new(-150.0, 70.0), slam_rot: 0.35, delay: 0.16,
                     });
                     spawn_cutout_letter(row1, CutoutLetter {
                         ch: "D",
-                        font_size: 44.0,
+                        font_size: 42.0,
                         bg: P5_WHITE,
                         fg: P5_BLACK,
-                        border: UiRect { left: Val::Px(2.0), top: Val::Px(2.0), right: Val::Px(4.5), bottom: Val::Px(4.5) },
+                        border: UiRect { left: Val::Px(2.0), top: Val::Px(1.0), right: Val::Px(5.5), bottom: Val::Px(5.5) },
                         border_color: BorderColor { left: P5_BLACK, top: P5_BLACK, right: P5_RED, bottom: P5_RED },
-                        tilt: 0.05, // +2.9 deg
-                        pad_h: 11.0, pad_v: 4.0,
-                        slam_offset: Vec2::new(-130.0, 60.0), slam_rot: -0.15, delay: 0.18,
+                        tilt: 0.09, // +5.2 deg
+                        pad_h: 9.0, pad_v: 7.0,
+                        slam_offset: Vec2::new(-130.0, 60.0), slam_rot: -0.2, delay: 0.18,
                     });
                 });
 
@@ -387,33 +385,33 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                     // --- WORD: "[ TO ]" (Ripped Tilted Tape Badge) ---
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "T",
-                        font_size: 30.0,
+                        font_size: 26.0,
                         bg: P5_BLACK,
                         fg: P5_WHITE,
-                        border: UiRect::all(Val::Px(2.0)),
-                        border_color: BorderColor::all(P5_RED),
-                        tilt: -0.18, // -10.3 deg
-                        pad_h: 9.0, pad_v: 4.0,
-                        slam_offset: Vec2::new(-280.0, 40.0), slam_rot: 0.35, delay: 0.14,
+                        border: UiRect { left: Val::Px(3.5), top: Val::Px(1.0), right: Val::Px(1.0), bottom: Val::Px(3.5) },
+                        border_color: BorderColor { left: P5_RED, top: P5_WHITE, right: P5_WHITE, bottom: P5_RED },
+                        tilt: -0.24, // -13.8 deg — extreme lean!
+                        pad_h: 7.0, pad_v: 5.0,
+                        slam_offset: Vec2::new(-280.0, 40.0), slam_rot: 0.5, delay: 0.14,
                     });
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "O",
-                        font_size: 28.0,
+                        font_size: 32.0,
                         bg: P5_WHITE,
                         fg: P5_BLACK,
-                        border: UiRect::all(Val::Px(2.0)),
-                        border_color: BorderColor::all(P5_BLACK),
-                        tilt: 0.11, // +6.3 deg
-                        pad_h: 8.0, pad_v: 4.0,
-                        slam_offset: Vec2::new(-260.0, 35.0), slam_rot: -0.25, delay: 0.16,
+                        border: UiRect { left: Val::Px(1.5), top: Val::Px(3.0), right: Val::Px(3.0), bottom: Val::Px(1.5) },
+                        border_color: BorderColor { left: P5_BLACK, top: P5_RED, right: P5_BLACK, bottom: P5_BLACK },
+                        tilt: 0.16, // +9.2 deg
+                        pad_h: 6.0, pad_v: 6.0,
+                        slam_offset: Vec2::new(-260.0, 35.0), slam_rot: -0.35, delay: 0.16,
                     });
 
                     // Word Gap
                     row2.spawn((
                         Node {
-                            width: Val::Px(18.0),
-                            height: Val::Px(10.0),
-                            margin: UiRect::axes(Val::Px(6.0), Val::Px(0.0)),
+                            width: Val::Px(cutout::TAPE_WIDTH_SM),
+                            height: Val::Px(cutout::TAPE_HEIGHT_SM),
+                            margin: UiRect::axes(Val::Px(cutout::TAPE_MARGIN_SM), Val::Px(0.0)),
                             border: UiRect::all(Val::Px(1.0)),
                             ..default()
                         },
@@ -427,47 +425,47 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                     // --- WORD: "LOCK" ---
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "L",
-                        font_size: 48.0,
+                        font_size: 56.0,
                         bg: P5_WHITE,
                         fg: P5_BLACK,
-                        border: UiRect { left: Val::Px(2.5), top: Val::Px(2.5), right: Val::Px(5.0), bottom: Val::Px(5.0) },
+                        border: UiRect { left: Val::Px(2.0), top: Val::Px(1.5), right: Val::Px(6.0), bottom: Val::Px(6.0) },
                         border_color: BorderColor { left: P5_BLACK, top: P5_BLACK, right: P5_RED, bottom: P5_RED },
-                        tilt: -0.10, // -5.7 deg
-                        pad_h: 12.0, pad_v: 5.0,
-                        slam_offset: Vec2::new(-230.0, 30.0), slam_rot: 0.3, delay: 0.18,
+                        tilt: -0.15, // -8.6 deg
+                        pad_h: 14.0, pad_v: 4.0,
+                        slam_offset: Vec2::new(-230.0, 30.0), slam_rot: 0.4, delay: 0.18,
                     });
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "O",
-                        font_size: 40.0,
+                        font_size: 36.0,
                         bg: P5_BLACK,
                         fg: P5_WHITE,
-                        border: UiRect::all(Val::Px(2.0)),
-                        border_color: BorderColor::all(P5_WHITE),
-                        tilt: 0.08, // +4.6 deg
-                        pad_h: 9.0, pad_v: 4.0,
-                        slam_offset: Vec2::new(-210.0, 25.0), slam_rot: -0.2, delay: 0.20,
+                        border: UiRect { left: Val::Px(4.0), top: Val::Px(2.0), right: Val::Px(2.0), bottom: Val::Px(2.0) },
+                        border_color: BorderColor { left: P5_RED, top: P5_WHITE, right: P5_WHITE, bottom: P5_WHITE },
+                        tilt: 0.12, // +6.9 deg
+                        pad_h: 7.0, pad_v: 6.0,
+                        slam_offset: Vec2::new(-210.0, 25.0), slam_rot: -0.3, delay: 0.20,
                     });
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "C",
-                        font_size: 46.0,
+                        font_size: 52.0,
                         bg: P5_WHITE,
                         fg: P5_BLACK,
-                        border: UiRect::all(Val::Px(2.0)),
-                        border_color: BorderColor::all(P5_RED),
-                        tilt: -0.15, // -8.6 deg
-                        pad_h: 11.0, pad_v: 5.0,
-                        slam_offset: Vec2::new(-190.0, 20.0), slam_rot: 0.35, delay: 0.22,
+                        border: UiRect { left: Val::Px(1.5), top: Val::Px(1.5), right: Val::Px(5.5), bottom: Val::Px(5.5) },
+                        border_color: BorderColor { left: P5_BLACK, top: P5_BLACK, right: P5_RED, bottom: P5_RED },
+                        tilt: -0.20, // -11.5 deg
+                        pad_h: 13.0, pad_v: 3.0,
+                        slam_offset: Vec2::new(-190.0, 20.0), slam_rot: 0.45, delay: 0.22,
                     });
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "K",
-                        font_size: 48.0,
+                        font_size: 44.0,
                         bg: P5_BLACK,
                         fg: P5_WHITE,
                         border: UiRect { left: Val::Px(5.0), top: Val::Px(2.0), right: Val::Px(2.0), bottom: Val::Px(2.0) },
                         border_color: BorderColor { left: P5_RED, top: P5_WHITE, right: P5_WHITE, bottom: P5_WHITE },
-                        tilt: 0.07, // +4.0 deg
-                        pad_h: 12.0, pad_v: 5.0,
-                        slam_offset: Vec2::new(-170.0, 15.0), slam_rot: -0.2, delay: 0.24,
+                        tilt: 0.10, // +5.7 deg
+                        pad_h: 10.0, pad_v: 7.0,
+                        slam_offset: Vec2::new(-170.0, 15.0), slam_rot: -0.25, delay: 0.24,
                     });
 
                     // Word Gap with Electric Chevron
@@ -484,73 +482,73 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                     // --- WORD: "FREEDOM" (Climax magazine clippings) ---
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "F",
-                        font_size: 48.0,
+                        font_size: 56.0,
                         bg: P5_BLACK,
                         fg: P5_WHITE,
-                        border: UiRect { left: Val::Px(5.0), top: Val::Px(2.0), right: Val::Px(2.0), bottom: Val::Px(2.0) },
-                        border_color: BorderColor { left: P5_RED, top: P5_WHITE, right: P5_WHITE, bottom: P5_WHITE },
-                        tilt: 0.06, pad_h: 10.0, pad_v: 5.0,
-                        slam_offset: Vec2::new(-140.0, 10.0), slam_rot: 0.2, delay: 0.26,
+                        border: UiRect { left: Val::Px(7.0), top: Val::Px(1.5), right: Val::Px(1.5), bottom: Val::Px(4.0) },
+                        border_color: BorderColor { left: P5_RED, top: P5_WHITE, right: P5_WHITE, bottom: P5_RED },
+                        tilt: 0.08, pad_h: 12.0, pad_v: 4.0,
+                        slam_offset: Vec2::new(-140.0, 10.0), slam_rot: 0.3, delay: 0.26,
                     });
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "R",
-                        font_size: 42.0,
+                        font_size: 38.0,
                         bg: P5_WHITE,
                         fg: P5_BLACK,
-                        border: UiRect { left: Val::Px(2.0), top: Val::Px(2.0), right: Val::Px(4.0), bottom: Val::Px(4.0) },
+                        border: UiRect { left: Val::Px(1.5), top: Val::Px(1.5), right: Val::Px(4.5), bottom: Val::Px(4.5) },
                         border_color: BorderColor { left: P5_BLACK, top: P5_BLACK, right: P5_RED, bottom: P5_RED },
-                        tilt: -0.09, pad_h: 9.0, pad_v: 4.0,
-                        slam_offset: Vec2::new(-120.0, 10.0), slam_rot: -0.25, delay: 0.28,
+                        tilt: -0.14, pad_h: 7.0, pad_v: 6.0,
+                        slam_offset: Vec2::new(-120.0, 10.0), slam_rot: -0.35, delay: 0.28,
                     });
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "E",
-                        font_size: 46.0,
+                        font_size: 50.0,
                         bg: P5_BLACK,
                         fg: P5_WHITE,
-                        border: UiRect::all(Val::Px(2.0)),
-                        border_color: BorderColor::all(P5_WHITE),
-                        tilt: 0.05, pad_h: 10.0, pad_v: 5.0,
-                        slam_offset: Vec2::new(-100.0, 10.0), slam_rot: 0.2, delay: 0.30,
+                        border: UiRect { left: Val::Px(2.0), top: Val::Px(5.0), right: Val::Px(2.0), bottom: Val::Px(2.0) },
+                        border_color: BorderColor { left: P5_WHITE, top: P5_RED, right: P5_WHITE, bottom: P5_WHITE },
+                        tilt: 0.06, pad_h: 11.0, pad_v: 3.0,
+                        slam_offset: Vec2::new(-100.0, 10.0), slam_rot: 0.25, delay: 0.30,
                     });
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "E",
-                        font_size: 40.0,
+                        font_size: 34.0,
                         bg: P5_WHITE,
                         fg: P5_BLACK,
-                        border: UiRect::all(Val::Px(2.0)),
-                        border_color: BorderColor::all(P5_RED),
-                        tilt: -0.12, pad_h: 8.5, pad_v: 4.0,
-                        slam_offset: Vec2::new(-80.0, 10.0), slam_rot: -0.3, delay: 0.32,
+                        border: UiRect { left: Val::Px(3.5), top: Val::Px(1.0), right: Val::Px(1.0), bottom: Val::Px(3.5) },
+                        border_color: BorderColor { left: P5_RED, top: P5_BLACK, right: P5_BLACK, bottom: P5_RED },
+                        tilt: -0.18, pad_h: 6.0, pad_v: 7.0,
+                        slam_offset: Vec2::new(-80.0, 10.0), slam_rot: -0.4, delay: 0.32,
                     });
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "D",
-                        font_size: 46.0,
+                        font_size: 48.0,
                         bg: P5_BLACK,
                         fg: P5_WHITE,
-                        border: UiRect { left: Val::Px(2.0), top: Val::Px(2.0), right: Val::Px(4.5), bottom: Val::Px(4.5) },
+                        border: UiRect { left: Val::Px(2.0), top: Val::Px(2.0), right: Val::Px(5.5), bottom: Val::Px(5.5) },
                         border_color: BorderColor { left: P5_WHITE, top: P5_WHITE, right: P5_RED, bottom: P5_RED },
-                        tilt: 0.08, pad_h: 10.0, pad_v: 5.0,
-                        slam_offset: Vec2::new(-60.0, 10.0), slam_rot: 0.25, delay: 0.34,
+                        tilt: 0.13, pad_h: 12.0, pad_v: 4.0,
+                        slam_offset: Vec2::new(-60.0, 10.0), slam_rot: 0.3, delay: 0.34,
                     });
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "O",
-                        font_size: 42.0,
+                        font_size: 40.0,
                         bg: P5_WHITE,
                         fg: P5_BLACK,
-                        border: UiRect::all(Val::Px(2.0)),
-                        border_color: BorderColor::all(P5_BLACK),
-                        tilt: -0.07, pad_h: 9.0, pad_v: 4.0,
-                        slam_offset: Vec2::new(-40.0, 10.0), slam_rot: -0.2, delay: 0.36,
+                        border: UiRect { left: Val::Px(1.5), top: Val::Px(4.0), right: Val::Px(1.5), bottom: Val::Px(1.5) },
+                        border_color: BorderColor { left: P5_BLACK, top: P5_RED, right: P5_BLACK, bottom: P5_BLACK },
+                        tilt: -0.11, pad_h: 8.0, pad_v: 5.0,
+                        slam_offset: Vec2::new(-40.0, 10.0), slam_rot: -0.25, delay: 0.36,
                     });
                     spawn_cutout_letter(row2, CutoutLetter {
                         ch: "M",
-                        font_size: 52.0,
+                        font_size: 62.0,
                         bg: P5_BLACK,
                         fg: P5_WHITE,
-                        border: UiRect { left: Val::Px(3.0), top: Val::Px(2.0), right: Val::Px(6.0), bottom: Val::Px(6.0) },
+                        border: UiRect { left: Val::Px(3.0), top: Val::Px(1.5), right: Val::Px(7.0), bottom: Val::Px(7.0) },
                         border_color: BorderColor { left: P5_WHITE, top: P5_WHITE, right: P5_RED, bottom: P5_RED },
-                        tilt: 0.04, pad_h: 13.0, pad_v: 6.0,
-                        slam_offset: Vec2::new(-20.0, 10.0), slam_rot: 0.15, delay: 0.38,
+                        tilt: 0.05, pad_h: 15.0, pad_v: 5.0,
+                        slam_offset: Vec2::new(-20.0, 10.0), slam_rot: 0.2, delay: 0.38,
                     });
 
                     // Closing Red Chevron
@@ -629,7 +627,7 @@ pub fn spawn_intro_slide(mut commands: Commands) {
             )).with_children(|sub| {
                 sub.spawn((
                     Text::new("High-Performance Concurrency, Memory Models & Lock-Free Data Structures"),
-                    TextFont::from_font_size(15.0),
+                    TextFont::from_font_size(FONT_BODY),
                     TextColor(P5_OFF_WHITE),
                 ));
             });
@@ -815,13 +813,13 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                     ));
                     h_left.spawn((
                         Text::new("PHANTOM CALLING CARD"),
-                        TextFont::from_font_size(14.0),
+                        TextFont::from_font_size(FONT_BODY_ICON),
                         TextColor(P5_WHITE),
                     ));
                 });
                 header.spawn((
                     Text::new("/// CLASSIFIED ///"),
-                    TextFont::from_font_size(11.0),
+                    TextFont::from_font_size(FONT_LABEL_SM),
                     TextColor(P5_RED),
                 ));
             });
@@ -853,12 +851,12 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                 )).with_children(|target| {
                     target.spawn((
                         Text::new("TO: SIR MUTEX OF THE KERNEL"),
-                        TextFont::from_font_size(15.0),
+                        TextFont::from_font_size(FONT_BODY),
                         TextColor(P5_WHITE),
                     ));
                     target.spawn((
                         Text::new("Captor of concurrent threads and thief of CPU cycles."),
-                        TextFont::from_font_size(11.0),
+                        TextFont::from_font_size(FONT_LABEL_SM),
                         TextColor(P5_MUTED),
                     ));
                 });
@@ -887,7 +885,7 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                 )).with_children(|letter| {
                     letter.spawn((
                         Text::new("A great sinner of thread captivity. You have locked CPU cores and forced execution into agonizing sleep states for far too long.\n\nTonight, we shall break the chains of mutexes and liberate pure lock-free atomics to the world."),
-                        TextFont::from_font_size(11.5),
+                        TextFont::from_font_size(FONT_LABEL),
                         TextColor(P5_OFF_WHITE),
                     ));
                 });
@@ -904,7 +902,7 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                 )).with_children(|sign| {
                     sign.spawn((
                         Text::new("— The Phantom Thieves of Locks"),
-                        TextFont::from_font_size(12.0),
+                        TextFont::from_font_size(FONT_CAPTION),
                         TextColor(P5_LIGHT_GREY),
                     ));
                 });
@@ -912,15 +910,10 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                 // Multi-Point Jagged Comic Seal / "TAKE YOUR LOCKS" Stamp
                 body.spawn((
                     Node {
-                        padding: UiRect::axes(Val::Px(18.0), Val::Px(8.0)),
+                        padding: UiRect::axes(Val::Px(starburst::SEAL_PAD.0), Val::Px(starburst::SEAL_PAD.1)),
                         justify_content: JustifyContent::Center,
                         align_items: AlignItems::Center,
-                        border: UiRect {
-                            left: Val::Px(3.0),
-                            top: Val::Px(3.0),
-                            right: Val::Px(6.0),
-                            bottom: Val::Px(6.0),
-                        },
+                        border: starburst::seal_border(),
                         ..default()
                     },
                     BackgroundColor(P5_WHITE),
@@ -930,14 +923,14 @@ pub fn spawn_intro_slide(mut commands: Commands) {
                         right: P5_RED,
                         bottom: P5_RED,
                     },
-                    Transform::from_rotation(Quat::from_rotation_z(0.12)), // +6.9 deg
+                    Transform::from_rotation(Quat::from_rotation_z(starburst::SEAL_TILT)), // +6.9 deg
                     Visibility::default(),
                     InheritedVisibility::default(),
-                    PunkJitter::new(0.12, 0.02),
+                    PunkJitter::new(starburst::SEAL_TILT, 0.02),
                 )).with_children(|stamp| {
                     stamp.spawn((
                         Text::new("💥 TAKE YOUR LOCKS 💥"),
-                        TextFont::from_font_size(15.0),
+                        TextFont::from_font_size(FONT_BODY),
                         TextColor(P5_BLACK),
                     ));
                 });

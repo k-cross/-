@@ -1,5 +1,7 @@
 use bevy::prelude::*;
 use crate::theme::colors::*;
+use crate::theme::captivity::*;
+use crate::theme::ink;
 
 #[derive(Component)]
 pub struct BackgroundShard {
@@ -43,26 +45,26 @@ fn setup_background(mut commands: Commands) {
             ..default()
         },
         Transform::from_xyz(100.0, -60.0, -95.0)
-            .with_rotation(Quat::from_rotation_z(-0.35)),
+            .with_rotation(Quat::from_rotation_z(STRIPE_ANGLE)),
     ));
 
     // ==============================================================
     // PRISON UNIFORM / CAPTIVITY HAZARD STRIPES (Black & White Bars)
     // ==============================================================
     // A diagonal ribbon of alternating stark black and white hazard bars
-    for i in 0..40 {
-        let offset = (i as f32 - 20.0) * 44.0;
+    for i in 0..STRIPE_COUNT {
+        let offset = (i as f32 - (STRIPE_COUNT as f32 / 2.0)) * STRIPE_SPACING;
         let is_white = i % 2 == 0;
         let color = if is_white { P5_WHITE } else { P5_OFF_BLACK };
 
         commands.spawn((
             Sprite {
                 color,
-                custom_size: Some(Vec2::new(20.0, 22.0)),
+                custom_size: Some(Vec2::new(STRIPE_WIDTH, STRIPE_HEIGHT)),
                 ..default()
             },
             Transform::from_xyz(offset, 40.0 + (offset * -0.36), -90.0)
-                .with_rotation(Quat::from_rotation_z(-0.35)),
+                .with_rotation(Quat::from_rotation_z(STRIPE_ANGLE)),
         ));
     }
 
@@ -74,7 +76,7 @@ fn setup_background(mut commands: Commands) {
             ..default()
         },
         Transform::from_xyz(100.0, 54.0, -85.0)
-            .with_rotation(Quat::from_rotation_z(-0.35)),
+            .with_rotation(Quat::from_rotation_z(STRIPE_ANGLE)),
     ));
 
     // Secondary bright crimson hair-line
@@ -85,7 +87,7 @@ fn setup_background(mut commands: Commands) {
             ..default()
         },
         Transform::from_xyz(100.0, 66.0, -84.0)
-            .with_rotation(Quat::from_rotation_z(-0.35)),
+            .with_rotation(Quat::from_rotation_z(STRIPE_ANGLE)),
     ));
 
     // Stark white torn-edge tape line
@@ -96,7 +98,7 @@ fn setup_background(mut commands: Commands) {
             ..default()
         },
         Transform::from_xyz(100.0, -180.0, -85.0)
-            .with_rotation(Quat::from_rotation_z(-0.35)),
+            .with_rotation(Quat::from_rotation_z(STRIPE_ANGLE)),
     ));
 
     // ==============================================================
@@ -114,7 +116,7 @@ fn setup_background(mut commands: Commands) {
         commands.spawn((
             Sprite {
                 color: P5_LIGHT_GREY,
-                custom_size: Some(Vec2::new(38.0, 18.0)),
+                custom_size: Some(Vec2::new(CHAIN_WIDTH, CHAIN_HEIGHT)),
                 ..default()
             },
             Transform::from_xyz(pos.x, pos.y, -72.0)
@@ -131,7 +133,7 @@ fn setup_background(mut commands: Commands) {
             chain.spawn((
                 Sprite {
                     color: P5_BLACK,
-                    custom_size: Some(Vec2::new(24.0, 8.0)),
+                    custom_size: Some(Vec2::new(CHAIN_CUTOUT_WIDTH, CHAIN_CUTOUT_HEIGHT)),
                     ..default()
                 },
                 Transform::from_xyz(0.0, 0.0, 1.0),
@@ -140,11 +142,11 @@ fn setup_background(mut commands: Commands) {
             chain.spawn((
                 Sprite {
                     color: P5_RED,
-                    custom_size: Some(Vec2::new(5.0, 18.0)),
+                    custom_size: Some(Vec2::new(FRACTURE_WIDTH, FRACTURE_HEIGHT)),
                     ..default()
                 },
-                Transform::from_xyz(12.0, 0.0, 2.0)
-                    .with_rotation(Quat::from_rotation_z(0.3)),
+                Transform::from_xyz(FRACTURE_OFFSET_X, 0.0, 2.0)
+                    .with_rotation(Quat::from_rotation_z(FRACTURE_ANGLE)),
             ));
         });
     }
@@ -216,7 +218,7 @@ fn setup_background(mut commands: Commands) {
         Vec2::new(-350.0, 70.0),
         -86.0,
         P5_OFF_BLACK,
-        110.0,
+        ink::RADIUS_XL,
         Vec2::new(1.2, -0.4),
     );
 
@@ -236,7 +238,7 @@ fn setup_background(mut commands: Commands) {
         Vec2::new(320.0, 70.0),
         -86.0,
         P5_CHARCOAL,
-        85.0,
+        ink::RADIUS_LG,
         Vec2::new(-1.0, -0.7),
     );
 

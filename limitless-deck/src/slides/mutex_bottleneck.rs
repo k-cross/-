@@ -2,6 +2,7 @@ use bevy::prelude::*;
 use bevy::state::state_scoped::DespawnOnExit;
 use crate::theme::colors::*;
 use crate::theme::geometry::*;
+use crate::theme::typography::*;
 use crate::slideshow::SlideState;
 use crate::slideshow::code_view::{spawn_styled_code_block, TokenKind};
 use crate::slideshow::animation::{SlamEntrance, PunkJitter};
@@ -56,7 +57,7 @@ pub fn spawn_mutex_bottleneck_slide(mut commands: Commands) {
             )).with_children(|tag| {
                 tag.spawn((
                     Text::new("/// EXHIBIT A // MUTEX VS ATOMIC PRIMITIVES ///"),
-                    TextFont::from_font_size(13.0),
+                    TextFont::from_font_size(FONT_BODY_SM),
                     TextColor(P5_WHITE),
                 ));
             });
@@ -84,7 +85,7 @@ pub fn spawn_mutex_bottleneck_slide(mut commands: Commands) {
             )).with_children(|t| {
                 t.spawn((
                     Text::new("THE COST OF SERIALIZATION"),
-                    TextFont::from_font_size(36.0),
+                    TextFont::from_font_size(FONT_HEADING_XL),
                     TextColor(P5_WHITE),
                 ));
             });
@@ -221,18 +222,18 @@ pub fn spawn_mutex_bottleneck_slide(mut commands: Commands) {
                     }).with_children(|h| {
                         h.spawn((
                             Text::new("⛓"),
-                            TextFont::from_font_size(14.0),
+                            TextFont::from_font_size(FONT_BODY_ICON),
                             TextColor(P5_RED),
                         ));
                         h.spawn((
                             Text::new("MUTEX PENALTY (CAPTIVITY)"),
-                            TextFont::from_font_size(14.5),
+                            TextFont::from_font_size(FONT_BODY_LG),
                             TextColor(P5_RED),
                         ));
                     });
                     c1.spawn((
                         Text::new("Contended locks trigger syscalls, context switches, and cache thrashing. Threads are jailed in OS sleep queues."),
-                        TextFont::from_font_size(12.0),
+                        TextFont::from_font_size(FONT_CAPTION),
                         TextColor(P5_OFF_WHITE),
                     ));
                 });
@@ -268,18 +269,18 @@ pub fn spawn_mutex_bottleneck_slide(mut commands: Commands) {
                     }).with_children(|h| {
                         h.spawn((
                             Text::new("★"),
-                            TextFont::from_font_size(14.0),
+                            TextFont::from_font_size(FONT_BODY_ICON),
                             TextColor(P5_WHITE),
                         ));
                         h.spawn((
                             Text::new("LOCK-FREE ADVANTAGE (FREEDOM)"),
-                            TextFont::from_font_size(14.5),
+                            TextFont::from_font_size(FONT_BODY_LG),
                             TextColor(P5_WHITE),
                         ));
                     });
                     c2.spawn((
                         Text::new("Executes via CPU hardware cache coherency bus protocol (MESI). Never blocks or puts the thread to sleep."),
-                        TextFont::from_font_size(12.0),
+                        TextFont::from_font_size(FONT_CAPTION),
                         TextColor(P5_OFF_WHITE),
                     ));
                 });

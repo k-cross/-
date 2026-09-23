@@ -1,5 +1,6 @@
 use bevy::prelude::*;
 use crate::theme::colors::*;
+use crate::theme::motion;
 
 #[derive(Component)]
 pub struct PhantomThiefRoot {
@@ -39,7 +40,7 @@ fn setup_character(mut commands: Commands) {
             base_pos: root_pos,
             idle_phase: 0.0,
             slash_timer: 0.0,
-            slash_duration: 0.35,
+            slash_duration: motion::CHARACTER_SLASH_DURATION,
         },
         Transform::from_translation(root_pos),
         Visibility::default(),
