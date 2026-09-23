@@ -1461,36 +1461,45 @@ one and hide which is carrying the result -- which is exactly what Phase 3 chang
 **Status: implemented and measured.** `phase-2.md` §2's six predictions, checked against `distributed
 --regret` and `residency`/`flows`/`volatility --clairvoyant`:
 
-- **P1** (scored's heuristic gap is the affinity tie-break, confined and small): **confirmed.** The
-  `scored` arm's `execution`, `heuristic` and `belief` gaps are all exactly zero; `scored, no flows`
-  -- which never falls back to affinity -- carries a tiny nonzero heuristic gap instead. The scored
-  arm's entire regret is model gap, as predicted.
+- **P1** (scored's heuristic gap is the affinity tie-break, confined and small): **confirmed, and
+  smaller than predicted.** The confinement holds by construction -- the affinity fallback is the
+  only way the policy's pick can differ from the model's own argmin -- and the size is 176
+  ns/decision for `scored, no flows` and **exactly zero** for `scored`, while `held_by_affinity`
+  fires on 0.8% and 0.4% of decisions respectively. Both arms fall back to affinity; for the
+  flow-aware one the ties it breaks are ties in realized cost too, so the fallback is free rather
+  than merely cheap. `scored`'s entire regret is model gap.
 - **P2** (myopic regret under-credits a policy whose value is the trajectory): **confirmed.**
   `hash only`, `residency only` and `flow only` all carry heuristic regret in the tens of millions of
   ns/decision while matching or beating `scored` on end-to-end service time -- the large-regret,
   small-deficit signature P2 named in advance.
-- **P3** (`R(p) == charged(p)` exactly, non-gang, non-saturated): **confirmed under ample capacity,
-  with a scoped exception.** Exact on the fixture every regret test uses. Under a deliberately tight
-  pool a bounded residual appears (under 20% of spans in the adversarial fixture, isolated to
-  `execution` alone -- the other three gaps stay exactly zero wherever it fires): `plan` prices a
-  request's chain and its dependencies independently against one snapshot, while `run_here`
-  materialises them in sequence, so real eviction pressure lets one side's admission invalidate the
-  other's price. Not belief staleness -- both reads see the same, current, true state -- and left
-  alone per rule 1 rather than patched mid-phase; `machine.rs`'s test pins the boundary.
-- **P4** (clairvoyant may lose on cost): **confirmed, the losing branch.** At `residency`'s defaults,
-  clairvoyant eviction buys +16.2pp `KvBlock` hit rate over soft-floor and costs +96.1% stall/req.
-  The diagnostic did its job: eviction quality is not what limits GDSF here, cost-weighting is.
-- **P5** (coupled % is low at the published defaults, higher where memory binds): **half-confirmed,
-  and the surprising half is the finding.** Locality coupling is low (1-2% of scored decisions) as
-  predicted. Memory coupling is **not** near zero at `distributed`'s defaults -- 44-55% of host-DDR
-  evictions are cross-class for several arms, because real DDR pressure exists there that the
-  `residency-ledger.md` tables (measured on an older engine model) did not show. The prediction was
-  wrong about the regime, not about the mechanism: coupled % tracks pressure exactly as designed, and
-  `distributed`'s defaults turn out to have more of it than assumed.
+- **P3** (`R(p) == charged(p)` exactly, non-gang, non-saturated): **confirmed under ample capacity;
+  the exception is wider than first published.** Exact on the fixture every regret test uses. It is
+  *not* exact at `distributed`'s own defaults, where every arm with DDR eviction pressure shows a
+  nonzero `execution` gap beside an exactly-zero `belief` -- so staleness cannot be the cause. `plan`
+  prices a request's chain and its dependencies independently against one snapshot while `run_here`
+  materialises them in sequence, so pressure lets one side's admission invalidate the other's price.
+  Bounded (under 20% of spans in the adversarial fixture) and isolated (the other three gaps stay
+  exactly zero wherever it fires). Left alone per rule 1 rather than patched mid-phase; `machine.rs`
+  pins the boundary and `oracle.rs` no longer claims the gap is zero whenever the view is exact.
+- **P4** (clairvoyant may lose on cost): **confirmed, the losing branch, by 3.7%.** Budget-matched --
+  `clairvoyant` and `no-floor` both at `Budget::Open`, so only eviction quality differs -- clairvoyant
+  eviction buys **+22.8pp `KvBlock` hit rate for +3.7% stall/req** at `residency`'s true defaults,
+  and `volatility --clairvoyant` reproduces +3.1-3.5% at every level. The reading stands: GDSF gives
+  up 22.8pp of hits and still wins on cost, so its value is cost-weighting rather than recency
+  prediction. The figure first published here (+16.2pp, +96.1%) was wrong twice over -- it divided an
+  open-budget arm by a swept split-budget one, putting budget policy inside an eviction-quality
+  number, and it was taken from a `--ops 5000` run labelled "defaults". Both are fixed in the tool.
+- **P5** (coupled % is low at the published defaults, higher where memory binds): **confirmed on both
+  axes.** Memory coupling is **0.0%** at `distributed`'s defaults (0-2,265 evictions per arm -- no
+  pressure, nothing to couple) and **93.8-96.4% of 16k-24k evictions** when tightened to 4 GiB DDR
+  per node. Locality coupling is 0.8-1.7% of scored decisions in both regimes. The 44-55% figure
+  first published here was an instrument defect, not a regime surprise: coupling was counted inside
+  `TierPool::admit`, which the demotion path also reaches, so HBM->DDR spillover was being counted as
+  arbitration. `admit` and `offer` now take separate paths.
 - **P6** (the oracle cannot see the falsification that already failed): **confirmed.** Re-running the
   flow-payload sweep (§4.7's knob, region distance) through the instrument: at 512 MiB, `flow only`'s
   heuristic regret is far larger than `scored`'s (which stays exactly zero throughout, per P1) while
-  `flow only`'s service time is *lower* -- 534.5 ms against `scored`'s 537.3 ms. The metric's own
+  `flow only`'s service time is *lower* -- 534.5 ms against `scored`'s 535.6 ms. The metric's own
   blind spot, reproduced on demand rather than argued from the retracted numbers.
 
 ### Phase 3 -- The engine allocates; the orchestrator sizes the partition

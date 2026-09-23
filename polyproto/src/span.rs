@@ -19,13 +19,22 @@ use crate::oracle::{Regime, Regret};
 
 /// One decision's outcome, in the same currency (nanoseconds, node indices) `machine.rs`
 /// already reports in aggregate. `phase-2.md` §4.4: `decided_by` is the per-request form of
-/// the score's nested ladder, and its one exact reduction is to the *last* rung --
-/// `count(decided_by == Some(4)) == Machine::moved_by_congestion`, checked in `machine.rs`'s
-/// tests -- because `decided_by` holds only the single last term that changed the pick, while
-/// `moved_by_displacement`/`_flow`/`_load` each count how often *their own* comparison flipped
-/// regardless of what a later term did afterward. A decision can flip more than one term but
-/// is decided by only one, so only the outermost rung's count and this field's count are the
-/// same quantity computed twice.
+/// the score's nested ladder.
+///
+/// **Its reduction to `Machine::moved_by_congestion` is exact only where the two cover the
+/// same decisions**, which is narrower than it looks and is why the test that checks it
+/// (`decided_by_reduces_to_moved_by_congestion`) states its fixture's preconditions rather
+/// than relying on them. `moved_by_congestion` counts every scored decision, including the
+/// ones `run_tool` makes and the ones that end in a refusal; a `Span` is pushed only for
+/// non-gang `serve_request` decisions that were actually served. On any trace with tool calls
+/// or refusals the span count is strictly smaller and the two will not agree -- the
+/// denominators differ, not the mechanism.
+///
+/// Within the spans that do exist, `count(decided_by == Some(4)) == moved_by_congestion` holds
+/// for the last rung alone: `decided_by` holds only the single last term that changed the pick,
+/// while `moved_by_displacement`/`_flow`/`_load` each count how often *their own* comparison
+/// flipped regardless of what a later term did afterward. A decision can flip more than one
+/// term but is decided by only one.
 #[derive(Clone, Copy, Debug)]
 pub struct Span {
     /// This decision's position in `Machine`'s own op counter, for correlating a span back to

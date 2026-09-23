@@ -242,12 +242,6 @@ pub struct Machine {
     /// against truth, would not have -- `phase-2.md` §1.5. A count, never a duration: refusal
     /// has no realized cost to decompose, so it is reported beside regret and never folded in.
     pub feasibility_regret: u64,
-    /// Host-DDR admissions where the unified arbiter's eviction victim differs from what
-    /// `Quota::hard` semantics would choose, or where one admits and the other refuses --
-    /// `phase-2.md` §1.8, §4.6. Only meaningful beside `memory_coupled_decisions` and the
-    /// regime it was measured in.
-    pub memory_coupled: u64,
-    pub memory_coupled_decisions: u64,
     /// Placement decisions where the score's argmin over the full model differs from the
     /// argmin a silo (no handoff term, displacement restricted to the deciding class's own
     /// pool) would reach -- `phase-2.md` §1.8, §4.6.
@@ -342,8 +336,6 @@ impl Machine {
             regret: false,
             spans: Vec::new(),
             feasibility_regret: 0,
-            memory_coupled: 0,
-            memory_coupled_decisions: 0,
             locality_coupled: 0,
             locality_coupled_decisions: 0,
         }
@@ -1100,11 +1092,15 @@ impl Machine {
     ) -> OraclePick {
         let m_b = self.score_argmin(req, flow, candidates, View::Belief);
         let m_t = self.score_argmin(req, flow, candidates, View::Truth);
-        let (r_p, _) = self.realized_ns(p, req, decode_needed, decide_ns);
+        let (r_p, r_p_disp) = self.realized_ns(p, req, decode_needed, decide_ns);
         let (r_mb, _) = self.realized_ns(m_b, req, decode_needed, decide_ns);
         let (r_mt, _) = self.realized_ns(m_t, req, decode_needed, decide_ns);
         let mut r_o = r_p;
-        let mut r_o_disp = r_p;
+        // Seeded with `p`'s *displacement-priced* cost, not its plain one: `ns_disp >= ns`
+        // always and `p` is itself a candidate, so seeding from `r_p` would cap the
+        // displacement oracle below every value the loop can offer and collapse
+        // `total_with_displacement` onto the execution gap.
+        let mut r_o_disp = r_p_disp;
         let mut oracle_node = p;
         for &d in candidates {
             let (ns, ns_disp) = self.realized_ns(d, req, decode_needed, decide_ns);
@@ -1130,6 +1126,16 @@ impl Machine {
     /// request's state right now -- `phase-2.md` §1.5's feasibility regret. A refused request
     /// has no realized cost the oracle can price (`plan` never models refusal), so this is a
     /// separate, read-only admission check rather than a reading of `oracle_pick`.
+    ///
+    /// **Over-counts under `--hard-pools`, and cannot not.** `Telemetry::could_admit` compares
+    /// need against each pool's aggregate `reclaimable()`, which sums burst across classes;
+    /// `TierPool::admit` under a hard quota refuses on the admitting class's *own* ceiling and
+    /// `pick_class` never leaves that class. So where a hard quota refuses because one class
+    /// is at its floor beside a pool that is otherwise empty, this reports every symmetric
+    /// candidate as feasible and §1.5's "not simply because the request was refused" fails.
+    /// The same blindness is in `place_agent`'s gang feasibility test and predates this phase;
+    /// narrowing it would move a published fan-out result, so it is named here instead and the
+    /// counter is read as an upper bound on hard-quota runs.
     fn feasible_elsewhere(&self, req: &Request, candidates: &[usize], p: usize) -> bool {
         candidates.iter().any(|&d| {
             if d == p {
@@ -1748,8 +1754,10 @@ impl Machine {
     }
 
     /// `phase-2.md` §1.8, §4.6: `(cross-class evictions, evictions)` in host DDR, summed
-    /// across every domain -- `Hierarchy::ddr_memory_coupled` counts unconditionally, so this
-    /// needs no `self.regret` gate and is cheap to read even when it is off.
+    /// across every domain, over workload-driven admissions only -- see `TierPool::coupled`
+    /// for what that excludes and why, and for which half of §4.6's definition this is.
+    /// Counted unconditionally, so this needs no `self.regret` gate and is cheap to read even
+    /// when it is off.
     #[must_use]
     pub fn memory_coupled(&self) -> (u64, u64) {
         self.domains.iter().fold((0, 0), |(c, n), h| {

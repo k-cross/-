@@ -904,7 +904,14 @@ fn volatility_sweep(
         "volatility", "hard-partition (ms)", "soft-floor (ms)", "advantage"
     );
     if clairvoyant {
-        print!(" {:>16} {:>12}", "clairvoyant (ms)", "vs soft");
+        // `no-floor` is printed beside `clairvoyant` because it is the only budget-matched
+        // comparator: both are `Budget::Open`, so their difference is eviction quality and
+        // nothing else. Against the swept `soft-floor` the same subtraction would be
+        // dominated by budget policy (see `residency_report`).
+        print!(
+            " {:>16} {:>16} {:>12}",
+            "no-floor (ms)", "clairvoyant (ms)", "vs no-floor"
+        );
     }
     println!();
     for i in 0..=5 {
@@ -928,16 +935,21 @@ fn volatility_sweep(
             "{v:>10.1} {hm:>18.3} {sm:>16.3} {:>11.1}%",
             100.0 * (hm - sm) / hm
         );
-        // `phase-2.md` §1.7: same open budget as `open` elsewhere, so only eviction quality
-        // -- not admission policy -- differs from the two arms already printed.
+        // `phase-2.md` §1.7: the open-budget pair, so only eviction quality differs between
+        // the two columns compared. Neither is comparable to the swept arms to their left.
         if clairvoyant {
             let t_clair = Trial {
                 policy: Policy::Clairvoyant,
                 ..t
             };
+            let open = run("", t, Budget::Open);
             let clair = run("", t_clair, Budget::Open);
+            let om = mean_ms(open.total_ns, open.served.iter().sum());
             let cm = mean_ms(clair.total_ns, clair.served.iter().sum());
-            print!(" {cm:>16.3} {:>11.1}%", 100.0 * (cm - sm) / sm);
+            print!(
+                " {om:>16.3} {cm:>16.3} {:>11.1}%",
+                100.0 * (cm - om) / om.max(f64::MIN_POSITIVE)
+            );
         }
         println!();
     }
@@ -1169,12 +1181,23 @@ fn residency_report(
         100.0 * (soft.goodput() - hard.goodput())
     );
     if let Some(c) = &clair {
+        // Against `no-floor`, not against `soft-floor`: both run `Budget::Open`, so this
+        // isolates eviction quality, which is the only thing the arm exists to measure.
+        // Dividing by the swept `soft-floor` instead would report the budget-policy gap --
+        // far the larger effect here -- under an eviction-quality label.
         let cm = mean_ms(c.total_ns, c.served.iter().sum());
+        let om = mean_ms(open.total_ns, open.served.iter().sum());
         println!(
-            "clairvoyant vs soft-floor: {:+.1}% stall/req at {:+.1}pp hit rate (kv) -- a \
-             signed difference against a heuristic baseline, not a regret (phase-2.md §1.7)",
+            "\nclairvoyant vs no-floor (both open, so eviction quality alone): \
+             {:+.1}% stall/req at {:+.1}pp hit rate (kv) -- a signed difference against a \
+             heuristic baseline, not a regret (phase-2.md §1.7)",
+            100.0 * (cm - om) / om.max(f64::MIN_POSITIVE),
+            100.0 * (c.hit[0] - open.hit[0])
+        );
+        println!(
+            "clairvoyant vs soft-floor: {:+.1}% stall/req -- budget policy and eviction \
+             quality together, not attributable to either alone",
             100.0 * (cm - sm) / sm.max(f64::MIN_POSITIVE),
-            100.0 * (c.hit[0] - soft.hit[0])
         );
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "limitless-deck"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.19.1"
+
+# Enable fast compile times and compact binaries (prevents massive multi-GB debug symbols)
+[profile.dev]
+opt-level = 1
+debug = 0
+strip = "debuginfo"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = 0

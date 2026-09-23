@@ -209,11 +209,17 @@ pub fn run_on(label: &str, t: Trial, budget: Budget, trace: &[crate::work::Reque
         (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut flow_attempted = 0u64;
 
+    // Counts exactly what `clairvoyant_index` counted -- non-gang requests, in order -- so
+    // the ledger's notion of "already in the past" and the index's positions are the same
+    // number by construction rather than by coincidence.
+    let mut op = 0u64;
     for req in trace {
         // Gangs need somewhere to be placed across; a single ledger has no second node.
         if req.gang.is_some() {
             continue;
         }
+        h.set_clairvoyant_op(op);
+        op += 1;
         let k = req.kind_idx();
 
         if let Some(hint) = &req.hint

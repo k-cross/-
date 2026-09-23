@@ -271,11 +271,20 @@ pub struct TierPool {
     /// Expected loss per byte of the last blob actually evicted, in the same units as
     /// `marginal_price`. The fallback when nothing is currently reclaimable.
     last_price: f64,
-    /// `phase-2.md` §1.8, §4.6: evictions where the class evicted differs from the class being
-    /// admitted -- a cross-class trade a siloed, per-class quota could never make, since
-    /// `Quota::hard`'s `pick_class` always returns the admitting class itself. Counted here,
-    /// unconditionally and at zero cost to the eviction it observes: the comparison is a
-    /// byproduct of `pick_class`'s own already-computed answer, not a second simulation.
+    /// `phase-2.md` §1.8, §4.6: **workload-driven** evictions (`admit`, not `offer`) where the
+    /// class evicted differs from the class being admitted -- a cross-class trade a siloed,
+    /// per-class quota could never make, since `Quota::hard`'s `pick_class` always returns the
+    /// admitting class itself. A byproduct of `pick_class`'s own already-computed answer, not
+    /// a second simulation.
+    ///
+    /// This is the victim-class half of §4.6's definition, and the only half with content.
+    /// The other half -- "or where one admits and the other refuses" -- is vacuous in the
+    /// direction that could fire: the soft arbiter searches every class above its floor where
+    /// a hard quota searches only the admitting class, so anywhere the soft path refuses the
+    /// hard path refuses too, and "unified refuses, silo admits" cannot happen. The converse
+    /// ("unified admits by crossing classes where a silo would have refused") is already a
+    /// subset of `c != k` and is counted here. `coupled_decisions` counts evictions, not
+    /// refusals, so a refused admission enters neither column.
     pub coupled: u64,
     pub coupled_decisions: u64,
 }
@@ -383,17 +392,20 @@ impl TierPool {
         self.used > self.spec.capacity
     }
 
-    /// `Policy::Clairvoyant`'s branch is a placeholder, immediately overwritten by
-    /// `Hierarchy::clairvoyant_touch`'s `set_priority` the moment this entry's own reference
-    /// is processed -- `score` has no reference-stream index to consult, only `Hierarchy`
-    /// does, so it cannot compute the real furthest-next-use priority itself.
+    /// `score` has no reference-stream index to consult -- only `Hierarchy` holds one -- so
+    /// `Policy::Clairvoyant`'s branch is the policy's own default for a blob with nothing
+    /// scheduled: `-inf`, evict first. `Hierarchy::clairvoyant_touch` overwrites it with the
+    /// real `-(next occurrence)` as part of the same reference that admitted the entry. The
+    /// default matters anyway, because it is what an entry keeps if a reprice is ever missed,
+    /// and erring toward *evict first* degrades gracefully where erring toward the maximum
+    /// (every real priority is `<= 0`) would silently pin the entry forever.
     fn score(&self, meta: &BlobMeta, freq: u32, expect: f64) -> f64 {
         match self.policy {
             Policy::Gdsf => {
                 self.inflation + (f64::from(freq.min(FREQ_CAP)) + expect) * meta.value_per_byte()
             }
             Policy::Lru => self.clock as f64,
-            Policy::Clairvoyant => 0.0,
+            Policy::Clairvoyant => f64::NEG_INFINITY,
         }
     }
 
@@ -532,12 +544,17 @@ impl TierPool {
         self.reheap(id);
     }
 
-    /// Override one resident entry's priority directly, for a policy whose ranking is not a
-    /// function of `score()`'s inputs -- `Policy::Clairvoyant`'s furthest-next-use, set from
-    /// outside by `Hierarchy::clairvoyant_touch` once per real reference. A no-op if the
-    /// entry is not resident here, which happens whenever the reference just landed in a
-    /// different pool than the one holding the id's earlier occurrence.
-    pub fn set_priority(&mut self, id: BlobId, priority: f64) {
+    /// Override one resident entry's priority directly, for the one policy whose ranking is
+    /// not a function of `score()`'s inputs -- `Policy::Clairvoyant`'s furthest-next-use, set
+    /// by `Hierarchy::clairvoyant_touch` once per real reference. A no-op if this pool does
+    /// not hold the entry (the caller reprices all three tiers rather than guessing which
+    /// holds it) and, deliberately, a no-op under any other policy: a second writer of
+    /// `Entry::priority` that `Gdsf` or `Lru` could reach would be a way to desync a heap
+    /// from the scoring function that owns it.
+    pub(crate) fn set_priority(&mut self, id: BlobId, priority: f64) {
+        if self.policy != Policy::Clairvoyant {
+            return;
+        }
         let Some(e) = self.entries.get_mut(&id) else {
             return;
         };
@@ -668,11 +685,24 @@ impl TierPool {
         Some((r.id, e))
     }
 
+    /// Admit state the workload asked for. Counts toward `phase-2.md` §4.6's coupling, which
+    /// is a statement about *arbitration between classes competing for a pool* -- so the
+    /// ledger's own housekeeping (`offer`, below) deliberately does not.
     pub fn admit(
         &mut self,
         id: BlobId,
         meta: BlobMeta,
         out: &mut Vec<(BlobId, BlobMeta)>,
+    ) -> Admission {
+        self.admit_body(id, meta, out, true)
+    }
+
+    fn admit_body(
+        &mut self,
+        id: BlobId,
+        meta: BlobMeta,
+        out: &mut Vec<(BlobId, BlobMeta)>,
+        arbitrated: bool,
     ) -> Admission {
         if self.entries.contains_key(&id) {
             self.touch(id);
@@ -716,9 +746,16 @@ impl TierPool {
             // branch can never make -- it always returns `k`, the admitting class itself. So
             // this is the unified arbiter's choice compared against the silo's only possible
             // choice, read off `pick_class`'s answer rather than computed a second time.
-            self.coupled_decisions += 1;
-            if c != k {
-                self.coupled += 1;
+            //
+            // Only on the arbitrated path. A demotion arriving through `offer` is the ledger
+            // moving its own bytes down a tier, not two workloads competing for a pool, and
+            // counting it made the published figure track accelerator sizing (how much
+            // HBM->DDR spillover there is) rather than the arbiter's policy.
+            if arbitrated {
+                self.coupled_decisions += 1;
+                if c != k {
+                    self.coupled += 1;
+                }
             }
             if let Some((vid, v)) = self.take_victim(c) {
                 out.push((vid, v.meta));
@@ -748,16 +785,18 @@ impl TierPool {
         Admission::Admitted
     }
 
-    /// Admit without recording a refusal. For state the ledger is moving down a tier on its
-    /// own initiative: a demotion that does not fit is housekeeping, not a request turned away,
-    /// and counting it would bill the refusal rate for the ledger's own eviction policy.
+    /// Admit without recording a refusal, and without counting toward coupling. For state the
+    /// ledger is moving down a tier on its own initiative: a demotion that does not fit is
+    /// housekeeping, not a request turned away, and counting it would bill the refusal rate
+    /// for the ledger's own eviction policy -- and, `phase-2.md` §4.6, would bill the coupling
+    /// figure for spillover volume rather than for arbitration between classes.
     pub fn offer(
         &mut self,
         id: BlobId,
         meta: BlobMeta,
         out: &mut Vec<(BlobId, BlobMeta)>,
     ) -> Admission {
-        let a = self.admit(id, meta, out);
+        let a = self.admit_body(id, meta, out, false);
         if a == Admission::Pending {
             let k = meta.kind.idx();
             self.refused[k] = self.refused[k].saturating_sub(1);
@@ -886,6 +925,7 @@ pub struct Hierarchy {
     /// `set_clairvoyant_index` was called, and every touch site below skips the work when it
     /// is, so a run that never installs one pays nothing for the check.
     clairvoyant: HashMap<BlobId, VecDeque<u64>>,
+    clairvoyant_op: u64,
 }
 
 /// The *dynamic* census (`phase-1.md` §4.4). One counter per census-marked entry point,
@@ -956,6 +996,7 @@ impl Hierarchy {
             prewarm_ns: 0,
             engine_ops: EngineOps::default(),
             clairvoyant: HashMap::new(),
+            clairvoyant_op: 0,
         }
     }
 
@@ -967,22 +1008,78 @@ impl Hierarchy {
         self.clairvoyant = index;
     }
 
-    /// Pop the occurrence that just happened off `id`'s schedule and, if `Policy::Clairvoyant`
-    /// is running, push the resulting furthest-next-use priority into whichever pool now holds
-    /// it -- `-inf` when nothing remains, so a blob referenced for the last time is evicted
-    /// first. Called once per genuine reference (`access`, `access_set`, `supply`), never from
-    /// `announce`'s speculative prewarm (`TierPool::anticipate`'s own `Clairvoyant` arm does
-    /// not call this). A no-op, at the cost of one hash lookup, when no index was installed.
+    /// Where the reference stream has reached, set by the driving loop once per processed
+    /// request. `clairvoyant_touch` discards every scheduled position at or before it, which
+    /// is what makes a missed reference self-correcting instead of permanently desyncing.
+    pub fn set_clairvoyant_op(&mut self, op: u64) {
+        self.clairvoyant_op = op;
+    }
+
+    /// Advance `id`'s schedule past everything already in the past and reprice it at
+    /// `-(next occurrence)`, or `-inf` when nothing remains -- so a blob referenced for the
+    /// last time is evicted first. Called once per genuine reference (`access`, `access_set`,
+    /// `supply`), never from `announce`'s speculative prewarm. A no-op, at one hash lookup,
+    /// when no index was installed.
+    ///
+    /// **Why this is a side channel rather than a `next_use` argument threaded through
+    /// `touch`/`admit`.** Every blob a request names advances its own schedule, but `access`
+    /// deliberately touches only the *deepest* resident blob of a hit prefix -- the shallower
+    /// ones are read without a `TierPool` call at all. Folding repricing into `touch`/`admit`
+    /// would therefore leave most of a hit prefix holding a priority that points at an
+    /// occurrence already consumed, which is the one error this policy cannot tolerate.
+    ///
+    /// **Why it pops by position rather than by count.** Three paths reference a blob without
+    /// completing: `access` returns at the first refusal, `run_on` skips `access_set` when the
+    /// chain was refused, and `FlowMode::Gate` skips whole requests. A blind `pop_front` would
+    /// fall one position behind at each and never recover, making every later priority read
+    /// *more* urgent than the truth. Discarding everything `<= clairvoyant_op` repairs the
+    /// drift at the blob's next reference instead.
+    ///
+    /// **Why it writes to every pool.** A blob can be hot in HBM and offloaded in DDR at once,
+    /// and a spilled copy sits in `NVMe` under neither; `home_mut(kind)` would reprice one of
+    /// those and leave the others holding a stale priority for the same future.
     fn clairvoyant_touch(&mut self, id: BlobId, kind: BlobKind) {
         if self.clairvoyant.is_empty() {
             return;
         }
+        let op = self.clairvoyant_op;
         let Some(q) = self.clairvoyant.get_mut(&id) else {
             return;
         };
-        q.pop_front();
+        while q.front().is_some_and(|&pos| pos <= op) {
+            q.pop_front();
+        }
         let priority = q.front().map_or(f64::NEG_INFINITY, |&pos| -(pos as f64));
-        self.home_mut(kind).set_priority(id, priority);
+        match self.authority(kind, crate::own::Question::Allocation) {
+            crate::own::Authority::Engine => self.reprice_engine(id, kind, priority),
+            crate::own::Authority::Orchestrator => self.reprice_owned(id, priority),
+        }
+    }
+
+    fn reprice_owned(&mut self, id: BlobId, priority: f64) {
+        self.reprice_body(id, priority);
+    }
+
+    /// Reordering a `KvBlock`/`WeightShard` against a schedule this process holds is a value
+    /// judgement over engine-allocated state, exactly like `touch_engine`'s hit accounting --
+    /// so it dispatches on authority and is census-marked the same way (`phase-1.md` §4.4).
+    /// Counted into the `touch` bucket because it is the same kind of bookkeeping; it is zero
+    /// in every run that is not `Policy::Clairvoyant`, so no published census figure moves.
+    #[cfg_attr(
+        feature = "census",
+        deprecated(
+            note = "assumes allocation authority over engine state (clairvoyant repricing)"
+        )
+    )]
+    fn reprice_engine(&mut self, id: BlobId, kind: BlobKind, priority: f64) {
+        self.engine_ops.touch[kind.idx()] += 1;
+        self.reprice_body(id, priority);
+    }
+
+    fn reprice_body(&mut self, id: BlobId, priority: f64) {
+        for tier in [Tier::Hbm, Tier::Ddr, Tier::Nvme] {
+            self.pool_mut(tier).set_priority(id, priority);
+        }
     }
 
     #[must_use]
@@ -1630,11 +1727,16 @@ mod tests {
         index.insert(c, VecDeque::from([2u64, 9]));
         h.set_clairvoyant_index(index);
 
+        // Driven the way `arms::run_on` drives it: the op counter names the position the
+        // reference stream has reached, and every reference below sits at its own position.
+        h.set_clairvoyant_op(0);
         assert!(!h.access(&[(a, meta())]).pending);
+        h.set_clairvoyant_op(1);
         assert!(!h.access(&[(b, meta())]).pending);
         assert!(h.is_hot(&a, BlobKind::Snapshot));
         assert!(h.is_hot(&b, BlobKind::Snapshot));
 
+        h.set_clairvoyant_op(2);
         assert!(!h.access(&[(c, meta())]).pending);
         assert!(
             h.is_hot(&a, BlobKind::Snapshot),
@@ -1645,6 +1747,77 @@ mod tests {
             "b has no future use and must be evicted first"
         );
         assert!(h.is_hot(&c, BlobKind::Snapshot));
+    }
+
+    /// `phase-2.md` §4.5: a reference that never reaches `clairvoyant_touch` -- a refused
+    /// chain abandons the rest of its blobs, `run_on` drops a refused request's dependency
+    /// set, and `FlowMode::Gate` skips whole requests -- must not desync the schedule
+    /// permanently. Popping by *position* rather than by count is what repairs it: the blob's
+    /// next reference discards everything already in the past in one step.
+    #[test]
+    #[allow(
+        clippy::many_single_char_names,
+        reason = "four interchangeable fixture blobs; longer names would not distinguish them"
+    )]
+    fn a_skipped_reference_does_not_desync_the_clairvoyant_schedule() {
+        let bands = [0u8; BlobKind::N];
+        // Three blobs fit exactly; the fourth must evict one.
+        let mem = NodeMemory {
+            hbm: 0,
+            ddr: 300,
+            nvme: 0,
+            hbm_quota: Quota::open(0, bands),
+            ddr_quota: Quota::open(300, bands),
+            can_decode: true,
+        };
+        let mut h = Hierarchy::new(mem, Policy::Clairvoyant);
+        let meta = || BlobMeta {
+            kind: BlobKind::Snapshot,
+            bytes: 100,
+            parent: None,
+            recompute_ns: 1_000,
+        };
+        let (a, x, y, z) = (
+            BlobId::leaf(b"skip-a"),
+            BlobId::leaf(b"skip-x"),
+            BlobId::leaf(b"skip-y"),
+            BlobId::leaf(b"skip-z"),
+        );
+        let mut index = HashMap::new();
+        // `a` is referenced at 0, 1, 2 and then not again until 99. Ops 1 and 2 never reach
+        // the ledger -- exactly what a refused chain or a gated request leaves unseen -- so
+        // after op 3 its true next use is the *furthest* of anything resident. A schedule that
+        // advanced by count rather than by position would read 2 instead: the *nearest*.
+        index.insert(a, VecDeque::from([0u64, 1, 2, 99]));
+        index.insert(x, VecDeque::from([4u64, 10]));
+        index.insert(y, VecDeque::from([5u64, 20]));
+        index.insert(z, VecDeque::from([6u64, 7]));
+        h.set_clairvoyant_index(index);
+
+        h.set_clairvoyant_op(0);
+        assert!(!h.access(&[(a, meta())]).pending);
+        h.set_clairvoyant_op(3);
+        assert!(!h.access(&[(a, meta())]).pending);
+        h.set_clairvoyant_op(4);
+        assert!(!h.access(&[(x, meta())]).pending);
+        h.set_clairvoyant_op(5);
+        assert!(!h.access(&[(y, meta())]).pending);
+
+        // Pool is exactly full with a(next 99), x(next 10), y(next 20). Admitting a fourth
+        // must evict `a`. Under a count-advanced schedule `a` would read next-use 2, survive
+        // as the apparently most urgent entry, and `y` would be evicted in its place.
+        h.set_clairvoyant_op(6);
+        assert!(!h.access(&[(z, meta())]).pending);
+        assert!(
+            !h.is_hot(&a, BlobKind::Snapshot),
+            "a's true next use (99) is the furthest resident, so a goes first"
+        );
+        assert!(h.is_hot(&x, BlobKind::Snapshot));
+        assert!(
+            h.is_hot(&y, BlobKind::Snapshot),
+            "y is what a desynced schedule would have evicted instead of a"
+        );
+        assert!(h.is_hot(&z, BlobKind::Snapshot));
     }
 
     /// `phase-2.md` §1.8, §4.6: admitting a class that must evict a *different* class is

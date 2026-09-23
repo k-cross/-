@@ -17,9 +17,21 @@ use crate::cache::Cost;
 /// - `belief`     = `R(m_b) - R(m_t)`     -- the argmin was taken over a stale view
 /// - `model`      = `R(m_t) - R(o)`       -- the score's cost function is not the realized charge
 ///
-/// They telescope: `execution + heuristic + belief + model == total`. Under `Control::Unified`
-/// and `Control::Query` today, `execution` and `belief` are provably zero -- there is no stale
-/// view to diverge from -- and Phase 4's lossy telemetry is what first makes them nonzero.
+/// They telescope: `execution + heuristic + belief + model == total`.
+///
+/// `belief` is zero under `Control::Unified` and `Control::Query` and can only be nonzero under
+/// `Control::Gossip`: it is a difference between two argmins taken over belief and over truth,
+/// and without a stale view those are the same argmin. Phase 4's lossy telemetry is what makes
+/// it nonzero everywhere.
+///
+/// `execution` is **not** zero merely because the view is exact, and the doc comment here used
+/// to say it was. It is `charged(p) - R(p)`, and a second mechanism reaches it: `Machine::plan`
+/// prices a request's chain and its dependencies independently against one snapshot of
+/// residency, while `run_here` materialises them in sequence, so under eviction pressure one
+/// side's admission can invalidate the other's price. That fires at `distributed`'s own
+/// defaults for every arm with DDR pressure, not only in the adversarial fixture
+/// `machine.rs`'s tight-pool test uses. A nonzero `execution` alongside a zero `belief` is
+/// therefore this ordering effect, never staleness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Regret {
     pub total: i64,

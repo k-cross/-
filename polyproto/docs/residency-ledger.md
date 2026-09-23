@@ -1051,77 +1051,101 @@ shipping only the first two would measure the same.
 
 `phase-2.md`, implemented. A realized-cost oracle prices every candidate against truth at each
 decision (read-only, myopic by construction) and decomposes `charged(p) - R(o)` into four causes:
-`execution` (a plan executed against a view that had gone stale by the time it ran), `heuristic`
-(the policy is not an argmin over its own belief), `belief` (the argmin was taken over a stale
-view), `model` (the score's cost function is not the realized charge). `--regret` on `distributed`
-and `code-review`, `--clairvoyant` on `residency`/`flows`/`volatility`.
+`execution` (a plan whose price was invalidated before it ran), `heuristic` (the policy is not an
+argmin over its own belief), `belief` (the argmin was taken over a stale view), `model` (the score's
+cost function is not the realized charge). `--regret` on `distributed` and `code-review`,
+`--clairvoyant` on `residency`/`flows`/`volatility`.
+
+**On precision.** `distributed` embeds a live boundary measurement in its link costs, so it is not
+reproducible run to run -- two back-to-back runs here differ by ~1 ms of stall and several points of
+split rate. The ns figures below are one run, quoted to their printed precision but not stable in
+their last digits; the structural facts (which gaps are exactly zero, and the order-of-magnitude
+separation between arms) are what survive re-running.
 
 **The scored arm's entire regret is model gap.** 15k requests, rack, `distributed --regret`
 defaults:
 
 | arm | regret (mean ns/decision) | execution | heuristic | belief | model |
 |---|---|---|---|---|---|
-| hash only | 50,827,979 | 416,466 | 49,634,752 | 0 | 776,761 |
-| residency only | 676,236,637 | -421 | 547,157,113 | 0 | 129,079,945 |
-| flow only | 44,756,997 | 1,097,688 | 41,764,335 | 0 | 1,894,974 |
-| scored, no flows | 542,583 | 25 | 154 | 0 | 542,405 |
-| **scored** | **544,328** | **0** | **0** | 0 | 544,328 |
-| scored + fetch | 1,654,575 | 397,377 | 0 | 0 | 1,257,198 |
-| scored + fetch, gossiped | 8,195,042 | 6,159,418 | -151,253 | 810,357 | 1,376,520 |
+| hash only | 50,827,511 | 416,466 | 49,633,935 | 0 | 777,110 |
+| residency only | 676,237,616 | -421 | 547,157,998 | 0 | 129,080,039 |
+| flow only | 44,737,944 | 1,097,688 | 41,744,050 | 0 | 1,896,206 |
+| scored, no flows | 542,710 | 25 | 176 | 0 | 542,510 |
+| **scored** | **544,374** | **0** | **0** | 0 | 544,374 |
+| scored + fetch | 1,058,655 | 203,896 | 0 | 0 | 854,759 |
+| scored + fetch, gossiped | 8,124,594 | 6,098,380 | -176,835 | 886,675 | 1,316,373 |
 
-**`scored`'s heuristic gap is exactly zero; `scored, no flows`'s is 154 ns -- the affinity
-tie-break, and nothing else.** Every other arm carries heuristic regret in the tens to hundreds of
-millions of ns/decision while matching or beating `scored` on end-to-end service time: the
-large-regret, small-deficit signature of a policy whose value sits in the trajectory rather than
-the decision, not a defect in those arms. `belief` is zero everywhere except under `Control::Gossip`
-(29.7M and 810K ns/decision for the two gossiped rows), which is the one mechanism built to produce
-a stale view. `scored + fetch`'s nonzero `execution` (397,377 ns) is real and scoped, not noise: see
-below.
+**`scored`'s heuristic gap is exactly zero; `scored, no flows`'s is 176 ns.** Both arms fall back to
+content affinity when the score ties -- on 0.4% and 0.8% of decisions respectively -- and the
+fallback is the only way the policy's pick can differ from the model's own argmin, so the heuristic
+gap is confined to exactly those decisions by construction. For the flow-aware arm it is not merely
+small but free: the ties it breaks are ties in realized cost too. Every unscored arm carries
+heuristic regret in the tens to hundreds of millions of ns/decision while matching or beating
+`scored` on end-to-end service time -- the large-regret, small-deficit signature of a policy whose
+value sits in the trajectory rather than the decision, not a defect in those arms.
+
+`belief` is zero everywhere except under `Control::Gossip` (29.7M and 887K ns/decision for the two
+gossiped rows), which is the one mechanism built to produce a stale view. **`execution` is not zero
+merely because the view is exact**, and an earlier version of this section said it was: the arms
+with nonzero `execution` here are the arms with DDR eviction pressure, and their `belief` is exactly
+zero, so staleness cannot be the cause. See the residual paragraph at the end of this section.
 
 **A myopic oracle cannot see the falsification that already failed, and re-running it proves it.**
 The flow-payload sweep above, replayed through `--flow-payload` and `--regret` at region distance:
 
 | flow payload | flow only service/req | scored service/req | flow only heuristic regret | scored heuristic regret |
 |---|---|---|---|---|
-| 1 MiB | 534.5 ms | 497.2 ms | 52,068,692 | 0 |
-| 4 MiB | 534.5 ms | 497.5 ms | 51,822,287 | 0 |
-| 64 MiB | 534.5 ms | 502.2 ms | 47,976,644 | 0 |
-| 512 MiB | **534.5 ms** | **537.3 ms** | 38,189,822 | 0 |
+| 1 MiB | 534.5 ms | 497.2 ms | 52,073,532 | 0 |
+| 512 MiB | **534.5 ms** | **535.6 ms** | 38,312,514 | 0 |
 
 At 512 MiB `flow only` overtakes `scored` on service time while carrying tens of millions of ns of
 heuristic regret the whole way -- the metric's blind spot, reproduced on demand. (This sweep runs at
-15k `code-review`-shaped ops and the original config's fanout/tool mix, not the falsification
-section's now-retracted engine model, so the two tables are not directly comparable cell for cell;
-the qualitative finding -- regret and service time can disagree in this specific, named way -- is
-what carries over.)
+6k ops with the `distributed` fanout/tool mix, not the falsification section's now-retracted engine
+model, so the two tables are not comparable cell for cell; the qualitative finding -- regret and
+service time can disagree in this specific, named way -- is what carries over.)
 
-**Coupled %.** Memory coupling (host DDR, cross-class evictions the ledger's own `pick_class`
-already makes, compared against what a per-class quota's `pick_class` could ever choose) is **not**
-near zero at `distributed`'s defaults, which the earlier tables' engine model did not have pressure
-to show: 44.8-54.9% of evictions are cross-class for `flow only` and both `unified`/`gossiped`
-arms, against 0.0-0.5% for `hash only` and `residency only`, whose concentration-driven eviction
-patterns happen not to cross classes here. Locality coupling (the scored arm's argmin against a
-silo's -- no handoff term, displacement in one pool) is low throughout, 1.1-1.7% of scored
-decisions. Read together: at these defaults the unified advantage this phase can bound from above
-runs through memory arbitration, not through placement -- the opposite emphasis from `owned-and-
-observed.md`'s prospective ranking of where the largest effects should be, worth carrying into
-Phase 6's tenancy work rather than resolving here.
+**Coupled % is a statement about a regime, and at the published defaults the regime does not bind.**
+Memory coupling (host DDR: workload-driven evictions where the class evicted differs from the class
+being admitted, which is the trade a per-class quota's `pick_class` can never make) is **0.0% on
+every arm** at `distributed`'s defaults, over eviction counts of 0 to 2,265 -- there is almost no
+DDR pressure there, and none of what there is crosses classes. Tightened to 4 GiB DDR per node it is
+**93.8-96.4% of 16k-24k evictions**. Locality coupling (the scored arm's argmin against a silo's --
+no handoff term, displacement in one pool) is 0.8-1.7% of scored decisions in both regimes. So the
+axis behaves as §3.4 says it should: near zero where nothing binds, near total where memory does,
+and a single published figure would be a statement about a capacity choice rather than about an
+architecture.
 
-**Clairvoyant eviction wins hit rate and loses on cost.** `residency --clairvoyant`, defaults:
-soft-floor 42.632 ms/req at 0.61 `KvBlock` hit rate; clairvoyant (same open budget) 83.168 ms/req at
-0.77 -- **+16.2pp hit rate, +96.1% stall/req.** The diagnostic did the job §1.7 built it for: GDSF's
-gap to a perfect recency oracle is not where the ledger's cost comes from, so eviction-quality
-research is not where the next result is.
+An earlier version of this paragraph reported 44.8-54.9% at the defaults and read a conclusion off
+it. That was an instrument defect: coupling was counted inside `TierPool::admit`, which the
+`HBM -> DDR` demotion path also reaches through `offer`, so spillover volume was being counted as
+arbitration and the figure tracked accelerator sizing rather than the arbiter's policy. The two
+paths are now separate and only the workload-driven one counts.
 
-**A residual worth naming rather than hiding.** `scored + fetch`'s 397,377 ns execution gap (and
-the larger 6.16M ns under `gossiped`, where it compounds with real staleness) is not belief
-staleness -- both the oracle's read and the ledger's own plan see the same, current, true state at
-the moment each runs. It is a same-request ordering effect: `Machine::plan` prices a request's
-chain and its dependencies independently against one snapshot; `run_here` materialises the chain
-first and the dependencies second, and under real eviction pressure one side's admission can evict
-what the other side's price assumed would still be there. Reproduces under a deliberately tight
-pool regardless of split memory, vanishes at ample capacity, and stays under 20% of decisions even
-in the adversarial fixture built to find it (`machine.rs`'s test). Left alone rather than patched
+**Clairvoyant eviction wins hit rate and loses slightly on cost.** `residency --clairvoyant` at its
+true defaults, compared against `no-floor` because both run the open budget and so differ only in
+eviction quality: no-floor 74.097 ms/req at 0.51 `KvBlock` hit rate, clairvoyant 76.828 ms/req at
+0.74 -- **+22.8pp hit rate for +3.7% stall/req**. `volatility --clairvoyant` reproduces +3.1-3.5% at
+every volatility level. The diagnostic did the job §1.7 built it for, and the answer is sharper for
+being small: GDSF gives up 22.8 points of hit rate to a perfect recency oracle and still comes out
+ahead on cost, because the hits it gives up are the cheap ones. Eviction-quality research is not
+where the next result is; cost-weighting is already doing the work.
+
+*(This figure was first published as +16.2pp and +96.1%, which was wrong in two independent ways: it
+divided the open-budget clairvoyant arm by the swept `soft-floor` arm, putting budget policy inside
+a number labelled eviction quality -- the budget-matched comparator was two rows above it in the
+same table -- and it came from a `--ops 5000` run described as "defaults". The comparator is fixed
+in the tool, which now prints the budget-matched line first and labels the soft-floor line as the
+two effects combined: `clairvoyant vs soft-floor` is +469.2%, and almost all of that is the budget.)*
+
+**A residual worth naming rather than hiding.** The nonzero `execution` gaps in the table above are
+not belief staleness -- both the oracle's read and the ledger's own plan see the same, current, true
+state at the moment each runs, and `belief` is exactly zero on those rows. It is a same-request
+ordering effect: `Machine::plan` prices a request's chain and its dependencies independently against
+one snapshot; `run_here` materialises the chain first and the dependencies second, and under
+eviction pressure one side's admission can evict what the other side's price assumed would still be
+there. It appears at the defaults for every arm with DDR pressure, not only in the tight-pool
+fixture built to isolate it, and it stays bounded (under 20% of decisions even there) and isolated
+(the other three gaps stay exactly zero wherever it fires). Left alone rather than patched
 mid-phase, per `phase-2.md`'s own rule: the apparatus measures, it does not repair.
 
 ## Method
@@ -1246,8 +1270,8 @@ computed.
 | KV state transfer | roughly neutral end to end |
 | state transfer taxes the FaaS warm pool | **retracted** — a unified-memory and capacity artifact |
 | the score's handoff term prices co-placement | **fails** (pre-batching model, not re-run); the myopic regret oracle reproduces the same blind spot on demand — `flow only` beats `scored` on service time at 512 MiB while carrying far larger heuristic regret |
-| memory coupling at the `distributed` defaults | **not near zero** — 44.8–54.9% of host-DDR evictions are cross-class for several arms; locality coupling stays low (1.1–1.7%) |
-| clairvoyant eviction vs GDSF | wins hit rate (+16.2pp), loses on cost (+96.1% stall/req) — the ledger's value is in cost-weighting, not recency prediction |
+| memory coupling | regime-bound — **0.0%** at the `distributed` defaults (nothing binds), **93.8–96.4%** at 4 GiB DDR/node; locality coupling 0.8–1.7% in both |
+| clairvoyant eviction vs GDSF | budget-matched: wins hit rate (+22.8pp), loses on cost (+3.7%) — GDSF gives up the *cheap* hits, so cost-weighting is already doing the work |
 | unified control plane beats RPC-queried | rounding error in aggregate; 43–60% of a warm invocation |
 | announce / anticipatory prewarm | 11–18% faster tasks, net work slightly worse |
 | downstream-aware gate | Tier 1 — replicable by a hint API |

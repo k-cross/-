@@ -101,6 +101,17 @@ lossy telemetry is what makes the execution and belief gaps nonzero under every 
 Phase 2 builds the instrument with two slots that are provably empty now, and Phase 4 fills them
 without touching the instrument.
 
+**Measured: half of that last claim is wrong, and the table's `execution` row with it.** `belief` is
+as predicted -- identically zero under `Unified` and `Query`, nonzero only under `Gossip`, one empty
+slot for Phase 4 to fill. `execution` is **not** an empty slot: it is nonzero at `distributed`'s own
+defaults for every arm with DDR eviction pressure, with `belief` sitting at exactly zero beside it,
+so staleness cannot be the cause. A second mechanism reaches it, named after the fact rather than in
+advance: `Machine::plan` prices a request's chain and its dependencies independently against one
+snapshot of residency, while `run_here` materialises them in sequence, so an admission on one side
+can evict what the other side's price assumed. The row should read "a plan whose price was
+invalidated before it ran", of which a stale view is one cause and same-request ordering under
+pressure is another. §2's P3 records how this was found and what bounds it.
+
 ### 1.3 Realized cost has to be computable without mutating anything
 
 The oracle runs inside the decision loop, on every candidate. If it mutates, it is no longer an
@@ -285,6 +296,18 @@ fires where the costs are equal.
   quietly deciding placements. That would be a finding about the score, found by the instrument, and
   it goes in the ledger's *Standing* table rather than being repaired here.
 
+**Measured: confirmed on the count, and smaller than "small but not zero" on the size.** The
+confinement holds by construction -- the affinity fallback is the only way `p` can differ from
+`m_b`, so a heuristic gap outside `held_by_affinity`'s decisions would have been an instrument bug
+-- and none appeared. The size came in at **176 ns/decision for `scored, no flows` and exactly 0 for
+`scored`**, against `held_by_affinity` firing on 0.8% and 0.4% of decisions respectively. So the
+tie-break fires in both arms and is, for the flow-aware one, not merely cheap but free: the ties it
+breaks are ties in realized cost too. `scored`'s regret is all model gap, as the *if right* branch
+says, but for a stronger reason than predicted. Worth recording that the first published draft of
+this outcome explained it by claiming `scored, no flows` "never falls back to affinity" -- which the
+instrument's own counters refute, since that arm falls back twice as often as the one it was being
+contrasted with. The counters were right and the prose was invented around them.
+
 **P2 -- regret preserves the arms' ranking but compresses their gaps, and `hash only` is the
 exception that carries the information.** The score is an argmin over a cost model, so it should
 show the least regret; residency-greedy picks saturated nodes and should show the most. But `hash
@@ -326,6 +349,24 @@ ns/byte discounted by measured regret, so it will keep a `WeightShard` a distanc
   measuring the smaller of two effects, and Phase 3's LRU is cheaper than feared for the wrong
   reason -- because the thing it replaces was not very good either.
 
+**Measured: the losing branch, by 3.7% -- and the first published version of this number was 96.1%,
+which was a measurement error, not a result.** Budget-matched (`clairvoyant` and `no-floor` both at
+`Budget::Open`, so only eviction quality differs), `residency --clairvoyant` at its true defaults
+buys **+22.8pp `KvBlock` hit rate for +3.7% stall/req**; `volatility --clairvoyant` reproduces
++3.1-3.5% at every volatility level. The *if it loses on cost* branch therefore fires, and its
+reading stands: a large hit-rate gain converting to a cost loss is exactly "the ledger's value is in
+cost weighting, not recency prediction", because GDSF gives up 22.8pp of hits and still comes out
+ahead on cost by evicting the cheap things.
+
+**The error is worth recording in full, because it was the kind §7 is about.** The first draft
+divided the clairvoyant arm (`Budget::Open`) by the *swept* `soft-floor` arm (`Budget::Split`) and
+published the quotient under an eviction-quality label; the budget-matched comparator was printed
+two rows above it in the same table. That put budget policy -- far the larger effect -- inside a
+number attributed to eviction, and inverted the sign of the interesting part. It was also published
+as "at `residency`'s defaults" from a `--ops 5000` run. Both the comparator and the provenance are
+fixed in the tool, not just in the prose: `residency_report` now prints the budget-matched line
+first and labels the soft-floor line as the two effects combined.
+
 **P5 -- memory coupling is double digits where memory binds and near zero at the published
 defaults; locality coupling is single digits everywhere.** The soft-floor result is 32% on the
 tightened configuration, so classes there genuinely contend; the `distributed` defaults report no
@@ -341,6 +382,21 @@ missing.
   it is the first number that separates the two.
 - *If both are near zero in every regime:* the unified thesis is narrower than §5 claims, and
   `owned-and-observed.md` should say so in §5 rather than waiting for Phase 7's per-pattern table.
+
+**Measured: confirmed on both axes, after the counter was corrected.** At `distributed`'s defaults
+memory coupling is **0.0%** on every arm, over eviction counts of 0-2,265 -- no pressure, nothing to
+couple, exactly as predicted. Tightened to 4 GiB DDR per node it is **93.8-96.4% of 16k-24k
+evictions**. Locality coupling is **0.8-1.7%** of scored decisions in both regimes, single digits as
+predicted and near the `moved_by_flow` scale. So §3.4's "answers it per regime" qualifier is the
+right one, and a single published coupled figure really would be a statement about a capacity choice.
+
+**This prediction was briefly published as half-wrong, and that was the instrument's fault.** The
+first version counted coupling inside `TierPool::admit`, which `offer` also reaches -- so every
+HBM->DDR demotion counted as an arbitrated eviction, and the defaults reported 44.8-54.9% of ~46k-86k
+"evictions". That number tracked accelerator sizing rather than the arbiter's policy: it was
+spillover volume wearing a coupling label. `admit` and `offer` now take separate paths and only the
+workload-driven one counts. The corrected defaults agree with the prediction; the prediction was
+never the thing that was wrong.
 
 **P6 -- the oracle cannot see the falsification that already failed, and running it there proves
 it.** Re-run the flow-payload sweep (512x, region distance) with the instrument attached. Prediction:
