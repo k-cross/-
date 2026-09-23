@@ -726,6 +726,19 @@ what it displaces. In a siloed stack a retention hint is advisory and unpriced.
 
 ### 3.4 Oracle, regret, coupling
 
+**Status: implemented and measured** (`phase-2.md`, `src/oracle.rs`, `Machine::oracle_pick` /
+`finish_regret` in `src/machine.rs`). "Oracle" names three different things, only one of which is
+buildable: an *information* oracle (the model's own cost over true state) is identical to the scored
+policy by construction and its regret is trivially zero; a *clairvoyant* oracle over the whole future
+trace is intractable, since a decision changes the residency the next decision faces. What is built is
+the **realized-cost oracle** -- at each decision, read-only, price what the simulator would actually
+charge to serve this request at each candidate, against truth rather than belief, and take the
+minimum. It is a lower bound on what a better policy could win, not an upper one: it is myopic, so it
+cannot see a policy whose value is the residency it creates, which `residency-ledger.md`'s
+*falsification test that fails* already demonstrated (§9's P6 re-ran that test through this exact
+instrument and reproduced the blind spot: at a 512 MiB flow payload, `flow only` shows far larger
+heuristic regret than `scored` while achieving *lower* service time).
+
 The methodological gap, and the reason every number so far carries a fairness caveat. Import three
 metrics from `sched_lm`:
 
@@ -1444,6 +1457,41 @@ one and hide which is carrying the result -- which is exactly what Phase 3 chang
   against a hand-built baseline, retiring the fairness caveat on every number so far.
 - **Risk:** the oracle may reveal the scored policy's margin is mostly baseline weakness. Better
   found here than after Phase 3 muddies it. **Size:** medium.
+
+**Status: implemented and measured.** `phase-2.md` §2's six predictions, checked against `distributed
+--regret` and `residency`/`flows`/`volatility --clairvoyant`:
+
+- **P1** (scored's heuristic gap is the affinity tie-break, confined and small): **confirmed.** The
+  `scored` arm's `execution`, `heuristic` and `belief` gaps are all exactly zero; `scored, no flows`
+  -- which never falls back to affinity -- carries a tiny nonzero heuristic gap instead. The scored
+  arm's entire regret is model gap, as predicted.
+- **P2** (myopic regret under-credits a policy whose value is the trajectory): **confirmed.**
+  `hash only`, `residency only` and `flow only` all carry heuristic regret in the tens of millions of
+  ns/decision while matching or beating `scored` on end-to-end service time -- the large-regret,
+  small-deficit signature P2 named in advance.
+- **P3** (`R(p) == charged(p)` exactly, non-gang, non-saturated): **confirmed under ample capacity,
+  with a scoped exception.** Exact on the fixture every regret test uses. Under a deliberately tight
+  pool a bounded residual appears (under 20% of spans in the adversarial fixture, isolated to
+  `execution` alone -- the other three gaps stay exactly zero wherever it fires): `plan` prices a
+  request's chain and its dependencies independently against one snapshot, while `run_here`
+  materialises them in sequence, so real eviction pressure lets one side's admission invalidate the
+  other's price. Not belief staleness -- both reads see the same, current, true state -- and left
+  alone per rule 1 rather than patched mid-phase; `machine.rs`'s test pins the boundary.
+- **P4** (clairvoyant may lose on cost): **confirmed, the losing branch.** At `residency`'s defaults,
+  clairvoyant eviction buys +16.2pp `KvBlock` hit rate over soft-floor and costs +96.1% stall/req.
+  The diagnostic did its job: eviction quality is not what limits GDSF here, cost-weighting is.
+- **P5** (coupled % is low at the published defaults, higher where memory binds): **half-confirmed,
+  and the surprising half is the finding.** Locality coupling is low (1-2% of scored decisions) as
+  predicted. Memory coupling is **not** near zero at `distributed`'s defaults -- 44-55% of host-DDR
+  evictions are cross-class for several arms, because real DDR pressure exists there that the
+  `residency-ledger.md` tables (measured on an older engine model) did not show. The prediction was
+  wrong about the regime, not about the mechanism: coupled % tracks pressure exactly as designed, and
+  `distributed`'s defaults turn out to have more of it than assumed.
+- **P6** (the oracle cannot see the falsification that already failed): **confirmed.** Re-running the
+  flow-payload sweep (§4.7's knob, region distance) through the instrument: at 512 MiB, `flow only`'s
+  heuristic regret is far larger than `scored`'s (which stays exactly zero throughout, per P1) while
+  `flow only`'s service time is *lower* -- 534.5 ms against `scored`'s 537.3 ms. The metric's own
+  blind spot, reproduced on demand rather than argued from the retracted numbers.
 
 ### Phase 3 -- The engine allocates; the orchestrator sizes the partition
 
