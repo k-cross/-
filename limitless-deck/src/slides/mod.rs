@@ -1,8 +1,8 @@
 pub mod intro;
 pub mod mutex_bottleneck;
 
-use bevy::prelude::*;
 use crate::slideshow::SlideState;
+use bevy::prelude::*;
 
 pub struct SlidesPlugin;
 

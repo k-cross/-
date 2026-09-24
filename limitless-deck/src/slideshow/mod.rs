@@ -59,7 +59,14 @@ impl Plugin for SlideshowPlugin {
                 character::CharacterPlugin,
             ))
             .add_systems(Startup, hud::setup_hud)
-            .add_systems(Update, (handle_slide_input, hud::update_hud, hud::animate_hud));
+            .add_systems(
+                Update,
+                (
+                    handle_slide_input,
+                    hud::update_hud.run_if(resource_changed::<SlideController>),
+                    hud::animate_hud,
+                ),
+            );
     }
 }
 

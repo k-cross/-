@@ -1,14 +1,16 @@
-use bevy::prelude::*;
-use bevy::state::state_scoped::DespawnOnExit;
-use crate::theme::colors::*;
-use crate::theme::geometry::*;
-use crate::slideshow::SlideState;
 use crate::slideshow::FontAssets;
-use crate::slideshow::animation::{SlamEntrance, PunkJitter, BobbingCursor};
-use crate::slideshow::splatter::{spawn_ink_blotch, spawn_ui_ink_blotch, spawn_corner_ink_splatter, CardCorner};
+use crate::slideshow::SlideState;
+use crate::slideshow::animation::{BobbingCursor, PunkJitter, SlamEntrance};
+use crate::slideshow::splatter::{
+    CardCorner, spawn_corner_ink_splatter, spawn_ink_blotch, spawn_ui_ink_blotch,
+};
+use crate::theme::colors::*;
 use crate::theme::cutout;
+use crate::theme::geometry::*;
 use crate::theme::starburst;
 use crate::theme::typography::*;
+use bevy::prelude::*;
+use bevy::state::state_scoped::DespawnOnExit;
 
 #[allow(dead_code)]
 pub struct CutoutLetter {
@@ -35,33 +37,31 @@ pub fn spawn_cutout_letter(builder: &mut ChildSpawnerCommands, letter: CutoutLet
     if let Some(font) = letter.font {
         text_font = text_font.with_font(font);
     }
-    builder.spawn((
-        Node {
-            padding: UiRect::axes(Val::Px(letter.pad_h), Val::Px(letter.pad_v)),
-            border: letter.border,
-            border_radius: letter.border_radius,
-            margin: UiRect {
-                left: Val::Px(cutout::SCRAP_MARGIN),
-                right: Val::Px(cutout::SCRAP_MARGIN),
-                top: Val::Px(letter.offset_y.max(0.0)),
-                bottom: Val::Px((-letter.offset_y).max(0.0)),
+    builder
+        .spawn((
+            Node {
+                padding: UiRect::axes(Val::Px(letter.pad_h), Val::Px(letter.pad_v)),
+                border: letter.border,
+                border_radius: letter.border_radius,
+                margin: UiRect {
+                    left: Val::Px(cutout::SCRAP_MARGIN),
+                    right: Val::Px(cutout::SCRAP_MARGIN),
+                    top: Val::Px(letter.offset_y.max(0.0)),
+                    bottom: Val::Px((-letter.offset_y).max(0.0)),
+                },
+                ..default()
             },
-            ..default()
-        },
-        BackgroundColor(letter.bg),
-        letter.border_color,
-        Transform::from_rotation(Quat::from_rotation_z(letter.tilt)),
-        Visibility::default(),
-        InheritedVisibility::default(),
-        SlamEntrance::new(letter.slam_offset, letter.slam_rot, letter.delay),
-        PunkJitter::new(letter.tilt, 0.055),
-    )).with_children(|scrap| {
-        scrap.spawn((
-            Text::new(letter.ch),
-            text_font,
-            TextColor(letter.fg),
-        ));
-    });
+            BackgroundColor(letter.bg),
+            letter.border_color,
+            Transform::from_rotation(Quat::from_rotation_z(letter.tilt)),
+            Visibility::default(),
+            InheritedVisibility::default(),
+            SlamEntrance::new(letter.slam_offset, letter.slam_rot, letter.delay),
+            PunkJitter::new(letter.tilt, 0.055),
+        ))
+        .with_children(|scrap| {
+            scrap.spawn((Text::new(letter.ch), text_font, TextColor(letter.fg)));
+        });
 }
 
 pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
@@ -74,7 +74,9 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
         85.0,
         Vec2::new(1.1, -0.5),
     );
-    commands.entity(title_blotch).insert(DespawnOnExit(SlideState::Intro));
+    commands
+        .entity(title_blotch)
+        .insert(DespawnOnExit(SlideState::Intro));
 
     // Slide-scoped high-voltage crimson ink spray across the bottom divider
     let crimson_spray = spawn_ink_blotch(
@@ -85,7 +87,9 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
         42.0,
         Vec2::new(1.4, 0.4),
     );
-    commands.entity(crimson_spray).insert(DespawnOnExit(SlideState::Intro));
+    commands
+        .entity(crimson_spray)
+        .insert(DespawnOnExit(SlideState::Intro));
 
     // Root full-screen slide container for intro
     commands.spawn((

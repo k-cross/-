@@ -1,12 +1,12 @@
-use bevy::prelude::*;
-use bevy::state::state_scoped::DespawnOnExit;
+use crate::slideshow::FontAssets;
+use crate::slideshow::SlideState;
+use crate::slideshow::animation::{PunkJitter, SlamEntrance};
+use crate::slideshow::code_view::{TokenKind, spawn_styled_code_block};
 use crate::theme::colors::*;
 use crate::theme::geometry::*;
 use crate::theme::typography::*;
-use crate::slideshow::SlideState;
-use crate::slideshow::FontAssets;
-use crate::slideshow::code_view::{spawn_styled_code_block, TokenKind};
-use crate::slideshow::animation::{SlamEntrance, PunkJitter};
+use bevy::prelude::*;
+use bevy::state::state_scoped::DespawnOnExit;
 
 pub fn spawn_mutex_bottleneck_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     // Root full-screen slide container

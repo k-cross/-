@@ -1,5 +1,5 @@
-use bevy::prelude::*;
 use bevy::asset::AssetId;
+use bevy::prelude::*;
 
 const IMPACT_BYTES: &[u8] = include_bytes!("../../assets/fonts/impact.ttf");
 const ARIAL_BOLD_BYTES: &[u8] = include_bytes!("../../assets/fonts/arial_bold.ttf");
@@ -53,7 +53,10 @@ impl FromWorld for FontAssets {
 
         // Also upgrade the engine's default font (AssetId::default()) from FiraMono-subset
         // to Arial Bold so any unadorned TextFont automatically inherits clean, bold sans-serif.
-        let _ = fonts.insert(AssetId::default(), Font::from_bytes(ARIAL_BOLD_BYTES.to_vec()));
+        let _ = fonts.insert(
+            AssetId::default(),
+            Font::from_bytes(ARIAL_BOLD_BYTES.to_vec()),
+        );
 
         FontAssets {
             display,

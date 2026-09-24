@@ -47,13 +47,13 @@ pub mod colors {
     // --- CODE STYLING (Strictly Reds, Whites, Blacks & Greys) ---
     pub const CODE_BG: Color = Color::srgb(0.035, 0.035, 0.047);
     pub const CODE_HEADER_BG: Color = Color::srgb(0.10, 0.10, 0.13);
-    pub const CODE_KEYWORD: Color = Color::srgb(0.95, 0.12, 0.20);  // Punchy P5 crimson
-    pub const CODE_TYPE: Color = Color::srgb(1.0, 1.0, 1.0);        // Pure stark white
+    pub const CODE_KEYWORD: Color = Color::srgb(0.95, 0.12, 0.20); // Punchy P5 crimson
+    pub const CODE_TYPE: Color = Color::srgb(1.0, 1.0, 1.0); // Pure stark white
     pub const CODE_FUNCTION: Color = Color::srgb(0.88, 0.88, 0.92); // Light silver
-    pub const CODE_STRING: Color = Color::srgb(0.75, 0.75, 0.80);   // Silver grey
-    pub const CODE_COMMENT: Color = Color::srgb(0.48, 0.48, 0.54);  // Muted slate grey
-    pub const CODE_NUMBER: Color = Color::srgb(0.92, 0.92, 0.95);   // Crisp off-white
-    pub const CODE_TEXT: Color = Color::srgb(0.98, 0.98, 1.0);      // Crisp white
+    pub const CODE_STRING: Color = Color::srgb(0.75, 0.75, 0.80); // Silver grey
+    pub const CODE_COMMENT: Color = Color::srgb(0.48, 0.48, 0.54); // Muted slate grey
+    pub const CODE_NUMBER: Color = Color::srgb(0.92, 0.92, 0.95); // Crisp off-white
+    pub const CODE_TEXT: Color = Color::srgb(0.98, 0.98, 1.0); // Crisp white
 
     // --- P5 ACCENT HIGHLIGHTS (Shop & Menu Special Selections) ---
     /// Vibrant Gold / Amber accent (e.g. Iwai Airsoft Shop SELL card)
@@ -388,6 +388,10 @@ pub mod motion {
     pub const JITTER_FREQUENCY: f32 = 12.0;
     /// Interval between erratic sharp twitches (seconds) — fires twice as often
     pub const JITTER_TWITCH_INTERVAL: f32 = 0.25;
+    /// Minimum twitch timer reset floor (seconds)
+    pub const JITTER_TWITCH_MIN: f32 = 0.15;
+    /// Random twitch timer range added to min (seconds) — total range 0.15–0.45s
+    pub const JITTER_TWITCH_RANGE: f32 = 0.3;
     /// Twitch decay rate (per-second exponential falloff) — snappier snap-back
     pub const JITTER_TWITCH_DECAY: f32 = 12.0;
     /// Micro-pulse scale ceiling (1.0 + this value) — more visible breathing

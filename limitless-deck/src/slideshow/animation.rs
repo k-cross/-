@@ -1,5 +1,6 @@
-use bevy::prelude::*;
+use crate::theme::colors::*;
 use crate::theme::motion::*;
+use bevy::prelude::*;
 
 /// Fast spring easing function (~15 frames / 0.25s) with snappy overshoot
 pub fn ease_out_back(t: f32) -> f32 {
@@ -94,10 +95,10 @@ impl Plugin for AnimationPlugin {
         app.add_systems(
             Update,
             (
-                animate_slam_entrances,
+                animate_slam_entrances.run_if(any_with_component::<SlamEntrance>),
                 animate_punk_jitter,
                 animate_bobbing_cursors,
-                animate_screen_slashes,
+                animate_screen_slashes.run_if(any_with_component::<ScreenSlashBlade>),
             ),
         );
     }
@@ -118,7 +119,8 @@ fn animate_slam_entrances(
 
             // Start far off along the violent slam trajectory
             transform.translation += Vec3::new(slam.initial_offset.x, slam.initial_offset.y, 0.0);
-            transform.rotation = slam.target_rotation * Quat::from_rotation_z(slam.initial_rot_offset);
+            transform.rotation =
+                slam.target_rotation * Quat::from_rotation_z(slam.initial_rot_offset);
             transform.scale = slam.target_scale * SLAM_INITIAL_SCALE; // burst up from compact scale
 
             slam.initialized = true;
@@ -136,7 +138,8 @@ fn animate_slam_entrances(
 
         // Interpolate position with spring bounce
         let remaining_offset = slam.initial_offset * (1.0 - factor);
-        transform.translation = slam.target_translation + Vec3::new(remaining_offset.x, remaining_offset.y, 0.0);
+        transform.translation =
+            slam.target_translation + Vec3::new(remaining_offset.x, remaining_offset.y, 0.0);
 
         // Interpolate rotation
         let remaining_rot = slam.initial_rot_offset * (1.0 - factor);
@@ -168,7 +171,8 @@ fn animate_punk_jitter(
 
         // Rapid-fire erratic twitch every 0.15 - 0.45s
         if jitter.twitch_timer <= 0.0 {
-            jitter.twitch_timer = 0.15 + (jitter.phase.sin().abs() * 0.3);
+            jitter.twitch_timer =
+                JITTER_TWITCH_MIN + (jitter.phase.sin().abs() * JITTER_TWITCH_RANGE);
             // Aggressive punk twitch
             jitter.current_twitch = (jitter.phase * 3.14).sin() * 0.045;
         } else {
@@ -186,10 +190,7 @@ fn animate_punk_jitter(
     }
 }
 
-fn animate_bobbing_cursors(
-    time: Res<Time>,
-    mut query: Query<(&mut Node, &BobbingCursor)>,
-) {
+fn animate_bobbing_cursors(time: Res<Time>, mut query: Query<(&mut Node, &BobbingCursor)>) {
     let elapsed = time.elapsed_secs();
 
     for (mut node, cursor) in &mut query {
@@ -224,7 +225,7 @@ pub fn spawn_screen_slash(commands: &mut Commands) {
     // 1. Heavy Black Cut Blade
     commands.spawn((
         Sprite {
-            color: Color::srgb(0.05, 0.05, 0.07),
+            color: P5_BLACK,
             custom_size: Some(Vec2::new(3500.0, 120.0)),
             ..default()
         },
@@ -241,7 +242,7 @@ pub fn spawn_screen_slash(commands: &mut Commands) {
     // 2. High-Voltage Razor Crimson Edge
     commands.spawn((
         Sprite {
-            color: Color::srgb(0.902, 0.0, 0.071),
+            color: P5_RED,
             custom_size: Some(Vec2::new(3500.0, 16.0)),
             ..default()
         },
@@ -258,7 +259,7 @@ pub fn spawn_screen_slash(commands: &mut Commands) {
     // 3. Blinding Stark White Fracture Line
     commands.spawn((
         Sprite {
-            color: Color::WHITE,
+            color: P5_WHITE,
             custom_size: Some(Vec2::new(3500.0, 6.0)),
             ..default()
         },
