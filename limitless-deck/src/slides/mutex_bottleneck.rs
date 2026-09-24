@@ -4,10 +4,11 @@ use crate::theme::colors::*;
 use crate::theme::geometry::*;
 use crate::theme::typography::*;
 use crate::slideshow::SlideState;
+use crate::slideshow::FontAssets;
 use crate::slideshow::code_view::{spawn_styled_code_block, TokenKind};
 use crate::slideshow::animation::{SlamEntrance, PunkJitter};
 
-pub fn spawn_mutex_bottleneck_slide(mut commands: Commands) {
+pub fn spawn_mutex_bottleneck_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     // Root full-screen slide container
     commands.spawn((
         Node {
@@ -57,7 +58,7 @@ pub fn spawn_mutex_bottleneck_slide(mut commands: Commands) {
             )).with_children(|tag| {
                 tag.spawn((
                     Text::new("/// EXHIBIT A // MUTEX VS ATOMIC PRIMITIVES ///"),
-                    TextFont::from_font_size(FONT_BODY_SM),
+                    TextFont::from_font_size(FONT_BODY_SM).with_font(font_assets.display.clone()),
                     TextColor(P5_WHITE),
                 ));
             });
@@ -85,7 +86,7 @@ pub fn spawn_mutex_bottleneck_slide(mut commands: Commands) {
             )).with_children(|t| {
                 t.spawn((
                     Text::new("THE COST OF SERIALIZATION"),
-                    TextFont::from_font_size(FONT_HEADING_XL),
+                    TextFont::from_font_size(FONT_HEADING_XL).with_font(font_assets.display.clone()),
                     TextColor(P5_WHITE),
                 ));
             });
@@ -177,6 +178,7 @@ pub fn spawn_mutex_bottleneck_slide(mut commands: Commands) {
                     "concurrency_primitives.rs",
                     "RUST // ATOMICS",
                     code_lines,
+                    Some(font_assets.monospace.clone()),
                 );
             });
 
@@ -221,19 +223,19 @@ pub fn spawn_mutex_bottleneck_slide(mut commands: Commands) {
                         ..default()
                     }).with_children(|h| {
                         h.spawn((
-                            Text::new("⛓"),
-                            TextFont::from_font_size(FONT_BODY_ICON),
+                            Text::new("◆"),
+                            TextFont::from_font_size(FONT_BODY_ICON).with_font(font_assets.symbols.clone()),
                             TextColor(P5_RED),
                         ));
                         h.spawn((
                             Text::new("MUTEX PENALTY (CAPTIVITY)"),
-                            TextFont::from_font_size(FONT_BODY_LG),
+                            TextFont::from_font_size(FONT_BODY_LG).with_font(font_assets.sans_heavy.clone()),
                             TextColor(P5_RED),
                         ));
                     });
                     c1.spawn((
                         Text::new("Contended locks trigger syscalls, context switches, and cache thrashing. Threads are jailed in OS sleep queues."),
-                        TextFont::from_font_size(FONT_CAPTION),
+                        TextFont::from_font_size(FONT_CAPTION).with_font(font_assets.sans.clone()),
                         TextColor(P5_OFF_WHITE),
                     ));
                 });
@@ -269,18 +271,18 @@ pub fn spawn_mutex_bottleneck_slide(mut commands: Commands) {
                     }).with_children(|h| {
                         h.spawn((
                             Text::new("★"),
-                            TextFont::from_font_size(FONT_BODY_ICON),
+                            TextFont::from_font_size(FONT_BODY_ICON).with_font(font_assets.symbols.clone()),
                             TextColor(P5_WHITE),
                         ));
                         h.spawn((
                             Text::new("LOCK-FREE ADVANTAGE (FREEDOM)"),
-                            TextFont::from_font_size(FONT_BODY_LG),
+                            TextFont::from_font_size(FONT_BODY_LG).with_font(font_assets.sans_heavy.clone()),
                             TextColor(P5_WHITE),
                         ));
                     });
                     c2.spawn((
                         Text::new("Executes via CPU hardware cache coherency bus protocol (MESI). Never blocks or puts the thread to sleep."),
-                        TextFont::from_font_size(FONT_CAPTION),
+                        TextFont::from_font_size(FONT_CAPTION).with_font(font_assets.sans.clone()),
                         TextColor(P5_OFF_WHITE),
                     ));
                 });

@@ -54,6 +54,14 @@ pub mod colors {
     pub const CODE_COMMENT: Color = Color::srgb(0.48, 0.48, 0.54);  // Muted slate grey
     pub const CODE_NUMBER: Color = Color::srgb(0.92, 0.92, 0.95);   // Crisp off-white
     pub const CODE_TEXT: Color = Color::srgb(0.98, 0.98, 1.0);      // Crisp white
+
+    // --- P5 ACCENT HIGHLIGHTS (Shop & Menu Special Selections) ---
+    /// Vibrant Gold / Amber accent (e.g. Iwai Airsoft Shop SELL card)
+    pub const P5_GOLD: Color = Color::srgb(1.0, 0.78, 0.0);
+    /// Prismatic Neon Cyan slice accent (Reference 1 ITEM wedge)
+    pub const P5_CYAN: Color = Color::srgb(0.0, 0.90, 1.0);
+    /// Prismatic Neon Magenta slice accent (Reference 1 ITEM wedge)
+    pub const P5_MAGENTA: Color = Color::srgb(1.0, 0.0, 0.5);
 }
 
 /// Angles and geometry constants for Persona 5 slanted aesthetic
@@ -72,6 +80,16 @@ pub mod geometry {
 
     /// Strong accent tilt (~ -6.0 degrees)
     pub const TILT_STRONG: f32 = -0.105;
+
+    /// Descending tilt for P5 menu card staircases (~ -2.6 degrees)
+    pub const TILT_CARD: f32 = -0.045;
+
+    /// Horizontal indentation step for descending card staircase (px)
+    pub const CASCADE_STAIR_STEP: f32 = 28.0;
+
+    pub fn rot_card() -> Transform {
+        Transform::from_rotation(Quat::from_rotation_z(TILT_CARD))
+    }
 
     pub fn rot_primary() -> Transform {
         Transform::from_rotation(Quat::from_rotation_z(TILT_PRIMARY))
@@ -162,6 +180,52 @@ pub mod cutout {
             right: Val::Px(thin),
             bottom: Val::Px(thin),
         }
+    }
+
+    // --- Scrap shape presets using BorderRadius ---
+    /// Torn paper scrap with severed top-right corner
+    pub fn scrap_torn_tr() -> BorderRadius {
+        BorderRadius {
+            top_left: Val::Px(1.0),
+            top_right: Val::Px(14.0),
+            bottom_right: Val::Px(3.0),
+            bottom_left: Val::Px(1.0),
+        }
+    }
+
+    /// Rounded pill / zine badge scrap
+    pub fn scrap_rounded() -> BorderRadius {
+        BorderRadius::all(Val::Px(8.0))
+    }
+
+    /// Asymmetric diagonal clipped corner scrap
+    pub fn scrap_diagonal_cut() -> BorderRadius {
+        BorderRadius {
+            top_left: Val::Px(16.0),
+            top_right: Val::Px(1.0),
+            bottom_right: Val::Px(16.0),
+            bottom_left: Val::Px(1.0),
+        }
+    }
+
+    /// Opposite diagonal clipped scrap
+    pub fn scrap_diagonal_alt() -> BorderRadius {
+        BorderRadius {
+            top_left: Val::Px(1.0),
+            top_right: Val::Px(14.0),
+            bottom_right: Val::Px(1.0),
+            bottom_left: Val::Px(14.0),
+        }
+    }
+
+    /// Circular stamp / wax seal shaped scrap
+    pub fn scrap_circular() -> BorderRadius {
+        BorderRadius::MAX
+    }
+
+    /// Sharp sheared rectangular newspaper scrap
+    pub fn scrap_sharp() -> BorderRadius {
+        BorderRadius::ZERO
     }
 }
 

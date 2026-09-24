@@ -36,7 +36,19 @@ pub fn spawn_styled_code_block(
     file_title: &str,
     language_tag: &str,
     lines: Vec<Vec<(&str, TokenKind)>>,
+    mono_font: Option<Handle<Font>>,
 ) {
+    let font_gutter = if let Some(ref f) = mono_font {
+        TextFont::from_font_size(13.0).with_font(f.clone())
+    } else {
+        TextFont::from_font_size(13.0)
+    };
+    let font_token = if let Some(ref f) = mono_font {
+        TextFont::from_font_size(14.0).with_font(f.clone())
+    } else {
+        TextFont::from_font_size(14.0)
+    };
+
     // Outer Container with Persona 5 layered framing
     parent.spawn((
         Node {
@@ -132,7 +144,7 @@ pub fn spawn_styled_code_block(
                     )).with_children(|gutter| {
                         gutter.spawn((
                             Text::new(format!("{:02}", line_idx + 1)),
-                            TextFont::from_font_size(13.0),
+                            font_gutter.clone(),
                             TextColor(P5_MUTED),
                         ));
                     });
@@ -158,7 +170,7 @@ pub fn spawn_styled_code_block(
                         for (text, kind) in tokens {
                             token_row.spawn((
                                 Text::new(text),
-                                TextFont::from_font_size(14.0),
+                                font_token.clone(),
                                 TextColor(kind.color()),
                             ));
                         }

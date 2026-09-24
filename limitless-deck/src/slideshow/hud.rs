@@ -3,6 +3,7 @@ use crate::theme::colors::*;
 use crate::theme::geometry::*;
 use crate::theme::typography::*;
 use super::SlideController;
+use super::FontAssets;
 
 #[derive(Component)]
 pub struct SlideCounterText;
@@ -20,7 +21,7 @@ pub struct PulsingAlarm {
     pub speed: f32,
 }
 
-pub fn setup_hud(mut commands: Commands, controller: Res<SlideController>) {
+pub fn setup_hud(mut commands: Commands, controller: Res<SlideController>, font_assets: Res<FontAssets>) {
     // Root HUD node (non-blocking, full-screen overlay)
     commands.spawn((
         Node {
@@ -84,7 +85,7 @@ pub fn setup_hud(mut commands: Commands, controller: Res<SlideController>) {
                     // Date Stamp
                     row.spawn((
                         Text::new("09 / 23"),
-                        TextFont::from_font_size(FONT_HUD_DATE),
+                        TextFont::from_font_size(FONT_HUD_DATE).with_font(font_assets.display.clone()),
                         TextColor(P5_WHITE),
                     ));
                     // Weather / Time Tag
@@ -99,7 +100,7 @@ pub fn setup_hud(mut commands: Commands, controller: Res<SlideController>) {
                     )).with_children(|w| {
                         w.spawn((
                             Text::new("AFTER SCHOOL"),
-                            TextFont::from_font_size(FONT_TAG),
+                            TextFont::from_font_size(FONT_TAG).with_font(font_assets.sans_heavy.clone()),
                             TextColor(P5_LIGHT_GREY),
                         ));
                     });
@@ -114,19 +115,19 @@ pub fn setup_hud(mut commands: Commands, controller: Res<SlideController>) {
                 }).with_children(|sub| {
                     sub.spawn((
                         Text::new("PALACE: KERNEL // ALERT:"),
-                        TextFont::from_font_size(FONT_LABEL_SM),
+                        TextFont::from_font_size(FONT_LABEL_SM).with_font(font_assets.display.clone()),
                         TextColor(P5_MUTED),
                     ));
                     // Segmented Alarm Meter
                     sub.spawn((
                         Text::new("[▮▮▮▮▮▮▮▮▮▯ 99%]"),
-                        TextFont::from_font_size(FONT_LABEL_SM),
+                        TextFont::from_font_size(FONT_LABEL_SM).with_font(font_assets.symbols.clone()),
                         TextColor(P5_RED),
                         PulsingAlarm { speed: 8.0 },
                     ));
                     sub.spawn((
                         Text::new("[! TRESPASSER !]"),
-                        TextFont::from_font_size(FONT_TAG_SM),
+                        TextFont::from_font_size(FONT_TAG_SM).with_font(font_assets.sans_heavy.clone()),
                         TextColor(P5_WHITE),
                     ));
                 });
@@ -158,12 +159,12 @@ pub fn setup_hud(mut commands: Commands, controller: Res<SlideController>) {
             )).with_children(|status| {
                 status.spawn((
                     Text::new("TARGET: CORRUPT LORD OF MUTEXES"),
-                    TextFont::from_font_size(FONT_CAPTION_LG),
+                    TextFont::from_font_size(FONT_CAPTION_LG).with_font(font_assets.display.clone()),
                     TextColor(P5_WHITE),
                 ));
                 status.spawn((
                     Text::new("CHAINS OF SERIALIZATION: BREAKING"),
-                    TextFont::from_font_size(FONT_LABEL_SM),
+                    TextFont::from_font_size(FONT_LABEL_SM).with_font(font_assets.sans.clone()),
                     TextColor(P5_LIGHT_GREY),
                 ));
             });
@@ -222,12 +223,12 @@ pub fn setup_hud(mut commands: Commands, controller: Res<SlideController>) {
                 )).with_children(|badge| {
                     badge.spawn((
                         Text::new("///"),
-                        TextFont::from_font_size(FONT_HUD_STAR),
+                        TextFont::from_font_size(FONT_HUD_STAR).with_font(font_assets.display.clone()),
                         TextColor(P5_RED),
                     ));
                     badge.spawn((
                         Text::new(format!("SLIDE {:02} / {:02}", controller.current_index + 1, controller.total_slides)),
-                        TextFont::from_font_size(FONT_HUD_COUNTER),
+                        TextFont::from_font_size(FONT_HUD_COUNTER).with_font(font_assets.display.clone()),
                         TextColor(P5_WHITE),
                         SlideCounterText,
                     ));
@@ -260,43 +261,43 @@ pub fn setup_hud(mut commands: Commands, controller: Res<SlideController>) {
                     // Animated Persona 5 "Take Your Time" rotating star
                     prompt.spawn((
                         Text::new("★"),
-                        TextFont::from_font_size(FONT_HUD_STAR),
+                        TextFont::from_font_size(FONT_HUD_STAR).with_font(font_assets.symbols.clone()),
                         TextColor(P5_RED),
                         RotatingStar { speed: 2.5 },
                     ));
                     prompt.spawn((
                         Text::new("TAKE YOUR TIME"),
-                        TextFont::from_font_size(FONT_HUD_LABEL),
+                        TextFont::from_font_size(FONT_HUD_LABEL).with_font(font_assets.display.clone()),
                         TextColor(P5_LIGHT_GREY),
                     ));
                     prompt.spawn((
                         Text::new("|"),
-                        TextFont::from_font_size(FONT_HUD_LABEL),
+                        TextFont::from_font_size(FONT_HUD_LABEL).with_font(font_assets.sans.clone()),
                         TextColor(P5_BORDER),
                     ));
                     prompt.spawn((
                         Text::new("[SPACE / →] EXECUTE ATTACK"),
-                        TextFont::from_font_size(FONT_HUD_PROMPT),
+                        TextFont::from_font_size(FONT_HUD_PROMPT).with_font(font_assets.sans_heavy.clone()),
                         TextColor(P5_WHITE),
                     ));
                     prompt.spawn((
                         Text::new("★"),
-                        TextFont::from_font_size(FONT_HUD_LABEL),
+                        TextFont::from_font_size(FONT_HUD_LABEL).with_font(font_assets.symbols.clone()),
                         TextColor(P5_RED),
                     ));
                     prompt.spawn((
                         Text::new("[←] BATON PASS"),
-                        TextFont::from_font_size(FONT_HUD_PROMPT),
+                        TextFont::from_font_size(FONT_HUD_PROMPT).with_font(font_assets.sans_heavy.clone()),
                         TextColor(P5_WHITE),
                     ));
                     prompt.spawn((
                         Text::new("★"),
-                        TextFont::from_font_size(FONT_HUD_LABEL),
+                        TextFont::from_font_size(FONT_HUD_LABEL).with_font(font_assets.symbols.clone()),
                         TextColor(P5_RED),
                     ));
                     prompt.spawn((
                         Text::new("[F] ALL-OUT ATTACK (FULLSCREEN)"),
-                        TextFont::from_font_size(FONT_HUD_PROMPT),
+                        TextFont::from_font_size(FONT_HUD_PROMPT).with_font(font_assets.sans_heavy.clone()),
                         TextColor(P5_WHITE),
                     ));
                 });

@@ -212,43 +212,43 @@ fn setup_background(mut commands: Commands) {
     // ==============================================================
     // 6. ORGANIC INK BLOTCHES & HIGH-VELOCITY SPRAY SPLATTERS
     // ==============================================================
-    // Deep black ink pool anchoring the title scrap area
+    // High-voltage crimson ink pool anchoring the left side of the screen
     crate::slideshow::splatter::spawn_ink_blotch(
         &mut commands,
-        Vec2::new(-350.0, 70.0),
-        -86.0,
-        P5_OFF_BLACK,
+        Vec2::new(-380.0, 120.0),
+        -75.0,
+        P5_DARK_RED,
         ink::RADIUS_XL,
-        Vec2::new(1.2, -0.4),
+        Vec2::new(1.3, -0.4),
     );
 
-    // Electric crimson splatter cutting under the divider
+    // Electric bright crimson splatter cutting under the hazard band
     crate::slideshow::splatter::spawn_ink_blotch(
         &mut commands,
-        Vec2::new(-200.0, -120.0),
-        -82.0,
-        P5_RED,
-        45.0,
+        Vec2::new(-180.0, -110.0),
+        -74.0,
+        P5_BRIGHT_RED,
+        50.0,
         Vec2::new(1.5, 0.3),
     );
 
-    // Charcoal ink stain pooling under the calling card
+    // High-contrast crimson ink splatter radiating from the right side
     crate::slideshow::splatter::spawn_ink_blotch(
         &mut commands,
-        Vec2::new(320.0, 70.0),
-        -86.0,
-        P5_CHARCOAL,
+        Vec2::new(180.0, 190.0),
+        -75.0,
+        P5_RED,
         ink::RADIUS_LG,
-        Vec2::new(-1.0, -0.7),
+        Vec2::new(-1.1, -0.6),
     );
 
-    // Crimson spray splatter near bottom-right
+    // High-velocity crimson spray splatter near bottom-right
     crate::slideshow::splatter::spawn_ink_blotch(
         &mut commands,
-        Vec2::new(450.0, -180.0),
-        -82.0,
-        P5_DARK_RED,
-        38.0,
+        Vec2::new(480.0, -160.0),
+        -74.0,
+        P5_RED,
+        48.0,
         Vec2::new(-0.8, 1.4),
     );
 }

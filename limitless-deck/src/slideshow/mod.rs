@@ -2,8 +2,11 @@ pub mod animation;
 pub mod background;
 pub mod character;
 pub mod code_view;
+pub mod fonts;
 pub mod hud;
 pub mod splatter;
+
+pub use fonts::FontAssets;
 
 use bevy::prelude::*;
 
@@ -50,6 +53,7 @@ impl Plugin for SlideshowPlugin {
         app.init_state::<SlideState>()
             .init_resource::<SlideController>()
             .add_plugins((
+                fonts::FontPlugin,
                 background::BackgroundPlugin,
                 animation::AnimationPlugin,
                 character::CharacterPlugin,
