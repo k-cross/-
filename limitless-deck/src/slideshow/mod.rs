@@ -2,6 +2,7 @@ pub mod animation;
 pub mod background;
 pub mod character;
 pub mod code_view;
+pub mod diagrams;
 pub mod fonts;
 pub mod hud;
 pub mod splatter;
@@ -16,15 +17,47 @@ pub enum SlideState {
     #[default]
     Intro,
     MutexBottleneck,
+    SizeFocus,
+    StateAmbiguity,
+    BoolRep,
+    MemInit,
+    AbaProblem,
+    ThreadSafety,
+    Recovery,
+    AutomateRecovery,
+    CacheContention,
+    DisassembledCode,
+    BranchlessIndex,
+    TailLatency,
+    UnboundedLatency,
+    Backoffs,
+    Scaling,
+    Simplification,
 }
 
 impl SlideState {
-    pub const TOTAL_COUNT: usize = 2;
+    pub const TOTAL_COUNT: usize = 18;
 
     pub fn from_index(index: usize) -> Self {
         match index {
             0 => SlideState::Intro,
             1 => SlideState::MutexBottleneck,
+            2 => SlideState::SizeFocus,
+            3 => SlideState::StateAmbiguity,
+            4 => SlideState::BoolRep,
+            5 => SlideState::MemInit,
+            6 => SlideState::AbaProblem,
+            7 => SlideState::ThreadSafety,
+            8 => SlideState::Recovery,
+            9 => SlideState::AutomateRecovery,
+            10 => SlideState::CacheContention,
+            11 => SlideState::DisassembledCode,
+            12 => SlideState::BranchlessIndex,
+            13 => SlideState::TailLatency,
+            14 => SlideState::UnboundedLatency,
+            15 => SlideState::Backoffs,
+            16 => SlideState::Scaling,
+            17 => SlideState::Simplification,
             _ => SlideState::Intro,
         }
     }
@@ -65,6 +98,7 @@ impl Plugin for SlideshowPlugin {
                     handle_slide_input,
                     hud::update_hud.run_if(resource_changed::<SlideController>),
                     hud::animate_hud,
+                    code_view::scroll_code_blocks,
                 ),
             );
     }

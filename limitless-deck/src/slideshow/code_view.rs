@@ -1,7 +1,31 @@
 use crate::theme::colors::*;
 use crate::theme::geometry::*;
 use crate::theme::typography::*;
+use bevy::input::mouse::AccumulatedMouseScroll;
 use bevy::prelude::*;
+use bevy::ui::ScrollPosition;
+
+#[derive(Component)]
+pub struct CodeBlockScroll;
+
+pub fn scroll_code_blocks(
+    mouse_scroll: Res<AccumulatedMouseScroll>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut query: Query<&mut ScrollPosition, With<CodeBlockScroll>>,
+) {
+    let mut delta_y = -mouse_scroll.delta.y * 20.0;
+    if keyboard.pressed(KeyCode::KeyJ) || keyboard.pressed(KeyCode::ArrowDown) {
+        delta_y += 8.0;
+    }
+    if keyboard.pressed(KeyCode::KeyK) || keyboard.pressed(KeyCode::ArrowUp) {
+        delta_y -= 8.0;
+    }
+    if delta_y != 0.0 {
+        for mut pos in &mut query {
+            pos.y = (pos.y + delta_y).max(0.0);
+        }
+    }
+}
 
 /// Token type for syntax highlighting in presentation code blocks
 #[derive(Clone, Copy)]
@@ -123,63 +147,69 @@ pub fn spawn_styled_code_block(
 
             // --- Code Content Area ---
             // Laid out strictly rectilinear for maximum readability without perspective distortion
-            card.spawn((Node {
-                flex_direction: FlexDirection::Column,
-                padding: UiRect::all(Val::Px(18.0)),
-                row_gap: Val::Px(6.0),
-                ..default()
-            },))
-                .with_children(|code_body| {
-                    for (line_idx, tokens) in lines.into_iter().enumerate() {
-                        code_body
-                            .spawn((Node {
-                                flex_direction: FlexDirection::Row,
-                                align_items: AlignItems::Center,
-                                column_gap: Val::Px(16.0),
+            card.spawn((
+                Node {
+                    flex_direction: FlexDirection::Column,
+                    padding: UiRect::all(Val::Px(18.0)),
+                    row_gap: Val::Px(6.0),
+                    max_height: Val::Px(420.0),
+                    overflow: Overflow::scroll_y(),
+                    ..default()
+                },
+                ScrollPosition::default(),
+                CodeBlockScroll,
+            ))
+            .with_children(|code_body| {
+                for (line_idx, tokens) in lines.into_iter().enumerate() {
+                    code_body
+                        .spawn((Node {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(16.0),
+                            ..default()
+                        },))
+                        .with_children(|row| {
+                            // Line number gutter with subtle pointer
+                            row.spawn((Node {
+                                width: Val::Px(32.0),
+                                justify_content: JustifyContent::FlexEnd,
                                 ..default()
                             },))
-                            .with_children(|row| {
-                                // Line number gutter with subtle pointer
-                                row.spawn((Node {
-                                    width: Val::Px(32.0),
-                                    justify_content: JustifyContent::FlexEnd,
+                                .with_children(|gutter| {
+                                    gutter.spawn((
+                                        Text::new(format!("{:02}", line_idx + 1)),
+                                        font_gutter.clone(),
+                                        TextColor(P5_MUTED),
+                                    ));
+                                });
+
+                            // Separator bar
+                            row.spawn((
+                                Node {
+                                    width: Val::Px(1.5),
+                                    height: Val::Px(14.0),
                                     ..default()
-                                },))
-                                    .with_children(|gutter| {
-                                        gutter.spawn((
-                                            Text::new(format!("{:02}", line_idx + 1)),
-                                            font_gutter.clone(),
-                                            TextColor(P5_MUTED),
+                                },
+                                BackgroundColor(P5_BORDER),
+                            ));
+
+                            // Token spans
+                            row.spawn((Node {
+                                flex_direction: FlexDirection::Row,
+                                column_gap: Val::Px(0.0),
+                                ..default()
+                            },))
+                                .with_children(|token_row| {
+                                    for (text, kind) in tokens {
+                                        token_row.spawn((
+                                            Text::new(text),
+                                            font_token.clone(),
+                                            TextColor(kind.color()),
                                         ));
-                                    });
-
-                                // Separator bar
-                                row.spawn((
-                                    Node {
-                                        width: Val::Px(1.5),
-                                        height: Val::Px(14.0),
-                                        ..default()
-                                    },
-                                    BackgroundColor(P5_BORDER),
-                                ));
-
-                                // Token spans
-                                row.spawn((Node {
-                                    flex_direction: FlexDirection::Row,
-                                    column_gap: Val::Px(0.0),
-                                    ..default()
-                                },))
-                                    .with_children(|token_row| {
-                                        for (text, kind) in tokens {
-                                            token_row.spawn((
-                                                Text::new(text),
-                                                font_token.clone(),
-                                                TextColor(kind.color()),
-                                            ));
-                                        }
-                                    });
-                            });
-                    }
-                });
+                                    }
+                                });
+                        });
+                }
+            });
         });
 }
