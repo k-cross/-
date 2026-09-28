@@ -1571,6 +1571,8 @@ number is an A/B on the bit, and Phases 4-6 should quote which side they ran on.
 
 ### Phase 4 -- Belief, not truth: lossy telemetry and risk-adjusted scoring
 
+Implementation plan: [`phase-4.md`](phase-4.md), which states its predictions before the run.
+
 Two halves, in order.
 
 **First, the belief becomes a probability** (§3.7): `E[acquire] = P(resident) * cost_hit +
