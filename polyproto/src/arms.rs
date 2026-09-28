@@ -1,5 +1,6 @@
+use crate::admit::{Reservations, Reserve};
 use crate::blob::{BlobId, BlobKind};
-use crate::cache::{Hierarchy, NodeMemory, Policy, Quota, accelerated};
+use crate::cache::{Cost, EngineKv, Hierarchy, NodeMemory, Policy, Quota, accelerated};
 use crate::flow::FlowMode;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -15,6 +16,45 @@ pub struct Trial {
     pub seed: u64,
     pub ops: u64,
     pub vol: f64,
+    pub fix: Correction,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Correction {
+    pub engine: Option<EngineArm>,
+    pub decode_kv: Option<u64>,
+    pub reserve: Reserve,
+    pub max_token_slack: f64,
+    pub prewarm_kv: bool,
+}
+
+impl Default for Correction {
+    fn default() -> Self {
+        Self {
+            engine: None,
+            decode_kv: None,
+            reserve: Reserve::Prompt,
+            max_token_slack: crate::work::MAX_TOKEN_SLACK,
+            prewarm_kv: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct EngineArm {
+    pub scale: f64,
+    pub partition: Option<u64>,
+    pub clairvoyant: bool,
+}
+
+impl Default for EngineArm {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            partition: None,
+            clairvoyant: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -42,13 +82,23 @@ pub struct Report {
     pub prewarm_ns: u64,
     /// `phase-1.md` §4.4's dynamic census, per census-marked entry point.
     pub engine_ops: crate::cache::EngineOps,
+    pub kv_mean: [u64; 3],
+    pub refused_by_router: [u64; BlobKind::N],
+    pub preempted: [u64; BlobKind::N],
+    pub grant: Option<EngineKv>,
+    pub decode_blocks: u64,
+    pub decodes: u64,
+    pub kv_orphans: usize,
 }
 
 impl Report {
     #[must_use]
     pub fn goodput(&self) -> f64 {
         let served: u64 = self.served.iter().sum();
-        let total: u64 = served + self.refused.iter().sum::<u64>() + self.gated;
+        let total: u64 = served
+            + self.refused.iter().sum::<u64>()
+            + self.refused_by_router.iter().sum::<u64>()
+            + self.gated;
         if total == 0 {
             0.0
         } else {
@@ -85,7 +135,7 @@ impl Report {
 
     #[must_use]
     pub fn class_goodput(&self, k: usize) -> f64 {
-        let total = self.served[k] + self.refused[k];
+        let total = self.served[k] + self.refused[k] + self.refused_by_router[k];
         if total == 0 {
             0.0
         } else {
@@ -96,7 +146,12 @@ impl Report {
 
 #[must_use]
 pub fn trace(t: Trial) -> Vec<crate::work::Request> {
-    crate::work::Workload::new(t.seed, t.ops, t.vol).collect()
+    let w = crate::work::Workload::new(t.seed, t.ops, t.vol)
+        .with_max_token_slack(t.fix.max_token_slack);
+    match t.fix.decode_kv {
+        Some(per_block) => w.with_decode_kv(per_block).collect(),
+        None => w.collect(),
+    }
 }
 
 /// `Policy::Clairvoyant`'s reference-stream index, built once from the full trace before a run
@@ -169,7 +224,7 @@ impl Budget {
     }
 }
 
-fn memory_for(t: Trial, budget: Budget) -> NodeMemory {
+fn memory_for(t: Trial, budget: Budget, kv: Option<EngineKv>) -> NodeMemory {
     NodeMemory {
         hbm: t.hbm,
         ddr: t.dram,
@@ -177,6 +232,41 @@ fn memory_for(t: Trial, budget: Budget) -> NodeMemory {
         hbm_quota: budget.accelerator(t.hbm, t.bands),
         ddr_quota: budget.host(t.dram, t.bands, t.hbm > 0),
         can_decode: true,
+        kv,
+    }
+}
+
+#[must_use]
+pub fn grant(t: Trial, budget: Budget, arm: EngineArm, off: &Report) -> EngineKv {
+    grant_for(&memory_for(t, budget, None), off.kv_mean, arm)
+}
+
+/// `phase-3.md` §1.11 for any node: in each pool, KV's floor where the budget names one,
+/// else the mean KV occupancy the correction-off run measured there.
+#[must_use]
+pub fn grant_for(mem: &NodeMemory, off: [u64; 3], arm: EngineArm) -> EngineKv {
+    let split = mem.hbm > 0;
+    let floor_or = |q: &Quota, mean: u64| match q.floor_of(BlobKind::KvBlock) {
+        0 => mean,
+        floor => floor,
+    };
+    let (partition, pool) = if split {
+        (floor_or(&mem.hbm_quota, off[0]), mem.hbm)
+    } else {
+        (floor_or(&mem.ddr_quota, off[0]), mem.ddr)
+    };
+    EngineKv {
+        partition: arm
+            .partition
+            .unwrap_or((partition as f64 * arm.scale) as u64)
+            .min(pool),
+        offload: if split {
+            floor_or(&mem.ddr_quota, off[1]).min(mem.ddr)
+        } else {
+            0
+        },
+        spill: off[2].min(mem.nvme),
+        clairvoyant: arm.clairvoyant,
     }
 }
 
@@ -192,10 +282,40 @@ pub fn run(label: &str, t: Trial, budget: Budget) -> Report {
 /// With split memory one budget governs both pools: in HBM it sets KV against weights, in DDR
 /// it sets function cells and service heaps against what the accelerator has offloaded.
 pub fn run_on(label: &str, t: Trial, budget: Budget, trace: &[crate::work::Request]) -> Report {
-    let mut h = Hierarchy::new(memory_for(t, budget), t.policy);
-    if t.policy == Policy::Clairvoyant {
+    let Some(arm) = t.fix.engine else {
+        return run_with(label, t, budget, trace, None);
+    };
+    let ledger = Trial {
+        fix: Correction {
+            engine: None,
+            ..t.fix
+        },
+        ..t
+    };
+    let off = run_with("", ledger, budget, trace, None);
+    run_with(label, t, budget, trace, Some(grant(t, budget, arm, &off)))
+}
+
+#[must_use]
+#[allow(clippy::too_many_lines, reason = "one request loop, tallied in place")]
+pub fn run_with(
+    label: &str,
+    t: Trial,
+    budget: Budget,
+    trace: &[crate::work::Request],
+    kv: Option<EngineKv>,
+) -> Report {
+    let mut h = Hierarchy::new(memory_for(t, budget, kv), t.policy);
+    h.set_prewarm_kv(t.fix.prewarm_kv);
+    if t.policy == Policy::Clairvoyant || kv.is_some_and(|k| k.clairvoyant) {
         h.set_clairvoyant_index(clairvoyant_index(trace));
     }
+    let per_block = t.fix.decode_kv.unwrap_or(crate::work::TOKENS_PER_KV_BLOCK);
+    let nothing_in_flight = Reservations::default();
+    let mut refused_by_router = [0u64; BlobKind::N];
+    let mut preempted = [0u64; BlobKind::N];
+    let (mut decode_blocks, mut decodes) = (0u64, 0u64);
+    let mut kv_sum = [0u64; 3];
     let mut costs: Vec<u64> = Vec::with_capacity(t.ops as usize);
     let (mut total, mut transfer) = (0u64, 0u64);
     let mut phase_ns = [0u64; crate::work::PHASES];
@@ -220,6 +340,9 @@ pub fn run_on(label: &str, t: Trial, budget: Budget, trace: &[crate::work::Reque
         }
         h.set_clairvoyant_op(op);
         op += 1;
+        for (sum, bytes) in kv_sum.iter_mut().zip(h.kv_bytes()) {
+            *sum += bytes;
+        }
         let k = req.kind_idx();
 
         if let Some(hint) = &req.hint
@@ -239,16 +362,36 @@ pub fn run_on(label: &str, t: Trial, budget: Budget, trace: &[crate::work::Reque
             continue;
         }
 
-        let mut c = h.access(&req.chain);
+        let turned_away = h.kv_partition().is_some_and(|(capacity, _)| {
+            !nothing_in_flight.admits(capacity, req, t.fix.reserve, per_block, None)
+        });
+        let mut c = if turned_away {
+            refused_by_router[k] += 1;
+            Cost {
+                pending: true,
+                ..Cost::default()
+            }
+        } else {
+            h.access(&req.chain)
+        };
+        let chain_recompute = c.recompute_ns;
         if !c.pending && !req.requires.is_empty() {
             let dep = h.access_set(&req.requires);
             c.transfer_ns += dep.transfer_ns;
             c.recompute_ns += dep.recompute_ns;
             c.pending |= dep.pending;
+            c.preempted |= dep.preempted;
         }
         if !c.pending {
             c.exec_ns = req.exec_ns;
+            h.decode_output(&req.chain, &req.produces, chain_recompute, &mut c);
+            if req.tokens > 0 {
+                decode_blocks += req.produces.len() as u64;
+                decodes += 1;
+            }
+            preempted[k] += u64::from(c.preempted);
         }
+        h.seal(None);
 
         if let Some(up) = req.completes.and_then(|task| started.remove(&task)) {
             if c.pending {
@@ -279,7 +422,8 @@ pub fn run_on(label: &str, t: Trial, budget: Budget, trace: &[crate::work::Reque
     }
 
     costs.sort_unstable();
-    finish(
+    let samples = op.max(1);
+    let mut r = finish(
         label,
         &h,
         &costs,
@@ -297,7 +441,14 @@ pub fn run_on(label: &str, t: Trial, budget: Budget, trace: &[crate::work::Reque
             flow_broken,
             flow_e2e,
         },
-    )
+    );
+    r.kv_mean = kv_sum.map(|b| b / samples);
+    r.refused_by_router = refused_by_router;
+    r.preempted = preempted;
+    r.grant = kv;
+    r.decode_blocks = decode_blocks;
+    r.decodes = decodes;
+    r
 }
 
 struct Tally {
@@ -357,6 +508,13 @@ fn finish(label: &str, h: &Hierarchy, costs: &[u64], t: &Tally) -> Report {
         prewarmed_bytes: h.prewarmed_bytes,
         prewarm_ns: h.prewarm_ns,
         engine_ops: h.engine_ops,
+        kv_mean: [0; 3],
+        refused_by_router: [0; BlobKind::N],
+        preempted: [0; BlobKind::N],
+        grant: None,
+        decode_blocks: 0,
+        decodes: 0,
+        kv_orphans: h.kv_orphans(),
     }
 }
 
@@ -366,5 +524,164 @@ pub fn mean_ms(ns: u64, ops: u64) -> f64 {
         0.0
     } else {
         ns as f64 / ops as f64 / 1e6
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::EngineOps;
+
+    fn trial(ops: u64) -> Trial {
+        Trial {
+            bands: [0, 1, 2, 1],
+            flows: FlowMode::Announce,
+            hbm: 4 << 30,
+            dram: 8 << 30,
+            nvme: 64 << 30,
+            policy: Policy::Gdsf,
+            seed: 1,
+            ops,
+            vol: 1.0,
+            fix: Correction::default(),
+        }
+    }
+
+    fn engine(t: Trial) -> Trial {
+        Trial {
+            fix: Correction {
+                engine: Some(EngineArm::default()),
+                ..t.fix
+            },
+            ..t
+        }
+    }
+
+    fn row(ops: &EngineOps, kind: BlobKind) -> [u64; 8] {
+        let k = kind.idx();
+        [
+            ops.admit[k],
+            ops.touch[k],
+            ops.anticipate[k],
+            ops.demote[k],
+            ops.forget_cold[k],
+            ops.superseded[k],
+            ops.spill[k],
+            ops.drain[k],
+        ]
+    }
+
+    const HARD: Budget = Budget::Split {
+        split: [0.25, 0.25, 0.25, 0.125],
+        hard: true,
+    };
+
+    #[test]
+    fn census_kvblock_row_is_zero_with_the_bit_on() {
+        for hbm in [4u64 << 30, 0] {
+            for budget in [Budget::Open, HARD] {
+                let t = engine(Trial {
+                    hbm,
+                    dram: if hbm == 0 { 12 << 30 } else { 8 << 30 },
+                    ..trial(3_000)
+                });
+                let off = run(
+                    "",
+                    Trial {
+                        fix: Correction::default(),
+                        ..t
+                    },
+                    budget,
+                );
+                let on = run("", t, budget);
+                assert!(
+                    row(&off.engine_ops, BlobKind::KvBlock).iter().sum::<u64>() > 0,
+                    "the fixture must exercise engine paths with the bit off"
+                );
+                assert_eq!(
+                    row(&on.engine_ops, BlobKind::KvBlock),
+                    [0; 8],
+                    "hbm={hbm} {budget:?}"
+                );
+            }
+        }
+    }
+
+    // GDSF's inflation is per pool, so a KV eviction reorders weights even behind a hard
+    // partition; only an LRU ledger leaves the weights row nothing to move it.
+    #[test]
+    fn census_weightshard_row_is_unchanged_across_the_bit_under_hard_lru_partitions() {
+        let t = engine(Trial {
+            flows: FlowMode::Blind,
+            policy: Policy::Lru,
+            ..trial(3_000)
+        });
+        let off = run(
+            "",
+            Trial {
+                fix: Correction::default(),
+                ..t
+            },
+            HARD,
+        );
+        let on = run("", t, HARD);
+        let (w_off, w_on) = (
+            row(&off.engine_ops, BlobKind::WeightShard),
+            row(&on.engine_ops, BlobKind::WeightShard),
+        );
+        assert!(w_off.iter().sum::<u64>() > 0);
+        assert_eq!(w_off, w_on);
+    }
+
+    #[test]
+    fn the_partition_never_holds_a_block_without_its_parent() {
+        for decode_kv in [None, Some(crate::work::TOKENS_PER_KV_BLOCK)] {
+            let t = engine(Trial {
+                fix: Correction {
+                    decode_kv,
+                    ..Correction::default()
+                },
+                ..trial(3_000)
+            });
+            let r = run("", t, Budget::Open);
+            assert!(r.grant.is_some());
+            assert_eq!(r.kv_orphans, 0, "decode_kv={decode_kv:?}");
+        }
+    }
+
+    #[test]
+    fn decode_output_holds_the_mean_growth_at_35_and_reproduces_the_table() {
+        for (per_block, expect) in [(35u64, 4.015), (32, 4.33), (16, 8.18), (8, 15.88)] {
+            let r = run(
+                "",
+                Trial {
+                    fix: Correction {
+                        decode_kv: Some(per_block),
+                        ..Correction::default()
+                    },
+                    ..trial(15_000)
+                },
+                Budget::Open,
+            );
+            let mean = r.decode_blocks as f64 / r.decodes as f64;
+            assert!(
+                (mean - expect).abs() / expect < 0.02,
+                "{per_block}: {mean:.3} blocks per decode against {expect}"
+            );
+            if per_block == 35 {
+                assert!((mean - 4.0).abs() / 4.0 < 0.01, "{mean:.3}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_grant_is_the_budgets_own_kv_floor() {
+        let t = engine(trial(1_000));
+        let off = run("", trial(1_000), HARD);
+        let g = grant(t, HARD, EngineArm::default(), &off);
+        let mem = memory_for(t, HARD, None);
+        assert_eq!(g.partition, mem.hbm_quota.floor_of(BlobKind::KvBlock));
+        assert_eq!(g.offload, mem.ddr_quota.floor_of(BlobKind::KvBlock));
+        assert_eq!(g.spill, off.kv_mean[2]);
     }
 }

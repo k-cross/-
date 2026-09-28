@@ -1,7 +1,8 @@
 use clap::{Parser, Subcommand};
-use polyphonic::arms::{Budget, Report, Trial, mean_ms, run, run_on, trace};
+use polyphonic::admit::Reserve;
+use polyphonic::arms::{Budget, Correction, EngineArm, Report, Trial, mean_ms, run, run_on, trace};
 use polyphonic::blob::BlobKind;
-use polyphonic::cache::{NodeMemory, Policy, Quota};
+use polyphonic::cache::{EngineKv, NodeMemory, Policy, Quota};
 use polyphonic::flow::FlowMode;
 use polyphonic::own::{Authority, Question, authority};
 use polyphonic::tier::Tier;
@@ -46,6 +47,8 @@ enum Cmd {
         /// of time, so it exists to separate eviction quality from budget policy
         #[arg(long)]
         clairvoyant: bool,
+        #[command(flatten)]
+        p3: Correct,
     },
 
     /// Do cross-workload flows pay: blind vs. anticipatory value vs. downstream-aware admission
@@ -70,6 +73,8 @@ enum Cmd {
         /// so it is not confounded with the prewarm effect
         #[arg(long)]
         clairvoyant: bool,
+        #[command(flatten)]
+        p3: Correct,
     },
 
     /// State-blind vs state-aware placement over a synthetic multi-domain machine
@@ -102,6 +107,11 @@ enum Cmd {
         /// migrates to the survivors, so the bytes remain but every hash to it is stale.
         #[arg(long, default_value_t = 0.0)]
         drain_at: f64,
+        /// Drain the retired domain's spill tier too (phase-3.md §1.12's fix, its own bit)
+        #[arg(long)]
+        drain_spill: bool,
+        #[command(flatten)]
+        p3: Correct,
     },
 
     /// Residency-aware placement across a cluster, with the control plane's own cost charged
@@ -154,6 +164,10 @@ enum Cmd {
         /// re-running residency-ledger.md's flow-payload sweep under --regret
         #[arg(long, value_parser = parse_bytes)]
         flow_payload: Option<u64>,
+        #[command(flatten)]
+        p3: Correct,
+        #[command(flatten)]
+        bits: ClusterBits,
     },
 
     /// One model host and one agent-framework host, swept from same-socket to cross-region.
@@ -212,6 +226,10 @@ enum Cmd {
         /// wall time and is off by default
         #[arg(long)]
         regret: bool,
+        #[command(flatten)]
+        p3: Correct,
+        #[command(flatten)]
+        bits: ClusterBits,
     },
 
     /// The data path as an arm: integrated vs. sidecar, charging Phase 0's measured seam
@@ -300,6 +318,8 @@ enum Cmd {
         /// (phase-2.md §1.7, §4.5)
         #[arg(long)]
         clairvoyant: bool,
+        #[command(flatten)]
+        p3: Correct,
     },
 
     /// Print the ownership predicate `own.rs` computes (owned-and-observed.md §1's table,
@@ -318,7 +338,186 @@ enum Cmd {
         seed: u64,
         #[arg(long, default_value = "0,1,2,1", value_parser = parse_bands)]
         bands: String,
+        #[command(flatten)]
+        p3: Correct,
     },
+
+    /// The price of the engine boundary: phase-3.md §4.11's sweeps, per class and at p99.
+    /// Charges no control crossing, so every number is reproducible from the seed
+    Price {
+        #[arg(long, default_value_t = 4)]
+        nodes: usize,
+        #[arg(long, default_value_t = 3)]
+        units_per_node: usize,
+        /// Total accelerator HBM across the cluster
+        #[arg(long, default_value = "16GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        /// Total host DDR across the cluster
+        #[arg(long, default_value = "32GiB", value_parser = parse_bytes)]
+        dram: u64,
+        #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
+        nvme: u64,
+        #[arg(long, default_value_t = 15_000)]
+        ops: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value = "0,1,2,1", value_parser = parse_bands)]
+        bands: String,
+        #[arg(long, default_value = "rack")]
+        distance: String,
+        #[arg(long, default_value_t = 250.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 0.10)]
+        fanout: f64,
+        /// Single-node HBM for the eviction-rule sweep (P7), as `residency` runs it
+        #[arg(long, default_value = "4GiB", value_parser = parse_bytes)]
+        node_hbm: u64,
+        #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
+        node_dram: u64,
+        /// Requests for the single-node sweep
+        #[arg(long, default_value_t = 20_000)]
+        node_ops: u64,
+    },
+}
+
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct Correct {
+    /// Engine allocates KV in a partition this process sizes; prints beside the ledger's run
+    #[arg(long)]
+    engine_cache: bool,
+    /// Model the KV a decode writes, held with its prompt until the decode ends
+    #[arg(long)]
+    decode_kv: bool,
+    /// Tokens per KV block under --decode-kv; 35 keeps today's mean chain growth
+    #[arg(long, default_value_t = polyphonic::work::TOKENS_PER_KV_BLOCK)]
+    tokens_per_block: u64,
+    /// What the router reserves per request against the partition
+    #[arg(long, value_enum, default_value_t = AdmitArg::None)]
+    admit: AdmitArg,
+    /// `max_tokens` as a multiple of the workload's longest output
+    #[arg(long, default_value_t = polyphonic::work::MAX_TOKEN_SLACK)]
+    max_token_slack: f64,
+    /// Partition relative to the default phase-3.md §1.11 derives
+    #[arg(long, default_value_t = 1.0)]
+    kv_scale: f64,
+    /// Partition per node, overriding --kv-scale
+    #[arg(long, value_parser = parse_bytes)]
+    kv_partition: Option<u64>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum AdmitArg {
+    Bound,
+    Perfect,
+    None,
+}
+
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct ClusterBits {
+    /// Price a cross-node `NVMe` pool of this size, LRU, in the acquire argmin (phase-3.md §4.10)
+    #[arg(long, value_parser = parse_bytes)]
+    shared_l2: Option<u64>,
+    /// Zero the displacement term: phase-3.md §4.8's control arm
+    #[arg(long)]
+    no_displacement: bool,
+}
+
+impl Correct {
+    fn reserve(self) -> Reserve {
+        match self.admit {
+            AdmitArg::Bound => Reserve::Bound,
+            AdmitArg::Perfect => Reserve::Perfect,
+            AdmitArg::None => Reserve::Prompt,
+        }
+    }
+
+    fn base(self) -> Correction {
+        Correction {
+            engine: None,
+            decode_kv: self.decode_kv.then_some(self.tokens_per_block),
+            reserve: self.reserve(),
+            max_token_slack: self.max_token_slack,
+            prewarm_kv: true,
+        }
+    }
+
+    fn engine(self, clairvoyant: bool) -> Correction {
+        Correction {
+            engine: Some(EngineArm {
+                scale: self.kv_scale,
+                partition: self.kv_partition,
+                clairvoyant,
+            }),
+            ..self.base()
+        }
+    }
+
+    fn workload(self, w: polyphonic::work::Workload) -> polyphonic::work::Workload {
+        let w = w.with_max_token_slack(self.max_token_slack);
+        if self.decode_kv {
+            w.with_decode_kv(self.tokens_per_block)
+        } else {
+            w
+        }
+    }
+
+    fn setup(self, mach: &mut polyphonic::machine::Machine, bits: ClusterBits) {
+        mach.set_admission(self.reserve(), self.tokens_per_block);
+        mach.set_hold_decodes(self.decode_kv);
+        mach.set_shared_l2(bits.shared_l2);
+        mach.set_displacement(!bits.no_displacement);
+    }
+
+    fn grant(self, mem: &NodeMemory, off: [u64; 3]) -> Option<EngineKv> {
+        mem.can_decode.then(|| {
+            polyphonic::arms::grant_for(
+                mem,
+                off,
+                EngineArm {
+                    scale: self.kv_scale,
+                    partition: self.kv_partition,
+                    clairvoyant: false,
+                },
+            )
+        })
+    }
+
+    fn engine_memory(self, mem: NodeMemory, off: [u64; 3]) -> NodeMemory {
+        NodeMemory {
+            kv: self.grant(&mem, off),
+            ..mem
+        }
+    }
+
+    fn describe(self) -> String {
+        let decode = if self.decode_kv {
+            format!(
+                "decode output modelled at {} tokens/block",
+                self.tokens_per_block
+            )
+        } else {
+            "decode output not modelled".to_string()
+        };
+        format!(
+            "router reserves {}, max_tokens {:.0}x, {decode}",
+            self.reserve().label(),
+            self.max_token_slack
+        )
+    }
+}
+
+fn grant_label(g: Option<EngineKv>) -> String {
+    g.map_or_else(
+        || "no engine".to_string(),
+        |g| {
+            format!(
+                "partition {:.2} GiB, offload {:.2} GiB, spill {:.2} GiB",
+                gib(g.partition),
+                gib(g.offload),
+                gib(g.spill)
+            )
+        },
+    )
 }
 
 fn parse_bands(s: &str) -> Result<String, String> {
@@ -386,7 +585,7 @@ fn prefer(a: &Report, b: &Report, bands: [u8; BlobKind::N]) -> bool {
             for (k, &kb) in bands.iter().enumerate() {
                 if kb == band {
                     s += r.served[k];
-                    n += r.served[k] + r.refused[k];
+                    n += r.served[k] + r.refused[k] + r.refused_by_router[k];
                 }
             }
             if n == 0 { 1.0 } else { s as f64 / n as f64 }
@@ -460,6 +659,7 @@ fn node_memory(hbm: u64, ddr: u64, nvme: u64, bands: [u8; BlobKind::N], hard: bo
             hbm_quota: Quota::open(0, bands),
             ddr_quota: q,
             can_decode: true,
+            kv: None,
         };
     }
     NodeMemory {
@@ -469,6 +669,7 @@ fn node_memory(hbm: u64, ddr: u64, nvme: u64, bands: [u8; BlobKind::N], hard: bo
         hbm_quota: Quota::from_split(hbm, [0.25, 0.0, 0.50, 0.0], bands, hard),
         ddr_quota: Quota::from_split(ddr, [0.10, 0.15, 0.15, 0.35], bands, hard).offloaded(),
         can_decode: true,
+        kv: None,
     }
 }
 
@@ -549,6 +750,10 @@ fn arm_row(r: &Report) {
     clippy::too_many_arguments,
     reason = "experiment knobs, all surfaced on the CLI"
 )]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table per combination of drain bits"
+)]
 fn placement(
     sockets: usize,
     units_per_socket: usize,
@@ -560,6 +765,8 @@ fn placement(
     bands: [u8; BlobKind::N],
     rate: f64,
     drain_at: f64,
+    p3: Correct,
+    drain_spill: bool,
 ) {
     use polyphonic::machine::{Machine, Placement};
     use polyphonic::topo::Topology;
@@ -587,16 +794,6 @@ fn placement(
         println!();
     }
 
-    println!(
-        "{:<13} {:>12} {:>14} {:>12} {:>10} {:>12} {:>14}",
-        "placement",
-        "stall/req",
-        "interconnect",
-        "local hops",
-        "cold",
-        "bytes moved",
-        "domain spread"
-    );
     // Cross-socket links are coherent and cheap, so this is the topology where shipping
     // state should beat rebuilding it almost always. Whether it does is the point of the row.
     let modes = [
@@ -607,45 +804,118 @@ fn placement(
         (Placement::Scored, false),
         (Placement::Scored, true),
     ];
-    for (mode, transfer) in modes {
-        let mut m = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, mode);
-        m.set_state_transfer(transfer);
-        m.set_arrival_rate(rate);
-        let mut total = 0u64;
-        let mut served = 0u64;
-        let drain_op = if drain_at > 0.0 {
-            (ops as f64 * drain_at) as u64
-        } else {
-            u64::MAX
-        };
-        for (i, req) in polyphonic::work::Workload::new(seed, ops, 1.0).enumerate() {
-            if i as u64 == drain_op {
-                m.drain(0);
-            }
-            let c = m.serve_request(&req);
-            if c.pending {
-                continue;
-            }
-            total += c.total_ns();
-            served += 1;
+    // `phase-3.md` risk 8: a drain moves for the lost KV migration, the spill fix and the
+    // partition at once, so each combination of the two bits gets its own table.
+    let mut tables = vec![(false, drain_spill)];
+    if drain_spill {
+        tables.insert(0, (false, false));
+    }
+    if p3.engine_cache {
+        tables.push((true, false));
+        if drain_spill {
+            tables.push((true, true));
         }
-        let label = match (mode, transfer) {
-            (Placement::Blind, _) => "blind",
-            (Placement::Sticky, _) => "sticky",
-            (Placement::Aware, false) => "aware",
-            (Placement::Aware, true) => "aware+fetch",
-            (Placement::Scored, false) => "scored",
-            (Placement::Scored, true) => "scored+fetch",
-        };
+    }
+    let mut means = Vec::with_capacity(modes.len());
+    for (n, &(engine, spill)) in tables.iter().enumerate() {
+        if tables.len() > 1 {
+            let drained = if drain_at <= 0.0 {
+                ""
+            } else if spill {
+                "; on drain its spill tier is migrated too"
+            } else {
+                "; on drain its spill tier is left behind"
+            };
+            println!(
+                "{}{}{drained}",
+                if n > 0 { "\n" } else { "" },
+                if engine {
+                    "engine allocates KV (phase-3.md), which dies with a drained node"
+                } else {
+                    "ledger allocates KV, which migrates with a drained node"
+                },
+            );
+        }
         println!(
-            "{label:<13} {:>11.3}ms {:>13.1}s {:>10.2}s {:>11.1}% {:>9.1}% {:>13.2}",
-            mean_ms(total, served),
-            total.saturating_sub(m.interconnect_ns + m.handoff_ns) as f64 / 1e9,
-            m.handoff_ns as f64 / 1e9,
-            100.0 * m.split_tasks as f64 / (m.split_tasks + m.joined_tasks).max(1) as f64,
-            100.0 * m.cold as f64 / served.max(1) as f64,
-            m.domain_spread(),
+            "{:<13} {:>12} {:>14} {:>12} {:>10} {:>12} {:>14}",
+            "placement",
+            "stall/req",
+            "interconnect",
+            "local hops",
+            "cold",
+            "bytes moved",
+            "domain spread"
         );
+        for (i, &(mode, transfer)) in modes.iter().enumerate() {
+            let mem = if engine {
+                p3.engine_memory(memory, means[i])
+            } else {
+                memory
+            };
+            let mut m = Machine::new(topo.clone(), |_| mem, Policy::Gdsf, mode);
+            m.set_state_transfer(transfer);
+            m.set_arrival_rate(rate);
+            m.set_drain_spill(spill);
+            p3.setup(
+                &mut m,
+                ClusterBits {
+                    shared_l2: None,
+                    no_displacement: false,
+                },
+            );
+            let mut total = 0u64;
+            let mut served = 0u64;
+            let drain_op = if drain_at > 0.0 {
+                (ops as f64 * drain_at) as u64
+            } else {
+                u64::MAX
+            };
+            let workload = p3.workload(polyphonic::work::Workload::new(seed, ops, 1.0));
+            for (i, req) in workload.enumerate() {
+                if i as u64 == drain_op {
+                    m.drain(0);
+                }
+                let c = m.serve_request(&req);
+                if c.pending {
+                    continue;
+                }
+                total += c.total_ns();
+                served += 1;
+            }
+            if n == 0 {
+                means.push(m.kv_mean());
+            }
+            let label = match (mode, transfer) {
+                (Placement::Blind, _) => "blind",
+                (Placement::Sticky, _) => "sticky",
+                (Placement::Aware, false) => "aware",
+                (Placement::Aware, true) => "aware+fetch",
+                (Placement::Scored, false) => "scored",
+                (Placement::Scored, true) => "scored+fetch",
+            };
+            println!(
+                "{label:<13} {:>11.3}ms {:>13.1}s {:>10.2}s {:>11.1}% {:>9.1}% {:>13.2}",
+                mean_ms(total, served),
+                total.saturating_sub(m.interconnect_ns + m.handoff_ns) as f64 / 1e9,
+                m.handoff_ns as f64 / 1e9,
+                100.0 * m.split_tasks as f64 / (m.split_tasks + m.joined_tasks).max(1) as f64,
+                100.0 * m.cold as f64 / served.max(1) as f64,
+                m.domain_spread(),
+            );
+            if engine {
+                println!(
+                    "{:<13} {}; migrated {:.2} GiB; router refused {}, engine preempted {}",
+                    "",
+                    grant_label(mem.kv),
+                    gib(m.migrated_bytes),
+                    m.refused_by_router.iter().sum::<u64>(),
+                    m.preempted.iter().sum::<u64>(),
+                );
+                debug_assert_eq!(m.kv_orphans(), 0);
+            } else if tables.len() > 1 && drain_at > 0.0 {
+                println!("{:<13} migrated {:.2} GiB", "", gib(m.migrated_bytes));
+            }
+        }
     }
 }
 
@@ -809,7 +1079,11 @@ fn topology(bytes: u64, iters: u32) {
 
 #[allow(
     clippy::too_many_arguments,
-    reason = "one flag per experiment knob, all independent"
+    reason = "experiment knobs, all independent"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table per side of the correction"
 )]
 fn flows_report(
     hbm: u64,
@@ -820,6 +1094,7 @@ fn flows_report(
     step: f64,
     bands: [u8; BlobKind::N],
     clairvoyant: bool,
+    p3: Correct,
 ) {
     println!(
         "{} ops={ops} seed={seed} bands={bands:?}\n",
@@ -835,6 +1110,7 @@ fn flows_report(
         seed,
         ops,
         vol: 1.0,
+        fix: p3.base(),
     };
     let (_, split) = best_split(cfg, false, step);
     let budget = Budget::Split { split, hard: false };
@@ -848,14 +1124,7 @@ fn flows_report(
         "{:<10} {:>13} {:>13} {:>14} {:>11} {:>10} {:>10}",
         "flows", "task e2e (ms)", "stall total", "prewarm work", "net work", "inference", "goodput"
     );
-    for mode in [FlowMode::Blind, FlowMode::Announce, FlowMode::Gate] {
-        let trial = Trial { flows: mode, ..cfg };
-        let r = run("", trial, budget);
-        let label = match mode {
-            FlowMode::Blind => "blind",
-            FlowMode::Announce => "announce",
-            FlowMode::Gate => "gate",
-        };
+    let row = |label: &str, r: &Report| {
         let stall_s = r.total_ns as f64 / 1e9;
         let prewarm_s = r.prewarm_ns as f64 / 1e9;
         println!(
@@ -865,6 +1134,18 @@ fn flows_report(
             mean_ms(r.kind_ns[0], r.kind_ops[0]),
             100.0 * r.goodput(),
         );
+    };
+    let modes = [FlowMode::Blind, FlowMode::Announce, FlowMode::Gate];
+    let label = |mode: FlowMode| match mode {
+        FlowMode::Blind => "blind",
+        FlowMode::Announce => "announce",
+        FlowMode::Gate => "gate",
+    };
+    let mut off = Vec::with_capacity(modes.len());
+    for mode in modes {
+        let r = run("", Trial { flows: mode, ..cfg }, budget);
+        row(label(mode), &r);
+        off.push(r);
     }
     // `phase-2.md` §1.7, §4.5: eviction quality alone, blind to flows so it is not confounded
     // with prewarm's own effect -- a signed difference against `blind`, not a regret.
@@ -874,20 +1155,69 @@ fn flows_report(
             policy: Policy::Clairvoyant,
             ..cfg
         };
-        let r = run("", trial, budget);
-        let stall_s = r.total_ns as f64 / 1e9;
-        let prewarm_s = r.prewarm_ns as f64 / 1e9;
-        println!(
-            "{:<10} {:>13.2} {stall_s:>12.2}s {prewarm_s:>13.2}s {:>10.2}s {:>10.2} {:>9.1}%",
-            "clairvoy.",
-            r.flow_e2e_ms(),
-            stall_s + prewarm_s,
-            mean_ms(r.kind_ns[0], r.kind_ops[0]),
-            100.0 * r.goodput(),
-        );
+        row("clairvoy.", &run("", trial, budget));
     }
+    if !p3.engine_cache {
+        return;
+    }
+
+    // `phase-3.md` §1.8, P6: announce with its KV half removed, on the ledger's own side of
+    // the bit, splits the published margin by class before the correction changes anything.
+    let host_only = run(
+        "",
+        Trial {
+            flows: FlowMode::Announce,
+            fix: Correction {
+                prewarm_kv: false,
+                ..cfg.fix
+            },
+            ..cfg
+        },
+        budget,
+    );
+    row("host-only", &host_only);
+    println!(
+        "\nengine allocates KV (phase-3.md), same soft floors sizing the partition; {}",
+        p3.describe()
+    );
+    let mut on = Vec::with_capacity(modes.len());
+    for mode in modes {
+        let r = run(
+            "",
+            Trial {
+                flows: mode,
+                fix: p3.engine(false),
+                ..cfg
+            },
+            budget,
+        );
+        row(label(mode), &r);
+        on.push(r);
+    }
+    let margin = |blind: &Report, with: &Report| {
+        100.0 * (blind.flow_e2e_ms() - with.flow_e2e_ms()) / blind.flow_e2e_ms().max(1e-9)
+    };
+    let full = margin(&off[0], &off[1]);
+    let snapshot = margin(&off[0], &host_only);
+    println!(
+        "\nannounce's task-latency margin, P6: {full:.1}% with the ledger allocating, of which \
+         {snapshot:.1}% survives without KV prewarm -- KV carried {:.0}% of it; {:.1}% with the \
+         engine allocating",
+        100.0 * (full - snapshot) / full.abs().max(1e-9),
+        margin(&on[0], &on[1]),
+    );
+    println!(
+        "grant: {}; router refused {}, engine preempted {} (announce arm)",
+        grant_label(on[1].grant),
+        on[1].refused_by_router.iter().sum::<u64>(),
+        on[1].preempted.iter().sum::<u64>(),
+    );
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "experiment knobs, all independent"
+)]
 fn volatility_sweep(
     hbm: u64,
     dram: u64,
@@ -896,6 +1226,7 @@ fn volatility_sweep(
     seed: u64,
     step: f64,
     clairvoyant: bool,
+    p3: Correct,
 ) {
     let bands = [0u8, 1, 2, 1];
     println!("{} ops={ops} seed={seed}\n", memory_label(hbm, dram));
@@ -913,6 +1244,12 @@ fn volatility_sweep(
             "no-floor (ms)", "clairvoyant (ms)", "vs no-floor"
         );
     }
+    if p3.engine_cache {
+        print!(
+            " {:>16} {:>16} {:>14}",
+            "engine hard (ms)", "engine soft (ms)", "engine adv."
+        );
+    }
     println!();
     for i in 0..=5 {
         let v = f64::from(i) / 5.0;
@@ -926,6 +1263,7 @@ fn volatility_sweep(
             seed,
             ops,
             vol: v,
+            fix: p3.base(),
         };
         let (hard, _) = best_split(t, true, step);
         let (soft, _) = best_split(t, false, step);
@@ -951,6 +1289,19 @@ fn volatility_sweep(
                 100.0 * (cm - om) / om.max(f64::MIN_POSITIVE)
             );
         }
+        if p3.engine_cache {
+            let t_on = Trial {
+                fix: p3.engine(false),
+                ..t
+            };
+            let (hard_on, _) = best_split(t_on, true, step);
+            let (soft_on, _) = best_split(t_on, false, step);
+            let (hn, sn) = (per_req(&hard_on), per_req(&soft_on));
+            print!(
+                " {hn:>16.3} {sn:>16.3} {:>13.1}%",
+                100.0 * (hn - sn) / hn.max(f64::MIN_POSITIVE)
+            );
+        }
         println!();
     }
 }
@@ -958,7 +1309,23 @@ fn volatility_sweep(
 /// `phase-1.md` §4.5: print the ownership predicate and the census, so both are
 /// reproducible from a single command rather than quoted from a build log or a table in
 /// a doc.
-fn ownership_report(hbm: u64, dram: u64, nvme: u64, ops: u64, seed: u64, bands: [u8; BlobKind::N]) {
+#[allow(
+    clippy::too_many_arguments,
+    reason = "experiment knobs, all independent"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the table, then the census on each side of the bit"
+)]
+fn ownership_report(
+    hbm: u64,
+    dram: u64,
+    nvme: u64,
+    ops: u64,
+    seed: u64,
+    bands: [u8; BlobKind::N],
+    p3: Correct,
+) {
     println!(
         "own.rs's authority table -- owned-and-observed.md \u{a7}1, executable (phase-1.md \u{a7}4.2)\n"
     );
@@ -1012,6 +1379,7 @@ fn ownership_report(hbm: u64, dram: u64, nvme: u64, ops: u64, seed: u64, bands: 
         seed,
         ops,
         vol: 1.0,
+        fix: p3.base(),
     };
     let r = run("", t, Budget::Open);
     let ops = r.engine_ops;
@@ -1028,11 +1396,58 @@ fn ownership_report(hbm: u64, dram: u64, nvme: u64, ops: u64, seed: u64, bands: 
         "drain",
         "total"
     );
-    for kind in BlobKind::ALL {
+    census_rows("", &ops, &BlobKind::ALL);
+    if !p3.engine_cache {
+        return;
+    }
+    let on = run(
+        "",
+        Trial {
+            fix: p3.engine(false),
+            ..t
+        },
+        Budget::Open,
+    );
+    let with = on.engine_ops;
+    println!(
+        "\nwith the engine allocating KV (phase-3.md \u{a7}1.10, the phase's progress bar), {}",
+        grant_label(on.grant)
+    );
+    census_rows(
+        "engine ",
+        &with,
+        &[BlobKind::KvBlock, BlobKind::WeightShard],
+    );
+    let row = |o: &polyphonic::cache::EngineOps, k: usize| {
+        [
+            o.admit[k],
+            o.touch[k],
+            o.anticipate[k],
+            o.demote[k],
+            o.forget_cold[k],
+            o.superseded[k],
+            o.spill[k],
+            o.drain[k],
+        ]
+    };
+    let (kv, w) = (BlobKind::KvBlock.idx(), BlobKind::WeightShard.idx());
+    println!(
+        "KvBlock row zero on every counter: {}. WeightShard row unchanged op for op: {} -- \
+         it can only be under a policy with no per-pool state shared across classes; GDSF's \
+         inflation is per pool, so a KV eviction reorders the weights beside it (the test \
+         census_weightshard_row_is_unchanged_across_the_bit_under_hard_lru_partitions checks \
+         the case where it must hold)",
+        row(&with, kv).iter().all(|&n| n == 0),
+        row(&with, w) == row(&ops, w),
+    );
+}
+
+fn census_rows(prefix: &str, ops: &polyphonic::cache::EngineOps, kinds: &[BlobKind]) {
+    for &kind in kinds {
         let k = kind.idx();
         println!(
             "{:<13} {:>8} {:>7} {:>10} {:>8} {:>11} {:>10} {:>8} {:>6} {:>9}",
-            CLASS_NAME[k],
+            format!("{prefix}{}", CLASS_NAME[k]),
             ops.admit[k],
             ops.touch[k],
             ops.anticipate[k],
@@ -1044,6 +1459,101 @@ fn ownership_report(hbm: u64, dram: u64, nvme: u64, ops: u64, seed: u64, bands: 
             ops.total(kind),
         );
     }
+}
+
+fn residency_arms(t: Trial, step: f64) -> (Report, Report, Report) {
+    let (mut hard, hs) = best_split(t, true, step);
+    hard.label = format!(
+        "hard-partition [{:.2}/{:.2}/{:.2}/{:.2}]",
+        hs[0], hs[1], hs[2], hs[3]
+    );
+    let (mut soft, ss) = best_split(t, false, step);
+    soft.label = format!(
+        "soft-floor     [{:.2}/{:.2}/{:.2}/{:.2}]",
+        ss[0], ss[1], ss[2], ss[3]
+    );
+    let mut open = run("", t, Budget::Open);
+    open.label = "no-floor       [open]".to_string();
+    (hard, soft, open)
+}
+
+fn residency_tables(rows: &[&Report]) {
+    println!(
+        "{:<32} {:>11} {:>9} {:>9} {:>10} {:>20} {:>21}",
+        "arm", "stall/req", "p99 (ms)", "goodput", "from tier", "hit kv/sn/wt/svc", "resident GiB"
+    );
+    for r in rows {
+        arm_row(r);
+    }
+
+    println!("\nadmission integrity");
+    for r in rows {
+        println!(
+            "{:<32} over-capacity={:<7} refused={:?} pinned-skips={}",
+            r.label, r.over_capacity, r.refused, r.pinned_skips
+        );
+    }
+
+    println!("\nper-class: mean stall per served request (ms) / goodput");
+    println!(
+        "{:<32} {:>16} {:>16} {:>16} {:>16}",
+        "arm", CLASS_NAME[0], CLASS_NAME[1], CLASS_NAME[2], CLASS_NAME[3]
+    );
+    for r in rows {
+        print!("{:<32}", r.label);
+        for k in 0..BlobKind::N {
+            let cell = format!(
+                "{:.1} / {:.0}%",
+                mean_ms(r.kind_ns[k], r.kind_ops[k]),
+                100.0 * r.class_goodput(k)
+            );
+            print!("{cell:>16}");
+        }
+        println!();
+    }
+
+    println!("\nshare of total stall by class (policy can only move what dominates)");
+    for r in rows {
+        print!("{:<32}", r.label);
+        for k in 0..BlobKind::N {
+            print!(
+                "{:>15.1}%",
+                100.0 * r.kind_ns[k] as f64 / r.total_ns.max(1) as f64
+            );
+        }
+        println!();
+    }
+
+    println!("\nstall (s) by phase");
+    println!(
+        "{:<32} {:>16} {:>16} {:>16} {:>16}",
+        "arm", PHASE_NAME[0], PHASE_NAME[1], PHASE_NAME[2], PHASE_NAME[3]
+    );
+    for r in rows {
+        print!("{:<32}", r.label);
+        for p in r.phase_ns {
+            print!("{:>16.2}", p as f64 / 1e9);
+        }
+        println!();
+    }
+}
+
+fn engine_taxonomy(rows: &[&Report]) {
+    println!("\nengine grant and refusal taxonomy (goodput is not comparable across the bit)");
+    for r in rows {
+        println!(
+            "{:<32} {}; router refused {:?}, engine preempted {:?}, ledger refused {:?}",
+            r.label,
+            grant_label(r.grant),
+            r.refused_by_router,
+            r.preempted,
+            r.refused,
+        );
+    }
+}
+
+fn per_req(r: &Report) -> f64 {
+    mean_ms(r.total_ns, r.served.iter().sum())
 }
 
 #[allow(
@@ -1064,6 +1574,7 @@ fn residency_report(
     volatility: f64,
     bands: [u8; BlobKind::N],
     clairvoyant: bool,
+    p3: Correct,
 ) {
     println!(
         "{} nvme={:.1}GiB ops={ops} seed={seed} volatility={volatility}\n",
@@ -1082,24 +1593,10 @@ fn residency_report(
         seed,
         ops,
         vol: volatility,
+        fix: p3.base(),
     };
-    let (mut hard, hs) = best_split(t, true, step);
-    hard.label = format!(
-        "hard-partition [{:.2}/{:.2}/{:.2}/{:.2}]",
-        hs[0], hs[1], hs[2], hs[3]
-    );
-    let (mut soft, ss) = best_split(t, false, step);
-    soft.label = format!(
-        "soft-floor     [{:.2}/{:.2}/{:.2}/{:.2}]",
-        ss[0], ss[1], ss[2], ss[3]
-    );
-    let mut open = run("", t, Budget::Open);
-    open.label = "no-floor       [open]".to_string();
+    let (hard, soft, open) = residency_arms(t, step);
 
-    // `phase-2.md` §1.7, §4.5: furthest-next-use, at the same open budget as `open` so only
-    // eviction quality differs. Never called an oracle and never scored as regret -- §1.7's
-    // reasoning is that variable size and cost make offline caching here NP-hard, so this is a
-    // clairvoyant *heuristic*, and its column below is a signed difference, not a bound.
     let clair = clairvoyant.then(|| {
         let t_clair = Trial {
             policy: Policy::Clairvoyant,
@@ -1113,68 +1610,10 @@ fn residency_report(
     if let Some(c) = &clair {
         rows.push(c);
     }
+    residency_tables(&rows);
 
-    println!(
-        "{:<32} {:>11} {:>9} {:>9} {:>10} {:>20} {:>21}",
-        "arm", "stall/req", "p99 (ms)", "goodput", "from tier", "hit kv/sn/wt/svc", "resident GiB"
-    );
-    for r in &rows {
-        arm_row(r);
-    }
-
-    println!("\nadmission integrity");
-    for r in &rows {
-        println!(
-            "{:<32} over-capacity={:<7} refused={:?} pinned-skips={}",
-            r.label, r.over_capacity, r.refused, r.pinned_skips
-        );
-    }
-
-    println!("\nper-class: mean stall per served request (ms) / goodput");
-    println!(
-        "{:<32} {:>16} {:>16} {:>16} {:>16}",
-        "arm", CLASS_NAME[0], CLASS_NAME[1], CLASS_NAME[2], CLASS_NAME[3]
-    );
-    for r in &rows {
-        print!("{:<32}", r.label);
-        for k in 0..BlobKind::N {
-            let cell = format!(
-                "{:.1} / {:.0}%",
-                mean_ms(r.kind_ns[k], r.kind_ops[k]),
-                100.0 * r.class_goodput(k)
-            );
-            print!("{cell:>16}");
-        }
-        println!();
-    }
-
-    println!("\nshare of total stall by class (policy can only move what dominates)");
-    for r in &rows {
-        print!("{:<32}", r.label);
-        for k in 0..BlobKind::N {
-            print!(
-                "{:>15.1}%",
-                100.0 * r.kind_ns[k] as f64 / r.total_ns.max(1) as f64
-            );
-        }
-        println!();
-    }
-
-    println!("\nstall (s) by phase");
-    println!(
-        "{:<32} {:>16} {:>16} {:>16} {:>16}",
-        "arm", PHASE_NAME[0], PHASE_NAME[1], PHASE_NAME[2], PHASE_NAME[3]
-    );
-    for r in &rows {
-        print!("{:<32}", r.label);
-        for p in r.phase_ns {
-            print!("{:>16.2}", p as f64 / 1e9);
-        }
-        println!();
-    }
-
-    let hm = mean_ms(hard.total_ns, hard.served.iter().sum());
-    let sm = mean_ms(soft.total_ns, soft.served.iter().sum());
+    let hm = per_req(&hard);
+    let sm = per_req(&soft);
     println!(
         "\nsoft-floor vs hard-partition: {:+.1}% stall/req at {:+.1}pp goodput",
         100.0 * (hm - sm) / hm,
@@ -1185,8 +1624,8 @@ fn residency_report(
         // isolates eviction quality, which is the only thing the arm exists to measure.
         // Dividing by the swept `soft-floor` instead would report the budget-policy gap --
         // far the larger effect here -- under an eviction-quality label.
-        let cm = mean_ms(c.total_ns, c.served.iter().sum());
-        let om = mean_ms(open.total_ns, open.served.iter().sum());
+        let cm = per_req(c);
+        let om = per_req(&open);
         println!(
             "\nclairvoyant vs no-floor (both open, so eviction quality alone): \
              {:+.1}% stall/req at {:+.1}pp hit rate (kv) -- a signed difference against a \
@@ -1198,6 +1637,69 @@ fn residency_report(
             "clairvoyant vs soft-floor: {:+.1}% stall/req -- budget policy and eviction \
              quality together, not attributable to either alone",
             100.0 * (cm - sm) / sm.max(f64::MIN_POSITIVE),
+        );
+    }
+    if !p3.engine_cache {
+        return;
+    }
+
+    println!(
+        "\n== engine allocates KV (phase-3.md): every arm re-tuned with the bit on; {} ==\n",
+        p3.describe()
+    );
+    let t_on = Trial {
+        fix: p3.engine(false),
+        ..t
+    };
+    let (hard_on, soft_on, open_on) = residency_arms(t_on, step);
+    let clair_on = clairvoyant.then(|| {
+        let mut c = run(
+            "",
+            Trial {
+                fix: p3.engine(true),
+                ..t
+            },
+            Budget::Open,
+        );
+        c.label = "clairvoyant    [open]".to_string();
+        c
+    });
+    let mut on: Vec<&Report> = vec![&hard_on, &soft_on, &open_on];
+    if let Some(c) = &clair_on {
+        on.push(c);
+    }
+    residency_tables(&on);
+    engine_taxonomy(&on);
+
+    let (hn, sn) = (per_req(&hard_on), per_req(&soft_on));
+    println!(
+        "\nsoft-floor vs hard-partition, P1: {:+.1}% stall/req with the ledger allocating, \
+         {:+.1}% with the engine allocating; weight hit {:.2} -> {:.2} (soft) and {:.2} -> \
+         {:.2} (hard)",
+        100.0 * (hm - sm) / hm,
+        100.0 * (hn - sn) / hn.max(f64::MIN_POSITIVE),
+        soft.hit[2],
+        soft_on.hit[2],
+        hard.hit[2],
+        hard_on.hit[2],
+    );
+    for (off, with) in [(&hard, &hard_on), (&soft, &soft_on), (&open, &open_on)] {
+        println!(
+            "the bit on {}: {:+.1}% stall/req, {:+.2}pp kv hit, {:+.2}pp weight hit",
+            off.label.split_whitespace().next().unwrap_or(""),
+            100.0 * (per_req(with) - per_req(off)) / per_req(off).max(f64::MIN_POSITIVE),
+            100.0 * (with.hit[0] - off.hit[0]),
+            100.0 * (with.hit[2] - off.hit[2]),
+        );
+    }
+    if let Some(c) = &clair_on {
+        let (cm, om) = (per_req(c), per_req(&open_on));
+        println!(
+            "\nclairvoyant engine cache vs LRU engine cache (phase-3.md §1.9, both open): \
+             {:+.1}% stall/req at {:+.1}pp kv hit -- what a better block manager would be \
+             worth, a signed difference and not a bound",
+            100.0 * (cm - om) / om.max(f64::MIN_POSITIVE),
+            100.0 * (c.hit[0] - open_on.hit[0]),
         );
     }
 }
@@ -1218,6 +1720,7 @@ fn main() {
             volatility,
             bands,
             clairvoyant,
+            p3,
         } => {
             residency_report(
                 hbm,
@@ -1229,6 +1732,7 @@ fn main() {
                 volatility,
                 bands_of(&bands),
                 clairvoyant,
+                p3,
             );
         }
         Cmd::Calibrate { path, iters } => calibrate(&path, iters),
@@ -1250,6 +1754,8 @@ fn main() {
             repeat,
             regret,
             flow_payload,
+            p3,
+            bits,
         } => distributed(
             nodes,
             units_per_node,
@@ -1267,6 +1773,8 @@ fn main() {
             repeat,
             regret,
             flow_payload,
+            p3,
+            bits,
         ),
         Cmd::CodeReview {
             hbm,
@@ -1286,6 +1794,8 @@ fn main() {
             hard_pools,
             repeat,
             regret,
+            p3,
+            bits,
         } => code_review(
             hbm,
             model_ddr,
@@ -1304,6 +1814,8 @@ fn main() {
             hard_pools,
             repeat,
             regret,
+            p3,
+            bits,
         ),
         Cmd::DataPath {
             nodes,
@@ -1346,6 +1858,8 @@ fn main() {
             bands,
             rate,
             drain_at,
+            drain_spill,
+            p3,
         } => {
             placement(
                 sockets,
@@ -1358,6 +1872,8 @@ fn main() {
                 bands_of(&bands),
                 rate,
                 drain_at,
+                p3,
+                drain_spill,
             );
         }
         Cmd::Flows {
@@ -1369,6 +1885,7 @@ fn main() {
             step,
             bands,
             clairvoyant,
+            p3,
         } => {
             flows_report(
                 hbm,
@@ -1379,6 +1896,7 @@ fn main() {
                 step,
                 bands_of(&bands),
                 clairvoyant,
+                p3,
             );
         }
         Cmd::Volatility {
@@ -1389,8 +1907,9 @@ fn main() {
             seed,
             step,
             clairvoyant,
+            p3,
         } => {
-            volatility_sweep(hbm, dram, nvme, ops, seed, step, clairvoyant);
+            volatility_sweep(hbm, dram, nvme, ops, seed, step, clairvoyant, p3);
         }
         Cmd::Ownership {
             hbm,
@@ -1399,9 +1918,41 @@ fn main() {
             ops,
             seed,
             bands,
+            p3,
         } => {
-            ownership_report(hbm, dram, nvme, ops, seed, bands_of(&bands));
+            ownership_report(hbm, dram, nvme, ops, seed, bands_of(&bands), p3);
         }
+        Cmd::Price {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            bands,
+            distance,
+            rate,
+            fanout,
+            node_hbm,
+            node_dram,
+            node_ops,
+        } => price(&PriceArgs {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            bands: bands_of(&bands),
+            distance,
+            rate,
+            fanout,
+            node_hbm,
+            node_dram,
+            node_ops,
+        }),
     }
 }
 
@@ -1617,6 +2168,10 @@ struct ClassTally {
     /// `owned-and-observed.md` §3.5's acquisition regime, over every served request
     /// regardless of class -- `Regime::idx`'s four exclusive buckets, summing to `served`.
     regime: [u64; polyphonic::oracle::REGIME_COUNT],
+    samples: [Vec<u64>; BlobKind::N],
+    chat: Vec<u64>,
+    stage: Vec<u64>,
+    produced: [u64; 2],
 }
 
 type ClassRow<'a> = (&'a str, ClassTally);
@@ -1932,9 +2487,129 @@ fn crossing_of(
     })
 }
 
+struct ArmRun {
+    mach: polyphonic::machine::Machine,
+    t: ClassTally,
+    total: u64,
+    served: u64,
+    offered: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Scenario {
+    cost: polyphonic::boundary::Cost,
+    rate: f64,
+    fanout: f64,
+    seed: u64,
+    ops: u64,
+    flow_payload: Option<u64>,
+    regret: bool,
+    p3: Correct,
+    bits: ClusterBits,
+}
+
+fn distributed_run(
+    a: &Arm,
+    topo: &polyphonic::topo::Topology,
+    memory: NodeMemory,
+    sc: Scenario,
+) -> ArmRun {
+    use polyphonic::machine::Machine;
+    let mut mach = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, a.placement);
+    mach.set_flow_aware(a.flow);
+    mach.set_control(a.control, sc.cost);
+    mach.set_state_transfer(a.transfer);
+    mach.set_arrival_rate(sc.rate);
+    mach.set_fanout_atomic(true);
+    mach.set_regret(sc.regret);
+    sc.p3.setup(&mut mach, sc.bits);
+    let workload = polyphonic::work::Workload::with_fanout(sc.seed, sc.ops, 1.0, sc.fanout);
+    let workload = match sc.flow_payload {
+        Some(bytes) => workload.with_flow_payload(bytes),
+        None => workload,
+    };
+    let (t, total, served, offered) = drive(&mut mach, sc.rate, sc.p3.workload(workload));
+    ArmRun {
+        mach,
+        t,
+        total,
+        served,
+        offered,
+    }
+}
+
+fn distributed_header() {
+    println!(
+        "{:<22} {:>13} {:>12} {:>9} {:>10} {:>11} {:>9} {:>9} {:>9} {:>11}",
+        "arm",
+        "service/req",
+        "stall/req",
+        "served",
+        "fan-outs",
+        "deciding",
+        "of stall",
+        "split",
+        "handoff",
+        "spread"
+    );
+}
+
+fn distributed_row(a: &Arm, r: &ArmRun, regret: bool) {
+    let (mach, label) = (&r.mach, a.label);
+    let stall = mean_ms(r.total, r.served);
+    let service = mean_ms(r.t.service.iter().sum(), r.served);
+    println!(
+        "{label:<22} {service:>11.3}ms {stall:>10.3}ms {:>8.1}% {:>9.1}% {:>9.3}ms \
+         {:>8.2}% {:>8.1}% {:>8.2}s {:>11.2}",
+        100.0 * r.served as f64 / r.offered.max(1) as f64,
+        100.0 * mach.fanouts_admitted as f64
+            / (mach.fanouts_admitted + mach.fanouts_refused).max(1) as f64,
+        mean_ms(mach.decide_ns, r.served),
+        100.0 * mach.decide_ns as f64 / r.total.max(1) as f64,
+        100.0 * mach.split_tasks as f64 / (mach.split_tasks + mach.joined_tasks).max(1) as f64,
+        mach.handoff_ns as f64 / 1e9,
+        mach.domain_spread(),
+    );
+    state_terms(mach, r.served);
+    if a.placement == Placement::Scored {
+        score_terms(mach, r.served);
+        term_spread(mach);
+    }
+    if regret {
+        regret_report(mach);
+    }
+}
+
+fn correction_terms(mach: &polyphonic::machine::Machine, r: &ArmRun, bits: ClusterBits) {
+    let pct = |n: u64| 100.0 * n as f64 / r.offered.max(1) as f64;
+    let refused: u64 = mach.refused_by_router.iter().sum();
+    let preempted: u64 = mach.preempted.iter().sum();
+    print!(
+        "{:<22} router refused {:.2}% of requests, engine preempted {:.2}%, {} orphaned blocks",
+        "",
+        pct(refused),
+        pct(preempted),
+        mach.kv_orphans(),
+    );
+    if bits.shared_l2.is_some() {
+        let k = BlobKind::KvBlock.idx();
+        let w = BlobKind::WeightShard.idx();
+        print!(
+            "; shared L2 read by {:.2}% of served requests for KV, {:.2}% for weights",
+            100.0 * mach.shared_requests[k] as f64 / r.served.max(1) as f64,
+            100.0 * mach.shared_requests[w] as f64 / r.served.max(1) as f64,
+        );
+    }
+    println!();
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "experiment knobs, all independent"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one table per side of the correction"
 )]
 fn distributed(
     nodes: usize,
@@ -1953,8 +2628,9 @@ fn distributed(
     repeat: usize,
     regret: bool,
     flow_payload: Option<u64>,
+    p3: Correct,
+    bits: ClusterBits,
 ) {
-    use polyphonic::machine::Machine;
     use polyphonic::topo::{Distance, Topology};
 
     let ladder = polyphonic::boundary::measure(repeat);
@@ -1973,6 +2649,17 @@ fn distributed(
     );
 
     cluster_header(nodes, units_per_node, &memory, crossing, cost);
+    let sc = Scenario {
+        cost,
+        rate,
+        fanout,
+        seed,
+        ops,
+        flow_payload,
+        regret,
+        p3,
+        bits,
+    };
 
     // Residency routing and flow co-placement are separate mechanisms that were previously
     // bundled into one arm. Split so the win can be attributed to one of them.
@@ -1991,69 +2678,46 @@ fn distributed(
             dist.one_way_ns() as f64 / 1000.0,
             dist.ns_per_byte()
         );
-        // Service time leads: once decode cost depends on the batch a request joins, placement
-        // moves execution as well as waiting, and stall alone cannot see the difference.
-        println!(
-            "{:<22} {:>13} {:>12} {:>9} {:>10} {:>11} {:>9} {:>9} {:>9} {:>11}",
-            "arm",
-            "service/req",
-            "stall/req",
-            "served",
-            "fan-outs",
-            "deciding",
-            "of stall",
-            "split",
-            "handoff",
-            "spread"
-        );
+        distributed_header();
         let mut per_class: Vec<ClassRow<'_>> = Vec::new();
+        let mut means = Vec::with_capacity(arms.len());
         for a in &arms {
-            let label = a.label;
-            let mut mach = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, a.placement);
-            mach.set_flow_aware(a.flow);
-            mach.set_control(a.control, cost);
-            mach.set_state_transfer(a.transfer);
-            mach.set_arrival_rate(rate);
-            mach.set_fanout_atomic(true);
-            mach.set_regret(regret);
-            let workload = polyphonic::work::Workload::with_fanout(seed, ops, 1.0, fanout);
-            let workload = match flow_payload {
-                Some(bytes) => workload.with_flow_payload(bytes),
-                None => workload,
-            };
-            let (t, total, served, offered) = drive(&mut mach, rate, workload);
-            let stall = mean_ms(total, served);
-            let service = mean_ms(t.service.iter().sum(), served);
-            println!(
-                "{label:<22} {service:>11.3}ms {stall:>10.3}ms {:>8.1}% {:>9.1}% {:>9.3}ms \
-                 {:>8.2}% {:>8.1}% {:>8.2}s {:>11.2}",
-                100.0 * served as f64 / offered.max(1) as f64,
-                100.0 * mach.fanouts_admitted as f64
-                    / (mach.fanouts_admitted + mach.fanouts_refused).max(1) as f64,
-                mean_ms(mach.decide_ns, served),
-                100.0 * mach.decide_ns as f64 / total.max(1) as f64,
-                100.0 * mach.split_tasks as f64
-                    / (mach.split_tasks + mach.joined_tasks).max(1) as f64,
-                mach.handoff_ns as f64 / 1e9,
-                mach.domain_spread(),
-            );
-            state_terms(&mach, served);
-            if a.placement == Placement::Scored {
-                score_terms(&mach, served);
-                term_spread(&mach);
+            let r = distributed_run(a, &topo, memory, sc);
+            distributed_row(a, &r, regret);
+            if p3.engine_cache {
+                correction_terms(&r.mach, &r, bits);
             }
-            if regret {
-                regret_report(&mach);
-            }
-            for (seen, (ns, n)) in warm_seen.iter_mut().zip(t.warm_ns.iter().zip(&t.warm)) {
+            means.push(r.mach.kv_mean());
+            for (seen, (ns, n)) in warm_seen.iter_mut().zip(r.t.warm_ns.iter().zip(&r.t.warm)) {
                 seen.0 += ns;
                 seen.1 += n;
             }
-            per_class.push((label, t));
+            per_class.push((a.label, r.t));
         }
 
         class_table(&per_class);
-        fanout_admission(&topo, memory, seed, ops, rate, fanout);
+        fanout_admission(&topo, memory, sc);
+        if !p3.engine_cache {
+            continue;
+        }
+        let g = p3.grant(&memory, [0; 3]);
+        println!(
+            "\n-- engine allocates KV (phase-3.md): partition {:.2} GiB, offload {:.2} GiB per \
+             node, spill from each arm's own run above; {} --",
+            gib(g.map_or(0, |g| g.partition)),
+            gib(g.map_or(0, |g| g.offload)),
+            p3.describe(),
+        );
+        distributed_header();
+        let mut per_class_on: Vec<ClassRow<'_>> = Vec::new();
+        for (a, off) in arms.iter().zip(&means) {
+            let r = distributed_run(a, &topo, p3.engine_memory(memory, *off), sc);
+            distributed_row(a, &r, regret);
+            correction_terms(&r.mach, &r, bits);
+            per_class_on.push((a.label, r.t));
+        }
+        class_table(&per_class_on);
+        engine_fanout_admission(&topo, memory, sc);
     }
     crossover(&ladder, cost, &warm_seen);
 }
@@ -2094,6 +2758,8 @@ fn code_review(
     hard_pools: bool,
     repeat: usize,
     regret: bool,
+    p3: Correct,
+    bits: ClusterBits,
 ) {
     use polyphonic::machine::Machine;
     use polyphonic::topo::{Distance, Topology};
@@ -2118,8 +2784,8 @@ fn code_review(
         hbm_quota: Quota::open(0, bands),
         ddr_quota: Quota::from_split(agent_ddr, [0.0, 0.35, 0.0, 0.35], bands, hard_pools),
         can_decode: false,
+        kv: None,
     };
-    let memory_at = move |d: usize| if d == MODEL { model_mem } else { agent_mem };
 
     println!(
         "model host:  hbm={:.1}GiB ddr={:.1}GiB, decode engine\n\
@@ -2159,20 +2825,22 @@ fn code_review(
             dist.one_way_ns() as f64 / 1000.0,
             dist.ns_per_byte()
         );
-        println!(
-            "{:<22} {:>13} {:>12} {:>9} {:>11} {:>10} {:>10} {:>11}",
-            "arm",
-            "service/req",
-            "stall/req",
-            "served",
-            "round trip",
-            "tools home",
-            "handoff",
-            "on model"
-        );
-        let mut per_class: Vec<ClassRow<'_>> = Vec::new();
-        for a in &arms {
-            let label = a.label;
+        let header = || {
+            println!(
+                "{:<22} {:>13} {:>12} {:>9} {:>11} {:>10} {:>10} {:>11}",
+                "arm",
+                "service/req",
+                "stall/req",
+                "served",
+                "round trip",
+                "tools home",
+                "handoff",
+                "on model"
+            );
+        };
+        header();
+        let run_arm = |a: &Arm, model: NodeMemory| -> ArmRun {
+            let memory_at = move |d: usize| if d == MODEL { model } else { agent_mem };
             let mut mach = Machine::new(topo.clone(), memory_at, Policy::Gdsf, a.placement);
             mach.set_flow_aware(a.flow);
             mach.set_control(a.control, cost);
@@ -2180,6 +2848,7 @@ fn code_review(
             mach.set_fanout_atomic(true);
             mach.set_tool_anchor(Some(AGENT));
             mach.set_regret(regret);
+            p3.setup(&mut mach, bits);
             // Every reasoning request starts at the agent host and its answer returns there.
             // The context delta going in is dominated by the last tool result the agent
             // gathered, so that is what sizes the trip.
@@ -2187,11 +2856,24 @@ fn code_review(
             let (t, total, served, offered) = drive(
                 &mut mach,
                 rate,
-                polyphonic::work::Workload::new(seed, ops, 1.0)
-                    .with_tool_profile(tool_fraction, tool_payload),
+                p3.workload(
+                    polyphonic::work::Workload::new(seed, ops, 1.0)
+                        .with_tool_profile(tool_fraction, tool_payload),
+                ),
             );
-            let stall = mean_ms(total, served);
-            let service = mean_ms(t.service.iter().sum(), served);
+            ArmRun {
+                mach,
+                t,
+                total,
+                served,
+                offered,
+            }
+        };
+        let row = |a: &Arm, r: &ArmRun| {
+            let mach = &r.mach;
+            let label = a.label;
+            let stall = mean_ms(r.total, r.served);
+            let service = mean_ms(r.t.service.iter().sum(), r.served);
             // A task is "split" when its downstream stage did not run where its upstream did.
             // Here that is the agent host keeping its own tool call, so the complement is the
             // share of tool calls that stayed home.
@@ -2199,26 +2881,52 @@ fn code_review(
             println!(
                 "{label:<22} {service:>11.3}ms {stall:>10.3}ms {:>8.1}% {:>9.3}ms {:>9.1}% \
                  {:>9.2}s {:>10.1}%",
-                100.0 * served as f64 / offered.max(1) as f64,
+                100.0 * r.served as f64 / r.offered.max(1) as f64,
                 mean_ms(mach.origin_ns, mach.origin_hops),
                 100.0 * mach.joined_tasks as f64 / stages as f64,
                 mach.handoff_ns as f64 / 1e9,
                 100.0 * mach.decodes_on(MODEL) as f64 / mach.decodes().max(1) as f64,
             );
-            state_terms(&mach, served);
+            state_terms(mach, r.served);
             if a.placement == Placement::Scored {
-                score_terms(&mach, served);
+                score_terms(mach, r.served);
             }
             if regret {
-                regret_report(&mach);
+                regret_report(mach);
             }
-            for (seen, (ns, n)) in warm_seen.iter_mut().zip(t.warm_ns.iter().zip(&t.warm)) {
+        };
+        let mut per_class: Vec<ClassRow<'_>> = Vec::new();
+        let mut means = Vec::with_capacity(arms.len());
+        for a in &arms {
+            let r = run_arm(a, model_mem);
+            row(a, &r);
+            if p3.engine_cache {
+                correction_terms(&r.mach, &r, bits);
+            }
+            means.push(r.mach.kv_mean());
+            for (seen, (ns, n)) in warm_seen.iter_mut().zip(r.t.warm_ns.iter().zip(&r.t.warm)) {
                 seen.0 += ns;
                 seen.1 += n;
             }
-            per_class.push((label, t));
+            per_class.push((a.label, r.t));
         }
         class_table(&per_class);
+        if !p3.engine_cache {
+            continue;
+        }
+        println!(
+            "\n-- engine allocates KV on the model host (phase-3.md); {} --",
+            p3.describe()
+        );
+        header();
+        let mut per_class_on: Vec<ClassRow<'_>> = Vec::new();
+        for (a, off) in arms.iter().zip(&means) {
+            let r = run_arm(a, p3.engine_memory(model_mem, *off));
+            row(a, &r);
+            correction_terms(&r.mach, &r, bits);
+            per_class_on.push((a.label, r.t));
+        }
+        class_table(&per_class_on);
     }
     crossover(&ladder, cost, &warm_seen);
 }
@@ -2247,6 +2955,17 @@ fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
         t.service[k] += c.service_ns();
         t.decide[k] += c.decide_ns;
         t.ops[k] += 1;
+        t.samples[k].push(c.service_ns());
+        if k == BlobKind::KvBlock.idx() {
+            let out: u64 = req.produces.iter().map(|(_, m)| m.bytes).sum();
+            if req.completes.is_some() {
+                t.stage.push(c.service_ns());
+                t.produced[1] += out;
+            } else {
+                t.chat.push(c.service_ns());
+                t.produced[0] += out;
+            }
+        }
         // Warm means the ledger had everything: no fetch, no recompute, just the work.
         if c.transfer_ns == 0 && c.recompute_ns == 0 {
             t.warm[k] += 1;
@@ -2264,48 +2983,629 @@ fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
 /// scheduler does when nobody told it the requests belong together. An orchestrator missing
 /// one agent cannot resume, so every agent that did run was work for nothing -- and it ran on
 /// engines and memory that other requests needed.
-fn fanout_admission(
-    topo: &polyphonic::topo::Topology,
-    memory: NodeMemory,
-    seed: u64,
-    ops: u64,
-    rate: f64,
-    fanout: f64,
-) {
-    use polyphonic::machine::{Machine, Placement};
-    if fanout <= 0.0 {
+fn fanout_admission(topo: &polyphonic::topo::Topology, memory: NodeMemory, sc: Scenario) {
+    if sc.fanout <= 0.0 {
         return;
     }
     println!("\n  fan-out admission (scored + fetch, unified control)");
+    fanout_header();
+    for atomic in [false, true] {
+        let r = fanout_run(topo, memory, sc, atomic);
+        fanout_row(atomic, &r);
+    }
+}
+
+fn fanout_header() {
     println!(
         "  {:<16} {:>11} {:>13} {:>12} {:>12} {:>16} {:>9}",
         "admission", "fan-outs", "wasted work", "fan-out", "stall/req", "inference stall", "served"
     );
-    for atomic in [false, true] {
-        let mut mach = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, Placement::Scored);
-        mach.set_flow_aware(true);
-        mach.set_state_transfer(true);
-        mach.set_fanout_atomic(atomic);
-        let (t, total, served, offered) = drive(
-            &mut mach,
-            rate,
-            polyphonic::work::Workload::with_fanout(seed, ops, 1.0, fanout),
+}
+
+fn fanout_run(
+    topo: &polyphonic::topo::Topology,
+    memory: NodeMemory,
+    sc: Scenario,
+    atomic: bool,
+) -> ArmRun {
+    use polyphonic::machine::{Machine, Placement};
+    let mut mach = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, Placement::Scored);
+    mach.set_flow_aware(true);
+    mach.set_state_transfer(true);
+    mach.set_fanout_atomic(atomic);
+    sc.p3.setup(&mut mach, sc.bits);
+    let (t, total, served, offered) = drive(
+        &mut mach,
+        sc.rate,
+        sc.p3.workload(polyphonic::work::Workload::with_fanout(
+            sc.seed, sc.ops, 1.0, sc.fanout,
+        )),
+    );
+    ArmRun {
+        mach,
+        t,
+        total,
+        served,
+        offered,
+    }
+}
+
+fn fanout_row(atomic: bool, r: &ArmRun) {
+    let mach = &r.mach;
+    println!(
+        "  {:<16} {:>6}/{:<4} {:>11.2}s {:>10.1}ms {:>10.3}ms {:>14.3}ms {:>8.1}%",
+        if atomic {
+            "all-or-nothing"
+        } else {
+            "per agent"
+        },
+        mach.fanouts_admitted,
+        mach.fanouts_admitted + mach.fanouts_refused,
+        mach.fanout_wasted_ns as f64 / 1e9,
+        mean_ms(mach.fanout_service_ns, mach.fanouts_admitted),
+        mean_ms(r.total, r.served),
+        mean_ms(r.t.stall[0], r.t.ops[0]),
+        100.0 * r.served as f64 / r.offered.max(1) as f64,
+    );
+}
+
+fn engine_fanout_admission(topo: &polyphonic::topo::Topology, memory: NodeMemory, sc: Scenario) {
+    if sc.fanout <= 0.0 {
+        return;
+    }
+    println!(
+        "\n  fan-out admission, engine allocates KV (router reserves {})",
+        sc.p3.reserve().label()
+    );
+    fanout_header();
+    let mut completed = [(0u64, 0u64); 2];
+    for (i, atomic) in [false, true].into_iter().enumerate() {
+        let off = fanout_run(topo, memory, sc, atomic);
+        let r = fanout_run(
+            topo,
+            sc.p3.engine_memory(memory, off.mach.kv_mean()),
+            sc,
+            atomic,
+        );
+        fanout_row(atomic, &r);
+        completed[i] = (off.mach.fanouts_admitted, r.mach.fanouts_admitted);
+    }
+    let gain = |base: u64, with: u64| 100.0 * (with as f64 - base as f64) / base.max(1) as f64;
+    println!(
+        "  all-or-nothing over per-agent: {:+.1}% fan-outs completed on the ledger, {:+.1}% \
+         with the engine allocating",
+        gain(completed[0].0, completed[1].0),
+        gain(completed[0].1, completed[1].1),
+    );
+}
+
+struct PriceArgs {
+    nodes: usize,
+    units_per_node: usize,
+    hbm: u64,
+    dram: u64,
+    nvme: u64,
+    ops: u64,
+    seed: u64,
+    bands: [u8; BlobKind::N],
+    distance: String,
+    rate: f64,
+    fanout: f64,
+    node_hbm: u64,
+    node_dram: u64,
+    node_ops: u64,
+}
+
+fn quantile(v: &[u64], q: f64) -> u64 {
+    if v.is_empty() {
+        return 0;
+    }
+    let mut sorted = v.to_vec();
+    sorted.sort_unstable();
+    sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)]
+}
+
+fn mean_of(v: &[u64]) -> f64 {
+    mean_ms(v.iter().sum(), v.len() as u64)
+}
+
+fn correct(decode_kv: bool, admit: AdmitArg) -> Correct {
+    Correct {
+        engine_cache: true,
+        decode_kv,
+        tokens_per_block: polyphonic::work::TOKENS_PER_KV_BLOCK,
+        admit,
+        max_token_slack: polyphonic::work::MAX_TOKEN_SLACK,
+        kv_scale: 1.0,
+        kv_partition: None,
+    }
+}
+
+fn price_run(
+    a: &PriceArgs,
+    topo: &polyphonic::topo::Topology,
+    memory: NodeMemory,
+    p3: Correct,
+    regret: bool,
+) -> ArmRun {
+    use polyphonic::machine::Machine;
+    let mut mach = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, Placement::Scored);
+    mach.set_flow_aware(true);
+    mach.set_control(Control::Unified, polyphonic::boundary::Cost::default());
+    mach.set_state_transfer(true);
+    mach.set_fanout_atomic(true);
+    mach.set_regret(regret);
+    p3.setup(
+        &mut mach,
+        ClusterBits {
+            shared_l2: None,
+            no_displacement: false,
+        },
+    );
+    let workload = polyphonic::work::Workload::with_fanout(a.seed, a.ops, 1.0, a.fanout);
+    let (t, total, served, offered) = drive(&mut mach, a.rate, p3.workload(workload));
+    ArmRun {
+        mach,
+        t,
+        total,
+        served,
+        offered,
+    }
+}
+
+fn price_pair(
+    a: &PriceArgs,
+    topo: &polyphonic::topo::Topology,
+    memory: NodeMemory,
+    p3: Correct,
+    regret: bool,
+) -> (ArmRun, ArmRun) {
+    let ledger = Correct {
+        engine_cache: false,
+        ..p3
+    };
+    let off = price_run(a, topo, memory, ledger, regret);
+    let on = price_run(
+        a,
+        topo,
+        p3.engine_memory(memory, off.mach.kv_mean()),
+        p3,
+        regret,
+    );
+    (off, on)
+}
+
+fn price_header() {
+    println!(
+        "  {:<24} {:>10} {:>9} {:>17} {:>17} {:>9} {:>9} {:>8} {:>9} {:>8} {:>8}",
+        "",
+        "service",
+        "p99",
+        "chat mean/p99",
+        "stage mean/p99",
+        "faas p99",
+        "svc p99",
+        "served",
+        "fan-outs",
+        "refused",
+        "preempt"
+    );
+}
+
+fn price_row(label: &str, r: &ArmRun) {
+    let all: Vec<u64> = r.t.samples.iter().flatten().copied().collect();
+    let refused: u64 = r.mach.refused_by_router.iter().sum();
+    let preempted: u64 = r.mach.preempted.iter().sum();
+    let pct = |n: u64| 100.0 * n as f64 / r.offered.max(1) as f64;
+    let gangs = r.mach.fanouts_admitted + r.mach.fanouts_refused;
+    println!(
+        "  {label:<24} {:>8.1}ms {:>7.0}ms {:>7.1}/{:>7.0}ms {:>7.1}/{:>7.0}ms {:>7.1}ms \
+         {:>7.0}ms {:>7.1}% {:>8.1}% {:>7.2}% {:>7.2}%",
+        mean_of(&all),
+        ms(quantile(&all, 0.99)),
+        mean_of(&r.t.chat),
+        ms(quantile(&r.t.chat, 0.99)),
+        mean_of(&r.t.stage),
+        ms(quantile(&r.t.stage, 0.99)),
+        ms(quantile(&r.t.samples[BlobKind::Snapshot.idx()], 0.99)),
+        ms(quantile(&r.t.samples[BlobKind::ServiceHeap.idx()], 0.99)),
+        pct(r.served),
+        100.0 * r.mach.fanouts_admitted as f64 / gangs.max(1) as f64,
+        pct(refused),
+        pct(preempted),
+    );
+}
+
+fn signed(off: f64, on: f64) -> f64 {
+    100.0 * (on - off) / off.abs().max(f64::MIN_POSITIVE)
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "six sweeps, printed in the order phase-3.md lists them"
+)]
+fn price(a: &PriceArgs) {
+    use polyphonic::topo::{Distance, Topology};
+    let Ok(dist) = a.distance.trim().parse::<Distance>() else {
+        println!("unknown distance {}", a.distance);
+        return;
+    };
+    let n = a.nodes as u64;
+    let memory = node_memory(a.hbm / n, a.dram / n, a.nvme / n, a.bands, false);
+    let topo = Topology::cluster(
+        a.nodes,
+        a.units_per_node,
+        a.dram / n,
+        dist,
+        polyphonic::boundary::Cost::default(),
+    );
+    println!(
+        "the price of the engine boundary (phase-3.md \u{a7}4.11)\n\
+         cluster: {} nodes, {} per node, {}, {} req/s, {:.0}% fan-out, ops={} seed={}\n\
+         arm: scored + fetch, flow-aware, unified control, no control crossing charged\n\
+         default grant per node: {}\n\
+         chat = a session's own turn; stage = inference another task waits on\n",
+        a.nodes,
+        memory_label(memory.hbm, memory.ddr),
+        dist.label(),
+        a.rate,
+        100.0 * a.fanout,
+        a.ops,
+        a.seed,
+        {
+            let g = correct(false, AdmitArg::None).grant(&memory, [0; 3]);
+            format!(
+                "partition {:.2} GiB, offload {:.2} GiB, spill sized per run",
+                gib(g.map_or(0, |g| g.partition)),
+                gib(g.map_or(0, |g| g.offload)),
+            )
+        },
+    );
+
+    println!("1. the bit: who allocates KV, holding everything else fixed");
+    price_header();
+    for decode_kv in [false, true] {
+        let p3 = correct(decode_kv, AdmitArg::None);
+        let (off, on) = price_pair(a, &topo, memory, p3, false);
+        let tag = if decode_kv { ", decode kv" } else { "" };
+        price_row(&format!("ledger{tag}"), &off);
+        price_row(&format!("engine{tag}"), &on);
+        let (all_off, all_on): (Vec<u64>, Vec<u64>) = (
+            off.t.samples.iter().flatten().copied().collect(),
+            on.t.samples.iter().flatten().copied().collect(),
         );
         println!(
-            "  {:<16} {:>6}/{:<4} {:>11.2}s {:>10.1}ms {:>10.3}ms {:>14.3}ms {:>8.1}%",
-            if atomic {
-                "all-or-nothing"
-            } else {
-                "per agent"
-            },
-            mach.fanouts_admitted,
-            mach.fanouts_admitted + mach.fanouts_refused,
-            mach.fanout_wasted_ns as f64 / 1e9,
-            mean_ms(mach.fanout_service_ns, mach.fanouts_admitted),
-            mean_ms(total, served),
-            mean_ms(t.stall[0], t.ops[0]),
-            100.0 * served as f64 / offered.max(1) as f64,
+            "  {:<24} {:+.1}% mean, {:+.1}% p99; chat p99 {:+.1}%, stage p99 {:+.1}%; \
+             served {:+.1}pp -- a price is only a price where served agrees",
+            "  price",
+            signed(mean_of(&all_off), mean_of(&all_on)),
+            signed(
+                quantile(&all_off, 0.99) as f64,
+                quantile(&all_on, 0.99) as f64
+            ),
+            signed(
+                quantile(&off.t.chat, 0.99) as f64,
+                quantile(&on.t.chat, 0.99) as f64
+            ),
+            signed(
+                quantile(&off.t.stage, 0.99) as f64,
+                quantile(&on.t.stage, 0.99) as f64
+            ),
+            100.0 * (on.served as f64 - off.served as f64) / off.offered.max(1) as f64,
         );
+    }
+
+    println!(
+        "\n2. admission bracket (P4): what the router reserves, decode output modelled and held"
+    );
+    price_header();
+    let ledger = price_run(
+        a,
+        &topo,
+        memory,
+        Correct {
+            engine_cache: false,
+            ..correct(true, AdmitArg::None)
+        },
+        false,
+    );
+    price_row("ledger (reference)", &ledger);
+    let mean = ledger.mach.kv_mean();
+    for scale in [1.0, 0.5, 0.25] {
+        let mut bracket = Vec::new();
+        for admit in [AdmitArg::Bound, AdmitArg::Perfect, AdmitArg::None] {
+            let p3 = Correct {
+                kv_scale: scale,
+                ..correct(true, admit)
+            };
+            let r = price_run(a, &topo, p3.engine_memory(memory, mean), p3, false);
+            price_row(&format!("{scale}x, {}", p3.reserve().label()), &r);
+            bracket.push(r);
+        }
+        let (perfect, none) = (&bracket[1], &bracket[2]);
+        let out = none.t.produced;
+        println!(
+            "  {scale}x none against perfect: chat p99 {:+.1}%, stage p99 {:+.1}%, faas p99 \
+             {:+.1}%; unreserved output {:.0}% chat, {:.0}% stage (fan-out agents not counted)",
+            signed(
+                quantile(&perfect.t.chat, 0.99) as f64,
+                quantile(&none.t.chat, 0.99) as f64
+            ),
+            signed(
+                quantile(&perfect.t.stage, 0.99) as f64,
+                quantile(&none.t.stage, 0.99) as f64
+            ),
+            signed(
+                quantile(&perfect.t.samples[BlobKind::Snapshot.idx()], 0.99) as f64,
+                quantile(&none.t.samples[BlobKind::Snapshot.idx()], 0.99) as f64
+            ),
+            100.0 * out[0] as f64 / (out[0] + out[1]).max(1) as f64,
+            100.0 * out[1] as f64 / (out[0] + out[1]).max(1) as f64,
+        );
+    }
+
+    println!("\n3. max_tokens slack under `bound`");
+    price_header();
+    for slack in [1.0, 2.0, 4.0, 8.0] {
+        let p3 = Correct {
+            max_token_slack: slack,
+            ..correct(true, AdmitArg::Bound)
+        };
+        let r = price_run(a, &topo, p3.engine_memory(memory, mean), p3, false);
+        price_row(&format!("bound, {slack:.0}x"), &r);
+    }
+
+    println!(
+        "\n4. tokens per KV block (\u{a7}1.3): measured blocks per decode against the \
+         arithmetic, and the bit at each"
+    );
+    price_header();
+    for (per_block, expect) in [(8u64, 15.88), (16, 8.18), (32, 4.33), (35, 4.015)] {
+        let p3 = Correct {
+            tokens_per_block: per_block,
+            ..correct(true, AdmitArg::None)
+        };
+        let single = run(
+            "",
+            Trial {
+                bands: a.bands,
+                flows: FlowMode::Blind,
+                hbm: a.node_hbm,
+                dram: a.node_dram,
+                nvme: 64 << 30,
+                policy: Policy::Gdsf,
+                seed: a.seed,
+                ops: a.node_ops,
+                vol: 1.0,
+                fix: p3.base(),
+            },
+            Budget::Open,
+        );
+        let (off, on) = price_pair(a, &topo, memory, p3, false);
+        println!(
+            "  {per_block} tokens/block: {:.3} blocks per decode, {expect} expected",
+            single.decode_blocks as f64 / single.decodes.max(1) as f64
+        );
+        price_row(&format!("ledger, {per_block}"), &off);
+        price_row(&format!("engine, {per_block}"), &on);
+    }
+
+    println!(
+        "\n5. partition size (P7): the bit at each size on the cluster, and on one node beside \
+         what a clairvoyant block manager would buy at that size"
+    );
+    price_header();
+    let base = Trial {
+        bands: a.bands,
+        flows: FlowMode::Blind,
+        hbm: a.node_hbm,
+        dram: a.node_dram,
+        nvme: 64 << 30,
+        policy: Policy::Gdsf,
+        seed: a.seed,
+        ops: a.node_ops,
+        vol: 1.0,
+        fix: Correction::default(),
+    };
+    let stream = trace(base);
+    let (node_off, split) = best_split(base, false, 0.125);
+    let budget = Budget::Split { split, hard: false };
+    let mut node_rows = Vec::new();
+    let base_p3 = correct(false, AdmitArg::None);
+    let cluster_off = price_run(
+        a,
+        &topo,
+        memory,
+        Correct {
+            engine_cache: false,
+            ..base_p3
+        },
+        false,
+    );
+    price_row("ledger", &cluster_off);
+    for scale in [0.5, 0.75, 1.0, 1.5, 2.0] {
+        let p3 = Correct {
+            kv_scale: scale,
+            ..base_p3
+        };
+        let on = price_run(
+            a,
+            &topo,
+            p3.engine_memory(memory, cluster_off.mach.kv_mean()),
+            p3,
+            false,
+        );
+        price_row(
+            &format!(
+                "engine, {scale}x = {:.2} GiB",
+                gib(p3.grant(&memory, [0; 3]).map_or(0, |g| g.partition))
+            ),
+            &on,
+        );
+        let arm = |clairvoyant| Trial {
+            fix: Correction {
+                engine: Some(EngineArm {
+                    scale,
+                    partition: None,
+                    clairvoyant,
+                }),
+                ..Correction::default()
+            },
+            ..base
+        };
+        let lru = run_on("", arm(false), budget, &stream);
+        let clair = run_on("", arm(true), budget, &stream);
+        node_rows.push((scale, lru, clair));
+    }
+    println!(
+        "\n  one node, {}, {} ops, residency's soft floors [{:.2}/{:.2}/{:.2}/{:.2}] held fixed; \
+         ledger {:.3} ms stall/req at {:.1}% goodput",
+        memory_label(a.node_hbm, a.node_dram),
+        a.node_ops,
+        split[0],
+        split[1],
+        split[2],
+        split[3],
+        per_req(&node_off),
+        100.0 * node_off.goodput(),
+    );
+    println!(
+        "  {:<8} {:>12} {:>13} {:>9} {:>14} {:>14} {:>22}",
+        "scale",
+        "partition",
+        "bit (stall)",
+        "goodput",
+        "kv hit",
+        "weight hit",
+        "clairvoyant vs LRU"
+    );
+    for (scale, lru, clair) in &node_rows {
+        println!(
+            "  {:<8} {:>9.2} GiB {:>12.1}% {:>8.1}% {:>7.2} -> {:.2} {:>7.2} -> {:.2} {:>14.1}% \
+             ({:+.1}pp kv)",
+            format!("{scale}x"),
+            gib(lru.grant.map_or(0, |g| g.partition)),
+            signed(per_req(&node_off), per_req(lru)),
+            100.0 * lru.goodput(),
+            node_off.hit[0],
+            lru.hit[0],
+            node_off.hit[2],
+            lru.hit[2],
+            signed(per_req(lru), per_req(clair)),
+            100.0 * (clair.hit[0] - lru.hit[0]),
+        );
+    }
+
+    println!(
+        "\n6. fan-out admission (P5): all-or-nothing against per agent, across the capacities \
+         residency-ledger.md swept, on the ledger's per-block test and the router's partition one"
+    );
+    println!(
+        "  {:<15} {:>22} {:>26} {:>26} {:>26}",
+        "HBM + DDR", "ledger", "engine, none", "engine + decode, perfect", "engine + decode, bound"
+    );
+    for (hbm, dram) in [(4u64, 8u64), (5, 10), (6, 12), (8, 16)] {
+        let mem = node_memory(
+            (hbm << 30) / n,
+            (dram << 30) / n,
+            a.nvme / n,
+            a.bands,
+            false,
+        );
+        let sc = |p3: Correct| Scenario {
+            cost: polyphonic::boundary::Cost::default(),
+            rate: a.rate,
+            fanout: a.fanout,
+            seed: a.seed,
+            ops: a.ops,
+            flow_payload: None,
+            regret: false,
+            p3,
+            bits: ClusterBits {
+                shared_l2: None,
+                no_displacement: false,
+            },
+        };
+        let cell = |p3: Correct| -> String {
+            let mut out = Vec::with_capacity(2);
+            for atomic in [false, true] {
+                let off = fanout_run(
+                    &topo,
+                    mem,
+                    sc(Correct {
+                        engine_cache: false,
+                        ..p3
+                    }),
+                    atomic,
+                );
+                let r = if p3.engine_cache {
+                    fanout_run(
+                        &topo,
+                        p3.engine_memory(mem, off.mach.kv_mean()),
+                        sc(p3),
+                        atomic,
+                    )
+                } else {
+                    off
+                };
+                out.push((r.mach.fanouts_admitted, r.mach.fanout_wasted_ns));
+            }
+            format!(
+                "{} / {} ({:.0}s / {:.0}s)",
+                out[0].0,
+                out[1].0,
+                out[0].1 as f64 / 1e9,
+                out[1].1 as f64 / 1e9
+            )
+        };
+        println!(
+            "  {:<15} {:>22} {:>26} {:>26} {:>26}",
+            format!("{hbm} + {dram} GiB"),
+            cell(Correct {
+                engine_cache: false,
+                ..correct(false, AdmitArg::None)
+            }),
+            cell(correct(false, AdmitArg::None)),
+            cell(correct(true, AdmitArg::Perfect)),
+            cell(correct(true, AdmitArg::Bound)),
+        );
+    }
+    println!(
+        "  cells: fan-outs completed per agent / all-or-nothing, of those offered (wasted work)"
+    );
+
+    println!(
+        "\n7. arbitration and regret (P2, P3): host-DDR coupling and the four gaps on both \
+         sides of the bit"
+    );
+    for dram in [a.dram, a.dram / 2] {
+        let mem = node_memory(a.hbm / n, dram / n, a.nvme / n, a.bands, false);
+        let (off, on) = price_pair(a, &topo, mem, correct(false, AdmitArg::None), true);
+        println!("  {}", memory_label(mem.hbm, mem.ddr));
+        for (label, r) in [("ledger", &off), ("engine", &on)] {
+            let (c, d) = r.mach.memory_coupled();
+            let spans = r.mach.spans.len().max(1) as f64;
+            let sum = |f: fn(&polyphonic::oracle::Regret) -> i64| -> f64 {
+                r.mach.spans.iter().map(|s| f(&s.regret)).sum::<i64>() as f64 / spans
+            };
+            let nonzero = r
+                .mach
+                .spans
+                .iter()
+                .filter(|s| s.regret.execution != 0)
+                .count();
+            println!(
+                "    {label:<8} memory coupled {:>5.1}% of {:>6} DDR evictions; execution \
+                 {:>9.0} ns/decision ({:.1}% of spans), belief {:.0}, model {:.0}, total {:.0}",
+                100.0 * c as f64 / d.max(1) as f64,
+                d,
+                sum(|g| g.execution),
+                100.0 * nonzero as f64 / spans,
+                sum(|g| g.belief),
+                sum(|g| g.model),
+                sum(|g| g.total),
+            );
+        }
     }
 }
 

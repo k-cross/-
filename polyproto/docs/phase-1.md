@@ -182,6 +182,9 @@ From reading the call graph: the bulk sits in `cache.rs` (`admit_hot`'s four cal
 
 **Measured: wrong on the low side, and the mechanism explains why rather than just the ledger's
 shape.** The static census is **12**, not 10-25, and `machine.rs`'s share is **0**, not "at most 5".
+*(It is 13 today: Phase 2's clairvoyant arm added `Hierarchy::reprice_engine`, a genuine assumption
+of authority that writes an eviction priority into an engine-allocated entry, and this line kept
+saying 12 until `phase-3.md` §1.10 recounted. Phase 3 adds none.)*
 
 The first number is mostly an artifact of what the lint can count, set out in §4.4: `#[deprecated]`
 fires once per *named item*, so each authority-split entry point contributes exactly one warning

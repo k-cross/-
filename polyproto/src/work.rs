@@ -81,6 +81,10 @@ pub const SERVICE_EXEC_NS: u64 = 250_000;
 pub const DECODE_NS_PER_TOKEN: u64 = 8_000_000;
 const TOKENS_MIN: u64 = 24;
 const TOKENS_SPAN: u64 = 200;
+// Calibrated, not idiomatic: 35 is where `tokens.div_ceil(n)` over [24, 223] averages 4.015,
+// holding the fixed 4 blocks a turn grew by before decode output was modelled (phase-3.md §1.3).
+pub const TOKENS_PER_KV_BLOCK: u64 = 35;
+pub const MAX_TOKEN_SLACK: f64 = 4.0;
 
 /// Fraction of agent turns that call a tool, and of function invocations that call a model.
 /// Both directions of the cross-workload dependency exist: an agent reaching for a function,
@@ -93,6 +97,13 @@ const FLOW_PROMPT_BLOCKS: u64 = 24;
 pub const FLOW_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
 /// A tool result handed back to the agent: far smaller than a prompt bundle.
 pub const TOOL_PAYLOAD_BYTES: u64 = 256 * 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct Turn {
+    slot: usize,
+    session: u64,
+    index: u32,
+}
 
 /// A downstream stage waiting for its lead time to elapse.
 #[derive(Clone, Debug)]
@@ -120,6 +131,7 @@ struct Session {
     tenant: usize,
     id: u64,
     turns: u32,
+    grown: Vec<u64>,
 }
 
 pub const PHASES: usize = 4;
@@ -143,6 +155,8 @@ pub struct Agent {
     pub requires: Chain,
     pub tokens: u64,
     pub tools: Vec<ToolCall>,
+    pub produces: Chain,
+    pub max_tokens: u64,
 }
 
 /// An orchestrator's fan-out: sub-agents that must all be admitted or none of them.
@@ -178,6 +192,8 @@ pub struct Request {
     pub tokens: u64,
     /// Set on a multi-agent fan-out.
     pub gang: Option<Gang>,
+    pub produces: Chain,
+    pub max_tokens: u64,
 }
 
 impl Request {
@@ -240,6 +256,8 @@ pub struct Workload {
     /// sweep is the only available test of the regret metric's known blind spot (§1.1), and
     /// `FLOW_PAYLOAD_BYTES` is otherwise a compile-time constant.
     flow_payload_bytes: u64,
+    tokens_per_block: Option<u64>,
+    max_token_slack: f64,
 }
 
 fn kv(parent: BlobId, tag: &[u8]) -> (BlobId, BlobMeta) {
@@ -284,6 +302,8 @@ impl Workload {
             tool_fraction: TOOL_FRACTION,
             tool_payload_bytes: TOOL_PAYLOAD_BYTES,
             flow_payload_bytes: FLOW_PAYLOAD_BYTES,
+            tokens_per_block: None,
+            max_token_slack: MAX_TOKEN_SLACK,
         };
         for _ in 0..SESSIONS {
             let s = w.fresh_session();
@@ -318,6 +338,40 @@ impl Workload {
         self
     }
 
+    #[must_use]
+    pub fn with_decode_kv(mut self, tokens_per_block: u64) -> Self {
+        self.tokens_per_block = Some(tokens_per_block.max(1));
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_token_slack(mut self, slack: f64) -> Self {
+        self.max_token_slack = slack;
+        self
+    }
+
+    fn max_tokens(&self, tokens: u64) -> u64 {
+        if tokens == 0 {
+            0
+        } else {
+            (self.max_token_slack * (TOKENS_MIN + TOKENS_SPAN) as f64) as u64
+        }
+    }
+
+    fn produced(&self, parent: BlobId, tokens: u64, tag: &str) -> Chain {
+        let Some(per_block) = self.tokens_per_block else {
+            return Vec::new();
+        };
+        let mut at = parent;
+        (0..tokens.div_ceil(per_block))
+            .map(|blk| {
+                let (id, meta) = kv(at, format!("{tag}:{blk}").as_bytes());
+                at = id;
+                (id, meta)
+            })
+            .collect()
+    }
+
     /// Sub-agents of one orchestrator turn, and the turn that resumes once they return.
     ///
     /// Roles may run different models, but most share the orchestrator's: a skewed pick keeps
@@ -336,6 +390,7 @@ impl Workload {
                 chain.push((id, meta));
             }
             let model = (home_model + self.rng.zipf(MODELS, 2.0)) % MODELS;
+            let tail = at;
             let tools = (0..self.rng.below(TOOLS_MAX + 1))
                 .map(|_| {
                     let f = self.rng.zipf(FUNCTIONS, 1.5);
@@ -346,11 +401,14 @@ impl Workload {
                     }
                 })
                 .collect();
+            let tokens = self.tokens();
             agents.push(Agent {
                 chain,
                 requires: Self::shards_of(model),
-                tokens: self.tokens(),
+                tokens,
                 tools,
+                produces: self.produced(tail, tokens, &format!("agentout:{task}:{a}")),
+                max_tokens: self.max_tokens(tokens),
             });
         }
         let mut resume = parent.clone();
@@ -377,6 +435,7 @@ impl Workload {
             tenant,
             id: self.next_session,
             turns: 1,
+            grown: vec![4],
         }
     }
 
@@ -464,13 +523,18 @@ impl Workload {
     /// One turn of an agent session: the tenant's system prefix, every turn so far, and the
     /// blocks this turn adds. The chain grows monotonically, which is what makes a resident
     /// prefix worth anything.
-    fn agent_turn(&mut self) -> (Chain, usize) {
+    fn agent_turn(&mut self) -> (Chain, usize, Turn) {
         let slot = self.rng.zipf(self.sessions.len() as u64, 1.3) as usize;
         let s = self.sessions[slot].clone();
         let mut chain = self.tenant_prefix[s.tenant].clone();
         let mut parent = chain.last().map_or(ROOT, |(id, _)| *id);
         for turn in 0..s.turns {
-            for blk in 0..4 {
+            let blocks = if self.tokens_per_block.is_some() {
+                s.grown[turn as usize]
+            } else {
+                4
+            };
+            for blk in 0..blocks {
                 let (id, meta) = kv(parent, format!("s:{}:{turn}:{blk}", s.id).as_bytes());
                 parent = id;
                 chain.push((id, meta));
@@ -481,7 +545,19 @@ impl Workload {
         } else {
             self.sessions[slot].turns += 1;
         }
-        (chain, s.tenant)
+        let turn = Turn {
+            slot,
+            session: s.id,
+            index: s.turns,
+        };
+        (chain, s.tenant, turn)
+    }
+
+    fn grow(&mut self, turn: Turn, blocks: u64) {
+        let s = &mut self.sessions[turn.slot];
+        if s.id == turn.session {
+            s.grown.push(blocks);
+        }
     }
 
     /// The inference working set a given function calls into: a per-function system prompt
@@ -559,8 +635,16 @@ impl Iterator for Workload {
                     exec_ns: 0,
                     tokens: 0,
                     gang: Some(f.gang),
+                    produces: Vec::new(),
+                    max_tokens: 0,
                 });
             }
+            let tail = q.chain.last().map_or(ROOT, |(id, _)| *id);
+            let produces = if q.tokens > 0 {
+                self.produced(tail, q.tokens, &format!("out:{}", q.task))
+            } else {
+                Vec::new()
+            };
             return Some(Request {
                 phase,
                 chain: q.chain,
@@ -570,6 +654,8 @@ impl Iterator for Workload {
                 exec_ns: q.exec_ns,
                 tokens: q.tokens,
                 gang: None,
+                produces,
+                max_tokens: self.max_tokens(q.tokens),
             });
         }
         let mix = self.mix();
@@ -590,6 +676,8 @@ impl Iterator for Workload {
             exec_ns: SERVICE_EXEC_NS,
             tokens: 0,
             gang: None,
+            produces: Vec::new(),
+            max_tokens: 0,
         })
     }
 }
@@ -657,8 +745,11 @@ impl Workload {
     /// An agent turn. Decode dominates its cost, and a fraction of turns reach for a tool,
     /// which is a function invocation the inference scheduler does not otherwise know about.
     fn inference_request(&mut self, phase: usize) -> Request {
-        let (chain, tenant) = self.agent_turn();
+        let (chain, tenant, turn) = self.agent_turn();
         let tokens = self.tokens();
+        let tail = chain.last().map_or(ROOT, |(id, _)| *id);
+        let produces = self.produced(tail, tokens, &format!("s:{}:{}", turn.session, turn.index));
+        self.grow(turn, produces.len() as u64);
         let requires = Self::model_shards(tenant);
         let hint = if self.fanout_fraction > 0.0 && self.rng.chance(self.fanout_fraction) {
             let task = self.next_task + 1;
@@ -692,6 +783,8 @@ impl Workload {
             exec_ns: tokens * DECODE_NS_PER_TOKEN,
             tokens,
             gang: None,
+            produces,
+            max_tokens: self.max_tokens(tokens),
         }
     }
 
@@ -724,6 +817,8 @@ impl Workload {
             exec_ns,
             tokens: 0,
             gang: None,
+            produces: Vec::new(),
+            max_tokens: 0,
         }
     }
 }

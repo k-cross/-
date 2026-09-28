@@ -581,7 +581,10 @@ have to re-specify the cluster to say anything.
   the entry with the furthest next use, including the never-again case.
 - `cargo fmt --check`, `cargo clippy --all-targets --all-features`, `cargo test` clean, and
   `cargo build --features census` still compiles with its warning count unchanged at 12 -- Phase 2
-  adds no allocation entry point, and a moved count would mean it did.
+  adds no allocation entry point, and a moved count would mean it did. *(Not satisfied as written,
+  and nobody noticed: the count is 13, because `reprice_engine` -- the clairvoyant arm's priority
+  write into an engine-allocated entry -- is an allocation entry point, correctly marked. The moved
+  count meant exactly what this line said it would. Found by `phase-3.md` §1.10.)*
 
 ---
 

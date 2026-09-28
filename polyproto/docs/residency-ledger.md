@@ -186,12 +186,15 @@ every tier, `Orchestrator` throughout for `Snapshot` and `ServiceHeap`:
 Reproducible with `polyphonic ownership`, which prints the full table and the census below rather
 than requiring either to be read off this file.
 
-**Static census: 12.** `cargo build --release --features census 2>&1 | grep -c 'use of deprecated'`
--- every one of them in `cache.rs`, none in `machine.rs`. The twelve are the allocation-split entry
+**Static census: 13.** `cargo build --release --features census 2>&1 | grep -c 'use of deprecated'`
+-- every one of them in `cache.rs`, none in `machine.rs`. Twelve are the allocation-split entry
 points `phase-1.md` §1.5 and §1.6 name:
 `Hierarchy::{admit,anticipate,touch,demote,forget_cold,drop_superseded,spill_displaced,drain}_engine`,
 `Quota::{floor,limit,band}_of_engine`, and `Quota::set_band_engine` — the one place the orchestrator
-*writes* an engine class's eviction band rather than reading it. This is below the 10–25 predicted
+*writes* an engine class's eviction band rather than reading it. The thirteenth is
+`Hierarchy::reprice_engine`, added by Phase 2's clairvoyant arm, which writes an eviction priority
+into an engine-allocated entry; this section said 12 until `phase-3.md` §1.10 counted again. Phase 3
+adds none -- every engine-cache path is reached before any `_engine` body. This is below the 10–25 predicted
 in `phase-1.md` §2 (P2), and the reason is the counting mechanism rather than the ledger being
 simpler than expected: `#[deprecated]` fires once per named item, so a dispatcher's one call to its
 census-marked sibling is one warning no matter how many external callers route through the
@@ -222,7 +225,7 @@ large one the path that was not.
 
 The static count says how much *code* Phase 3 has to change; this says how much of the simulator's
 *behaviour*, today, rests on the authority Phase 3 disclaims. `drain` is an eighth counter, zero
-here because a single-node trace never retires a domain; it fires from `Machine::retire`, which is
+here because a single-node trace never retires a domain; it fires from `Machine::drain`, which is
 the largest single assumption of the disclaimed authority in the simulator — it relocates an entire
 engine's KV cache by orchestrator fiat.
 
@@ -242,13 +245,18 @@ walking the call graph against the dispatcher list, not by any check failing. `p
 records the pattern, since Phase 3 will be adding engine-state paths under the same conditions.
 
 **A pre-existing defect this surfaced and deliberately did not fix.** `Hierarchy::drain_all` empties
-`hbm` and `ddr` and returns what it took; it does not touch `nvme`. So when `Machine::retire` drains
+`hbm` and `ddr` and returns what it took; it does not touch `nvme`. So when `Machine::drain` drains
 a domain, anything that had been spilled to that node's spill tier is neither returned to the
 caller nor migrated — the domain leaves `active` still holding it, and no `holds()` or `is_hot()`
 will ever report it again. `machine.rs`'s "The bytes survive" comment on `drain` is false for
 spilled state. This predates Phase 1 and fixing it would change `drain_at` results, which Phase 1
 may not do; it belongs to Phase 2, where the oracle makes a corrected baseline measurable. Recorded
 here rather than in a code comment because it is a finding, not an explanation of what the code does.
+*Phase 2 did not take it; Phase 3 fixed it behind its own bit, `placement --drain-spill`, so its
+effect is attributable: it more than doubles the bytes a drain migrates (11.5 -> 25.8 GiB for
+`blind`) and moves stall by at most 0.02 ms on any arm. Phase 3 also found that `--drain-at` was not
+reproducible at all -- drained entries left in `HashMap` order and were assigned destinations by
+position -- and fixed that unconditionally (`phase-3.md` §8.1).*
 
 **Byte-identity.** `residency`, `flows`, `placement` (split and unified memory) and `volatility`
 diff byte-for-byte before and after, at a reduced `--ops` and at a second seed, checked after each
@@ -1108,10 +1116,13 @@ service time can disagree in this specific, named way -- is what carries over.)
 Memory coupling (host DDR: workload-driven evictions where the class evicted differs from the class
 being admitted, which is the trade a per-class quota's `pick_class` can never make) is **0.0% on
 every arm** at `distributed`'s defaults, over eviction counts of 0 to 2,265 -- there is almost no
-DDR pressure there, and none of what there is crosses classes. Tightened to 4 GiB DDR per node it is
-**93.8-96.4% of 16k-24k evictions**. Locality coupling (the scored arm's argmin against a silo's --
-no handoff term, displacement in one pool) is 0.8-1.7% of scored decisions in both regimes. So the
-axis behaves as §3.4 says it should: near zero where nothing binds, near total where memory does,
+DDR pressure there, and none of what there is crosses classes. Tightened to 4 GiB DDR per node it
+was published here as **93.8-96.4% of 16k-24k evictions**, which does not reproduce: the commit
+before Phase 3, rebuilt and run with a fixed crossing, prints **54.1-85.4% of 4.5k-16.1k** across the
+eleven arms and three distances, and that is the baseline `phase-3.md` P2 measures against. Locality
+coupling (the scored arm's argmin against a silo's -- no handoff term, displacement in one pool) is
+0.8-1.7% of scored decisions in both regimes. So the axis behaves as §3.4 says it should: near zero
+where nothing binds, high where memory does,
 and a single published figure would be a statement about a capacity choice rather than about an
 architecture.
 
@@ -1147,6 +1158,112 @@ there. It appears at the defaults for every arm with DDR pressure, not only in t
 fixture built to isolate it, and it stays bounded (under 20% of decisions even there) and isolated
 (the other three gaps stay exactly zero wherever it fires). Left alone rather than patched
 mid-phase, per `phase-2.md`'s own rule: the apparatus measures, it does not repair.
+
+### Engine allocation: the price of the boundary
+
+`phase-3.md`, implemented. Every result above ran on a ledger that allocated the engine's KV -- it
+admitted, evicted by its own GDSF priority, refused, and relocated KV on a drain -- which
+`owned-and-observed.md` §1 disclaims. `--engine-cache` hands allocation to an `EngineCache`:
+leaf-first LRU over block hashes inside a partition the orchestrator sizes, never refusing,
+preempting and recomputing when a sequence cannot fit, with the connector's own LRU tiers in a DDR
+offload sub-budget and an `NVMe` spill sub-budget. The orchestrator keeps every read exact
+(`belief` is zero with the bit on, by test) and loses every write. Refusal for inference moves to a
+router check against the partition, over reservations the router made itself (`--admit`); decode
+output can be modelled and held for the decode's length (`--decode-kv`). Each result below is
+marked **ledger** or **engine** for the side of the bit that produced it; every number without a
+mark in this document is **ledger**.
+
+**Goodput is not comparable across the bit.** On the ledger a KV refusal is the ledger's; with the
+engine it is a router refusal or an engine preemption, counted apart (`refused`, `refused by
+router`, `preempted`) and never summed. An arm that refuses less is not thereby serving more, and a
+stall or service figure over a smaller served set is not a better one. Every engine row prints
+all three.
+
+**Sizing.** The partition is the KV floor the ledger's own budget implies -- 25% of HBM at the
+cluster defaults, 1.00 GiB per node -- and the offload the KV floor in DDR; a pool with no floor
+gets the ledger's mean KV occupancy there, which is always the case for the spill tier. This holds
+capacity fixed in the sense `phase-3.md` §1.11 meant and not in every sense: under soft floors the
+slack KV used to borrow goes to the weights, and under an open budget the mean occupancy is most of
+HBM (§8.3 there).
+
+**Memory arbitration** (single node, 20k requests, oracle-tuned per arm on each side):
+
+| arm | ledger stall/req | engine stall/req | ledger weight hit | engine weight hit |
+|---|---|---|---|---|
+| `hard-partition` | 26.80 ms | 26.03 ms | 0.51 | 0.52 |
+| `soft-floor` | **18.35 ms** | **16.61 ms** | 0.66 | **0.77** |
+| `no-floor` | 76.03 ms | 70.44 ms | 0.06 | 0.00 |
+| soft over hard | **+31.6%** | **+36.2%** | | |
+
+**Soft floors beat hard partitions by more with the engine allocating**: +38.5% -> +44.5% at
+`residency`'s 60k-op defaults, and at every volatility level (`volatility`: 31.3-34.2% on the ledger,
+38.0-39.9% with the engine allocating, at every level from zero volatility to full swing). The mechanism is weights, as the ledger always
+said, and the bit strengthens it: the partition takes KV out of HBM arbitration and the weights
+inherit the slack. On unified memory, where the ledger ties (-4.0%), soft floors now win (+7.3%).
+
+**Host-DDR arbitration does not survive in its per-eviction form.** `distributed --regret`, 4 GiB
+DDR per node: memory coupling is **54.1-85.4%** of 4.5k-16.1k evictions on the ledger and
+**0.0-26.0%** of 1.0k-4.8k with the engine allocating, 0.0-2.0% on the scored arms. Most of what the
+DDR arbiter arbitrated was the ledger offloading the engine's KV; what remains is Snapshot against
+ServiceHeap on the arms that concentrate host work. The orchestrator still decides how much DDR the
+connector gets, on a slower clock -- Phase 6's decision.
+
+**Regret.** `belief` stays exactly zero with the bit on. `execution` collapses where nothing is in
+flight -- `scored + fetch` 242,292 -> 109 ns/decision at the defaults, because a request can no
+longer evict its own weights once KV has its own partition -- and rises thirty-fold where decode
+output held against half the partition makes the engine preempt 8-11% of requests (`scored`
+25 -> 801,599 ns/decision): the plan prices a prefix the engine is about to take away, and nothing
+it reads can see that coming.
+
+**Admission** (`price`, decode output held, **engine**):
+
+| partition | `bound` (declared `max_tokens`) | `perfect` (exact output) | `none` (prompt only) |
+|---|---|---|---|
+| 1.00 GiB | 3.67% refused | 0.01% refused | 0.01% preempted |
+| 0.50 GiB | 17.04% refused | 8.63% refused | 10.52% preempted |
+| 0.25 GiB | 25.28% refused | 20.74% refused | 1.66% refused, 27.97% preempted |
+
+Where the partition binds, the bracket is wide and each rule buys goodput with recompute or recompute
+with goodput. `bound`'s cost is mostly its ceiling (0.10% refused at 1x slack, 9.61% at 8x). The
+p99 cost of `none` lands on a session's own turns and on stages other work waits on about equally
+(+14% each at a quarter of the partition): class-blind, spread by arrival.
+
+**Fan-out admission survives on the coarsened test** (`price` section 6, fan-outs completed per
+agent / all-or-nothing):
+
+| HBM + DDR (cluster) | ledger | engine | engine, decode KV held, `perfect` |
+|---|---|---|---|
+| 5 + 10 GiB | 7 / 7 | 0 / 0 | 0 / 0 |
+| 6 + 12 GiB | 326 / **333** | 321 / **351** | 151 / **175** |
+| 8 + 16 GiB | 396 / **397** | 449 / 449 | 350 / **366** |
+
+All-or-nothing wins or ties wherever admission binds and wastes nothing. The ledger's gain at
+6 + 12 GiB is +2% here, where `price` charges no control crossing, against the +22% above with a
+measured one: the crossing changes which models each node holds, and at that capacity gang
+feasibility is a cliff (`phase-3.md` §8.4). The direction is robust; the size is not.
+
+**Announce was half KV.** `flows --engine-cache`: announce's task-latency margin is 10.7% on the
+ledger, 5.3% of which survives with KV prewarm removed -- KV carried **50%** of it, **71%** on unified
+memory (17.6% -> 5.1%). With the engine allocating, announce buys 9.0% (split) and 3.2% (unified).
+The coupling-tier-1 claim rests on writing into the engine's cache more than it said.
+
+**Where the boundary costs anything.** On the cluster -- `scored + fetch`, 250 req/s, where decode is
+~1 s of every inference request -- the bit moves mean service by -0.2% and p99 by -0.4%, and a 0.5x
+to 2x partition sweep moves it by at most 1.2%. On one node a clairvoyant block manager beats LRU by
+2.5-3.1% of stall at 17-23pp of KV hit rate at every partition size, while the partition itself
+moves the A/B by under a point between 0.5x and 1x; past 1.5x the partition eats the weights' own
+floor and a quarter of requests are refused, which is a sizing failure rather than a price.
+
+**A shared L2 tier fires on KV within a rack.** `distributed --shared-l2 64GiB`, a write-through LRU
+pool the size of the cluster's local `NVMe`: 1.5-20.7% of served requests read KV from it at rack,
+0-2.3% read weights; from zone out it serves weights only. At 16 GiB KV reads fall to 0-13% and the
+scored arms still read KV (6-8%) far more than weights (under 0.7%). A contiguous segment pays the
+hop, the seek and the `PCIe` launch once, so two blocks already beat a rebuild.
+
+**Drain.** With the engine allocating, a drained node's KV dies with it and only `Snapshot`,
+`ServiceHeap` and weights migrate (`placement --drain-at 0.5`: 6.0-9.9 GiB migrated against
+8.6-11.6 GiB on the ledger). The effect on stall is arm-dependent and small beside the drain's own:
+`scored + fetch` 16.36 -> 14.60 ms, `scored` 15.03 -> 17.14 ms.
 
 ## Method
 
@@ -1236,9 +1353,11 @@ the decision loop.
 boundary separating state the orchestrator *owns* from what it *infers* and what it only
 *observes*, the workload taxonomy in [`taxo.md`](taxo.md) as a scheduler input rather than a
 document, and an oracle with regret and coupling metrics so results stop needing baseline
-caveats. It also corrects a mistake underneath every memory result here: the ledger currently
-*allocates* KV, when the architecture is explicit that an engine like vLLM owns that memory and
-the orchestrator only tracks it. The results marked there as contaminated are expected to shrink.
+caveats. Its Phase 3 has corrected the mistake underneath every memory result here -- the ledger
+*allocated* KV, when the architecture is explicit that an engine like vLLM owns that memory -- as a
+bit rather than a rewrite, and *Engine allocation* above says which results shrank. Budgets
+survived and grew; per-eviction host-DDR arbitration and KV prewarm did not. Phase 4 is next on
+that chain: the router's view of the engine cache becomes a belief rather than a read.
 
 ## Not built
 
@@ -1255,7 +1374,7 @@ computed.
 |---|---|
 | eviction priced as expected recovery cost per byte | holds — regret-discounted, recovery from the tier below |
 | admission that refuses rather than overcommits | holds |
-| soft floors beat hard partitions | **holds on split memory (32%), via host offload; ties on unified** |
+| soft floors beat hard partitions | **holds on split memory (32%), carried by weight residency; ties on unified** -- with the engine allocating KV it grows (36% at 20k, 45% at 60k) and wins on unified too (+7%) |
 | open sharing | worst arm in both memory models |
 | warm microVM cells are the cheapest state to rebuild | holds — 0.21–0.39 ns/byte |
 | cells and KV compete for the same bytes | **unified-memory only** — separate pools in the target |
@@ -1263,17 +1382,22 @@ computed.
 | scored placement | best arm at every load and distance — **4–6% end to end at moderate load, 38% near the knee**; restated as regret — its heuristic and execution gaps are exactly zero, every ns of its regret is model gap |
 | score adapts sibling co-location to load | holds — 63–66% vs 85–86% for filtered specialists |
 | score adapts tool placement to distance | holds — all calls local across regions, where hashing pays 10× |
-| all-or-nothing fan-out admission | holds where it binds — +22% fan-outs, inference stall −10% |
+| all-or-nothing fan-out admission | holds where it binds, on the ledger's per-block test and on the router's partition check alike; the **+22%** is sensitive to the control crossing (+2% with none charged) |
 | heterogeneous nodes (model host + agent host) | expressible — per-node memory, decode filter, origin round trip |
 | separating the orchestrator from the accelerator | free within a zone (0.16–1.7 ms), **61 ms per turn across regions** |
 | placement policy on that topology | worth 0.7% — the round trip and decode dominate, and no policy moves either |
 | KV state transfer | roughly neutral end to end |
 | state transfer taxes the FaaS warm pool | **retracted** — a unified-memory and capacity artifact |
 | the score's handoff term prices co-placement | **fails** (pre-batching model, not re-run); the myopic regret oracle reproduces the same blind spot on demand — `flow only` beats `scored` on service time at 512 MiB while carrying far larger heuristic regret |
-| memory coupling | regime-bound — **0.0%** at the `distributed` defaults (nothing binds), **93.8–96.4%** at 4 GiB DDR/node; locality coupling 0.8–1.7% in both |
+| memory coupling | regime-bound — **0.0%** at the `distributed` defaults (nothing binds), **54–85%** at 4 GiB DDR/node (re-measured; 93.8–96.4% was published and does not reproduce); locality coupling 0.8–1.7% in both. **With the engine allocating KV, 0–26%** (0–2% on the scored arms): most of it was the ledger allocating the engine's offload |
 | clairvoyant eviction vs GDSF | budget-matched: wins hit rate (+22.8pp), loses on cost (+3.7%) — GDSF gives up the *cheap* hits, so cost-weighting is already doing the work |
 | unified control plane beats RPC-queried | rounding error in aggregate; 43–60% of a warm invocation |
-| announce / anticipatory prewarm | 11–18% faster tasks, net work slightly worse |
+| announce / anticipatory prewarm | 11–18% faster tasks, net work slightly worse — **half to three-quarters of it was KV prewarm**, which the engine does not let the orchestrator do; 3–9% with the engine allocating |
 | downstream-aware gate | Tier 1 — replicable by a hint API |
 | data path binds below ~1 ms, dissolves an order of magnitude above | holds — crossover 0.84–1.42 ms / 4.35–7.42 ms, measured tax not borrowed |
 | out-of-process hook caps scheduler fleet size | holds — ~20 nodes (`ext_proc`) vs ~1000 (`Wasm`), `d` measured not assumed |
+| the ledger allocates the engine's KV | **corrected** — `--engine-cache` hands allocation to an engine LRU inside an orchestrator-sized partition; off by default so every row above stays the ledger's |
+| ceding KV allocation costs service time | **no, where decode dominates** — −0.2% mean, −0.4% p99 on the cluster; on one node it is cheaper, because the partition hands weights the slack |
+| optimistic admission moves its cost onto another class | **class-blind, not class-shifted** — the preempted arrival pays; chat turns and task stages lose p99 about equally |
+| a better block manager is worth asking for | ~3% of stall at 17–23pp KV hit, at every partition size — more than the partition's size moves the A/B below 1x |
+| shared L2 tier | fires on KV within a rack, on weights only from zone out |

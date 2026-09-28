@@ -93,7 +93,18 @@ impl<'a> Telemetry<'a> {
     /// quantity rather than a value this process derives directly.
     #[must_use]
     pub fn marginal_price(&self, tier: Tier) -> f64 {
+        if tier == Tier::Hbm
+            && self.hierarchy.split()
+            && let Some(price) = self.hierarchy.kv_tail_price()
+        {
+            return price;
+        }
         self.hierarchy.pool(tier).marginal_price()
+    }
+
+    #[must_use]
+    pub fn partition(&self) -> Option<(u64, u64)> {
+        self.hierarchy.kv_partition()
     }
 
     /// How often `kind`'s evictions, at its home tier, were later wanted back. Exact and
@@ -201,6 +212,7 @@ mod tests {
             hbm_quota: Quota::open(4 << 30, bands),
             ddr_quota: Quota::open(8 << 30, bands),
             can_decode: true,
+            kv: None,
         };
         (Hierarchy::new(mem, Policy::Gdsf), Engine::new(32))
     }

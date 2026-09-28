@@ -239,18 +239,23 @@ bytes. Whether that beats siloed specialists is the empirical question.
 
 Stated with expected direction, so the re-measurement cannot be quietly graded on a curve:
 
-| result | why it is affected | expected |
-|---|---|---|
-| soft floors beat hard partitions, 32% oracle-tuned | its mechanism is entirely host DDR: a soft floor lets HBM-evicted state grow into idle DDR and promote back over PCIe (weight residency 0.51 -> 0.66). The **budget** stays orchestrator-owned; only the offload demand becomes engine-driven | **likely survives.** Still needs re-running: the ledger chose the HBM victims that generated the offload |
-| fixed budgets cost 4.0% service, 2.7pp goodput | measures what non-borrowable per-class budgets cost. The DDR half (`Snapshot` / `ServiceHeap` / offload) stays orchestrator-owned; the HBM half (`KvBlock` / `WeightShard`) becomes the engine's | **shrinks** by roughly the HBM half's share |
-| 90% of tool calls shipped to idle model-host DDR | the option exists because the ledger controls that DDR; an engine KV connector may own it | **uncertain**, probably unchanged for `Snapshot` cells |
-| all-or-nothing fan-out admission: +22% fan-outs | rests on `could_admit` as a *per-block* HBM feasibility test, gone at that granularity | **survives, test coarsens** to the granted partition budget, engine slots, queue depth, host memory |
-| tool-placement inversion under memory pressure | driven by host DDR contention, which the orchestrator owns | **likely survives** |
-| acquisition crossover (KV ships within a rack, rebuilt across a zone) | a cost comparison, not an allocation decision | **survives**, and becomes advice to the engine rather than an action |
-| boundary-cost ladder, origin round trip, congestion toll | independent of memory ownership | **unaffected** |
+| result | why it is affected | expected | measured (`phase-3.md`) |
+|---|---|---|---|
+| soft floors beat hard partitions, 32% oracle-tuned | its mechanism is entirely host DDR: a soft floor lets HBM-evicted state grow into idle DDR and promote back over PCIe (weight residency 0.51 -> 0.66). The **budget** stays orchestrator-owned; only the offload demand becomes engine-driven | **likely survives.** Still needs re-running: the ledger chose the HBM victims that generated the offload | **survives and grows**: +31.6% -> **+36.2%** at 20k ops, +38.5% -> +44.5% at 60k, soft-floor weight hit 0.66 -> 0.77; unified memory goes from a tie (-4.0%) to +7.3%. The mechanism is weights, and the partition hands them the slack KV used to borrow |
+| fixed budgets cost 4.0% service, 2.7pp goodput | measures what non-borrowable per-class budgets cost. The DDR half (`Snapshot` / `ServiceHeap` / offload) stays orchestrator-owned; the HBM half (`KvBlock` / `WeightShard`) becomes the engine's | **shrinks** by roughly the HBM half's share | **does not shrink**: +4.0% -> **+4.2-4.5%** service, 2.7pp goodput on both sides. The refusals it costs are host classes', which stay owned, and the soft arm gains from the partition while the hard one cannot |
+| 90% of tool calls shipped to idle model-host DDR | the option exists because the ledger controls that DDR; an engine KV connector may own it | **uncertain**, probably unchanged for `Snapshot` cells | **unchanged**: 89.8% -> 90.1% shipped. The connector's DDR sub-budget does not reach the `Snapshot` slice the option uses |
+| all-or-nothing fan-out admission: +22% fan-outs | rests on `could_admit` as a *per-block* HBM feasibility test, gone at that granularity | **survives, test coarsens** to the granted partition budget, engine slots, queue depth, host memory | **survives on the router's partition check**: all-or-nothing wins or ties wherever admission binds and wastes nothing; the band's lower edge rises and decode output held against the partition extends it upward. The +22% itself is sensitive to the control crossing (+2% with none charged), because per-block feasibility has a cliff at one model of slack |
+| tool-placement inversion under memory pressure | driven by host DDR contention, which the orchestrator owns | **likely survives** | **survives**: ~10% of tool calls kept home under pressure, 65.7% at region, 57.9% under hard pools, on both sides |
+| acquisition crossover (KV ships within a rack, rebuilt across a zone) | a cost comparison, not an allocation decision | **survives**, and becomes advice to the engine rather than an action | **survives**: `scored + fetch` fetches 30.5% -> 25.8% of what it acquires at rack, 0.1% from zone out on both sides |
+| boundary-cost ladder, origin round trip, congestion toll | independent of memory ownership | **unaffected** | **unaffected**: the origin round trip is identical to the microsecond at every distance |
+| `announce` buys 11-18% task latency (added by `phase-3.md` §1.8) | for state not yet hot it *admits* the blob and then reprices it -- both halves disclaimed authority over a `KvBlock` | the KV half is the smaller half, under a third (P6) | **wrong: KV carried 50% of the margin on split memory and 71% on unified.** With the engine allocating, announce buys 9.0% and 3.2%; Phase 5 becomes load-bearing |
 
 The pattern: results about **costs** survive; results about **per-block authority over inference
-memory** do not; results about **budgets** survive in whichever pool the orchestrator sizes. Those
+memory** do not; results about **budgets** survive in whichever pool the orchestrator sizes.
+Measured, the pattern held with one addition it did not name: a result about *prewarming* was a
+result about per-block authority wearing a flow's clothes, and it lost most of its margin. The
+per-eviction form of host-DDR arbitration, which no row above states directly, lost most of its
+coupling too (54-85% -> 0-26% of evictions, `phase-3.md` P2). Those
 do not divide along HBM/host lines, which is why "host" is not usable as shorthand for "survives".
 
 ### Observability is not a stale exact view
@@ -1269,7 +1274,7 @@ compiler still generates the work list, it just needs a two-axis predicate to ge
 
 | area | what changes | scale |
 |---|---|---|
-| `cache.rs` | HBM `TierPool` splits into an orchestrator-sized partition and an engine-cache *model* inside it; `Snapshot` and `ServiceHeap` keep current semantics, offloaded KV does not | **measured: 12/12 census-marked allocation entry points** (`phase-1.md`). Still the whole of it -- and the dynamic split says **admission is under a third** of what the ledger does on the engine's behalf, with demotion, cascade spill and superseded-copy removal making up the rest, so the offload and promote paths are the bulk of the rewrite rather than a detail of it |
+| `cache.rs` | HBM `TierPool` splits into an orchestrator-sized partition and an engine-cache *model* inside it; `Snapshot` and `ServiceHeap` keep current semantics, offloaded KV does not | **measured: 13 census-marked allocation entry points** (`phase-1.md`'s twelve and Phase 2's `reprice_engine`; this row said 12/12 until `phase-3.md` §1.10 recounted). Still the whole of it -- and the dynamic split says **admission is under a third** of what the ledger does on the engine's behalf, with demotion, cascade spill and superseded-copy removal making up the rest, so the offload and promote paths are the bulk of the rewrite rather than a detail of it |
 | `machine.rs` | residency reads go through a belief; `could_admit` for KV coarsens; displacement for KV becomes an estimate; the acquire term becomes an expectation over `P(resident)` scored at a per-class quantile (§3.7) | **measured: 0/8** -- every read here is a query (`Telemetry`, `ground_truth_holds`), not an allocation decision, so Phase 1's census found nothing to mark. "Moderate, mechanical" still describes the *edits* Phase 3/4 make to these query sites; it no longer describes a share of a disclaimed *authority*, since this file never held any |
 | `main.rs` | new arms (engine honours / ignores directives; precise / approximate index; data path) | additive |
 | `work.rs` | unaffected by ownership; changes for §3.2 and §4 | none for this correction |
@@ -1434,7 +1439,8 @@ wrong here is what would leave Phase 3 ambiguous about what changes hands.
 - **Deliverable:** results byte-identical to today, plus a count of call sites assuming *allocation*
   authority over engine state. That count *is* the feasibility answer, generated by the compiler.
   **Measured** (`phase-1.md` §2, §5): byte-identity confirmed on every reproducible command; the
-  static census is **12**, all in `cache.rs`, none in `machine.rs` -- the scheduler turned out to
+  static census is **12** at Phase 1 -- **13** since Phase 2's `reprice_engine`, which `phase-3.md`
+  §1.10 counted -- all in `cache.rs`, none in `machine.rs` -- the scheduler turned out to
   hold no allocation authority to disclaim in the first place, only residency and cost *queries*,
   which is a stronger form of "moderate, mechanical" than §8 asserted. The dynamic census (§4.4) is
   four to five orders of magnitude larger, and its split by entry point says **admission is under a
@@ -1533,6 +1539,35 @@ path.
   see that.
 - **Risk:** the headline. Gang feasibility and the gate lose their per-block test and must be
   re-grounded. **Size:** large -- the core of the correction.
+
+**Status: implemented and measured.** `phase-3.md` §2's eight predictions, checked with
+`residency`/`flows`/`volatility`/`placement`/`distributed`/`code-review`/`ownership --engine-cache`
+and `polyphonic price`, which runs §4.11's sweeps reproducibly:
+
+- **The price of the boundary is near zero where decode dominates** -- -0.2% mean and -0.4% p99
+  service on the cluster, at most 1.2% across a 0.5x-2x partition sweep -- and negative on one node,
+  where the partition's default hands the weights the slack KV used to borrow.
+- **P1 confirmed and larger**: soft floors +31.6% -> +36.2% (20k), +38.5% -> +44.5% (60k).
+- **P2 confirmed on the arms the results are about**: DDR coupling 54-85% -> 0-26% of evictions in
+  the binding regime, 0.0-2.0% on the scored arms, 0.0% at the defaults. A partial negative
+  verdict, and published as one: the per-eviction form of host-DDR arbitration was mostly the
+  ledger allocating the engine's offload. The published 93.8-96.4% baseline does not reproduce.
+- **P3 split**: `belief` stays exactly zero; `execution` collapses where nothing is in flight (the
+  partition stops a request evicting its own weights) and rises thirty-fold where held decode
+  output makes the engine preempt -- the boundary's signature, exactly where §1's asymmetry lives.
+- **P4**: the bracket is narrow at the default partition and wide at half of it (`bound` 17% refused,
+  `perfect` 8.6%, `none` 0% refused and 10.5% preempted); `none`'s p99 loss is class-blind, spread by
+  arrival, so on the class axis available before §4's taxonomy the two-tier mix buys nothing a
+  scalar would not.
+- **P5 confirmed in direction**; the +22% is sensitive to the control crossing (+2% with none).
+- **P6 wrong**: KV carried 50-71% of `announce`'s margin.
+- **P7 wrong where it is meaningful**: a better block manager is worth ~3% of stall at every
+  partition size, more than the partition moves the A/B between 0.5x and 1x.
+- **P8 wrong at rack**: the shared L2 term fires on KV within a rack and on weights only from zone
+  out.
+
+The bit stays **off by default**: the ledger's results remain the published ones, every Phase 3
+number is an A/B on the bit, and Phases 4-6 should quote which side they ran on.
 
 ### Phase 4 -- Belief, not truth: lossy telemetry and risk-adjusted scoring
 

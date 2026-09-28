@@ -1,3 +1,4 @@
+pub mod admit;
 pub mod arms;
 pub mod blob;
 pub mod boundary;

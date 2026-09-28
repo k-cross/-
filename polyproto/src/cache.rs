@@ -2,6 +2,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::blob::{BlobId, BlobKind, BlobMeta};
+use crate::engine::EngineCache;
 use crate::flow::FlowHint;
 use crate::tier::{Tier, TierSpec};
 
@@ -807,8 +808,11 @@ impl TierPool {
     /// Empty the pool, handing back everything it held. Used when a domain is drained: the
     /// state is migrating, not being discarded, so callers must re-admit it somewhere.
     pub fn drain_all(&mut self) -> Vec<(BlobId, BlobMeta)> {
-        let out: Vec<(BlobId, BlobMeta)> =
+        let mut out: Vec<(BlobId, BlobMeta)> =
             self.entries.iter().map(|(id, e)| (*id, e.meta)).collect();
+        // Migration targets are assigned by position, so a HashMap-ordered drain made
+        // `placement --drain-at` differ between two runs of the same binary.
+        out.sort_unstable_by_key(|(id, _)| *id);
         self.ghosts.clear();
         self.ghost_set.clear();
         self.entries.clear();
@@ -848,6 +852,7 @@ pub struct Cost {
     pub exec_ns: u64,
     pub bytes_in: u64,
     pub pending: bool,
+    pub preempted: bool,
 }
 
 impl Cost {
@@ -882,6 +887,48 @@ pub struct NodeMemory {
     /// `hbm == 0` alone cannot express (that also means "unified memory", where every node
     /// decodes). Defaults belong at the call site: every existing experiment sets this `true`.
     pub can_decode: bool,
+    pub kv: Option<EngineKv>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct EngineKv {
+    pub partition: u64,
+    pub offload: u64,
+    pub spill: u64,
+    pub clairvoyant: bool,
+}
+
+#[derive(Debug)]
+struct KvTiers {
+    gpu: EngineCache,
+    offload: EngineCache,
+    spill: EngineCache,
+}
+
+impl KvTiers {
+    fn offload(&mut self, id: BlobId, meta: BlobMeta) {
+        let placed = self.offload.admit(id, meta, false);
+        let mut down = placed.evicted;
+        if !placed.resident {
+            down.push((id, meta));
+        }
+        for (vid, vmeta) in down {
+            let _ = self.spill.admit(vid, vmeta, false);
+        }
+    }
+
+    fn place(&mut self, id: BlobId, meta: BlobMeta) -> bool {
+        let placed = self.gpu.admit(id, meta, true);
+        for (vid, vmeta) in placed.evicted {
+            self.offload(vid, vmeta);
+        }
+        placed.resident
+    }
+
+    fn forget_cold(&mut self, id: &BlobId) {
+        self.offload.remove(id);
+        self.spill.remove(id);
+    }
 }
 
 /// Classes whose hot copy lives on the accelerator when there is one.
@@ -926,6 +973,10 @@ pub struct Hierarchy {
     /// is, so a run that never installs one pays nothing for the check.
     clairvoyant: HashMap<BlobId, VecDeque<u64>>,
     clairvoyant_op: u64,
+    policy: Policy,
+    kv: Option<KvTiers>,
+    prewarm_kv: bool,
+    seq_hits: u64,
 }
 
 /// The *dynamic* census (`phase-1.md` §4.4). One counter per census-marked entry point,
@@ -966,15 +1017,55 @@ impl EngineOps {
 }
 
 impl Hierarchy {
+    /// # Panics
+    ///
+    /// When `mem.kv` grants more than a pool holds, or an offload tier on unified memory.
     #[must_use]
     pub fn new(mem: NodeMemory, policy: Policy) -> Self {
-        let nvme = TierSpec::nvme(mem.nvme);
-        let mut hbm = TierPool::new(TierSpec::hbm(mem.hbm), policy, true, mem.hbm_quota);
-        let mut ddr = TierPool::new(TierSpec::dram(mem.ddr), policy, true, mem.ddr_quota);
+        let split = mem.hbm > 0;
+        let grant = mem.kv.unwrap_or(EngineKv {
+            partition: 0,
+            offload: 0,
+            spill: 0,
+            clairvoyant: false,
+        });
+        assert!(
+            split || grant.offload == 0,
+            "unified memory has no offload tier beneath its partition"
+        );
+        let carve = |pool: u64, part: u64, what: &str| {
+            pool.checked_sub(part)
+                .unwrap_or_else(|| panic!("KV {what} of {part} B exceeds its {pool} B pool"))
+        };
+        let (hbm_cap, ddr_cap) = if split {
+            (
+                carve(mem.hbm, grant.partition, "partition"),
+                carve(mem.ddr, grant.offload, "offload"),
+            )
+        } else {
+            (0, carve(mem.ddr, grant.partition, "partition"))
+        };
+        let nvme_cap = carve(mem.nvme, grant.spill, "spill");
+        let nvme = TierSpec::nvme(nvme_cap);
+        let mut hbm = TierPool::new(TierSpec::hbm(hbm_cap), policy, true, mem.hbm_quota);
+        let mut ddr = TierPool::new(TierSpec::dram(ddr_cap), policy, true, mem.ddr_quota);
         // Recovery is priced from the first tier an evictee lands in: host DDR under the
         // accelerator, the spill tier under the host.
         hbm.set_recovery(TierSpec::pcie());
         ddr.set_recovery(nvme);
+        let kv = mem.kv.map(|k| {
+            let recovery = if split { TierSpec::pcie() } else { nvme };
+            let gpu = EngineCache::new(k.partition, true).with_recovery(recovery);
+            KvTiers {
+                gpu: if k.clairvoyant {
+                    gpu.with_clairvoyance()
+                } else {
+                    gpu
+                },
+                offload: EngineCache::new(k.offload, false),
+                spill: EngineCache::new(k.spill, false),
+            }
+        });
         Self {
             hbm,
             ddr,
@@ -982,9 +1073,9 @@ impl Hierarchy {
                 nvme,
                 policy,
                 false,
-                Quota::open(mem.nvme, mem.ddr_quota.band),
+                Quota::open(nvme_cap, mem.ddr_quota.band),
             ),
-            split: mem.hbm > 0,
+            split,
             can_decode: mem.can_decode,
             link: TierSpec::pcie(),
             hits: [0; BlobKind::N],
@@ -997,7 +1088,15 @@ impl Hierarchy {
             engine_ops: EngineOps::default(),
             clairvoyant: HashMap::new(),
             clairvoyant_op: 0,
+            policy,
+            kv,
+            prewarm_kv: true,
+            seq_hits: 0,
         }
+    }
+
+    pub fn set_prewarm_kv(&mut self, on: bool) {
+        self.prewarm_kv = on;
     }
 
     /// Install `Policy::Clairvoyant`'s reference-stream index: for each blob, the absolute
@@ -1049,7 +1148,15 @@ impl Hierarchy {
         while q.front().is_some_and(|&pos| pos <= op) {
             q.pop_front();
         }
-        let priority = q.front().map_or(f64::NEG_INFINITY, |&pos| -(pos as f64));
+        let next = q.front().copied();
+        if let Some(kv) = self.kv.as_mut().filter(|_| kind == BlobKind::KvBlock) {
+            kv.gpu.reprice(id, next);
+            return;
+        }
+        if self.policy != Policy::Clairvoyant {
+            return;
+        }
+        let priority = next.map_or(f64::NEG_INFINITY, |pos| -(pos as f64));
         match self.authority(kind, crate::own::Question::Allocation) {
             crate::own::Authority::Engine => self.reprice_engine(id, kind, priority),
             crate::own::Authority::Orchestrator => self.reprice_owned(id, priority),
@@ -1112,6 +1219,15 @@ impl Hierarchy {
         self.tier_of(kind) == Tier::Hbm
     }
 
+    #[must_use]
+    pub fn lift_ns(&self, kind: BlobKind, bytes: u64) -> u64 {
+        if self.on_accelerator(kind) {
+            self.link.fetch_ns(bytes)
+        } else {
+            0
+        }
+    }
+
     /// Takes a tier rather than a class, which is what lets a caller reach `Nvme` at all --
     /// `home` cannot, since no class rests there. `pub(crate)` for `tele.rs`.
     pub(crate) fn pool(&self, tier: Tier) -> &TierPool {
@@ -1148,9 +1264,21 @@ impl Hierarchy {
         crate::own::authority(kind, self.tier_of(kind), q)
     }
 
+    fn engine_kv(&self, kind: BlobKind) -> Option<&KvTiers> {
+        self.kv.as_ref().filter(|_| kind == BlobKind::KvBlock)
+    }
+
+    #[must_use]
+    pub fn engine_cache(&self) -> bool {
+        self.kv.is_some()
+    }
+
     /// Usable right now, with no copy.
     #[must_use]
     pub fn is_hot(&self, id: &BlobId, kind: BlobKind) -> bool {
+        if let Some(kv) = self.engine_kv(kind) {
+            return kv.gpu.contains(id);
+        }
         self.home(kind).contains(id)
     }
 
@@ -1158,15 +1286,21 @@ impl Hierarchy {
     /// RDMA, so either can be a source.
     #[must_use]
     pub fn holds(&self, id: &BlobId, kind: BlobKind) -> bool {
+        if let Some(kv) = self.engine_kv(kind) {
+            return kv.gpu.contains(id) || kv.offload.contains(id);
+        }
         self.home(kind).contains(id) || (self.on_accelerator(kind) && self.ddr.contains(id))
     }
 
     pub fn hot_ids(&self) -> impl Iterator<Item = BlobId> + '_ {
         let split = self.split;
-        self.hbm.resident_ids().chain(
-            self.ddr
-                .resident_ids_where(move |k| !(split && accelerated(k))),
-        )
+        self.hbm
+            .resident_ids()
+            .chain(
+                self.ddr
+                    .resident_ids_where(move |k| !(split && accelerated(k))),
+            )
+            .chain(self.kv.iter().flat_map(|kv| kv.gpu.ids()))
     }
 
     /// What it costs this node to make one missing blob hot without leaving the node: promote
@@ -1174,6 +1308,20 @@ impl Hierarchy {
     #[must_use]
     pub fn local_ns(&self, id: &BlobId, meta: &BlobMeta) -> u64 {
         let up = self.on_accelerator(meta.kind);
+        if let Some(kv) = self.engine_kv(meta.kind) {
+            if kv.offload.contains(id) {
+                return self.link.fetch_ns(meta.bytes);
+            }
+            if kv.spill.contains(id) {
+                let lift = if up {
+                    self.link.fetch_ns(meta.bytes)
+                } else {
+                    0
+                };
+                return self.nvme.spec().fetch_ns(meta.bytes) + lift;
+            }
+            return meta.recompute_ns;
+        }
         if up && self.ddr.contains(id) {
             return self.link.fetch_ns(meta.bytes);
         }
@@ -1188,15 +1336,17 @@ impl Hierarchy {
         meta.recompute_ns
     }
 
-    /// Bytes a set of per-class needs would claim in each pool.
     fn by_pool(&self, need: &[u64; BlobKind::N]) -> (u64, u64) {
-        BlobKind::ALL.iter().fold((0, 0), |(h, d), &k| {
-            if self.on_accelerator(k) {
-                (h + need[k.idx()], d)
-            } else {
-                (h, d + need[k.idx()])
-            }
-        })
+        BlobKind::ALL
+            .iter()
+            .filter(|&&k| self.engine_kv(k).is_none())
+            .fold((0, 0), |(h, d), &k| {
+                if self.on_accelerator(k) {
+                    (h + need[k.idx()], d)
+                } else {
+                    (h, d + need[k.idx()])
+                }
+            })
     }
 
     /// Would this node take these bytes, on top of `reserved`, without refusing? Read-only,
@@ -1218,7 +1368,16 @@ impl Hierarchy {
         let short = |pool: &TierPool, n: u64, r: u64| {
             n.saturating_sub(pool.free_bytes().saturating_sub(r)) as f64 * pool.marginal_price()
         };
-        short(&self.hbm, nh, rh) + short(&self.ddr, nd, rd)
+        short(&self.hbm, nh, rh) + short(&self.ddr, nd, rd) + self.kv_displacement(need, reserved)
+    }
+
+    fn kv_displacement(&self, need: &[u64; BlobKind::N], reserved: &[u64; BlobKind::N]) -> f64 {
+        let Some(kv) = &self.kv else {
+            return 0.0;
+        };
+        let k = BlobKind::KvBlock.idx();
+        need[k].saturating_sub(kv.gpu.free().saturating_sub(reserved[k])) as f64
+            * kv.gpu.tail_price()
     }
 
     /// `displacement`, restricted to one pool -- `phase-2.md` §1.8's locality-coupling silo.
@@ -1236,21 +1395,86 @@ impl Hierarchy {
         let short = |pool: &TierPool, n: u64, r: u64| {
             n.saturating_sub(pool.free_bytes().saturating_sub(r)) as f64 * pool.marginal_price()
         };
+        let kv_here = self.kv.is_some() && self.tier_of(BlobKind::KvBlock) == tier;
+        let kv = if kv_here {
+            self.kv_displacement(need, reserved)
+        } else {
+            0.0
+        };
         match tier {
-            Tier::Hbm => short(&self.hbm, nh, rh),
-            Tier::Ddr => short(&self.ddr, nd, rd),
+            Tier::Hbm => short(&self.hbm, nh, rh) + kv,
+            Tier::Ddr => short(&self.ddr, nd, rd) + kv,
             Tier::Nvme => 0.0,
         }
     }
 
     #[must_use]
     pub fn used(&self) -> u64 {
-        self.hbm.used() + self.ddr.used()
+        let pools = self.hbm.used() + self.ddr.used();
+        match &self.kv {
+            Some(kv) => pools + kv.gpu.used() + kv.offload.used(),
+            None => pools,
+        }
     }
 
     #[must_use]
     pub fn resident_bytes(&self, kind: BlobKind) -> u64 {
+        if let Some(kv) = self.engine_kv(kind) {
+            return kv.gpu.used();
+        }
         self.home(kind).resident_bytes(kind)
+    }
+
+    #[must_use]
+    pub fn kv_bytes(&self) -> [u64; 3] {
+        let k = BlobKind::KvBlock;
+        if let Some(kv) = &self.kv {
+            return [kv.gpu.used(), kv.offload.used(), kv.spill.used()];
+        }
+        let offloaded = if self.split {
+            self.ddr.resident_bytes(k)
+        } else {
+            0
+        };
+        [
+            self.home(k).resident_bytes(k),
+            offloaded,
+            self.nvme.resident_bytes(k),
+        ]
+    }
+
+    #[must_use]
+    pub fn kv_partition(&self) -> Option<(u64, u64)> {
+        self.kv
+            .as_ref()
+            .map(|kv| (kv.gpu.capacity(), kv.gpu.pinned()))
+    }
+
+    #[must_use]
+    pub fn kv_tail_price(&self) -> Option<f64> {
+        self.kv.as_ref().map(|kv| kv.gpu.tail_price())
+    }
+
+    #[must_use]
+    pub fn preemptions(&self) -> u64 {
+        self.kv.as_ref().map_or(0, |kv| kv.gpu.preemptions)
+    }
+
+    #[must_use]
+    pub fn kv_orphans(&self) -> usize {
+        self.kv.as_ref().map_or(0, |kv| kv.gpu.orphans())
+    }
+
+    pub fn seal(&mut self, until: Option<u64>) {
+        if let Some(kv) = self.kv.as_mut() {
+            kv.gpu.seal(until);
+        }
+    }
+
+    pub fn release(&mut self, now_ns: u64) {
+        if let Some(kv) = self.kv.as_mut() {
+            kv.gpu.release(now_ns);
+        }
     }
 
     #[must_use]
@@ -1265,13 +1489,23 @@ impl Hierarchy {
     /// engine-reported eviction metric against.
     #[must_use]
     pub fn evicted(&self) -> [u64; BlobKind::N] {
-        std::array::from_fn(|k| self.hbm.evicted[k] + self.ddr.evicted[k] + self.nvme.evicted[k])
+        let mut out: [u64; BlobKind::N] = std::array::from_fn(|k| {
+            self.hbm.evicted[k] + self.ddr.evicted[k] + self.nvme.evicted[k]
+        });
+        if let Some(kv) = &self.kv {
+            out[BlobKind::KvBlock.idx()] +=
+                kv.gpu.evictions + kv.offload.evictions + kv.spill.evictions;
+        }
+        out
     }
 
     /// Spares a caller from knowing the tier: `TierPool::regret_rate` is keyed by index
     /// within one pool, and which pool that is depends on `split`.
     #[must_use]
     pub fn regret_rate(&self, kind: BlobKind) -> f64 {
+        if self.engine_kv(kind).is_some() {
+            return 1.0;
+        }
         self.home(kind).regret_rate(kind.idx())
     }
 
@@ -1282,7 +1516,11 @@ impl Hierarchy {
 
     #[must_use]
     pub fn over_capacity(&self) -> bool {
-        self.hbm.over_capacity() || self.ddr.over_capacity()
+        let kv = self
+            .kv
+            .as_ref()
+            .is_some_and(|kv| kv.gpu.used() > kv.gpu.capacity());
+        self.hbm.over_capacity() || self.ddr.over_capacity() || kv
     }
 
     /// `phase-2.md` §1.8's memory-coupling axis: `(cross-class evictions, evictions)` in host
@@ -1371,6 +1609,10 @@ impl Hierarchy {
     }
 
     fn admit_hot(&mut self, id: BlobId, meta: BlobMeta) -> Admission {
+        debug_assert!(
+            self.engine_kv(meta.kind).is_none(),
+            "engine-allocated KV reached the ledger's admission path"
+        );
         match self.authority(meta.kind, crate::own::Question::Allocation) {
             crate::own::Authority::Engine => self.admit_engine(id, meta),
             crate::own::Authority::Orchestrator => self.admit_owned(id, meta),
@@ -1407,6 +1649,88 @@ impl Hierarchy {
             self.demote(vid, vmeta);
         }
         a
+    }
+
+    fn materialise_kv(&mut self, id: BlobId, meta: BlobMeta, cost: &mut Cost) -> bool {
+        let k = meta.kind.idx();
+        let up = self.split;
+        let lift = self.link.fetch_ns(meta.bytes);
+        let spill_read = self.nvme.spec().fetch_ns(meta.bytes);
+        let Some(kv) = self.kv.as_mut() else {
+            return false;
+        };
+        let offloaded = kv.offload.contains(&id);
+        let staged = kv.spill.contains(&id);
+        if !kv.place(id, meta) {
+            return false;
+        }
+        kv.forget_cold(&id);
+        if offloaded {
+            cost.transfer_ns += lift;
+            self.offload_hits[k] += 1;
+        } else if staged {
+            cost.transfer_ns += spill_read + if up { lift } else { 0 };
+            self.nvme_hits[k] += 1;
+        } else {
+            cost.recompute_ns += meta.recompute_ns;
+            self.misses[k] += 1;
+        }
+        cost.bytes_in += meta.bytes;
+        true
+    }
+
+    // phase-3.md §1.2: a preempted sequence loses its prefix hit and is recomputed whole.
+    fn preempt(&mut self, chain: &[(BlobId, BlobMeta)], from: usize, cost: &mut Cost) {
+        let whole: u64 = chain.iter().map(|(_, m)| m.recompute_ns).sum();
+        cost.recompute_ns = cost.recompute_ns.max(whole);
+        cost.preempted = true;
+        if let Some((_, m)) = chain.first() {
+            let k = m.kind.idx();
+            self.hits[k] = self.hits[k].saturating_sub(self.seq_hits);
+            self.misses[k] += self.seq_hits + (chain.len() - from) as u64;
+        }
+        self.seq_hits = 0;
+        self.seal(None);
+    }
+
+    pub fn produce(&mut self, blocks: &[(BlobId, BlobMeta)]) -> bool {
+        for &(id, meta) in blocks {
+            if self.engine_kv(meta.kind).is_some() {
+                let placed = self.kv.as_mut().is_some_and(|kv| kv.place(id, meta));
+                if !placed {
+                    self.seal(None);
+                    return false;
+                }
+            } else if self.admit_hot(id, meta) == Admission::Pending {
+                // Output that cannot be held is not a request turned away: the request ran.
+                let pool = self.home_mut(meta.kind);
+                pool.refused[meta.kind.idx()] = pool.refused[meta.kind.idx()].saturating_sub(1);
+                return false;
+            }
+            self.clairvoyant_touch(id, meta.kind);
+        }
+        true
+    }
+
+    pub fn decode_output(
+        &mut self,
+        chain: &[(BlobId, BlobMeta)],
+        produces: &[(BlobId, BlobMeta)],
+        chain_recompute: u64,
+        cost: &mut Cost,
+    ) {
+        if cost.preempted || produces.is_empty() || self.produce(produces) {
+            return;
+        }
+        let whole: u64 = chain.iter().map(|(_, m)| m.recompute_ns).sum();
+        cost.recompute_ns += whole.saturating_sub(chain_recompute);
+        cost.preempted = true;
+        if let Some((_, m)) = chain.first() {
+            let k = m.kind.idx();
+            self.hits[k] = self.hits[k].saturating_sub(self.seq_hits);
+            self.misses[k] += self.seq_hits;
+        }
+        self.seq_hits = 0;
     }
 
     /// Make one missing blob hot by the cheapest local route, charging `cost`.
@@ -1470,6 +1794,10 @@ impl Hierarchy {
     /// same state twice. `phase-1.md` §1.5's "remove": splits the same way `admit_hot` and
     /// `demote` do.
     fn forget_cold(&mut self, id: &BlobId, kind: BlobKind) {
+        if let Some(kv) = self.kv.as_mut().filter(|_| kind == BlobKind::KvBlock) {
+            kv.forget_cold(id);
+            return;
+        }
         match self.authority(kind, crate::own::Question::Allocation) {
             crate::own::Authority::Engine => self.forget_cold_engine(id, kind),
             crate::own::Authority::Orchestrator => self.forget_cold_owned(id, kind),
@@ -1502,6 +1830,9 @@ impl Hierarchy {
     /// Raise a blob's value at its home pool because a flow says it is about to be
     /// needed. Dispatches on `kind`'s allocation authority the way `admit_hot` does.
     fn anticipate(&mut self, id: BlobId, kind: BlobKind, weight: f64) {
+        if self.engine_kv(kind).is_some() {
+            return;
+        }
         match self.authority(kind, crate::own::Question::Allocation) {
             crate::own::Authority::Engine => self.anticipate_engine(id, kind, weight),
             crate::own::Authority::Orchestrator => self.anticipate_owned(id, kind, weight),
@@ -1525,6 +1856,10 @@ impl Hierarchy {
     }
 
     fn touch(&mut self, id: BlobId, kind: BlobKind) {
+        if let Some(kv) = self.kv.as_mut().filter(|_| kind == BlobKind::KvBlock) {
+            kv.gpu.touch(id, true);
+            return;
+        }
         match self.authority(kind, crate::own::Question::Allocation) {
             crate::own::Authority::Engine => self.touch_engine(id, kind),
             crate::own::Authority::Orchestrator => self.touch_owned(id, kind),
@@ -1552,6 +1887,12 @@ impl Hierarchy {
     /// state someone is actually using.
     pub fn announce(&mut self, hint: &FlowHint) {
         for &(id, meta) in &hint.downstream {
+            // `phase-3.md` §1.8: the orchestrator can no longer insert or reprice a KV block.
+            if self.engine_kv(meta.kind).is_some()
+                || (!self.prewarm_kv && meta.kind == BlobKind::KvBlock)
+            {
+                continue;
+            }
             if self.is_hot(&id, meta.kind) {
                 self.anticipate(id, meta.kind, hint.probability);
                 continue;
@@ -1582,13 +1923,33 @@ impl Hierarchy {
                 need[meta.kind.idx()] += meta.bytes;
             }
         }
-        self.could_admit(&need, &[0; BlobKind::N])
+        let kv_fits = self.kv_partition().is_none_or(|(capacity, _)| {
+            let chain: u64 = hint
+                .downstream
+                .iter()
+                .filter(|(_, m)| m.kind == BlobKind::KvBlock)
+                .map(|(_, m)| m.bytes)
+                .sum();
+            chain <= capacity
+        });
+        kv_fits && self.could_admit(&need, &[0; BlobKind::N])
     }
 
     /// Admit migrated state without charging for it: the bytes already exist, they just live
     /// somewhere else now.
     pub fn reinstate(&mut self, id: BlobId, meta: BlobMeta) {
+        if self.engine_kv(meta.kind).is_some() {
+            return;
+        }
         let _ = self.admit_hot(id, meta);
+    }
+
+    /// Migrated state that was already cold on the node it left lands cold here too.
+    pub fn respill(&mut self, id: BlobId, meta: BlobMeta) {
+        if self.engine_kv(meta.kind).is_some() {
+            return;
+        }
+        self.spill(id, meta);
     }
 
     /// Empty the node's memory, handing back everything it held, hot or offloaded.
@@ -1597,19 +1958,29 @@ impl Hierarchy {
     /// -- it drains whole pools, and a pool holds whatever mix of classes the node was
     /// running. So it drains first and attributes afterwards, one census hit per
     /// engine-owned blob it took. This is the largest single assumption of allocation
-    /// authority in the simulator: `Machine::retire` relocates an entire engine's KV cache
+    /// authority in the simulator: `Machine::drain` relocates an entire engine's KV cache
     /// by orchestrator fiat, which no engine interface in §8 would permit.
-    pub fn drain_all(&mut self) -> Vec<(BlobId, BlobMeta)> {
-        let mut out = self.hbm.drain_all();
-        out.extend(self.ddr.drain_all());
-        for &(_, meta) in &out {
+    pub fn drain_all(&mut self, spill: bool) -> (crate::work::Chain, crate::work::Chain) {
+        let mut hot = self.hbm.drain_all();
+        hot.extend(self.ddr.drain_all());
+        let cold = if spill {
+            self.nvme.drain_all()
+        } else {
+            Vec::new()
+        };
+        if let Some(kv) = self.kv.as_mut() {
+            kv.gpu.drain();
+            kv.offload.drain();
+            kv.spill.drain();
+        }
+        for &(_, meta) in hot.iter().chain(&cold) {
             if self.authority(meta.kind, crate::own::Question::Allocation)
                 == crate::own::Authority::Engine
             {
                 self.drain_engine(meta.kind);
             }
         }
-        out
+        (hot, cold)
     }
 
     #[cfg_attr(
@@ -1627,6 +1998,18 @@ impl Hierarchy {
     /// be helped by shipping it.
     pub fn supply(&mut self, chain: &[(BlobId, BlobMeta)]) -> usize {
         for (n, &(id, meta)) in chain.iter().enumerate() {
+            if self.engine_kv(meta.kind).is_some() && !self.is_hot(&id, meta.kind) {
+                // A block whose prefix is not resident is unreachable by prefix lookup, so an
+                // engine does not install it -- a stale view can send a suffix without its head.
+                let orphan = meta.parent.is_some_and(|p| !self.is_hot(&p, meta.kind));
+                if orphan || !self.kv.as_mut().is_some_and(|kv| kv.place(id, meta)) {
+                    return n;
+                }
+                self.forget_cold(&id, meta.kind);
+                self.remote_hits[meta.kind.idx()] += 1;
+                self.clairvoyant_touch(id, meta.kind);
+                continue;
+            }
             if self.is_hot(&id, meta.kind) {
                 self.touch(id, meta.kind);
                 self.clairvoyant_touch(id, meta.kind);
@@ -1653,6 +2036,14 @@ impl Hierarchy {
                 self.clairvoyant_touch(id, meta.kind);
                 continue;
             }
+            if self.engine_kv(meta.kind).is_some() {
+                if self.materialise_kv(id, meta, &mut cost) {
+                    self.clairvoyant_touch(id, meta.kind);
+                } else {
+                    cost.preempted = true;
+                }
+                continue;
+            }
             if self.materialise(id, meta, &mut cost) == Admission::Pending {
                 cost.pending = true;
             } else {
@@ -1663,8 +2054,15 @@ impl Hierarchy {
     }
 
     pub fn access(&mut self, chain: &[(BlobId, BlobMeta)]) -> Cost {
+        if chain
+            .first()
+            .is_some_and(|(_, m)| self.engine_kv(m.kind).is_some())
+        {
+            return self.access_kv(chain);
+        }
         let mut cost = Cost::default();
         let hit = chain.partition_point(|(id, m)| self.is_hot(id, m.kind));
+        self.seq_hits = hit as u64;
         if hit > 0 {
             let (id, meta) = chain[hit - 1];
             self.touch(id, meta.kind);
@@ -1680,6 +2078,27 @@ impl Hierarchy {
         for &(id, meta) in &chain[hit..] {
             if self.materialise(id, meta, &mut cost) == Admission::Pending {
                 cost.pending = true;
+                return cost;
+            }
+            self.clairvoyant_touch(id, meta.kind);
+        }
+        cost
+    }
+
+    fn access_kv(&mut self, chain: &[(BlobId, BlobMeta)]) -> Cost {
+        let mut cost = Cost::default();
+        let hit = chain.partition_point(|(id, m)| self.is_hot(id, m.kind));
+        for &(id, meta) in &chain[..hit] {
+            self.touch(id, meta.kind);
+            self.clairvoyant_touch(id, meta.kind);
+        }
+        if hit > 0 {
+            self.hits[chain[0].1.kind.idx()] += hit as u64;
+        }
+        self.seq_hits = hit as u64;
+        for (i, &(id, meta)) in chain.iter().enumerate().skip(hit) {
+            if !self.materialise_kv(id, meta, &mut cost) {
+                self.preempt(chain, i, &mut cost);
                 return cost;
             }
             self.clairvoyant_touch(id, meta.kind);
@@ -1705,6 +2124,7 @@ mod tests {
             hbm_quota: Quota::open(0, bands),
             ddr_quota: Quota::open(200, bands),
             can_decode: true,
+            kv: None,
         };
         let mut h = Hierarchy::new(mem, Policy::Clairvoyant);
         // Snapshot, not ServiceHeap: a ServiceHeap entry is pinned while "serving" (unevictable
@@ -1769,6 +2189,7 @@ mod tests {
             hbm_quota: Quota::open(0, bands),
             ddr_quota: Quota::open(300, bands),
             can_decode: true,
+            kv: None,
         };
         let mut h = Hierarchy::new(mem, Policy::Clairvoyant);
         let meta = || BlobMeta {
@@ -1906,6 +2327,7 @@ mod tests {
             hbm_quota: Quota::open(hbm, bands),
             ddr_quota: Quota::open(8 << 30, bands),
             can_decode: true,
+            kv: None,
         };
         Hierarchy::new(mem, Policy::Gdsf)
     }
@@ -1930,6 +2352,185 @@ mod tests {
                 assert_ne!(got, Tier::Nvme);
             }
         }
+    }
+
+    fn granted(hbm: u64, partition: u64) -> Hierarchy {
+        let bands = [0u8; BlobKind::N];
+        Hierarchy::new(
+            NodeMemory {
+                hbm,
+                ddr: 8 << 30,
+                nvme: 64 << 30,
+                hbm_quota: Quota::open(hbm, bands),
+                ddr_quota: Quota::open(8 << 30, bands),
+                can_decode: true,
+                kv: Some(EngineKv {
+                    partition,
+                    offload: if hbm > 0 { 1 << 30 } else { 0 },
+                    spill: 2 << 30,
+                    clairvoyant: false,
+                }),
+            },
+            Policy::Gdsf,
+        )
+    }
+
+    #[test]
+    fn the_partition_and_its_pool_sum_to_the_declared_capacity() {
+        let split = granted(4 << 30, 1 << 30);
+        assert_eq!(split.hbm.spec().capacity + (1 << 30), 4 << 30);
+        assert_eq!(split.ddr.spec().capacity + (1 << 30), 8 << 30);
+        assert_eq!(split.nvme.spec().capacity + (2 << 30), 64 << 30);
+        assert_eq!(split.kv_partition(), Some((1 << 30, 0)));
+        let unified = granted(0, 3 << 30);
+        assert_eq!(unified.ddr.spec().capacity + (3 << 30), 8 << 30);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds")]
+    fn a_partition_larger_than_its_pool_is_refused_at_construction() {
+        let _ = granted(0, 16 << 30);
+    }
+
+    #[test]
+    fn a_sequence_that_cannot_fit_is_preempted_and_charged_its_whole_rebuild() {
+        let mut h = granted(4 << 30, 3 * (512 << 10));
+        let chain: Vec<(BlobId, BlobMeta)> = {
+            let mut out = Vec::new();
+            let mut parent = None;
+            for i in 0..5u8 {
+                let id = parent.map_or_else(|| BlobId::leaf(&[i]), |p| BlobId::chain(p, &[i]));
+                out.push((
+                    id,
+                    BlobMeta {
+                        kind: BlobKind::KvBlock,
+                        bytes: 512 << 10,
+                        parent,
+                        recompute_ns: 1_000,
+                    },
+                ));
+                parent = Some(id);
+            }
+            out
+        };
+        let first = h.access(&chain[..2]);
+        assert!(!first.preempted && !first.pending);
+        h.seal(None);
+        let second = h.access(&chain);
+        assert!(
+            second.preempted,
+            "five blocks never fit a three-block partition"
+        );
+        assert!(!second.pending, "preemption is not a refusal");
+        assert_eq!(
+            second.recompute_ns,
+            5 * 1_000,
+            "the hit prefix is rebuilt too"
+        );
+        assert_eq!(h.preemptions(), 1);
+        assert_eq!(h.kv_partition().map(|(_, pinned)| pinned), Some(0));
+        assert_eq!(h.kv_orphans(), 0);
+    }
+
+    const BLOCK: u64 = 512 << 10;
+
+    fn kv_chain(tag: &str, len: usize) -> Vec<(BlobId, BlobMeta)> {
+        let mut out = Vec::with_capacity(len);
+        let mut parent = None;
+        for i in 0..len {
+            let content = format!("{tag}:{i}");
+            let id = parent.map_or_else(
+                || BlobId::leaf(content.as_bytes()),
+                |p| BlobId::chain(p, content.as_bytes()),
+            );
+            out.push((
+                id,
+                BlobMeta {
+                    kind: BlobKind::KvBlock,
+                    bytes: BLOCK,
+                    parent,
+                    recompute_ns: 1_000,
+                },
+            ));
+            parent = Some(id);
+        }
+        out
+    }
+
+    fn tiers(partition: u64, offload: u64) -> Hierarchy {
+        let bands = [0u8; BlobKind::N];
+        Hierarchy::new(
+            NodeMemory {
+                hbm: 4 << 30,
+                ddr: 8 << 30,
+                nvme: 64 << 30,
+                hbm_quota: Quota::open(4 << 30, bands),
+                ddr_quota: Quota::open(8 << 30, bands),
+                can_decode: true,
+                kv: Some(EngineKv {
+                    partition,
+                    offload,
+                    spill: 8 * BLOCK,
+                    clairvoyant: false,
+                }),
+            },
+            Policy::Gdsf,
+        )
+    }
+
+    #[test]
+    fn a_promoted_block_leaves_no_copy_in_a_colder_tier() {
+        let mut h = tiers(2 * BLOCK, BLOCK);
+        let (a, b) = (kv_chain("a", 2), kv_chain("b", 2));
+        for chain in [&a, &b, &a] {
+            assert!(!h.access(chain).preempted);
+            h.seal(None);
+        }
+        let kv = h.kv.as_ref().expect("the bit is on");
+        for (id, _) in &a {
+            assert!(kv.gpu.contains(id));
+            assert!(!kv.offload.contains(id) && !kv.spill.contains(id));
+        }
+    }
+
+    #[test]
+    fn a_preempted_prefix_counts_as_rebuilt_not_as_hit() {
+        let mut h = tiers(3 * BLOCK, BLOCK);
+        let chain = kv_chain("p", 5);
+        let _ = h.access(&chain[..2]);
+        h.seal(None);
+        let cost = h.access(&chain);
+        assert!(cost.preempted);
+        let k = BlobKind::KvBlock.idx();
+        assert_eq!(h.hits[k], 0);
+        assert_eq!(h.misses[k], 7, "two cold, then the whole second sequence");
+    }
+
+    #[test]
+    fn output_the_ledger_cannot_hold_is_a_preemption_not_a_refusal() {
+        let bands = [0u8; BlobKind::N];
+        let quota = Quota::from_split(4 * BLOCK, [0.75, 0.0, 0.0, 0.0], bands, true);
+        let mut h = Hierarchy::new(
+            NodeMemory {
+                hbm: 4 * BLOCK,
+                ddr: 8 << 30,
+                nvme: 64 << 30,
+                hbm_quota: quota,
+                ddr_quota: Quota::open(8 << 30, bands),
+                can_decode: true,
+                kv: None,
+            },
+            Policy::Gdsf,
+        );
+        let whole = kv_chain("o", 4);
+        let (chain, produces) = whole.split_at(2);
+        let mut cost = h.access(chain);
+        assert!(!cost.pending);
+        let charged = cost.recompute_ns;
+        h.decode_output(chain, produces, charged, &mut cost);
+        assert!(cost.preempted);
+        assert!(!cost.pending);
+        assert_eq!(h.refused()[BlobKind::KvBlock.idx()], 0);
     }
 
     #[test]

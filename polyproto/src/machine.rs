@@ -5,6 +5,7 @@
 //! routing by residency are the same decision; a scheduler that cannot see both makes it
 //! twice, badly.
 
+use crate::admit::{Reservations, Reserve};
 use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::boundary::Cost as Crossing;
 use crate::cache::{Cost, Hierarchy, NodeMemory, Policy};
@@ -12,6 +13,7 @@ use crate::engine::{Engine, MAX_BATCH};
 use crate::oracle;
 use crate::span::Span;
 use crate::tele::Telemetry;
+use crate::tier::TierSpec;
 use crate::topo::Topology;
 use crate::work::{Agent, Gang, Request, ToolCall};
 use std::collections::{HashMap, HashSet};
@@ -247,6 +249,20 @@ pub struct Machine {
     /// pool) would reach -- `phase-2.md` §1.8, §4.6.
     pub locality_coupled: u64,
     pub locality_coupled_decisions: u64,
+    drain_spill: bool,
+    reserve: Reserve,
+    tokens_per_block: u64,
+    hold_decodes: bool,
+    reserved: Vec<Reservations>,
+    staged_kv: Vec<u64>,
+    displacement: bool,
+    shared: Option<crate::engine::EngineCache>,
+    pub refused_by_router: [u64; BlobKind::N],
+    pub preempted: [u64; BlobKind::N],
+    pub shared_reads: [u64; BlobKind::N],
+    pub shared_requests: [u64; BlobKind::N],
+    kv_sum: [u64; 3],
+    kv_samples: u64,
 }
 
 impl Machine {
@@ -338,7 +354,94 @@ impl Machine {
             feasibility_regret: 0,
             locality_coupled: 0,
             locality_coupled_decisions: 0,
+            drain_spill: false,
+            reserve: Reserve::Prompt,
+            tokens_per_block: crate::work::TOKENS_PER_KV_BLOCK,
+            hold_decodes: false,
+            reserved: (0..n_domains).map(|_| Reservations::default()).collect(),
+            staged_kv: vec![0; n_domains],
+            displacement: true,
+            shared: None,
+            refused_by_router: [0; BlobKind::N],
+            preempted: [0; BlobKind::N],
+            shared_reads: [0; BlobKind::N],
+            shared_requests: [0; BlobKind::N],
+            kv_sum: [0; 3],
+            kv_samples: 0,
         }
+    }
+
+    pub fn set_admission(&mut self, reserve: Reserve, tokens_per_block: u64) {
+        self.reserve = reserve;
+        self.tokens_per_block = tokens_per_block;
+    }
+
+    pub fn set_hold_decodes(&mut self, on: bool) {
+        self.hold_decodes = on;
+    }
+
+    pub fn set_displacement(&mut self, on: bool) {
+        self.displacement = on;
+    }
+
+    /// A cross-node pool of `capacity` bytes, written through by every node and evicted LRU.
+    pub fn set_shared_l2(&mut self, capacity: Option<u64>) {
+        self.shared = capacity.map(|c| crate::engine::EngineCache::new(c, false));
+    }
+
+    #[must_use]
+    pub fn kv_mean(&self) -> [u64; 3] {
+        self.kv_sum.map(|b| b / self.kv_samples.max(1))
+    }
+
+    #[must_use]
+    pub fn preemptions(&self) -> u64 {
+        self.domains.iter().map(Hierarchy::preemptions).sum()
+    }
+
+    #[must_use]
+    pub fn kv_orphans(&self) -> usize {
+        self.domains.iter().map(Hierarchy::kv_orphans).sum()
+    }
+
+    #[must_use]
+    pub fn engine_ops(&self) -> crate::cache::EngineOps {
+        let mut total = crate::cache::EngineOps::default();
+        for h in &self.domains {
+            let o = &h.engine_ops;
+            for k in 0..BlobKind::N {
+                total.admit[k] += o.admit[k];
+                total.touch[k] += o.touch[k];
+                total.anticipate[k] += o.anticipate[k];
+                total.demote[k] += o.demote[k];
+                total.forget_cold[k] += o.forget_cold[k];
+                total.superseded[k] += o.superseded[k];
+                total.spill[k] += o.spill[k];
+                total.drain[k] += o.drain[k];
+            }
+        }
+        total
+    }
+
+    fn router_admits(&self, d: usize, req: &Request, staged: bool) -> bool {
+        let Some((capacity, _)) = self.telemetry(d).partition() else {
+            return true;
+        };
+        let staged = staged.then(|| (&self.staged[d], self.staged_kv[d]));
+        self.reserved[d].admits(capacity, req, self.reserve, self.tokens_per_block, staged)
+    }
+
+    fn shared_ns(&self, d: usize, kind: BlobKind, bytes: u64) -> Option<u64> {
+        let n = self.domains.len();
+        if n < 2 {
+            return None;
+        }
+        let hop = self.topo.fetch_ns(self.unit_in(d), (d + 1) % n, bytes);
+        Some(hop + TierSpec::nvme(0).fetch_ns(bytes) + self.domains[d].lift_ns(kind, bytes))
+    }
+
+    pub fn set_drain_spill(&mut self, on: bool) {
+        self.drain_spill = on;
     }
 
     /// Requests per second arriving at the cluster. Setting it turns on the engine model:
@@ -639,11 +742,16 @@ impl Machine {
             self.active.push(victim);
             return;
         }
-        let moving: Vec<(BlobId, BlobMeta)> = self.domains[victim].drain_all();
-        for (i, (id, meta)) in moving.into_iter().enumerate() {
+        let (hot, cold) = self.domains[victim].drain_all(self.drain_spill);
+        let n = hot.len();
+        for (i, (id, meta)) in hot.into_iter().chain(cold).enumerate() {
             let to = self.active[i % self.active.len()];
             self.migrated_bytes += meta.bytes;
-            self.domains[to].reinstate(id, meta);
+            if i < n {
+                self.domains[to].reinstate(id, meta);
+            } else {
+                self.domains[to].respill(id, meta);
+            }
         }
     }
 
@@ -745,6 +853,26 @@ impl Machine {
             deps: Vec::new(),
             need,
         };
+        if let Some(pool) = &self.shared {
+            let far = depth
+                + req.chain[depth..]
+                    .iter()
+                    .take_while(|(id, _)| pool.contains(id))
+                    .count();
+            let bytes: u64 = req.chain[depth..far].iter().map(|(_, m)| m.bytes).sum();
+            let kind = req.chain.first().map_or(BlobKind::KvBlock, |(_, m)| m.kind);
+            if far > depth
+                && let Some(read) = self.shared_ns(d, kind, bytes)
+            {
+                let cand = read + self.local_run_ns(d, &req.chain[far..]);
+                if cand < plan.ns {
+                    plan.ns = cand;
+                    plan.chain_cut = far;
+                    plan.chain_src = Some(Source::Shared);
+                    plan.chain_bytes = bytes;
+                }
+            }
+        }
         if self.state_transfer && depth < req.chain.len() {
             let unit = self.unit_in(d);
             for &p in &self.active {
@@ -761,7 +889,7 @@ impl Machine {
                 if cand < plan.ns {
                     plan.ns = cand;
                     plan.chain_cut = far;
-                    plan.chain_src = Some(p);
+                    plan.chain_src = Some(Source::Peer(p));
                     plan.chain_bytes = bytes;
                 }
             }
@@ -782,9 +910,16 @@ impl Machine {
                     let cand = self.topo.fetch_ns(unit, p, m.bytes);
                     if cand < best {
                         best = cand;
-                        src = Some(p);
+                        src = Some(Source::Peer(p));
                     }
                 }
+            }
+            if self.shared.as_ref().is_some_and(|pool| pool.contains(id))
+                && let Some(read) = self.shared_ns(d, m.kind, m.bytes)
+                && read < best
+            {
+                best = read;
+                src = Some(Source::Shared);
             }
             plan.ns += best;
             if let Some(p) = src {
@@ -802,7 +937,21 @@ impl Machine {
     /// something here rather than silently succeed.
     fn apply_chain(&mut self, d: usize, req: &Request, plan: &Plan) -> Cost {
         let mut cost = Cost::default();
-        if let Some(p) = plan.chain_src {
+        if plan.chain_src == Some(Source::Shared) {
+            let seg = req.chain[plan.local_depth..plan.chain_cut].to_vec();
+            let kind = seg.first().map_or(BlobKind::KvBlock, |(_, m)| m.kind);
+            let bytes: u64 = seg.iter().map(|(_, m)| m.bytes).sum();
+            cost.transfer_ns += self.shared_ns(d, kind, bytes).unwrap_or(0);
+            self.domains[d].supply(&seg);
+            self.shared_reads[kind.idx()] += seg.len() as u64;
+            if let Some(pool) = self.shared.as_mut() {
+                for (id, _) in &seg {
+                    pool.touch(*id, false);
+                }
+            }
+            return cost;
+        }
+        if let Some(Source::Peer(p)) = plan.chain_src {
             let truth = req
                 .chain
                 .partition_point(|(id, m)| self.ground_truth_holds(p, id, m.kind));
@@ -830,8 +979,17 @@ impl Machine {
     /// admitting state for work that will not run is exactly what refusal exists to prevent.
     fn apply_deps(&mut self, d: usize, req: &Request, plan: &Plan) -> Cost {
         let mut cost = Cost::default();
-        for &(i, p) in &plan.deps {
+        for &(i, src) in &plan.deps {
             let (id, m) = req.requires[i];
+            let Source::Peer(p) = src else {
+                cost.transfer_ns += self.shared_ns(d, m.kind, m.bytes).unwrap_or(0);
+                self.domains[d].supply(&[(id, m)]);
+                self.shared_reads[m.kind.idx()] += 1;
+                if let Some(pool) = self.shared.as_mut() {
+                    pool.touch(id, false);
+                }
+                continue;
+            };
             if !self.ground_truth_holds(p, &id, m.kind) {
                 self.stale_fetches += 1;
                 continue;
@@ -857,7 +1015,11 @@ impl Machine {
     fn placement_terms(&self, d: usize, req: &Request, flow: &[(usize, u64)], view: View) -> Terms {
         let plan = self.plan(d, req, view);
         let tele = self.telemetry(d);
-        let displaced = tele.displacement(&plan.need, &self.staged_bytes[d]);
+        let displaced = if self.displacement {
+            tele.displacement(&plan.need, &self.staged_bytes[d])
+        } else {
+            0.0
+        };
         let unit = self.unit_in(d);
         let handoff: f64 = flow
             .iter()
@@ -1144,6 +1306,7 @@ impl Machine {
             let plan = self.plan(d, req, View::Truth);
             self.telemetry(d)
                 .could_admit(&plan.need, &self.staged_bytes[d])
+                && self.router_admits(d, req, false)
         })
     }
 
@@ -1222,6 +1385,24 @@ impl Machine {
 
     pub fn serve_request(&mut self, req: &Request) -> Cost {
         self.arrival_ns += self.interval_ns;
+        let now = self.arrival_ns;
+        for (h, r) in self.domains.iter_mut().zip(&mut self.reserved) {
+            h.release(now);
+            r.release(now);
+        }
+        let engines: Vec<usize> = self
+            .active
+            .iter()
+            .copied()
+            .filter(|&d| self.domains[d].can_decode())
+            .collect();
+        let n = engines.len().max(1) as u64;
+        for d in engines {
+            for (sum, bytes) in self.kv_sum.iter_mut().zip(self.domains[d].kv_bytes()) {
+                *sum += bytes / n;
+            }
+        }
+        self.kv_samples += 1;
         if let Some(task) = req.completes
             && self.cancelled.remove(&task)
         {
@@ -1350,6 +1531,15 @@ impl Machine {
 
     /// Materialise a request's state on `home` by the cheapest route and run it there.
     fn run_here(&mut self, home: usize, req: &Request) -> Cost {
+        let class = req.kind_idx();
+        if !self.router_admits(home, req, false) {
+            self.refused_by_router[class] += 1;
+            return Cost {
+                pending: true,
+                ..Cost::default()
+            };
+        }
+        let shared_before = self.shared_reads;
         let ran_with = self.truly_resident(home, req);
         // Ship first, then read. Whatever a peer supplied is resident by the time `access`
         // walks the chain, so it costs the link once and never a rebuild; whatever no peer
@@ -1357,6 +1547,7 @@ impl Machine {
         let plan = self.plan(home, req, View::Belief);
         let fetch = self.apply_chain(home, req, &plan);
         let mut cost = self.domains[home].access(&req.chain);
+        let chain_recompute = cost.recompute_ns;
         cost.transfer_ns += fetch.transfer_ns;
         // Counted after the fact: a refused request never ran, so charging it a placement
         // outcome would inflate every rate by the refusal rate.
@@ -1378,16 +1569,41 @@ impl Machine {
             cost.transfer_ns += shipped.transfer_ns + dep.transfer_ns;
             cost.recompute_ns += dep.recompute_ns;
             cost.pending |= dep.pending;
+            cost.preempted |= dep.preempted;
         }
         // Charged only on a request that actually runs: a refusal does no work, and never
         // reaches an engine to dispatch to.
+        let mut until = None;
         if !cost.pending {
             cost.dispatch_ns += self.dispatch.ns(DISPATCH_BYTES);
             self.dispatches += 1;
             let (exec, queue) = self.execute(home, req);
             cost.exec_ns = exec;
             cost.queue_ns = queue;
+            self.domains[home].decode_output(&req.chain, &req.produces, chain_recompute, &mut cost);
+            self.preempted[class] += u64::from(cost.preempted);
+            let decoding = req.tokens > 0 && self.interval_ns > 0;
+            if self.hold_decodes && decoding && !cost.preempted {
+                until = Some(self.arrival_ns + queue + exec);
+            }
+            if let Some(pool) = self.shared.as_mut() {
+                for &(id, meta) in req.chain.iter().chain(&req.requires).chain(&req.produces) {
+                    let _ = pool.admit(id, meta, false);
+                }
+            }
+            for (k, (now, before)) in self.shared_reads.iter().zip(shared_before).enumerate() {
+                if *now > before {
+                    self.shared_requests[k] += 1;
+                }
+            }
         }
+        if let Some(end) = until
+            && self.domains[home].engine_cache()
+        {
+            let (blocks, extra) = self.reserve.claim(req, self.tokens_per_block);
+            self.reserved[home].commit(&blocks, extra, end);
+        }
+        self.domains[home].seal(until);
         cost
     }
 
@@ -1412,6 +1628,8 @@ impl Machine {
             exec_ns: agent.tokens * crate::work::DECODE_NS_PER_TOKEN,
             tokens: agent.tokens,
             gang: None,
+            produces: agent.produces.clone(),
+            max_tokens: agent.max_tokens,
         }
     }
 
@@ -1425,6 +1643,8 @@ impl Machine {
             exec_ns: tool.exec_ns,
             tokens: 0,
             gang: None,
+            produces: Vec::new(),
+            max_tokens: 0,
         }
     }
 
@@ -1555,6 +1775,11 @@ impl Machine {
         for &i in &order {
             match self.place_agent(&probes[i], flow) {
                 Some((d, need)) => {
+                    if self.domains[d].engine_cache() {
+                        let (blocks, extra) = self.reserve.claim(&probes[i], self.tokens_per_block);
+                        self.staged_kv[d] +=
+                            self.reserved[d].uncovered(&blocks, Some(&self.staged[d])) + extra;
+                    }
                     for (held, add) in self.staged_bytes[d].iter_mut().zip(need) {
                         *held += add;
                     }
@@ -1571,6 +1796,7 @@ impl Machine {
             self.staged[d].clear();
             self.staged_seqs[d] = 0;
             self.staged_bytes[d] = [0; BlobKind::N];
+            self.staged_kv[d] = 0;
         }
         if !short {
             return Some(assign);
@@ -1596,9 +1822,9 @@ impl Machine {
             .iter()
             .filter_map(|&d| {
                 let need = self.plan(d, probe, View::Belief).need;
-                self.telemetry(d)
-                    .could_admit(&need, &self.staged_bytes[d])
-                    .then_some((d, need))
+                (self.telemetry(d).could_admit(&need, &self.staged_bytes[d])
+                    && self.router_admits(d, probe, true))
+                .then_some((d, need))
             })
             .collect();
         let need_on = |d: usize| feasible.iter().find(|(f, _)| *f == d).map(|&(_, n)| n);
@@ -1829,6 +2055,12 @@ struct OraclePick {
     r_o_disp: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Source {
+    Peer(usize),
+    Shared,
+}
+
 /// The cheapest route to everything a request needs at one node: how deep its chain already
 /// goes here, how much of the rest a peer can supply, and which dependencies come over a
 /// link rather than off the spill tier or out of a rebuild.
@@ -1837,9 +2069,9 @@ struct Plan {
     ns: u64,
     local_depth: usize,
     chain_cut: usize,
-    chain_src: Option<usize>,
+    chain_src: Option<Source>,
     chain_bytes: u64,
-    deps: Vec<(usize, usize)>,
+    deps: Vec<(usize, Source)>,
     /// Bytes this node would have to admit, per class, which is what the displacement term
     /// prices -- per class because the classes land in different pools.
     need: Need,
@@ -1877,6 +2109,7 @@ mod tests {
             hbm_quota: Quota::open(0, bands),
             ddr_quota: Quota::open(64 << 30, bands),
             can_decode: true,
+            kv: None,
         };
         let topo = Topology::cluster(nodes, 1, mem.ddr, Distance::Socket, Crossing::default());
         Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored)
@@ -2029,6 +2262,7 @@ mod tests {
             hbm_quota: Quota::open(0, bands),
             ddr_quota: Quota::open(2 << 30, bands),
             can_decode: true,
+            kv: None,
         };
         let topo = Topology::cluster(4, 1, mem.ddr, Distance::Socket, Crossing::default());
         let mut mach = Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored);
@@ -2144,6 +2378,7 @@ mod tests {
             hbm_quota: Quota::open(0, bands),
             ddr_quota: Quota::open(1, bands),
             can_decode: true,
+            kv: None,
         };
         let topo = Topology::cluster(4, 1, mem.ddr, Distance::Socket, Crossing::default());
         let mut mach = Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored);
@@ -2182,5 +2417,118 @@ mod tests {
             "a flow-aware scored arm over a multi-node fixture must find at least one decision \
              the handoff term alone moved"
         );
+    }
+
+    fn engine_machine(hbm: u64, partition: u64, control: Control) -> Machine {
+        let bands = [0u8; BlobKind::N];
+        let mem = NodeMemory {
+            hbm,
+            ddr: 8 << 30,
+            nvme: 64 << 30,
+            hbm_quota: Quota::open(hbm, bands),
+            ddr_quota: Quota::open(8 << 30, bands),
+            can_decode: true,
+            kv: Some(crate::cache::EngineKv {
+                partition,
+                offload: if hbm > 0 { 1 << 30 } else { 0 },
+                spill: 8 << 30,
+                clairvoyant: false,
+            }),
+        };
+        let topo = Topology::cluster(4, 1, mem.ddr, Distance::Rack, Crossing::default());
+        let mut mach = Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored);
+        mach.set_control(control, Crossing::default());
+        mach
+    }
+
+    fn decode_trace(seed: u64, ops: u64) -> Vec<Request> {
+        Workload::with_fanout(seed, ops, 1.0, 0.1)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .collect()
+    }
+
+    #[test]
+    fn census_kvblock_row_is_zero_on_a_cluster_with_the_bit_on() {
+        for control in [Control::Unified, Control::Gossip { period: 50 }] {
+            let mut mach = engine_machine(4 << 30, 1 << 30, control);
+            mach.set_state_transfer(true);
+            mach.set_flow_aware(true);
+            mach.set_hold_decodes(true);
+            mach.set_arrival_rate(250.0);
+            let trace = decode_trace(3, 2_000);
+            for (i, req) in trace.iter().enumerate() {
+                if i == 1_000 {
+                    mach.drain(1);
+                }
+                mach.serve_request(req);
+            }
+            let ops = mach.engine_ops();
+            let k = BlobKind::KvBlock.idx();
+            assert_eq!(
+                [
+                    ops.admit[k],
+                    ops.touch[k],
+                    ops.anticipate[k],
+                    ops.demote[k],
+                    ops.forget_cold[k],
+                    ops.superseded[k],
+                    ops.spill[k],
+                    ops.drain[k],
+                ],
+                [0; 8],
+                "{control:?}"
+            );
+            assert!(ops.total(BlobKind::WeightShard) > 0);
+            assert_eq!(mach.kv_orphans(), 0, "{control:?}");
+        }
+    }
+
+    #[test]
+    fn belief_gap_stays_zero_and_regret_still_sums_with_the_bit_on() {
+        let trace = regret_fixture(4, 600);
+        for control in [Control::Unified, Control::Query] {
+            let mut mach = engine_machine(0, 4 << 30, control);
+            mach.set_regret(true);
+            for req in &trace {
+                mach.serve_request(req);
+            }
+            assert!(!mach.spans.is_empty(), "{control:?}");
+            for span in &mach.spans {
+                let r = span.regret;
+                assert_eq!(r.belief, 0, "{control:?}: {span:?}");
+                assert_eq!(r.execution + r.heuristic + r.belief + r.model, r.total);
+            }
+        }
+    }
+
+    #[test]
+    fn only_prompt_only_reservations_let_the_engine_preempt() {
+        let trace = decode_trace(5, 3_000);
+        let mut preempted = Vec::new();
+        for reserve in Reserve::ALL {
+            let mut mach = engine_machine(4 << 30, 96 << 20, Control::Unified);
+            mach.set_state_transfer(true);
+            mach.set_fanout_atomic(true);
+            mach.set_hold_decodes(true);
+            mach.set_admission(reserve, crate::work::TOKENS_PER_KV_BLOCK);
+            mach.set_arrival_rate(250.0);
+            for req in &trace {
+                mach.serve_request(req);
+            }
+            assert_eq!(mach.kv_orphans(), 0, "{reserve:?}");
+            preempted.push((reserve, mach.preemptions(), mach.refused_by_router));
+        }
+        for &(reserve, n, refused) in &preempted {
+            match reserve {
+                Reserve::Bound | Reserve::Perfect => {
+                    assert_eq!(n, 0, "{reserve:?} covers every byte it pins");
+                    assert!(
+                        refused.iter().sum::<u64>() > 0,
+                        "{reserve:?} must bind here"
+                    );
+                }
+                Reserve::Prompt => assert!(n > 0, "the fixture must overcommit under none"),
+            }
+        }
     }
 }

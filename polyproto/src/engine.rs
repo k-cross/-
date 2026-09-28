@@ -13,7 +13,10 @@
 //! the unbatched arm comparable. Replace both from a real engine before quoting a result.
 
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
+
+use crate::blob::{BlobId, BlobMeta};
+use crate::tier::TierSpec;
 
 pub const STEP_BASE_NS: u64 = 7_000_000;
 pub const STEP_PER_SEQ_NS: u64 = 40_000;
@@ -162,5 +165,441 @@ impl Engine {
         } else {
             self.batch_sum as f64 / self.admitted as f64
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct Placed {
+    pub evicted: Vec<(BlobId, BlobMeta)>,
+    pub resident: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Block {
+    meta: BlobMeta,
+    key: u64,
+    children: u32,
+    pins: u32,
+}
+
+// Not a `TierPool` configured as LRU: that would still compile at every call site Phase 1
+// census-marked, and the point is that those sites stop compiling (phase-3.md §1.1).
+#[derive(Debug)]
+pub struct EngineCache {
+    capacity: u64,
+    used: u64,
+    pinned: u64,
+    leaf_first: bool,
+    clairvoyant: bool,
+    clock: u64,
+    blocks: HashMap<BlobId, Block>,
+    evictable: BTreeSet<(u64, BlobId)>,
+    staging: Vec<BlobId>,
+    inflight: BinaryHeap<Reverse<(u64, u64)>>,
+    held: HashMap<u64, Vec<BlobId>>,
+    next_seq: u64,
+    recovery: Option<TierSpec>,
+    last_price: f64,
+    pub evictions: u64,
+    pub preemptions: u64,
+}
+
+impl EngineCache {
+    #[must_use]
+    pub fn new(capacity: u64, leaf_first: bool) -> Self {
+        Self {
+            capacity,
+            used: 0,
+            pinned: 0,
+            leaf_first,
+            clairvoyant: false,
+            clock: 0,
+            blocks: HashMap::new(),
+            evictable: BTreeSet::new(),
+            staging: Vec::new(),
+            inflight: BinaryHeap::new(),
+            held: HashMap::new(),
+            next_seq: 0,
+            recovery: None,
+            last_price: 0.0,
+            evictions: 0,
+            preemptions: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn with_recovery(mut self, spec: TierSpec) -> Self {
+        self.recovery = Some(spec);
+        self
+    }
+
+    #[must_use]
+    pub fn with_clairvoyance(mut self) -> Self {
+        self.clairvoyant = true;
+        self
+    }
+
+    #[must_use]
+    pub fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    #[must_use]
+    pub fn used(&self) -> u64 {
+        self.used
+    }
+
+    #[must_use]
+    pub fn free(&self) -> u64 {
+        self.capacity.saturating_sub(self.used)
+    }
+
+    #[must_use]
+    pub fn pinned(&self) -> u64 {
+        self.pinned
+    }
+
+    #[must_use]
+    pub fn contains(&self, id: &BlobId) -> bool {
+        self.blocks.contains_key(id)
+    }
+
+    pub fn ids(&self) -> impl Iterator<Item = BlobId> + '_ {
+        self.blocks.keys().copied()
+    }
+
+    #[must_use]
+    pub fn orphans(&self) -> usize {
+        self.blocks
+            .values()
+            .filter(|b| b.meta.parent.is_some_and(|p| !self.blocks.contains_key(&p)))
+            .count()
+    }
+
+    fn reslot(&mut self, id: BlobId, f: impl FnOnce(&mut Block)) {
+        let Some(b) = self.blocks.get_mut(&id) else {
+            return;
+        };
+        self.evictable.remove(&(b.key, id));
+        f(b);
+        if b.pins == 0 && !(self.leaf_first && b.children > 0) {
+            self.evictable.insert((b.key, id));
+        }
+    }
+
+    fn next_key(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn pin(&mut self, id: BlobId) {
+        let mut newly = 0;
+        self.reslot(id, |b| {
+            if b.pins == 0 {
+                newly = b.meta.bytes;
+            }
+            b.pins += 1;
+        });
+        self.pinned += newly;
+        self.staging.push(id);
+    }
+
+    fn unpin(&mut self, id: BlobId) {
+        let mut freed = 0;
+        self.reslot(id, |b| {
+            if b.pins == 1 {
+                freed = b.meta.bytes;
+            }
+            b.pins = b.pins.saturating_sub(1);
+        });
+        self.pinned -= freed;
+    }
+
+    fn loss_per_byte(&self, meta: &BlobMeta) -> f64 {
+        let rebuild = meta.value_per_byte();
+        self.recovery.map_or(rebuild, |r| {
+            (r.fetch_ns(meta.bytes) as f64 / meta.bytes as f64).min(rebuild)
+        })
+    }
+
+    pub fn touch(&mut self, id: BlobId, pin: bool) {
+        if !self.blocks.contains_key(&id) {
+            return;
+        }
+        if !self.clairvoyant {
+            let key = self.next_key();
+            self.reslot(id, |b| b.key = key);
+        }
+        if pin {
+            self.pin(id);
+        }
+    }
+
+    pub fn admit(&mut self, id: BlobId, meta: BlobMeta, pin: bool) -> Placed {
+        let mut placed = Placed {
+            evicted: Vec::new(),
+            resident: true,
+        };
+        if self.blocks.contains_key(&id) {
+            self.touch(id, pin);
+            return placed;
+        }
+        let parent = meta.parent.filter(|p| self.blocks.contains_key(p));
+        if let Some(p) = parent {
+            self.reslot(p, |b| b.children += 1);
+        }
+        while self.used + meta.bytes > self.capacity {
+            let Some(&(key, victim)) = self.evictable.iter().next() else {
+                if let Some(p) = parent {
+                    self.reslot(p, |b| b.children = b.children.saturating_sub(1));
+                }
+                if pin {
+                    self.preemptions += 1;
+                }
+                placed.resident = false;
+                return placed;
+            };
+            self.evictable.remove(&(key, victim));
+            let Some(b) = self.blocks.remove(&victim) else {
+                continue;
+            };
+            self.used -= b.meta.bytes;
+            self.evictions += 1;
+            self.last_price = self.loss_per_byte(&b.meta);
+            if let Some(vp) = b.meta.parent {
+                self.reslot(vp, |pb| pb.children = pb.children.saturating_sub(1));
+            }
+            placed.evicted.push((victim, b.meta));
+        }
+        let key = if self.clairvoyant { 0 } else { self.next_key() };
+        self.blocks.insert(
+            id,
+            Block {
+                meta,
+                key,
+                children: 0,
+                pins: 0,
+            },
+        );
+        self.used += meta.bytes;
+        self.evictable.insert((key, id));
+        if pin {
+            self.pin(id);
+        }
+        placed
+    }
+
+    pub fn remove(&mut self, id: &BlobId) -> Option<BlobMeta> {
+        let b = self.blocks.remove(id)?;
+        self.evictable.remove(&(b.key, *id));
+        self.used -= b.meta.bytes;
+        if b.pins > 0 {
+            self.pinned -= b.meta.bytes;
+        }
+        if let Some(p) = b.meta.parent {
+            self.reslot(p, |pb| pb.children = pb.children.saturating_sub(1));
+        }
+        Some(b.meta)
+    }
+
+    pub fn reprice(&mut self, id: BlobId, next_use: Option<u64>) {
+        if !self.clairvoyant {
+            return;
+        }
+        let key = next_use.map_or(0, |pos| u64::MAX - pos);
+        self.reslot(id, |b| b.key = key);
+    }
+
+    pub fn seal(&mut self, until: Option<u64>) {
+        let blocks = std::mem::take(&mut self.staging);
+        match until {
+            Some(end) => {
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                self.held.insert(seq, blocks);
+                self.inflight.push(Reverse((end, seq)));
+            }
+            None => {
+                for id in blocks {
+                    self.unpin(id);
+                }
+            }
+        }
+    }
+
+    pub fn release(&mut self, now_ns: u64) {
+        while let Some(&Reverse((end, seq))) = self.inflight.peek() {
+            if end > now_ns {
+                break;
+            }
+            self.inflight.pop();
+            for id in self.held.remove(&seq).unwrap_or_default() {
+                self.unpin(id);
+            }
+        }
+    }
+
+    pub fn drain(&mut self) {
+        self.blocks.clear();
+        self.evictable.clear();
+        self.staging.clear();
+        self.inflight.clear();
+        self.held.clear();
+        self.used = 0;
+        self.pinned = 0;
+    }
+
+    #[must_use]
+    pub fn tail_price(&self) -> f64 {
+        self.evictable
+            .iter()
+            .next()
+            .and_then(|(_, id)| self.blocks.get(id))
+            .map_or(self.last_price, |b| self.loss_per_byte(&b.meta))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob::BlobKind;
+
+    const BLOCK: u64 = 100;
+
+    fn chain(tag: &str, len: usize) -> Vec<(BlobId, BlobMeta)> {
+        let mut out = Vec::with_capacity(len);
+        let mut parent: Option<BlobId> = None;
+        for i in 0..len {
+            let id = parent.map_or_else(
+                || BlobId::leaf(format!("{tag}:{i}").as_bytes()),
+                |p| BlobId::chain(p, format!("{tag}:{i}").as_bytes()),
+            );
+            out.push((
+                id,
+                BlobMeta {
+                    kind: BlobKind::KvBlock,
+                    bytes: BLOCK,
+                    parent,
+                    recompute_ns: 1_000,
+                },
+            ));
+            parent = Some(id);
+        }
+        out
+    }
+
+    #[test]
+    fn a_sequence_larger_than_the_partition_preempts_and_is_never_refused() {
+        let mut cache = EngineCache::new(3 * BLOCK, true);
+        let seq = chain("big", 5);
+        let mut kept = 0;
+        for &(id, meta) in &seq {
+            let placed = cache.admit(id, meta, true);
+            if !placed.resident {
+                break;
+            }
+            kept += 1;
+        }
+        assert_eq!(kept, 3, "the partition holds exactly three blocks");
+        assert_eq!(cache.preemptions, 1);
+        assert_eq!(cache.used(), 3 * BLOCK);
+        cache.seal(None);
+        assert_eq!(cache.pinned(), 0, "a preempted sequence holds nothing");
+    }
+
+    #[test]
+    fn eviction_is_lru_over_unpinned_leaves_and_never_opens_a_hole() {
+        let mut cache = EngineCache::new(6 * BLOCK, true);
+        let a = chain("a", 3);
+        let b = chain("b", 3);
+        for &(id, meta) in &a {
+            assert!(cache.admit(id, meta, true).resident);
+        }
+        cache.seal(None);
+        for &(id, meta) in &b {
+            assert!(cache.admit(id, meta, true).resident);
+        }
+        cache.seal(None);
+        let c = chain("c", 4);
+        let mut evicted = Vec::new();
+        for &(id, meta) in &c {
+            let placed = cache.admit(id, meta, true);
+            assert!(placed.resident);
+            evicted.extend(placed.evicted.into_iter().map(|(id, _)| id));
+        }
+        assert_eq!(
+            evicted,
+            vec![a[2].0, a[1].0, a[0].0, b[2].0],
+            "oldest chain first, tail before parent"
+        );
+        assert_eq!(cache.orphans(), 0);
+        assert!(cache.contains(&b[0].0) && cache.contains(&b[1].0));
+    }
+
+    #[test]
+    fn a_running_sequence_is_not_evicted_until_it_is_released() {
+        let mut cache = EngineCache::new(4 * BLOCK, true);
+        let running = chain("run", 2);
+        for &(id, meta) in &running {
+            cache.admit(id, meta, true);
+        }
+        cache.seal(Some(1_000));
+        let arriving = chain("new", 3);
+        let mut resident = 0;
+        for &(id, meta) in &arriving {
+            if !cache.admit(id, meta, true).resident {
+                break;
+            }
+            resident += 1;
+        }
+        assert_eq!(
+            resident, 2,
+            "only the free half is available while `run` decodes"
+        );
+        assert_eq!(cache.preemptions, 1);
+        assert!(cache.contains(&running[0].0) && cache.contains(&running[1].0));
+        cache.seal(None);
+        cache.release(1_000);
+        assert_eq!(cache.pinned(), 0);
+        for &(id, meta) in &arriving {
+            assert!(cache.admit(id, meta, true).resident);
+        }
+        assert_eq!(cache.orphans(), 0);
+    }
+
+    #[test]
+    fn clairvoyant_evicts_the_block_used_furthest_ahead_and_the_never_again_block_first() {
+        let mut cache = EngineCache::new(3 * BLOCK, false).with_clairvoyance();
+        let blocks: Vec<_> = (0..4).map(|i| chain(&format!("k{i}"), 1)[0]).collect();
+        for &(id, meta) in &blocks[..3] {
+            cache.admit(id, meta, false);
+        }
+        cache.reprice(blocks[0].0, Some(50));
+        cache.reprice(blocks[1].0, None);
+        cache.reprice(blocks[2].0, Some(10));
+        let first = cache.admit(blocks[3].0, blocks[3].1, false);
+        assert_eq!(first.evicted[0].0, blocks[1].0, "never again goes first");
+        cache.reprice(blocks[3].0, Some(20));
+        let fifth = chain("k4", 1)[0];
+        let second = cache.admit(fifth.0, fifth.1, false);
+        assert_eq!(
+            second.evicted[0].0, blocks[0].0,
+            "then the furthest next use"
+        );
+    }
+
+    #[test]
+    fn tail_price_is_the_next_victims_loss_and_recovery_caps_it() {
+        let seq = chain("price", 1);
+        let mut rebuild = EngineCache::new(2 * BLOCK, true);
+        rebuild.admit(seq[0].0, seq[0].1, false);
+        assert!((rebuild.tail_price() - 10.0).abs() < 1e-9);
+        let mut offloadable = EngineCache::new(2 * BLOCK, true).with_recovery(TierSpec {
+            capacity: 0,
+            fixed_ns: 100,
+            ns_per_byte: 0.0,
+        });
+        offloadable.admit(seq[0].0, seq[0].1, false);
+        assert!((offloadable.tail_price() - 1.0).abs() < 1e-9);
     }
 }

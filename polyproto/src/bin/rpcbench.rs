@@ -97,6 +97,7 @@ fn populate() -> (Hierarchy, Vec<FlowHint>, Vec<u64>) {
             hbm_quota: Quota::from_split(HBM, [0.25, 0.0, 0.50, 0.0], bands, false),
             ddr_quota: Quota::from_split(DRAM, [0.10, 0.15, 0.15, 0.35], bands, false).offloaded(),
             can_decode: true,
+            kv: None,
         },
         Policy::Gdsf,
     );
