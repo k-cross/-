@@ -12,11 +12,11 @@ not about who wrote it; the HTTP itself is a linked library's (§2.6). **Cede th
 path** -- and the second is only defensible because of the first, since routing and cancellation
 are what is left to decide with once allocation is gone.
 
-**Status.** Phases 0-4 and 8 are built and measured; Phases 5-7 are design (§9). Current results
-are in [`residency-ledger.md`](residency-ledger.md); each phase's plan, predictions and outcomes are
-in its own `phase-N.md`. The corrected architecture runs behind bits that are off by default --
-`--engine-cache` (Phase 3) and `--belief` (Phase 4) -- so a published number is the ledger's unless
-it is marked otherwise.
+**Status.** Phases 0-4 and 8 are built and measured; Phases 5-7 and 9-11 are design (§9). Current
+results are in [`residency-ledger.md`](residency-ledger.md); each phase's plan, predictions and
+outcomes are in its own `phase-N.md`. The corrected architecture runs behind bits that are off by
+default -- `--engine-cache` (Phase 3) and `--belief` (Phase 4) -- so a published number is the
+ledger's unless it is marked otherwise.
 
 **On the numbers.** Four grades of evidence, kept apart:
 
@@ -129,7 +129,8 @@ and power stay observed.
 
 The rates in the table are asserted, not measured. Counting owned-state changes per tier per
 simulated second -- mostly from counters the runs already keep, `decisions` and `dispatches` among
-them -- is what would check that the tiers sit orders of magnitude apart.
+them -- is what would check that the tiers sit orders of magnitude apart; Phase 10 does that, and
+tests the failure model above by injecting each crash.
 
 ### Where polyproto's state falls
 
@@ -256,8 +257,9 @@ out to need:
 real rather than convenient. **It is unbuilt and unproven.** Phase 3's admission sweep found the
 bracket narrow at the published partition and wide at half of it -- `bound` refuses 17%, `perfect`
 8.6%, and `none` refuses nothing but preempts 10.5% -- and while the loss is class-blind, a two-tier
-mix buys nothing a scalar bound would not until requests carry a class it can act on: the `slo`
-field (§4), declared since Phase 4 and not yet read by admission.
+mix buys nothing a scalar bound would not until requests carry a class it can act on -- the `slo`
+field (§4), declared since Phase 4 -- and the router can choose the victim, which only cancellation
+allows (below). Phase 9 tests both.
 
 **The catch is that the orchestrator cannot cash that understanding inside the engine.** Ceding
 eviction ceded the **choice of victim**: the engine still preempts and recomputes under pressure,
@@ -690,8 +692,8 @@ this workload's decision rate, against ~1000 for a warm WASM hook (§5).
 Ordered by what makes the rest trustworthy: the boundary first (3.1), then the estimates that
 replace declarations (3.2-3.3), then the apparatus that makes any of it measurable (3.4-3.6), then
 confidence and tenancy (3.7-3.8), and three smaller points (3.9-3.11). Built: 3.1, 3.4, 3.5, 3.7,
-3.11, part of 3.6 and 3.10's term. Open: the flow estimator in 3.2 (Phase 7), 3.3 (Phase 5) and 3.8
-(Phase 6).
+3.11, part of 3.6 and 3.10's term. Open: the flow estimator in 3.2 (Phase 7), 3.3 and the rest of
+3.6 (Phase 5), and 3.8 (Phase 6).
 
 ### 3.1 A `Telemetry` boundary
 
@@ -817,7 +819,7 @@ a sequence the engine could not place until that step's batch arrives without th
 mistake came from a bad cost model or from a belief that drifted.
 
 **Partly built** (Phase 4): phantom share `|B \ A| / |B|` and miss share `|A \ B| / |A|` are sampled
-per engine. Divergence *by cause* is not built.
+per engine. Divergence *by cause* is not built; Phase 5 needs it and adds it.
 
 ### 3.7 Confidence has to reach the argmin
 
@@ -1356,7 +1358,8 @@ Worst first.
    charges seam costs from a measured ladder and never parses a byte of HTTP -- but it is the
    largest gap between this design being right and being shipped, and one piece of it has a
    modelling consequence: **a stalled stream's buffer is an occupant of the host DDR pool §5's
-   shadow price arbitrates**, and that term does not exist in the ledger.
+   shadow price arbitrates**, and that term does not exist in the ledger. Phase 9 adds it with
+   cancellation.
 
 ### What gets easier
 
@@ -1475,8 +1478,9 @@ simulate-first method, one level down.
 
 **The logged tier is FoundationDB too** -- a second cluster, appending with versionstamps, so one
 technology spans two failure domains; AX chose Redis for the same tier. It stays FoundationDB until
-evidence says otherwise, and the evidence that would is §1's per-tier count showing FoundationDB
-cannot carry the rate. A purpose-built log is the one place building below the layer could pay, and
+evidence says otherwise, and the evidence that would is Phase 10's per-tier count showing
+FoundationDB cannot carry the rate -- which it can only show once Phase 7 gives the logged tier its
+writers. A purpose-built log is the one place building below the layer could pay, and
 that count is what would justify it. The simulator models no store at all, so no result here
 depends on the choice.
 
@@ -1536,13 +1540,17 @@ run, and what was measured; the current numbers are in the ledger.
 | [2](phase-2.md) | oracle, regret, coupling, the wait regime, per-request spans | done | `scored`'s regret is all model gap; coupling is a statement about a regime |
 | [3](phase-3.md) | the engine allocates; the orchestrator sizes the partition (`--engine-cache`) | done | ceding allocation moves mean service by -0.2% where decode dominates; budgets survive and grow, per-block authority does not (§1) |
 | [4](phase-4.md) | belief, not truth: lossy telemetry and `P(resident)` (`--belief`) | done | within 0.16% of the exact view at 20% batch loss with no recovery |
-| 5 | influence: retention directives | **next** | |
-| 6 | macro authority: weight placement, partitions, the P:D ratio, tenancy | planned | |
-| 7 | learned flows, speculative authority, the taxonomy | planned | |
+| 5 | influence: retention directives, divergence by cause | **next** | |
+| 6 | macro authority: weight placement, partitions, disaggregated prefill/decode, tenancy | planned | |
+| 7 | learned flows, speculative authority, sessions that suspend, the taxonomy | planned | |
 | [8](phase-8.md) | the data path as an arm | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
+| 9 | enforcement: cancellation on the path, and two-tier admission | planned | |
+| 10 | durability: what each tier writes, and what a crash costs | planned | |
+| 11 | regions: a scheduler per region under global budgets | planned | |
 
 Built bits are off by default, and every result behind them is an A/B against the run without them.
-Two pieces the plans named are not built: two-tier admission (§1) and divergence by cause (§3.6).
+Phase numbers are stable once cited, so phases added later take new numbers and *Ordering* sets the
+sequence.
 
 ### Phase 5 -- Influence: retention directives
 
@@ -1551,6 +1559,11 @@ Directives are advisory by construction -- §1 removed any ability to hold a blo
 engine's will -- so the `ignores` arm is not a pessimistic sweep, it is §3.6's third divergence
 source turned into an experiment.
 
+That needs **divergence by cause** (§3.6), which Phase 4 measured only in total (phantom and miss
+shares): each divergent block attributed to not yet due, dropped, silenced, never stored,
+preempted, or an ignored directive. The simulator knows each event's fate, so the attribution is
+exact.
+
 - **Deliverable:** what a directive is worth, and what routing alone achieves when the serving stack
   does not cooperate. The second number is the one that matters for planning, and the first
   coupling-tier-1 result earned by influence rather than assumed by declaration. Phase 3 made this
@@ -1558,7 +1571,7 @@ source turned into an experiment.
   honest way left to buy it back.
 - **Risk:** low. **Size:** small to medium.
 
-### Phase 6 -- Macro authority: placement, partitions, tenancy
+### Phase 6 -- Macro authority: placement, partitions, prefill/decode, tenancy
 
 The slow, coarse, orchestrator-owned decisions -- §2.4's provisioning tier, and between them
 everything Phase 3 froze. These are also the decisions the system of record holds (§8).
@@ -1566,45 +1579,136 @@ everything Phase 3 froze. These are also the decisions the system of record hold
 Weight shards stop being per-request cache entries: the orchestrator decides which models load
 where on a slow timescale, with load and unload costs, through a model-agnostic interface (size,
 load time, context window, no internals). **HBM partition sizing stops being a fixed input**, since
-a node's partition budget and its resident model set are one allocation made twice. The **P:D
-replica ratio** (§2.5) is the third member, bound by different resources at each end, so the ratio
-serving a long-prompt mix starves an agent mix.
+a node's partition budget and its resident model set are one allocation made twice.
 
-**Tenancy constrains all three** (§3.8). Because engine eviction is tenant-blind, how many
+**Prefill and decode become separate engines** (§2.5). The simulator runs both on one engine today,
+so neither half of disaggregation has anything to act on. With them split, **per-request pairing**
+is a two-member gang with a direction -- one placement over a pair, all-or-nothing, the transfer
+priced by `Topology` -- and the **P:D replica ratio** is the fleet decision behind it, bound by
+different resources at each end, so the ratio serving a long-prompt mix starves an agent mix.
+
+**Tenancy constrains all of it** (§3.8). Because engine eviction is tenant-blind, how many
 partitions exist and who shares one *is* the fairness policy -- and because a partition is
 physically an engine, each extra one spends HBM on another copy of the weights. That is why
 isolation and capacity are decided in one act here rather than as separate knobs. It also adds the
 missing per-tenant axis to `Quota`, which is per-class only.
 
+These decisions are the record tier's writers, so Phase 6 extends Phase 10's count with them:
+partition resizes, placement changes, tenancy and quota edits.
+
 - **Deliverable:** a result no arm can produce today -- a heterogeneous fleet serving several model
-  types under a shifting request mix -- plus a tenancy arm: shared partitions against per-tenant
-  partitions under a bursty neighbour, reporting isolation's cost on all three prices §3.8 names --
-  cross-tenant prefix hits, batch width, and the HBM spent duplicating the weights. The third is
-  what makes this a capacity result rather than a policy toggle.
-- **Risk:** needs a workload with a realistic model mix, which `taxo.md` supplies. **Size:** medium.
+  types under a shifting request mix -- plus two arms: joint P/D pairing and ratio against a
+  sidecar-style pick of a prefiller from a list (coupled %, §3.4, sizes the difference), and shared
+  partitions against per-tenant partitions under a bursty neighbour, reporting isolation's cost on
+  all three prices §3.8 names -- cross-tenant prefix hits, batch width, and the HBM spent
+  duplicating the weights. The third is what makes this a capacity result rather than a policy
+  toggle.
+- **Risk:** needs a workload with a realistic model mix, which `taxo.md` supplies, and a
+  prompt/output-length mix with some shape, since the ratio only moves when the mix does.
+  **Size:** large, separable into increments -- weights and partitions, disaggregation, tenancy.
 
 ### Phase 7 -- Learned flows, speculative authority, and the taxonomy
 
 Predicted flows replacing declared ones (§3.2), a tool-gap estimator, taxonomy presets, the RAG
 class, durable retention, and authority-driven speculative scheduling (`ReadOnly` pre-execution,
 `DraftOnly` burst preemption, non-preemptible `SideEffecting` leases), then per-pattern coupled %.
+`DraftOnly` preemption inside an engine is a cancel (§4), so this phase follows Phase 9.
+
+**Sessions that suspend.** `taxo.md`'s long-running agent -- durable memory, checkpoints, human
+approval -- needs a session lifecycle the workload does not have: active, idle, suspended to cold
+storage, resumed. It is also the only writer of the logged tier (§1): `SideEffecting` intents,
+suspended-session records and approval pauses, so Phase 7 extends Phase 10's count with them, and
+§8's choice of store for the logged tier can only be tested once it has.
 
 - **Deliverable:** what the coupling-tier-1 win is worth against estimates rather than oracles; the
-  latency and goodput delta from speculative scheduling; and a table saying for which workload
-  patterns a unified orchestrator can help at all.
+  latency and goodput delta from speculative scheduling; the logged tier's write rate; and a table
+  saying for which workload patterns a unified orchestrator can help at all.
 - **Risk:** the coupling table may show the advantage confined to a few cells. That is a result.
   **Size:** large, separable into increments.
 
+### Phase 9 -- Enforcement: cancellation on the path, and two-tier admission
+
+§1 ceded the choice of victim, so every priority policy in this document -- two-tier admission
+(§1), `DraftOnly` preemption (§4), the tenancy trade (§3.8) -- has one enforcement arm: **cancel
+the request on the path it arrived on** (§2.3). The simulator has no cancel. Phase 8 priced the
+path's seams and left its stream semantics out of scope, so this phase adds them:
+
+- **Cancellation.** The router aborts a request in flight; the engine frees its blocks at the next
+  step boundary, and the request is requeued or dropped by its authority.
+- **The stalled-stream buffer.** Tokens generated for a slow client wait in host DDR -- an occupant
+  of the pool §5's shadow price arbitrates, and a term the ledger does not have (§8).
+
+The test case is **two-tier admission** by declared `slo` (§4): latency-bearing work reserved at a
+high quantile of the output distribution Phase 4 observes, throughput work borrowing against the
+mean, and throughput work the designated victim, cancelled to make room.
+
+- **Deliverable:** where the overcommit's tail loss lands once the router can choose the victim.
+  Phase 3 found it class-blind, spread by arrival, because the engine picks victims on its own
+  order. The prediction: with cancellation, the latency-bearing class's p99 recovers most of what
+  `perfect` admission achieves and the loss moves onto throughput work; without it, two-tier
+  admission stays a scalar. Program-level attained service (Autellix's PLAS) is a comparison arm
+  that needs no prediction of output length at all.
+- **Risk:** low; if the loss does not move, §1's per-class mix is a scalar and should be retired.
+  **Size:** medium.
+
+### Phase 10 -- Durability: what each tier writes, and what a crash costs
+
+§1 makes two claims about durability that no run tests: the three tiers' write rates sit orders of
+magnitude apart, and soft state can be rebuilt rather than stored.
+
+- **The per-tier count.** Owned-state changes per tier per simulated second, from counters the
+  runs mostly already keep. Today only the soft tier has writers; Phase 6 adds the record tier's
+  and Phase 7 the logged tier's, and each extends the count.
+- **Failure injection.** A scheduler restart -- soft state gone, rebuilt from node agents and
+  engines, with node agents' backpressure the only bound on what the rebuilding scheduler
+  over-admits; an engine crash -- its KV gone, every belief about it at `P(resident) = 0`, its
+  in-flight requests retried (§2.6's retry question); and node loss by lease expiry. Phase 4's
+  belief is most of the machinery: a restart is a belief reset plus a rebuild window.
+- **Optionally, the persistence seam.** A FoundationDB commit on the boundary ladder, behind its
+  own feature, so the consensus-commit latency §1 argues from is measured on the host rather than
+  published.
+
+- **Deliverable:** the soft tier's write rate -- what persisting every decision would face -- and
+  the cost of losing soft state: over-admission, service and goodput through the rebuild window.
+  If a restart costs more than checkpointing would, soft state needs checkpoints in the logged tier
+  and §1 changes; the count then also carries those writes.
+- **Risk:** low; it can overturn a decision already made, which is why it should run early.
+  **Size:** medium.
+
+### Phase 11 -- Regions: a scheduler per region under global budgets
+
+§8's shape puts a routing tier in each region, admitting within a budget the global tier sets on
+the provisioning clock. Every region-distance result so far is one scheduler taking a global
+argmin across regions, which that shape does not run.
+
+Model a scheduler per region, a global tier that sizes each region's budget per tenant, model and
+accelerator class, and rebalancing on the provisioning clock -- against today's single global
+argmin.
+
+- **Deliverable:** the price of the regional split -- what the global argmin buys across regions
+  that regional schedulers under budgets give up, and how much rebalancing recovers. Predicted
+  small: the scored arm already keeps tool calls in-region at region distance. The place it could
+  bind is an agent host and its model host in different regions, where the origin round trip is
+  61 ms and no placement moves it. A forecast-driven budget planner against a reactive one is an
+  optional arm, and needs traces with real time structure.
+- **Risk:** needs more than one scheduler in the simulator, which is a structural change to
+  `Machine`. **Size:** medium.
+
 ### Ordering
 
-Two independent chains, and one phase beside them.
+**The memory chain: 1 -> 2 -> 3 -> 4 -> 5 -> 6**, done through 4. Phase 5 is next. Phase 6 follows
+because it unfreezes what Phase 3 held fixed -- the partition's size and the weights' placement.
 
-**The memory chain: 1 -> 2 -> 3 -> 4 -> 5 -> 6**, done through 4. Phase 5 is next: Phases 4 and 5
-are two of the engine interface's three channels, observe then influence; the third, cancellation,
-is authoritative rather than advisory (§8) and arrives with the data path rather than the memory
-chain. Phase 6 follows because it unfreezes what Phase 3 held fixed -- the partition's size and the
-weights' placement.
+**The engine interface: 4 -> 5 -> 9.** Observe, influence, enforce -- the engine interface's three
+channels. Cancellation is the only one that is authoritative rather than advisory (§8), and Phase 7
+depends on it, so Phase 9 precedes 7.
 
 **The path chain: 0 -> 8**, done.
 
-**Phase 7** is orthogonal to both and can run alongside 5 and 6.
+**Phase 7** follows Phase 9 and can run alongside 6. **Phase 10** is independent and can run now;
+its count grows as 6 and 7 add writers. **Phase 11** follows 6, whose budgets and partitions it
+moves across regions.
+
+**The system of record** (§8) is built after Phase 6, once its contents are real decisions, and
+sized by Phase 10's count. It is infrastructure rather than a phase, since the simulator models no
+store.
