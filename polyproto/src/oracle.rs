@@ -1,37 +1,5 @@
-//! The four-gap regret decomposition and the acquisition regime, `owned-and-observed.md` §3.4
-//! and §3.5, designed in `phase-2.md`. Pure types and math: the realized-cost computation that
-//! feeds them needs `Machine`'s private state and lives in `machine.rs` as `Machine::oracle_pick`
-//! and `Machine::finish_regret`, which call `decompose` here once the four picks are known.
-//!
-//! `Regret` is signed and never clipped (`phase-2.md` §1.2, §3.9): a component summing to a
-//! negative number is a real finding -- a heuristic that beat the model's own argmin, or a
-//! clairvoyant baseline that lost on cost (§1.7) -- not an error to floor at zero.
-
 use crate::cache::Cost;
 
-/// `charged(p) - R(p) - R(m_b) - R(m_t) - R(o)`, decomposed so each of the four differences
-/// stays attributable to one cause rather than blended into a single number. `phase-2.md` §1.2:
-///
-/// - `execution`  = `charged - R(p)`      -- a plan made on a stale view, executed against truth
-/// - `heuristic`  = `R(p) - R(m_b)`       -- the policy is not an argmin over its own belief
-/// - `belief`     = `R(m_b) - R(m_t)`     -- the argmin was taken over a stale view
-/// - `model`      = `R(m_t) - R(o)`       -- the score's cost function is not the realized charge
-///
-/// They telescope: `execution + heuristic + belief + model == total`.
-///
-/// `belief` is zero under `Control::Unified` and `Control::Query` and can only be nonzero under
-/// `Control::Gossip`: it is a difference between two argmins taken over belief and over truth,
-/// and without a stale view those are the same argmin. Phase 4's lossy telemetry is what makes
-/// it nonzero everywhere.
-///
-/// `execution` is **not** zero merely because the view is exact, and the doc comment here used
-/// to say it was. It is `charged(p) - R(p)`, and a second mechanism reaches it: `Machine::plan`
-/// prices a request's chain and its dependencies independently against one snapshot of
-/// residency, while `run_here` materialises them in sequence, so under eviction pressure one
-/// side's admission can invalidate the other's price. That fires at `distributed`'s own
-/// defaults for every arm with DDR pressure, not only in the adversarial fixture
-/// `machine.rs`'s tight-pool test uses. A nonzero `execution` alongside a zero `belief` is
-/// therefore this ordering effect, never staleness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Regret {
     pub total: i64,
@@ -39,22 +7,12 @@ pub struct Regret {
     pub heuristic: i64,
     pub belief: i64,
     pub model: i64,
-    /// `total`, against the oracle argmin when displacement is priced as a realized cost too.
-    /// `Terms::displaced` is billed to nobody, so it is excluded from every other field here;
-    /// this is the metric's own reported sensitivity to that one term, per `phase-2.md` §1.3 --
-    /// never blended into `total`, always read beside it.
+
     pub total_with_displacement: i64,
 }
 
-/// The four realized-cost picks, turned into a `Regret`. `phase-2.md` §4.2's "one function that
-/// takes the four picks and returns the decomposition" -- `Machine` computes `r_p`..`r_o_disp`
-/// against its own private state and calls this once it has them.
 #[must_use]
-#[allow(
-    clippy::similar_names,
-    reason = "r_p/r_mb/r_mt/r_o are phase-2.md §1.2's own notation -- renaming them apart from \
-              the design doc's math would cost more clarity than it buys"
-)]
+#[allow(clippy::similar_names)]
 pub(crate) fn decompose(
     charged: u64,
     r_p: u64,
@@ -76,21 +34,14 @@ pub(crate) fn decompose(
     }
 }
 
-/// How a served request's state was actually acquired, exclusive and exhaustive over the same
-/// requests the warm/cold split already covers -- `owned-and-observed.md` §3.5, `phase-2.md`
-/// §1.10. Kept apart from `Machine::fetches`/`rebuilds`, which count *materialisations* (a
-/// request can fetch two blobs and rebuild a third); this counts *requests*, one bucket each,
-/// so the four percentages sum to 100 the way the materialisation counters cannot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Regime {
-    /// Nothing had to be acquired and nothing queued: the chain and its dependencies were
-    /// already resident, and the engine had a free slot.
     Resident,
-    /// The largest cost was time spent waiting for a decode slot.
+
     Wait,
-    /// The largest cost was time spent moving state over a link from a peer.
+
     Transfer,
-    /// The largest cost was time spent rebuilding state locally.
+
     Recompute,
 }
 
@@ -121,10 +72,6 @@ impl Regime {
     }
 }
 
-/// Classify one served request's regime from the `Cost` the simulator already charged it --
-/// argmax of `(queue_ns, transfer_ns, recompute_ns)`, `Resident` when all three are zero.
-/// Ties are broken in that fixed order (queue, then transfer, then recompute), so the result
-/// is deterministic and does not depend on iteration order anywhere.
 #[must_use]
 pub fn classify(cost: &Cost) -> Regime {
     if cost.queue_ns == 0 && cost.transfer_ns == 0 && cost.recompute_ns == 0 {
@@ -157,7 +104,6 @@ mod tests {
 
     #[test]
     fn decompose_allows_negative_components() {
-        // A heuristic that beats the model's own belief-argmin: r_p < r_mb.
         let r = decompose(1_000, 700, 900, 900, 900, 900);
         assert!(r.heuristic < 0, "{r:?}");
         assert_eq!(r.execution + r.heuristic + r.belief + r.model, r.total);

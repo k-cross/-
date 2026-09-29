@@ -1,56 +1,35 @@
-//! A machine of several memory domains, and the placement decision over them.
-//!
-//! The ledger in each domain decides what stays resident. This layer decides *which compute
-//! unit runs the work*, and therefore what the state costs to reach. Placing by load and
-//! routing by residency are the same decision; a scheduler that cannot see both makes it
-//! twice, badly.
-
 use crate::admit::{Reservations, Reserve};
+use crate::belief::{Conditions, Observer, SLO_QUANTILE, Scoring};
 use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::boundary::Cost as Crossing;
 use crate::cache::{Cost, Hierarchy, NodeMemory, Policy};
 use crate::engine::{Engine, MAX_BATCH};
+use crate::instruments::Instruments;
 use crate::oracle;
 use crate::span::Span;
 use crate::tele::Telemetry;
 use crate::tier::TierSpec;
 use crate::topo::Topology;
-use crate::work::{Agent, Gang, Request, ToolCall};
+use crate::work::{Agent, Gang, Request, RequestView, Slo, ToolCall};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Placement {
-    /// Spread by load, blind to where the state already is. A floor, not a fair baseline:
-    /// no real load balancer re-scatters continuations of the same session.
     Blind,
-    /// Consistent hash on the chain root, so a session always lands on the same domain.
-    /// What a load balancer in front of a stateless fleet actually does -- stable placement,
-    /// but still blind to *content*: it cannot see two sessions sharing a tenant prefix.
+
     Sticky,
-    /// Run the work where its state already lives.
+
     Aware,
-    /// Run the work where it is worth the most: state already resident, minus what admitting
-    /// the rest would displace, minus the handoff it avoids -- all in the ledger's own
-    /// currency of recompute nanoseconds. `Aware` scores only the numerator of this.
+
     Scored,
 }
 
-/// Where residency knowledge lives, and what it costs to consult.
-///
-/// This is the architectural question the prototype exists to answer. A scheduler that shares
-/// a process with the ledger reads residency off a field. One that does not must either ask
-/// -- and pay a boundary crossing on the request's critical path -- or work from a view that
-/// was true a moment ago. Both alternatives are what a Kubernetes scheduler extender and an
-/// informer cache respectively are.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Control {
-    /// Scheduler and ledger in one address space. A decision is a function call.
     Unified,
-    /// Scheduler asks every candidate node before placing. Always correct, and pays the
-    /// measured crossing on every request.
+
     Query,
-    /// Scheduler places from a view refreshed every `period` requests. Free at decision time;
-    /// wrong in proportion to how fast residency moves.
+
     Gossip { period: u64 },
 }
 
@@ -65,63 +44,35 @@ impl Control {
     }
 }
 
-/// Which residency `plan` consults. `Belief` is the scheduler's own view -- staged reservations
-/// included, gossiped or telemetry-read per `Control` -- and is what every placement decision
-/// runs against; it is what makes a decision replayable exactly as made. `Truth` substitutes
-/// `ground_truth_resident`/`ground_truth_holds` at the same two call sites and is `oracle.rs`'s
-/// only consumer (`phase-2.md` §1.3, §4.1): the oracle prices what the simulator would actually
-/// charge, which needs the real state, not the belief the policy acted on.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum View {
     Belief,
     Truth,
 }
 
-/// Where the routing decision runs, relative to the engine it dispatches to.
-///
-/// `Control` prices consulting residency knowledge; this prices the hook itself and the hop
-/// to the engine once a target is chosen -- the two seams `owned-and-observed.md` §2.2 calls
-/// "put the boundary where the rate is low". Independent of `Control`: llm-d's Endpoint
-/// Picker holds its own view of residency (so it can run at `Control::Unified` against that
-/// view) and still pays a callout to reach it, which is `DataPath::Sidecar`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DataPath {
-    /// Scheduler and data plane share a process. The hook is a function call; dispatch is a
-    /// local socket to the engine.
     Integrated,
-    /// A sidecar's routing hook, paid once per placement -- llm-d as deployed: the Endpoint
-    /// Picker scores its candidates in-process and returns one decision to the gateway.
+
     Sidecar,
-    /// What extending the sidecar's policy out of process would cost: the hook runs once per
-    /// candidate, inside the argmin, instead of once per placement. `phase-8.md` §1.3.
+
     SidecarPluggable,
 }
 
 #[derive(Debug)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "four independent experiment toggles (flow_aware, state_transfer, \
-              fanout_atomic, regret), not a state machine -- any subset can be on at once"
-)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Machine {
     topo: Topology,
     domains: Vec<Hierarchy>,
     placement: Placement,
     next_unit: usize,
     sticky_unit: usize,
-    /// Domains still accepting work. Draining one leaves its state migrated elsewhere and
-    /// every content hash that pointed at it stale.
+
     active: Vec<usize>,
     pub migrated_bytes: u64,
-    /// Domains each in-flight task's upstream stage ran in and the bytes each will hand over,
-    /// so the downstream stage can be co-placed with them -- or charged for the handoff when
-    /// it is not. A fan-out's results come back from as many nodes as it had agents, so a
-    /// task can have several sources. An agent's tool result and a function's prompt bundle
-    /// differ by an order of magnitude, so the payload travels with the task rather than
-    /// being assumed.
+
     upstream: HashMap<u64, Vec<(usize, u64)>>,
-    /// Downstream stages whose upstream was refused. They arrive anyway -- the workload does
-    /// not know -- and must be refused too, or the saving from refusing is imaginary.
+
     cancelled: HashSet<u64>,
     pub handoff_ns: u64,
     pub split_tasks: u64,
@@ -134,119 +85,87 @@ pub struct Machine {
     control: Control,
     crossing: Crossing,
     data_path: DataPath,
-    /// Routing-hook cost `DataPath::Sidecar` and `DataPath::SidecarPluggable` pay on top of
-    /// `crossing`. Zero under `DataPath::Integrated`.
+
     hook: Crossing,
-    /// The dispatch hop once a target is chosen -- reaching the engine. Local-socket cost
-    /// under `Integrated`, a loopback hop under either sidecar arm.
+
     dispatch: Crossing,
-    /// Co-place a task's downstream stage with its upstream. Orthogonal to residency
-    /// placement: the scheduler learns the upstream's location by having placed it, so this
-    /// needs no cross-node knowledge and pays no crossing to use.
+
     flow_aware: bool,
-    /// Residency as the scheduler believes it to be. Identical to the truth under `Unified`
-    /// and `Query`; a snapshot under `Gossip`.
+
     view: Vec<HashSet<BlobId>>,
-    /// State and decode slots promised to a fan-out's agents while the rest are still being
-    /// placed. Siblings share a context prefix, so an agent placed after another on the same
-    /// node will find that prefix resident; pretending otherwise prices co-location as if it
-    /// bought nothing.
+
     staged: Vec<HashSet<BlobId>>,
     staged_seqs: Vec<usize>,
     staged_bytes: Vec<Need>,
     ops: u64,
-    /// Latency charged to requests for deciding where to run them.
+
     pub decide_ns: u64,
-    /// Crossings spent on control traffic, whether or not they sit on the critical path.
+
     pub control_rpcs: u64,
-    /// Placement decisions made -- one per `decide()` call, so a gang's agents count once
-    /// and each of its tool calls counts again. `decisions / served` is `d`,
-    /// `phase-8.md`'s decisions-per-request multiplier.
+
     pub decisions: u64,
-    /// Sum of candidate counts scored, one term per `decide()` call. `candidates_seen /
-    /// decisions` is the mean fleet size a `SidecarPluggable` hook actually pays for --
-    /// `phase-8.md` §1.4's `N`.
+
     pub candidates_seen: u64,
-    /// `run_here` calls that reached the dispatch charge -- not one per served request:
-    /// a gang's agents and their tool calls each dispatch separately, while the gang itself
-    /// is one served item. `dispatches / served` is `phase-8.md` §4.5's exact per-request
-    /// dispatch multiplier.
+
     pub dispatches: u64,
-    /// Decisions where the scheduler's view of the chosen node disagreed with the truth.
+
     pub stale_decisions: u64,
-    /// How many placements each term of the score actually changed. A term that never moves
-    /// a decision is not a policy, it is a comment.
+
     pub moved_by_displacement: u64,
     pub moved_by_flow: u64,
     pub moved_by_load: u64,
-    /// Placements changed by pricing what joining a batch costs the sequences already in it.
+
     pub moved_by_congestion: u64,
-    /// Mean spread (max - min across candidate nodes) of each score term, in nanoseconds.
-    /// Only spread decides an argmin -- a term that is large everywhere is a constant, and a
-    /// term whose spread is an order of magnitude under another's cannot outvote it. This is
-    /// the number that says whether a term is a policy or a comment.
+
     pub term_spread: [f64; TERM_COUNT],
     pub scored_decisions: u64,
     pub held_by_affinity: u64,
     pub flow_requests: u64,
     pub flow_coplaced: u64,
-    /// One serving engine per domain. Decode cost is theirs to decide, not the workload's.
+
     engines: Vec<Engine>,
-    /// Spacing between arrivals, or zero to leave the engine model out and charge the
-    /// workload's own unbatched execution time.
+
     interval_ns: u64,
     arrival_ns: u64,
-    /// May a node obtain missing state from a peer that holds it, instead of rebuilding it?
-    /// Off is the older behaviour and the baseline the transfer arm is measured against.
+
     state_transfer: bool,
     pub fetched_bytes: u64,
     pub fetches: u64,
     pub rebuilds: u64,
-    /// Fetches planned against a view that turned out to be wrong, and fell back to a rebuild.
+
     pub stale_fetches: u64,
     pub moved_by_fetch: u64,
-    /// All-or-nothing fan-out admission. Off admits whichever agents fit and lets the
-    /// orchestrator stall anyway, which is the baseline a per-request scheduler provides.
+
     fanout_atomic: bool,
-    /// Fixed origin used for a downstream flow's recorded location, in place of wherever its
-    /// upstream actually ran. See `set_tool_anchor`.
+
     tool_anchor: Option<usize>,
-    /// Where requests enter the cluster, and the bytes that make the round trip when the work
-    /// runs somewhere else. See `set_origin`.
+
     origin: Option<(usize, u64)>,
-    /// Link time spent carrying requests to the node that can serve them and results back.
+
     pub origin_ns: u64,
     pub origin_hops: u64,
     pub fanouts_admitted: u64,
     pub fanouts_refused: u64,
-    /// Decode and tool time spent by agents of fan-outs that could never resume. Zero under
-    /// atomic admission by construction; under the baseline it is the cost of lacking it.
+
     pub fanout_wasted_ns: u64,
     pub fanout_wasted_bytes: u64,
-    /// Wall time of admitted fan-outs, which is their slowest agent's.
+
     pub fanout_service_ns: u64,
     pub agents_run: u64,
-    /// Agents that shared a node with at least one sibling.
+
     pub agents_colocated: u64,
     pub tool_calls: u64,
-    /// Tool calls that ran on their agent's own node.
+
     pub tool_coplaced: u64,
     pub tool_refused: u64,
     pub tool_ns: u64,
-    /// `phase-2.md`'s apparatus, on when `set_regret(true)` is called. Off by default and
-    /// checked first at every hook site, so an unflagged run does none of this work and stays
-    /// byte-identical to a build that never had it.
+
     regret: bool,
-    /// One record per decision, populated only while `regret` is on. `oracle.rs`'s
-    /// per-candidate work stays inside `Machine`; only its conclusion is kept.
+
     pub spans: Vec<Span>,
-    /// Decisions where the policy's chosen node refused but at least one candidate, priced
-    /// against truth, would not have -- `phase-2.md` §1.5. A count, never a duration: refusal
-    /// has no realized cost to decompose, so it is reported beside regret and never folded in.
+
     pub feasibility_regret: u64,
-    /// Placement decisions where the score's argmin over the full model differs from the
-    /// argmin a silo (no handoff term, displacement restricted to the deciding class's own
-    /// pool) would reach -- `phase-2.md` §1.8, §4.6.
+
     pub locality_coupled: u64,
     pub locality_coupled_decisions: u64,
     drain_spill: bool,
@@ -263,13 +182,18 @@ pub struct Machine {
     pub shared_requests: [u64; BlobKind::N],
     kv_sum: [u64; 3],
     kv_samples: u64,
+    observer: Option<Observer>,
+    scoring: Scoring,
+    observables: bool,
+    observed: [(u64, u64); 2],
+    pub instruments: Instruments,
+    instrument: bool,
 }
+
+const DIVERGENCE_EVERY: u64 = 16;
 
 impl Machine {
     #[must_use]
-    /// `memory` is a function of domain index rather than one shared value, so a cluster can be
-    /// heterogeneous: a domain with `hbm: 0, can_decode: false` is a host-only node that can
-    /// run `FaaS`/service work but never decode. Every existing experiment passes `|_| mem`.
     pub fn new(
         topo: Topology,
         memory: impl Fn(usize) -> NodeMemory,
@@ -368,6 +292,12 @@ impl Machine {
             shared_requests: [0; BlobKind::N],
             kv_sum: [0; 3],
             kv_samples: 0,
+            observer: None,
+            scoring: Scoring::FaceValue,
+            observables: false,
+            observed: [(0, 0); 2],
+            instruments: Instruments::default(),
+            instrument: false,
         }
     }
 
@@ -384,7 +314,6 @@ impl Machine {
         self.displacement = on;
     }
 
-    /// A cross-node pool of `capacity` bytes, written through by every node and evicted LRU.
     pub fn set_shared_l2(&mut self, capacity: Option<u64>) {
         self.shared = capacity.map(|c| crate::engine::EngineCache::new(c, false));
     }
@@ -440,13 +369,224 @@ impl Machine {
         Some(hop + TierSpec::nvme(0).fetch_ns(bytes) + self.domains[d].lift_ns(kind, bytes))
     }
 
+    pub fn set_belief(&mut self, cond: Conditions) {
+        self.record_kv_events(true);
+        let mut observer = Observer::new(self.domains.len(), cond);
+        for (d, h) in self.domains.iter().enumerate() {
+            if !h.engine_cache() {
+                observer.retire(d);
+            }
+        }
+        self.observer = Some(observer);
+    }
+
+    pub fn set_scoring(&mut self, scoring: Scoring) {
+        self.scoring = scoring;
+    }
+
+    #[must_use]
+    pub fn observer(&self) -> Option<&Observer> {
+        self.observer.as_ref()
+    }
+
+    fn belief_read(&self, d: usize, kind: BlobKind) -> bool {
+        self.sees_belief(d, kind) && self.control != Control::Query
+    }
+
+    fn rule(&self, slo: Slo) -> Scoring {
+        match (self.scoring, slo) {
+            (Scoring::Slo, Slo::Interactive) => Scoring::Quantile(SLO_QUANTILE),
+            (Scoring::Slo, Slo::Throughput) => Scoring::Expected,
+            (other, _) => other,
+        }
+    }
+
+    pub fn set_instrument(&mut self, on: bool) {
+        self.instrument = on;
+    }
+
+    pub fn set_observables(&mut self, on: bool) {
+        self.observables = on;
+    }
+
+    fn seen_tokens(&self, req: &Request) -> u64 {
+        if !self.observables || req.tokens == 0 {
+            return req.tokens;
+        }
+        match self.observed[req.slo.idx()] {
+            (sum, n) if n > 0 => sum / n,
+            _ => req.max_tokens,
+        }
+    }
+
+    fn view_of<'r>(&self, req: &'r Request) -> RequestView<'r> {
+        req.view(self.seen_tokens(req))
+    }
+
+    fn survives(&self, d: usize, id: &BlobId, kind: BlobKind, held: bool, rule: Scoring) -> bool {
+        let Scoring::Quantile(q) = rule else {
+            return true;
+        };
+        let Some(o) = &self.observer else {
+            return true;
+        };
+        if !self.belief_read(d, kind) || self.staged[d].contains(id) {
+            return true;
+        }
+        let p = if held {
+            o.held_survival(d, id)
+        } else {
+            o.survival(d, id)
+        };
+        p >= q
+    }
+
+    fn block_survival(&self, d: usize, id: &BlobId) -> f64 {
+        if self.staged[d].contains(id) {
+            return 1.0;
+        }
+        self.observer.as_ref().map_or(1.0, |o| o.survival(d, id))
+    }
+
+    fn expected_chain_ns(
+        &self,
+        d: usize,
+        req: &RequestView<'_>,
+        plan: &Plan,
+        rule: Scoring,
+    ) -> u64 {
+        let kind = req
+            .chain
+            .first()
+            .map_or(BlobKind::WeightShard, |(_, m)| m.kind);
+        if rule != Scoring::Expected || !self.belief_read(d, kind) {
+            return plan.ns;
+        }
+        let (depth, cut) = (plan.local_depth, plan.chain_cut);
+        let mut survival = Vec::with_capacity(depth);
+        let mut floor = 1.0f64;
+        for (id, _) in &req.chain[..depth] {
+            floor = floor.min(self.block_survival(d, id));
+            survival.push(floor);
+        }
+        let peer = match plan.chain_src {
+            Some(Source::Peer(p)) if cut > depth && self.belief_read(p, kind) => self
+                .observer
+                .as_ref()
+                .map_or(1.0, |o| o.held_survival(p, &req.chain[cut - 1].0)),
+            _ => 1.0,
+        };
+        if peer >= 1.0 && survival.iter().all(|&s| s >= 1.0) {
+            return plan.ns;
+        }
+        let mut suffix = vec![0u64; req.chain.len() + 1];
+        for (k, (id, meta)) in req.chain.iter().enumerate().rev() {
+            suffix[k] = suffix[k + 1] + self.local_ns(d, id, meta, View::Belief);
+        }
+        let fetch = plan.ns.saturating_sub(suffix[cut]);
+        let mut expected = 0.0;
+        for k in 0..=depth {
+            let before = if k == 0 { 1.0 } else { survival[k - 1] };
+            let after = if k < depth { survival[k] } else { 0.0 };
+            let weight = before - after;
+            let rebuilt = suffix[k] as f64;
+            let cost = if cut > depth {
+                let fetched = fetch as f64
+                    + if k == depth {
+                        suffix[cut] as f64
+                    } else {
+                        rebuilt
+                    };
+                peer * fetched + (1.0 - peer) * rebuilt
+            } else {
+                rebuilt
+            };
+            expected += weight * cost;
+        }
+        expected.round() as u64
+    }
+
+    fn sees_belief(&self, d: usize, kind: BlobKind) -> bool {
+        kind == BlobKind::KvBlock && self.observer.is_some() && self.domains[d].engine_cache()
+    }
+
+    fn observe_dispatch(&mut self, d: usize, req: &Request) {
+        if self.observer.is_none() || !self.domains[d].engine_cache() {
+            return;
+        }
+        let blocks: Vec<(BlobId, BlobMeta)> = req
+            .chain
+            .iter()
+            .chain(&req.produces)
+            .filter(|(_, m)| m.kind == BlobKind::KvBlock)
+            .copied()
+            .collect();
+        let Some((_, first)) = blocks.first() else {
+            return;
+        };
+        let price = self.domains[d].kv_unit_price(first);
+        let now = self.arrival_ns;
+        if let Some(o) = self.observer.as_mut() {
+            o.dispatched(d, &blocks, now, price);
+        }
+    }
+
+    fn observe_sent(&mut self, d: usize) {
+        if !self.domains[d].engine_cache() {
+            return;
+        }
+        if let Some(o) = self.observer.as_mut() {
+            o.sent(d);
+        }
+    }
+
+    fn observe_pin(&mut self, d: usize, req: &Request, until: u64) {
+        let ids: Vec<BlobId> = req
+            .chain
+            .iter()
+            .chain(&req.produces)
+            .filter(|(_, m)| m.kind == BlobKind::KvBlock)
+            .map(|(id, _)| *id)
+            .collect();
+        if let Some(o) = self.observer.as_mut() {
+            o.pin(d, ids, until);
+        }
+    }
+
+    fn observe_arrival(&mut self, now: u64) {
+        if self.observer.is_none() {
+            return;
+        }
+        let loads: Vec<usize> = self.engines.iter().map(|e| e.load(now)).collect();
+        let steps: Vec<u64> = loads.iter().map(|&l| Engine::step_ns(l + 1)).collect();
+        if let Some(o) = self.observer.as_mut() {
+            o.release(now);
+            o.pump(now, &steps, &loads);
+        }
+    }
+
+    fn observe_emit(&mut self, d: usize) {
+        if self.observer.is_none() {
+            return;
+        }
+        let events = self.domains[d].take_kv_events();
+        let now = self.arrival_ns;
+        let load = self.engines[d].load(now);
+        if let Some(o) = self.observer.as_mut() {
+            o.emit(d, events, now, load);
+        }
+    }
+
+    pub fn record_kv_events(&mut self, on: bool) {
+        for h in &mut self.domains {
+            h.record_kv_events(on);
+        }
+    }
+
     pub fn set_drain_spill(&mut self, on: bool) {
         self.drain_spill = on;
     }
 
-    /// Requests per second arriving at the cluster. Setting it turns on the engine model:
-    /// decode cost stops being a constant and starts depending on how many sequences are
-    /// already resident on the chosen node. Zero leaves it off.
     pub fn set_arrival_rate(&mut self, per_sec: f64) {
         self.interval_ns = if per_sec > 0.0 {
             (1e9 / per_sec) as u64
@@ -463,38 +603,14 @@ impl Machine {
         self.fanout_atomic = on;
     }
 
-    /// Turn on `phase-2.md`'s regret decomposition, coupled %, and per-decision spans. Off by
-    /// default: the apparatus is read-only and changes no policy, but it prices every
-    /// candidate a second time against truth, so it is opt-in rather than always-on.
     pub fn set_regret(&mut self, on: bool) {
         self.regret = on;
     }
 
-    /// Anchor the recorded origin of every downstream flow to a fixed domain, rather than
-    /// wherever its upstream stage actually ran.
-    ///
-    /// Real agent frameworks dispatch tool calls from the orchestrator's own process, not from
-    /// wherever the model happened to run a decode step -- the two are on different hosts by
-    /// construction on split-memory hardware. Without an anchor, a tool call's flow-affinity
-    /// pulls it toward the decode node, which is only correct when the orchestrator and the
-    /// engine are the same place. `None` (the default) keeps the original behaviour: downstream
-    /// work follows its upstream's actual location.
     pub fn set_tool_anchor(&mut self, anchor: Option<usize>) {
         self.tool_anchor = anchor;
     }
 
-    /// Where requests enter the cluster and where their results must return.
-    ///
-    /// An agent host with no engine cannot decode, so each reasoning request crosses to a node
-    /// that can and its result crosses back. No placement policy can remove that round trip --
-    /// it is the price of running the orchestrator off the accelerator, and the one cost here
-    /// that grows with distance. `payload` is what makes the trip: the context delta going in,
-    /// which is dominated by whatever the last tool call returned, and the generated tokens
-    /// coming back.
-    ///
-    /// Charged only to decode-bearing work that starts here. A downstream stage already pays
-    /// its own handoff from the origin recorded for it, and charging both would count the same
-    /// transfer twice.
     pub fn set_origin(&mut self, origin: Option<(usize, u64)>) {
         self.origin = origin;
     }
@@ -520,8 +636,6 @@ impl Machine {
         self.engines.iter().map(|e| e.admitted).sum()
     }
 
-    /// Sequences admitted by one domain's engine. In a heterogeneous cluster this is the check
-    /// that the decode constraint held: a host-only node must report zero.
     #[must_use]
     pub fn decodes_on(&self, d: usize) -> u64 {
         self.engines.get(d).map_or(0, |e| e.admitted)
@@ -532,8 +646,6 @@ impl Machine {
         self.engines.iter().map(|e| e.saturated).sum()
     }
 
-    /// Ratio of busiest to least-busy engine by sequences admitted. Residency-greedy routing
-    /// buys cache hits by concentrating decode, and this is what it pays with.
     #[must_use]
     pub fn engine_spread(&self) -> f64 {
         let hi = self.engines.iter().map(|e| e.admitted).max().unwrap_or(0) as f64;
@@ -547,8 +659,6 @@ impl Machine {
         hi / lo
     }
 
-    /// Install the control-plane model. `crossing` should come from `boundary::measure` on
-    /// the host being modelled, not from a constant.
     pub fn set_flow_aware(&mut self, on: bool) {
         self.flow_aware = on;
     }
@@ -561,12 +671,6 @@ impl Machine {
         }
     }
 
-    /// Install the data-path model. `hook` prices the routing callout `DataPath::Sidecar`
-    /// and `DataPath::SidecarPluggable` pay on top of whatever `Control` already charges for
-    /// residency knowledge; `dispatch` prices reaching the engine once placement is settled.
-    /// Both should come from `boundary::measure` on the host being modelled, not from a
-    /// constant. `DataPath::Integrated` with zero costs is the default, so every experiment
-    /// that never calls this stays byte-identical to before this existed.
     pub fn set_data_path(&mut self, path: DataPath, hook: Crossing, dispatch: Crossing) {
         self.data_path = path;
         self.hook = hook;
@@ -581,53 +685,53 @@ impl Machine {
         self.control_rpcs += self.domains.len() as u64;
     }
 
-    /// Residency as the scheduler sees it, which is not always residency as it is. The
-    /// `Unified`/`Query` branch reads through `Telemetry`, which is exact today -- Phase 4
-    /// is what makes this a belief rather than a wrapper around the truth.
     fn believes_resident(&self, d: usize, id: &BlobId, kind: BlobKind) -> bool {
         self.staged[d].contains(id)
             || match self.control {
-                Control::Gossip { .. } => self.view[d].contains(id),
-                Control::Unified | Control::Query => self.telemetry(d).resident(id, kind),
+                Control::Gossip { .. } if !self.sees_belief(d, kind) => self.view[d].contains(id),
+                Control::Gossip { .. } | Control::Unified | Control::Query => {
+                    let seen = self.telemetry(d).resident(id, kind);
+                    debug_assert!(
+                        self.exact_belief_agrees(d, kind, || {
+                            seen == self.domains[d].is_hot(id, kind)
+                        }),
+                        "an exact belief must read the truth"
+                    );
+                    seen
+                }
             }
     }
 
-    /// Whether a peer can supply this blob at all. Offloaded state in a peer's host memory is
-    /// as readable over RDMA as its accelerator's, so it counts -- except to a gossiped view,
-    /// which only ever advertised what was hot.
+    fn exact_belief_agrees(&self, d: usize, kind: BlobKind, check: impl Fn() -> bool) -> bool {
+        let exact = self
+            .observer
+            .as_ref()
+            .is_some_and(|o| o.conditions().is_exact());
+        !exact || self.control == Control::Query || !self.sees_belief(d, kind) || check()
+    }
+
     fn believes_held(&self, p: usize, id: &BlobId, kind: BlobKind) -> bool {
         match self.control {
-            Control::Gossip { .. } => self.view[p].contains(id),
-            Control::Unified | Control::Query => self.telemetry(p).held(id, kind),
+            Control::Gossip { .. } if !self.sees_belief(p, kind) => self.view[p].contains(id),
+            Control::Gossip { .. } | Control::Unified | Control::Query => {
+                let seen = self.telemetry(p).held(id, kind);
+                debug_assert!(
+                    self.exact_belief_agrees(p, kind, || seen == self.domains[p].holds(id, kind)),
+                    "an exact belief must read the truth"
+                );
+                seen
+            }
         }
     }
 
-    /// The engine's actual state on domain `p`, asked directly rather than through
-    /// `Telemetry`. `plan` scores candidates against `believes_held`'s *belief*;
-    /// `apply_chain` and `apply_deps` must check the *truth* when the transfer actually
-    /// happens, or a stale view would cost nothing instead of falling back to a rebuild --
-    /// `phase-1.md` §1.4. The gap between this and `believes_held` for the same `(p, id,
-    /// kind)` is `owned-and-observed.md` §3.6's divergence, once there is a real belief to
-    /// diverge from.
     fn ground_truth_holds(&self, p: usize, id: &BlobId, kind: BlobKind) -> bool {
         self.domains[p].holds(id, kind)
     }
 
-    /// The engine's actual usable-now state on domain `d`, asked directly. `believes_resident`
-    /// is `ground_truth_holds`'s counterpart on the *residency* predicate rather than the
-    /// *held* one: this is `plan`'s `View::Truth` arm, and `oracle.rs`'s only route to a
-    /// candidate's real depth. `phase-2.md` §1.3 -- read-only, so the oracle can consult it at
-    /// every candidate without mutating anything.
     fn ground_truth_resident(&self, d: usize, id: &BlobId, kind: BlobKind) -> bool {
         self.domains[d].is_hot(id, kind)
     }
 
-    /// What one placement decision costs, and what it costs the cluster. A fan-out query is
-    /// charged one crossing of *latency* because the asks go out in parallel, but N crossings
-    /// of *work*, which is what caps the decision rate. `candidates` is how many nodes this
-    /// decision scores -- `DataPath::SidecarPluggable`'s hook is paid once per candidate,
-    /// because an out-of-process policy term really does run inside the argmin, the way a
-    /// first-party one already does in `best_scored`.
     fn decide(&mut self, chain_len: usize, candidates: usize) -> u64 {
         self.ops += 1;
         self.decisions += 1;
@@ -648,10 +752,6 @@ impl Machine {
         control_ns + self.hook_ns(candidates)
     }
 
-    /// The routing hook's own cost, on top of whatever `Control` charges for residency
-    /// knowledge. Zero for `Integrated`, where the hook is a function call. `Sidecar` pays
-    /// one `ext_proc`-shaped callout per placement; `SidecarPluggable` prices the same hook
-    /// run once per candidate instead.
     fn hook_ns(&self, candidates: usize) -> u64 {
         match self.data_path {
             DataPath::Integrated => 0,
@@ -660,13 +760,9 @@ impl Machine {
         }
     }
 
-    /// Domain a chain belongs to by content, independent of what is currently resident:
-    /// a consistent hash of the chain root, which identifies the tenant or session.
     fn affinity_unit(&self, chain: &[(BlobId, BlobMeta)], candidates: &[usize]) -> usize {
         let root = Self::root_key(chain);
-        // Rendezvous hashing, not modulo: removing a domain remaps only the keys that lived
-        // on it, which is what a real balancer achieves. Modulo would remap nearly every key
-        // on resize and make the residency-aware arm look good for the wrong reason.
+
         let d = candidates
             .iter()
             .copied()
@@ -675,7 +771,6 @@ impl Machine {
         self.unit_in(d)
     }
 
-    /// How many domains `decode_pool` would return, without building the vector for it.
     fn decode_pool_len(&self) -> usize {
         let n = self
             .active
@@ -685,8 +780,6 @@ impl Machine {
         if n == 0 { self.active.len() } else { n }
     }
 
-    /// Domains that can serve a decode-bearing request, falling back to every active domain
-    /// if none can -- a misconfigured cluster should behave as it always did, not panic.
     fn decode_pool(&self) -> Vec<usize> {
         let pool: Vec<usize> = self
             .active
@@ -701,9 +794,6 @@ impl Machine {
         }
     }
 
-    /// Whether this request's chain needs a domain that can actually decode: a `KvBlock` or
-    /// `WeightShard` chain, or anything charged tokens. `Snapshot`/`ServiceHeap` work has no
-    /// such requirement and may run on a host-only node.
     fn needs_decode(req: &Request) -> bool {
         req.tokens > 0
             || req
@@ -731,8 +821,6 @@ impl Machine {
             .unwrap_or(0)
     }
 
-    /// Take a domain out of service, migrating its resident state to the remaining domains.
-    /// The bytes survive; every hash that pointed at the drained domain does not.
     pub fn drain(&mut self, victim: usize) {
         let Some(pos) = self.active.iter().position(|&d| d == victim) else {
             return;
@@ -743,6 +831,10 @@ impl Machine {
             return;
         }
         let (hot, cold) = self.domains[victim].drain_all(self.drain_spill);
+        if let Some(o) = self.observer.as_mut() {
+            self.domains[victim].take_kv_events();
+            o.retire(victim);
+        }
         let n = hot.len();
         for (i, (id, meta)) in hot.into_iter().chain(cold).enumerate() {
             let to = self.active[i % self.active.len()];
@@ -755,8 +847,6 @@ impl Machine {
         }
     }
 
-    /// The domain this policy would pick knowing nothing about flows: round-robin for
-    /// `Blind`, content hash for `Sticky`, deepest resident prefix for `Aware`.
     fn policy_target(
         &mut self,
         affinity: usize,
@@ -781,13 +871,8 @@ impl Machine {
         }
     }
 
-    /// Bytes of everything this request needs that domain `d` already holds: the resident
-    /// prefix of its chain, plus any shared dependencies. Weight shards dwarf a KV prefix, so
-    /// scoring by bytes is what lets sharing outvote caller identity.
     fn resident_value(&self, d: usize, req: &Request) -> u64 {
-        let depth = req
-            .chain
-            .partition_point(|(id, m)| self.believes_resident(d, id, m.kind));
+        let depth = self.prefix_len(&req.chain, |id, kind| self.believes_resident(d, id, kind));
         let chain_bytes: u64 = req.chain[..depth].iter().map(|(_, m)| m.bytes).sum();
         let dep_bytes: u64 = req
             .requires
@@ -798,54 +883,74 @@ impl Machine {
         chain_bytes + dep_bytes
     }
 
-    /// What it costs domain `d` to make one blob hot without leaving the node: promote it
-    /// from host memory, read it off the spill tier, or rebuild it.
-    fn local_ns(&self, d: usize, id: &BlobId, m: &BlobMeta) -> u64 {
-        self.telemetry(d).local_ns(id, m)
+    fn local_ns(&self, d: usize, id: &BlobId, m: &BlobMeta, view: View) -> u64 {
+        self.telemetry_in(d, view).local_ns(id, m)
     }
 
-    /// The scheduler's view of domain `d`. Constructing one costs two references, so a
-    /// per-read construction is cheaper than threading a borrow through `plan`'s loops.
+    fn telemetry_in(&self, d: usize, view: View) -> Telemetry<'_> {
+        match view {
+            View::Belief => self.telemetry(d),
+            View::Truth => Telemetry::new(&self.domains[d], &self.engines[d]),
+        }
+    }
+
     fn telemetry(&self, d: usize) -> Telemetry<'_> {
-        Telemetry::new(&self.domains[d], &self.engines[d])
+        let t = Telemetry::new(&self.domains[d], &self.engines[d]);
+        match self.observed_by(d) {
+            Some(o) => t.with_belief(Some(o.belief(d))),
+            None => t,
+        }
     }
 
-    fn local_run_ns(&self, d: usize, blobs: &[(BlobId, BlobMeta)]) -> u64 {
-        blobs.iter().map(|(id, m)| self.local_ns(d, id, m)).sum()
+    fn observed_by(&self, d: usize) -> Option<&Observer> {
+        self.observer
+            .as_ref()
+            .filter(|_| self.control != Control::Query && self.domains[d].engine_cache())
     }
 
-    /// The cheapest way for `d` to get everything this request needs.
-    ///
-    /// Three options, priced against each other every time rather than settled once by
-    /// policy: run where the state already is, ship the state to where the work is, or
-    /// rebuild it locally. Which one wins is not a property of the system, it is a property
-    /// of the moment -- a 512 KiB KV block is worth shipping across a rack and worth
-    /// rebuilding across a region, and the crossover moves with the link, the block size and
-    /// what the spill tier happens to be holding.
-    ///
-    /// Peers are scanned rather than assumed, because the deepest peer is only the cheapest
-    /// peer when every link is identical, and the whole point of the topology is that they
-    /// are not.
-    ///
-    /// `view` selects which residency predicate the two closures below consult; every branch
-    /// of `plan`'s own logic is unchanged by it, which is what makes `View::Truth` a read of
-    /// the same plan rather than a second one.
-    fn plan(&self, d: usize, req: &Request, view: View) -> Plan {
+    fn local_run_ns(&self, d: usize, blobs: &[(BlobId, BlobMeta)], view: View) -> u64 {
+        blobs
+            .iter()
+            .map(|(id, m)| self.local_ns(d, id, m, view))
+            .sum()
+    }
+
+    fn prefix_len(
+        &self,
+        chain: &[(BlobId, BlobMeta)],
+        present: impl Fn(&BlobId, BlobKind) -> bool,
+    ) -> usize {
+        if self.observer.is_some() {
+            chain
+                .iter()
+                .take_while(|(id, m)| present(id, m.kind))
+                .count()
+        } else {
+            chain.partition_point(|(id, m)| present(id, m.kind))
+        }
+    }
+
+    fn plan(&self, d: usize, req: &RequestView<'_>, view: View) -> Plan {
+        let rule = self.rule(req.slo);
         let resident = |dom: usize, id: &BlobId, kind: BlobKind| match view {
-            View::Belief => self.believes_resident(dom, id, kind),
+            View::Belief => {
+                self.believes_resident(dom, id, kind) && self.survives(dom, id, kind, false, rule)
+            }
             View::Truth => self.ground_truth_resident(dom, id, kind),
         };
         let held = |dom: usize, id: &BlobId, kind: BlobKind| match view {
-            View::Belief => self.believes_held(dom, id, kind),
+            View::Belief => {
+                self.believes_held(dom, id, kind) && self.survives(dom, id, kind, true, rule)
+            }
             View::Truth => self.ground_truth_holds(dom, id, kind),
         };
-        let depth = req.chain.partition_point(|(id, m)| resident(d, id, m.kind));
+        let depth = self.prefix_len(req.chain, |id, kind| resident(d, id, kind));
         let mut need = [0u64; BlobKind::N];
         for (_, m) in &req.chain[depth..] {
             need[m.kind.idx()] += m.bytes;
         }
         let mut plan = Plan {
-            ns: self.local_run_ns(d, &req.chain[depth..]),
+            ns: self.local_run_ns(d, &req.chain[depth..], view),
             local_depth: depth,
             chain_cut: depth,
             chain_src: None,
@@ -864,7 +969,7 @@ impl Machine {
             if far > depth
                 && let Some(read) = self.shared_ns(d, kind, bytes)
             {
-                let cand = read + self.local_run_ns(d, &req.chain[far..]);
+                let cand = read + self.local_run_ns(d, &req.chain[far..], view);
                 if cand < plan.ns {
                     plan.ns = cand;
                     plan.chain_cut = far;
@@ -879,13 +984,13 @@ impl Machine {
                 if p == d {
                     continue;
                 }
-                let far = req.chain.partition_point(|(id, m)| held(p, id, m.kind));
+                let far = self.prefix_len(req.chain, |id, kind| held(p, id, kind));
                 if far <= depth {
                     continue;
                 }
                 let bytes: u64 = req.chain[depth..far].iter().map(|(_, m)| m.bytes).sum();
-                let cand =
-                    self.topo.fetch_ns(unit, p, bytes) + self.local_run_ns(d, &req.chain[far..]);
+                let cand = self.topo.fetch_ns(unit, p, bytes)
+                    + self.local_run_ns(d, &req.chain[far..], view);
                 if cand < plan.ns {
                     plan.ns = cand;
                     plan.chain_cut = far;
@@ -894,12 +999,28 @@ impl Machine {
                 }
             }
         }
+        if view == View::Belief {
+            plan.ns = self.expected_chain_ns(d, req, &plan, rule);
+        }
+        self.plan_dependencies(d, req, &mut plan, view, &resident, &held);
+        plan
+    }
+
+    fn plan_dependencies(
+        &self,
+        d: usize,
+        req: &RequestView<'_>,
+        plan: &mut Plan,
+        view: View,
+        resident: &dyn Fn(usize, &BlobId, BlobKind) -> bool,
+        held: &dyn Fn(usize, &BlobId, BlobKind) -> bool,
+    ) {
         for (i, (id, m)) in req.requires.iter().enumerate() {
             if resident(d, id, m.kind) {
                 continue;
             }
             plan.need[m.kind.idx()] += m.bytes;
-            let mut best = self.local_ns(d, id, m);
+            let mut best = self.local_ns(d, id, m, view);
             let mut src = None;
             if self.state_transfer {
                 let unit = self.unit_in(d);
@@ -926,15 +1047,8 @@ impl Machine {
                 plan.deps.push((i, p));
             }
         }
-        plan
     }
 
-    /// Carry out a plan's chain transfer, charging the link and installing what arrives.
-    ///
-    /// The plan was made against the scheduler's view; the peer is asked against the truth.
-    /// A source that has since evicted the state supplies a shorter prefix or none at all,
-    /// and the rest falls back to a rebuild -- which is what makes a stale view cost
-    /// something here rather than silently succeed.
     fn apply_chain(&mut self, d: usize, req: &Request, plan: &Plan) -> Cost {
         let mut cost = Cost::default();
         if plan.chain_src == Some(Source::Shared) {
@@ -974,9 +1088,6 @@ impl Machine {
         cost
     }
 
-    /// The same for the request's shared dependencies. Separate from the chain because a
-    /// request whose chain was refused must not have its weight shards shipped anyway:
-    /// admitting state for work that will not run is exactly what refusal exists to prevent.
     fn apply_deps(&mut self, d: usize, req: &Request, plan: &Plan) -> Cost {
         let mut cost = Cost::default();
         for &(i, src) in &plan.deps {
@@ -1004,17 +1115,20 @@ impl Machine {
         cost
     }
 
-    /// What running this request on `d` would cost, in the ledger's own nanoseconds.
-    ///
-    /// Four terms, each of which has to be able to overrule the others: acquiring the state
-    /// by whichever of the three routes is cheapest here, the debt the next request pays for
-    /// bytes this one evicts, the handoff avoided by co-placing with an upstream stage, and
-    /// the wait an already-full engine imposes. The last is why a cache hit is not
-    /// automatically the right answer -- a node holding the prefix but running a full batch
-    /// can be the slower node, and nothing that scores residency alone can see it.
-    fn placement_terms(&self, d: usize, req: &Request, flow: &[(usize, u64)], view: View) -> Terms {
+    fn placement_terms(
+        &self,
+        d: usize,
+        req: &RequestView<'_>,
+        flow: &[(usize, u64)],
+        view: View,
+    ) -> Terms {
         let plan = self.plan(d, req, view);
-        let tele = self.telemetry(d);
+        let tele = match view {
+            View::Belief => self
+                .telemetry(d)
+                .with_load(self.observed_by(d).and_then(|o| o.reported_load(d))),
+            View::Truth => self.telemetry_in(d, view),
+        };
         let displaced = if self.displacement {
             tele.displacement(&plan.need, &self.staged_bytes[d])
         } else {
@@ -1050,19 +1164,9 @@ impl Machine {
         }
     }
 
-    /// Argmin of the cost, plus what each term changed. Reported rather than assumed: a term
-    /// worth four orders of magnitude less than another one cannot move an argmin, and saying
-    /// so is more useful than shipping it and believing otherwise.
-    ///
-    /// Returns the picked node and, alongside it, `decided_by`: the index into `TERM_LABELS`
-    /// of the last term whose addition changed the pick between `raw` (acquire alone) and
-    /// `top` (every term) -- `phase-2.md` §4.4's per-request form of the `moved_by_*`
-    /// counters below, which it must reduce to exactly. `None` when nothing after `acquire`
-    /// moved it. The affinity tie-break (`top` vs `full`) is deliberately excluded: that is
-    /// `held_by_affinity`'s own, separately tracked, phenomenon.
     fn best_scored(
         &mut self,
-        req: &Request,
+        req: &RequestView<'_>,
         flow: &[(usize, u64)],
         affinity: usize,
         candidates: &[usize],
@@ -1096,7 +1200,7 @@ impl Machine {
         let top = pick(&Terms::full);
         if self.regret {
             self.locality_coupled_decisions += 1;
-            let class = BlobKind::ALL[req.kind_idx()];
+            let class = BlobKind::ALL[req.class];
             let silo = |t: &Terms| -> f64 {
                 let tier = self.domains[t.domain].tier_of(class);
                 let disp = self.telemetry(t.domain).displacement_in(
@@ -1114,9 +1218,7 @@ impl Machine {
                 self.locality_coupled += 1;
             }
         }
-        // Never move without a reason. With nothing resident anywhere every cost is equal,
-        // and an argmin over ties would send every cold request to the same node; falling
-        // back to content affinity spreads them the way a hash does.
+
         let full = if cost(top) < cost(affinity) {
             top
         } else {
@@ -1152,11 +1254,6 @@ impl Machine {
         (full, decided_by)
     }
 
-    /// `reach`'s own arithmetic, read-only: the origin round trip a candidate would pay,
-    /// without charging it. `oracle.rs`'s realized cost needs every candidate's price, not
-    /// only the chosen one's, and `reach` itself must stay the single place that actually
-    /// bills it -- so this is a second, independent statement of the same four lines rather
-    /// than a refactor of `reach`, which is on the critical path of a published number.
     fn reach_ns(&self, home: usize, req: &Request, decode_needed: bool) -> u64 {
         let Some((origin, payload)) = self.origin else {
             return 0;
@@ -1167,22 +1264,6 @@ impl Machine {
         2 * self.topo.fetch_ns(self.unit_in(origin), home, payload)
     }
 
-    /// What the simulator would actually charge, read against truth, to serve `req` at
-    /// candidate `d` right now -- `oracle.rs`'s `R(d)`, `phase-2.md` §1.3. Read-only: peeks
-    /// `self.upstream` instead of draining it and reads the engine's `projected_ns` instead of
-    /// admitting into it, so every candidate can be priced without disturbing what the chosen
-    /// node's own execution does a moment later.
-    ///
-    /// `decide_ns` is the decision's own cost -- identical at every candidate, computed once
-    /// above the candidate loop by `Machine::decide` -- included only so this equals
-    /// `Cost::service_ns()` exactly at the policy's own node (`phase-2.md`'s execution gap,
-    /// P3). Returns `(without displacement, with displacement)`: `Terms::displaced` is billed
-    /// to nobody, so it is not part of a realized cost, and `phase-2.md` §1.3 reports both
-    /// rather than choosing one.
-    ///
-    /// Models `collect`'s handoff charge (a task's upstream sources, read from
-    /// `self.upstream`), not `run_tool`'s separate caller-and-back charge -- the oracle is
-    /// wired to `serve_request` only for now, and `run_tool` stays outside `self.spans`.
     fn realized_ns(
         &self,
         d: usize,
@@ -1190,7 +1271,7 @@ impl Machine {
         decode_needed: bool,
         decide_ns: u64,
     ) -> (u64, u64) {
-        let plan = self.plan(d, req, View::Truth);
+        let plan = self.plan(d, &req.view(req.tokens), View::Truth);
         let unit = self.unit_in(d);
         let mut ns = decide_ns + self.dispatch.ns(DISPATCH_BYTES) + plan.ns;
         if let Some(sources) = req.completes.and_then(|t| self.upstream.get(&t)) {
@@ -1203,25 +1284,23 @@ impl Machine {
         ns += self.reach_ns(d, req, decode_needed);
         let decoding = req.tokens > 0 && self.interval_ns > 0;
         ns += if decoding {
-            self.telemetry(d)
-                .projected_ns(self.arrival_ns, req.tokens, self.staged_seqs[d])
+            self.telemetry_in(d, View::Truth).projected_ns(
+                self.arrival_ns,
+                req.tokens,
+                self.staged_seqs[d],
+            )
         } else {
             req.exec_ns
         };
         let displaced = self
-            .telemetry(d)
+            .telemetry_in(d, View::Truth)
             .displacement(&plan.need, &self.staged_bytes[d]);
         (ns, ns + displaced as u64)
     }
 
-    /// The model's argmin over `candidates`, evaluated under `view` -- `phase-2.md` §1.2's
-    /// `m_b` (`View::Belief`) and `m_t` (`View::Truth`). Reuses `placement_terms`'s own
-    /// `Terms::full`, the same cost model `best_scored` scores, so this is not a second model
-    /// of the score -- and unlike `best_scored` it never falls back to affinity on a tie,
-    /// because it is meant to be the model's own recommendation rather than the policy's.
     fn score_argmin(
         &self,
-        req: &Request,
+        req: &RequestView<'_>,
         flow: &[(usize, u64)],
         candidates: &[usize],
         view: View,
@@ -1233,16 +1312,7 @@ impl Machine {
             .map_or_else(|| candidates.first().copied().unwrap_or(0), |t| t.domain)
     }
 
-    /// The four-gap decomposition's raw inputs (`phase-2.md` §1.2, §4.2), computed once per
-    /// decision *before* `run_here` mutates the state `realized_ns` reads -- the identity in
-    /// P3 depends on reading truth before this request's own execution changes it. `p` is the
-    /// node the policy actually chose; `Machine::finish_regret` combines this with the charged
-    /// cost, known only after `run_here` returns.
-    #[allow(
-        clippy::similar_names,
-        reason = "r_p/r_mb/r_mt/r_o are phase-2.md §1.2's own notation -- renaming them apart \
-                  from the design doc's math would cost more clarity than it buys"
-    )]
+    #[allow(clippy::similar_names)]
     fn oracle_pick(
         &self,
         req: &Request,
@@ -1252,16 +1322,14 @@ impl Machine {
         decide_ns: u64,
         p: usize,
     ) -> OraclePick {
-        let m_b = self.score_argmin(req, flow, candidates, View::Belief);
-        let m_t = self.score_argmin(req, flow, candidates, View::Truth);
+        let seen = self.view_of(req);
+        let m_b = self.score_argmin(&seen, flow, candidates, View::Belief);
+        let m_t = self.score_argmin(&seen, flow, candidates, View::Truth);
         let (r_p, r_p_disp) = self.realized_ns(p, req, decode_needed, decide_ns);
         let (r_mb, _) = self.realized_ns(m_b, req, decode_needed, decide_ns);
         let (r_mt, _) = self.realized_ns(m_t, req, decode_needed, decide_ns);
         let mut r_o = r_p;
-        // Seeded with `p`'s *displacement-priced* cost, not its plain one: `ns_disp >= ns`
-        // always and `p` is itself a candidate, so seeding from `r_p` would cap the
-        // displacement oracle below every value the loop can offer and collapse
-        // `total_with_displacement` onto the execution gap.
+
         let mut r_o_disp = r_p_disp;
         let mut oracle_node = p;
         for &d in candidates {
@@ -1275,6 +1343,8 @@ impl Machine {
             }
         }
         OraclePick {
+            m_b,
+            m_t,
             oracle_node,
             r_p,
             r_mb,
@@ -1284,37 +1354,19 @@ impl Machine {
         }
     }
 
-    /// Whether some candidate other than `p`, priced against truth, could have admitted this
-    /// request's state right now -- `phase-2.md` §1.5's feasibility regret. A refused request
-    /// has no realized cost the oracle can price (`plan` never models refusal), so this is a
-    /// separate, read-only admission check rather than a reading of `oracle_pick`.
-    ///
-    /// **Over-counts under `--hard-pools`, and cannot not.** `Telemetry::could_admit` compares
-    /// need against each pool's aggregate `reclaimable()`, which sums burst across classes;
-    /// `TierPool::admit` under a hard quota refuses on the admitting class's *own* ceiling and
-    /// `pick_class` never leaves that class. So where a hard quota refuses because one class
-    /// is at its floor beside a pool that is otherwise empty, this reports every symmetric
-    /// candidate as feasible and §1.5's "not simply because the request was refused" fails.
-    /// The same blindness is in `place_agent`'s gang feasibility test and predates this phase;
-    /// narrowing it would move a published fan-out result, so it is named here instead and the
-    /// counter is read as an upper bound on hard-quota runs.
     fn feasible_elsewhere(&self, req: &Request, candidates: &[usize], p: usize) -> bool {
         candidates.iter().any(|&d| {
             if d == p {
                 return false;
             }
-            let plan = self.plan(d, req, View::Truth);
+            let plan = self.plan(d, &req.view(req.tokens), View::Truth);
             self.telemetry(d)
                 .could_admit(&plan.need, &self.staged_bytes[d])
                 && self.router_admits(d, req, false)
         })
     }
 
-    /// Finish one decision's regret bookkeeping once `run_here` has returned the charged
-    /// `Cost`: combine `pick`'s truth-read picks with `cost.service_ns()` into a `Regret`, and
-    /// record a `Span`. Feasibility regret is counted separately here on the refusal branch,
-    /// where there is no charged cost to decompose. Called only when `self.regret` is on.
-    #[allow(clippy::too_many_arguments, reason = "one decision's full context")]
+    #[allow(clippy::too_many_arguments)]
     fn finish_regret(
         &mut self,
         req: &Request,
@@ -1340,6 +1392,9 @@ impl Machine {
             pick.r_o,
             pick.r_o_disp,
         );
+        if self.instrument && self.observer.is_some() && pick.r_mb != pick.r_mt {
+            self.classify_gap(req, pick.m_b, pick.m_t);
+        }
         let regime = oracle::classify(cost);
         self.spans.push(Span {
             op: self.ops,
@@ -1353,7 +1408,136 @@ impl Machine {
         });
     }
 
-    /// Where a residency-greedy policy would run this: the node holding the most of it.
+    fn depths(&self, d: usize, chain: &[(BlobId, BlobMeta)]) -> (usize, usize) {
+        let believed = chain
+            .iter()
+            .take_while(|(id, m)| self.believes_resident(d, id, m.kind))
+            .count();
+        let truth = chain
+            .iter()
+            .take_while(|(id, m)| self.ground_truth_resident(d, id, m.kind))
+            .count();
+        (believed, truth)
+    }
+
+    fn classify_gap(&mut self, req: &Request, m_b: usize, m_t: usize) {
+        let (believed, truth) = self.depths(m_b, &req.chain);
+        if believed > truth {
+            self.instruments.gap_phantom += 1;
+            return;
+        }
+        let (believed, truth) = self.depths(m_t, &req.chain);
+        if truth > believed {
+            self.instruments.gap_miss += 1;
+        } else {
+            self.instruments.gap_discount += 1;
+        }
+    }
+
+    fn instrument_decision(&mut self, req: &Request, candidates: &[usize], home: usize) {
+        let kv = req
+            .chain
+            .first()
+            .is_some_and(|(_, m)| m.kind == BlobKind::KvBlock);
+        if !kv {
+            return;
+        }
+        let now = self.arrival_ns;
+        self.instruments.place(&req.chain, home);
+        if self.observer.is_none() || !self.domains[home].engine_cache() {
+            return;
+        }
+        self.instruments.decisions += 1;
+        let mut exposed = false;
+        let mut best: Option<(usize, usize, usize)> = None;
+        for &d in candidates {
+            let (believed, truth) = self.depths(d, &req.chain);
+            if believed == 0 {
+                continue;
+            }
+            if best.is_none_or(|(_, b, _)| believed > b) {
+                best = Some((d, believed, truth));
+            }
+            let Some(o) = self.observer.as_ref() else {
+                continue;
+            };
+            let deepest = &req.chain[believed - 1].0;
+            let predicted = req.chain[..believed]
+                .iter()
+                .map(|(id, _)| o.survival(d, id))
+                .fold(1.0f64, f64::min);
+            let unknown = o.block_unknown(d, deepest);
+            let resident = truth >= believed;
+            self.instruments.all.record(predicted, unknown, resident);
+            if d == home {
+                self.instruments.chosen.record(predicted, unknown, resident);
+            }
+            if believed > truth {
+                exposed = true;
+                self.instruments.phantom_depth_blocks += (believed - truth) as u64;
+                self.instruments.exposed_chosen += u64::from(d == home);
+            }
+        }
+        self.instruments.exposed_any += u64::from(exposed);
+        if let Some((node, believed, truth)) = best
+            && node != home
+        {
+            self.instruments.migrations += 1;
+            self.instruments.needless_migrations += u64::from(truth >= believed);
+        }
+        self.observe_silence(home, now);
+        if self.instruments.decisions % DIVERGENCE_EVERY == 0 {
+            self.sample_divergence();
+        }
+    }
+
+    fn observe_silence(&mut self, home: usize, now: u64) {
+        let Some(o) = self.observer.as_ref() else {
+            return;
+        };
+        for e in &o.conditions().episodes {
+            let share = &mut self.instruments.silence;
+            if e.from_ns <= now && now < e.until_ns {
+                share.inside += 1;
+                share.inside_on_node += u64::from(home == e.node);
+            } else {
+                share.outside += 1;
+                share.outside_on_node += u64::from(home == e.node);
+            }
+        }
+    }
+
+    fn sample_divergence(&mut self) {
+        let Some(o) = self.observer.as_ref() else {
+            return;
+        };
+        let (mut phantom, mut miss, mut nodes) = (0.0, 0.0, 0u32);
+        for &d in &self.active {
+            if !self.domains[d].engine_cache() {
+                continue;
+            }
+            let belief = o.belief(d);
+            let (mut believed, mut wrong) = (0u64, 0u64);
+            for id in belief.gpu_ids() {
+                believed += 1;
+                wrong += u64::from(!self.domains[d].is_hot(id, BlobKind::KvBlock));
+            }
+            let (mut actual, mut missed) = (0u64, 0u64);
+            for id in self.domains[d].kv_gpu_ids() {
+                actual += 1;
+                missed += u64::from(!belief.believes_gpu(&id));
+            }
+            phantom += wrong as f64 / believed.max(1) as f64;
+            miss += missed as f64 / actual.max(1) as f64;
+            nodes += 1;
+        }
+        if nodes > 0 {
+            self.instruments.divergence_samples += 1;
+            self.instruments.phantom_share += phantom / f64::from(nodes);
+            self.instruments.miss_share += miss / f64::from(nodes);
+        }
+    }
+
     fn greedy_best(&self, req: &Request, candidates: &[usize]) -> usize {
         candidates
             .iter()
@@ -1366,13 +1550,8 @@ impl Machine {
         self.topo.units[self.affinity_unit(chain, candidates)].home as usize
     }
 
-    /// Bytes domain `d` really holds for this request, regardless of what the scheduler
-    /// thinks. Must span exactly what `resident_value` scores, dependencies included, or a
-    /// decision correctly made on weight residency is reported as stale.
     fn truly_resident(&self, d: usize, req: &Request) -> u64 {
-        let depth = req
-            .chain
-            .partition_point(|(id, m)| self.domains[d].is_hot(id, m.kind));
+        let depth = self.prefix_len(&req.chain, |id, kind| self.domains[d].is_hot(id, kind));
         let chain_bytes: u64 = req.chain[..depth].iter().map(|(_, m)| m.bytes).sum();
         let dep_bytes: u64 = req
             .requires
@@ -1390,6 +1569,7 @@ impl Machine {
             h.release(now);
             r.release(now);
         }
+        self.observe_arrival(now);
         let engines: Vec<usize> = self
             .active
             .iter()
@@ -1433,22 +1613,12 @@ impl Machine {
         let scored = self.placement == Placement::Scored;
         let affinity = self.topo.units[self.sticky_unit].home as usize;
         let (best, decided_by) = if scored {
-            self.best_scored(req, &flow, affinity, &candidates)
+            self.best_scored(&self.view_of(req), &flow, affinity, &candidates)
         } else {
             (self.greedy_best(req, &candidates), None)
         };
         let value = self.resident_value(best, req);
 
-        // A task's downstream stage belongs where its upstream ran: neither workload's own
-        // identity hashes to the other's domain, so only a scheduler that sees the flow can
-        // put them together. This overrides the placement policy for every policy, which is
-        // what makes it separable from residency routing. With several upstream nodes, as
-        // after a fan-out, the unscored policy follows the first of them that can actually
-        // serve this request -- a flow recorded from a host-only anchor must not force a
-        // decode-bearing downstream onto a node that cannot decode.
-        // Under `Scored` the score is the whole decision: the flow's pull is already inside
-        // it, priced against what co-placing would evict, and gating on `resident_value` as
-        // well would discard the scored choice using a metric the score never consulted.
         let target = if scored {
             best
         } else {
@@ -1458,8 +1628,7 @@ impl Machine {
             }
         };
         let home = self.topo.units[self.unit_in(target)].home as usize;
-        // Only meaningful for a policy that acted on residency: a hash placement did not
-        // consult a view, so it cannot have been misled by one.
+
         if self.placement == Placement::Aware
             && self.resident_value(target, req) > 0
             && self.truly_resident(target, req) == 0
@@ -1467,12 +1636,12 @@ impl Machine {
             self.stale_decisions += 1;
         }
 
-        // `phase-2.md` §1.3: computed before `collect`/`reach`/`run_here` touch anything --
-        // `oracle_pick` peeks `self.upstream` for the same task `collect` is about to drain,
-        // and reads every candidate's truth before `run_here` changes what is true at `home`.
         let pick = self
             .regret
             .then(|| self.oracle_pick(req, &flow, &candidates, decode_needed, decide_ns, home));
+        if self.instrument {
+            self.instrument_decision(req, &candidates, home);
+        }
 
         if let Some(hint) = &req.hint {
             let recorded = self.tool_anchor.unwrap_or(home);
@@ -1496,8 +1665,6 @@ impl Machine {
         cost
     }
 
-    /// Charge a request's round trip from wherever it entered the cluster to the node that can
-    /// actually serve it. Zero when the two are the same place, or when no origin is set.
     fn reach(&mut self, home: usize, req: &Request, decode_needed: bool) -> u64 {
         let Some((origin, payload)) = self.origin else {
             return 0;
@@ -1511,8 +1678,6 @@ impl Machine {
         hop
     }
 
-    /// Charge the handoffs from a task's upstream nodes into `home`, counting joined and
-    /// split stages as it goes.
     fn collect(&mut self, home: usize, sources: &[(usize, u64)]) -> u64 {
         let unit = self.unit_in(home);
         let mut total = 0;
@@ -1529,7 +1694,6 @@ impl Machine {
         total
     }
 
-    /// Materialise a request's state on `home` by the cheapest route and run it there.
     fn run_here(&mut self, home: usize, req: &Request) -> Cost {
         let class = req.kind_idx();
         if !self.router_admits(home, req, false) {
@@ -1541,16 +1705,14 @@ impl Machine {
         }
         let shared_before = self.shared_reads;
         let ran_with = self.truly_resident(home, req);
-        // Ship first, then read. Whatever a peer supplied is resident by the time `access`
-        // walks the chain, so it costs the link once and never a rebuild; whatever no peer
-        // could supply falls through to the ledger's own spill-or-rebuild choice.
-        let plan = self.plan(home, req, View::Belief);
+
+        let plan = self.plan(home, &req.view(req.tokens), View::Belief);
+        self.observe_dispatch(home, req);
         let fetch = self.apply_chain(home, req, &plan);
         let mut cost = self.domains[home].access(&req.chain);
         let chain_recompute = cost.recompute_ns;
         cost.transfer_ns += fetch.transfer_ns;
-        // Counted after the fact: a refused request never ran, so charging it a placement
-        // outcome would inflate every rate by the refusal rate.
+
         if !cost.pending {
             if fetch.transfer_ns > 0 {
                 self.remote += 1;
@@ -1560,9 +1722,7 @@ impl Machine {
                 self.local += 1;
             }
         }
-        // A refused request consumes nothing. Admitting its dependencies anyway would evict
-        // live state to make room for work that never runs, which is the opposite of what
-        // refusal is for.
+
         if !cost.pending && !req.requires.is_empty() {
             let shipped = self.apply_deps(home, req, &plan);
             let dep = self.domains[home].access_set(&req.requires);
@@ -1571,18 +1731,25 @@ impl Machine {
             cost.pending |= dep.pending;
             cost.preempted |= dep.preempted;
         }
-        // Charged only on a request that actually runs: a refusal does no work, and never
-        // reaches an engine to dispatch to.
+
         let mut until = None;
         if !cost.pending {
             cost.dispatch_ns += self.dispatch.ns(DISPATCH_BYTES);
             self.dispatches += 1;
             let (exec, queue) = self.execute(home, req);
+            if req.tokens > 0 {
+                let seen = &mut self.observed[req.slo.idx()];
+                seen.0 += req.tokens;
+                seen.1 += 1;
+            }
             cost.exec_ns = exec;
             cost.queue_ns = queue;
             self.domains[home].decode_output(&req.chain, &req.produces, chain_recompute, &mut cost);
             self.preempted[class] += u64::from(cost.preempted);
             let decoding = req.tokens > 0 && self.interval_ns > 0;
+            if decoding {
+                self.observe_sent(home);
+            }
             if self.hold_decodes && decoding && !cost.preempted {
                 until = Some(self.arrival_ns + queue + exec);
             }
@@ -1602,14 +1769,13 @@ impl Machine {
         {
             let (blocks, extra) = self.reserve.claim(req, self.tokens_per_block);
             self.reserved[home].commit(&blocks, extra, end);
+            self.observe_pin(home, req, end);
         }
         self.domains[home].seal(until);
+        self.observe_emit(home);
         cost
     }
 
-    /// What the work itself costs once its state is here. For a decode that is the engine's
-    /// answer, not the request's: the same hundred tokens cost one thing in a batch of two
-    /// and another in a batch of sixty.
     fn execute(&mut self, d: usize, req: &Request) -> (u64, u64) {
         if req.tokens == 0 || self.interval_ns == 0 {
             return (req.exec_ns, 0);
@@ -1630,6 +1796,7 @@ impl Machine {
             gang: None,
             produces: agent.produces.clone(),
             max_tokens: agent.max_tokens,
+            slo: agent.slo,
         }
     }
 
@@ -1645,25 +1812,14 @@ impl Machine {
             gang: None,
             produces: Vec::new(),
             max_tokens: 0,
+            slo: crate::work::Slo::Interactive,
         }
     }
 
-    /// Admit a fan-out's agents, all of them or none, run them, and record where their
-    /// results will come back from.
-    ///
-    /// Placement is sequential over agents, hardest first, and each placement is staged --
-    /// its state marked as about to be resident, its bytes and decode slot reserved -- so the
-    /// next sibling is priced against the node as it *will* be. That is what lets the score
-    /// see both halves of co-location: the shared prefix a sibling already paid for, and the
-    /// batch that sibling is about to widen. Nothing is admitted until every agent has a
-    /// feasible node.
     fn serve_gang(&mut self, req: &Request, gang: &Gang) -> Cost {
         let n = gang.agents.len().max(1);
         let blobs: usize = gang.agents.iter().map(|a| a.chain.len()).sum();
-        // One decide() for the whole gang: per-agent feasibility is resolved below in
-        // `stage_agents`, but the routing hook this charges is the single decision that
-        // dispatches the fan-out, not one per agent -- the same "one crossing of latency"
-        // reasoning `Control::Query` already applies to a fan-out's residency asks.
+
         let decide_ns = self.decide(blobs, self.decode_pool_len());
         self.decide_ns += decide_ns;
         let mut cost = Cost {
@@ -1707,7 +1863,7 @@ impl Machine {
             if per_node.get(&d).copied().unwrap_or(0) > 1 {
                 self.agents_colocated += 1;
             }
-            // The orchestrator waits for its slowest agent, and a refused agent never returns.
+
             cost.pending |= c.pending;
             if !c.pending {
                 spent.0 += c.service_ns();
@@ -1721,8 +1877,7 @@ impl Machine {
                 req.hint.as_ref().map_or(0, |h| h.payload_bytes) / n as u64,
             ));
         }
-        // Feasibility is checked against a conservative estimate, so an admitted fan-out can
-        // still lose an agent at admission. That is the same waste, reached the other way.
+
         if cost.pending {
             self.fanouts_refused += 1;
             self.fanout_wasted_ns += spent.0;
@@ -1748,12 +1903,6 @@ impl Machine {
         cost
     }
 
-    /// Place every agent, hardest first, staging each so its siblings see it. Returns the
-    /// assignment only if every agent found a node.
-    ///
-    /// Without atomic admission, the agents that did fit are run anyway before returning
-    /// `None`: the orchestrator waits on one that never comes, and their work is the number
-    /// the baseline exists to produce.
     fn stage_agents(
         &mut self,
         gang: &Gang,
@@ -1814,14 +1963,13 @@ impl Machine {
         None
     }
 
-    /// Where one agent goes, and the bytes it will claim there, or `None` if no node can take
-    /// it given what its siblings have already reserved.
     fn place_agent(&mut self, probe: &Request, flow: &[(usize, u64)]) -> Option<(usize, Need)> {
+        let seen = self.view_of(probe);
         let feasible: Vec<(usize, Need)> = self
             .decode_pool()
             .iter()
             .filter_map(|&d| {
-                let need = self.plan(d, probe, View::Belief).need;
+                let need = self.plan(d, &seen, View::Belief).need;
                 (self.telemetry(d).could_admit(&need, &self.staged_bytes[d])
                     && self.router_admits(d, probe, true))
                 .then_some((d, need))
@@ -1833,7 +1981,7 @@ impl Machine {
         let target = if self.placement == Placement::Scored {
             let terms: Vec<Terms> = feasible
                 .iter()
-                .map(|&(d, _)| self.placement_terms(d, probe, flow, View::Belief))
+                .map(|&(d, _)| self.placement_terms(d, &seen, flow, View::Belief))
                 .collect();
             let top = terms
                 .iter()
@@ -1849,11 +1997,6 @@ impl Machine {
         need_on(target).map(|need| (target, need))
     }
 
-    /// What an unscored policy picks when some nodes cannot take the work: the same rule,
-    /// applied after filtering those nodes out. That is what a Kubernetes scheduler's filter
-    /// phase does and what an inference router does when it only considers endpoints able to
-    /// serve the model. Without the filter, a policy that sends every sibling to one node is
-    /// refused whenever they do not fit there, and it loses for a reason no real system has.
     fn unscored_among(
         &mut self,
         probe: &Request,
@@ -1891,10 +2034,6 @@ impl Machine {
         })
     }
 
-    /// One agent's whole turn: its context and weights, its decode, the dispatch handed to
-    /// it, and each tool call it makes along the way. Tool time is added to the agent's wall
-    /// time as if the sequence paused for it; the decode slot is held from admission, which
-    /// overstates occupancy for an engine that parks sequences during tool calls.
     fn run_agent(
         &mut self,
         d: usize,
@@ -1918,17 +2057,11 @@ impl Machine {
         cost
     }
 
-    /// A function call made by an agent on `caller`. Placed like any other request, with the
-    /// agent as its flow: arguments go out and the result comes back, so a remote call pays
-    /// the link twice. Whether that beats restoring the function's snapshot next to the agent
-    /// is exactly the trade the score exists to make.
     fn run_tool(&mut self, caller: usize, tool: &ToolCall) -> Cost {
         let probe = Self::tool_request(tool);
         let flow = [(caller, tool.payload_bytes), (caller, tool.payload_bytes)];
         let candidates = self.active.clone();
-        // A flow-aware unscored policy returns the caller's node without an argmin, so it
-        // scores one candidate, not the fleet. Charging the fleet would bill a per-candidate
-        // hook for comparisons that never happen.
+
         let scored = if self.placement == Placement::Scored || !self.flow_aware {
             candidates.len()
         } else {
@@ -1938,7 +2071,8 @@ impl Machine {
         self.decide_ns += decide_ns;
         let affinity = self.affinity_domain(&probe.chain, &candidates);
         let target = if self.placement == Placement::Scored {
-            self.best_scored(&probe, &flow, affinity, &candidates).0
+            self.best_scored(&self.view_of(&probe), &flow, affinity, &candidates)
+                .0
         } else if self.flow_aware {
             caller
         } else {
@@ -1965,8 +2099,6 @@ impl Machine {
         cost
     }
 
-    /// Ratio of busiest to least-busy domain occupancy. Locality-greedy placement buys hops
-    /// by concentrating state, and this is what it pays with.
     #[must_use]
     pub fn domain_spread(&self) -> f64 {
         let used: Vec<u64> = self
@@ -1979,11 +2111,6 @@ impl Machine {
         hi / lo
     }
 
-    /// `phase-2.md` §1.8, §4.6: `(cross-class evictions, evictions)` in host DDR, summed
-    /// across every domain, over workload-driven admissions only -- see `TierPool::coupled`
-    /// for what that excludes and why, and for which half of §4.6's definition this is.
-    /// Counted unconditionally, so this needs no `self.regret` gate and is cheap to read even
-    /// when it is off.
     #[must_use]
     pub fn memory_coupled(&self) -> (u64, u64) {
         self.domains.iter().fold((0, 0), |(c, n), h| {
@@ -1993,10 +2120,6 @@ impl Machine {
     }
 }
 
-/// The terms of a placement cost, all in nanoseconds: getting the state here by the cheapest
-/// available route, what claiming the room costs whatever gets evicted, what not co-placing
-/// costs in handoff, and what this node's engine occupancy costs in queueing and a wider
-/// batch. Kept apart so each one's contribution can be counted rather than assumed.
 #[derive(Clone, Copy, Debug)]
 struct Terms {
     domain: usize,
@@ -2006,9 +2129,7 @@ struct Terms {
     handoff: f64,
     engine: f64,
     congestion: f64,
-    /// Per-class bytes this candidate would have to admit -- `Plan::need`, carried through so
-    /// `phase-2.md` §4.6's locality-coupling silo can price displacement in one pool without
-    /// recomputing `plan` a second time.
+
     need: Need,
 }
 
@@ -2042,11 +2163,10 @@ impl Terms {
     }
 }
 
-/// `oracle_pick`'s four realized-cost picks for one decision -- `phase-2.md` §1.2's `m_b`,
-/// `m_t`, `R(p)`, `R(m_b)`, `R(m_t)`, and the oracle argmin `R(o)` in both its displacement
-/// variants. Plain data, combined with the charged cost by `finish_regret`.
 #[derive(Clone, Copy, Debug)]
 struct OraclePick {
+    m_b: usize,
+    m_t: usize,
     oracle_node: usize,
     r_p: u64,
     r_mb: u64,
@@ -2061,9 +2181,6 @@ enum Source {
     Shared,
 }
 
-/// The cheapest route to everything a request needs at one node: how deep its chain already
-/// goes here, how much of the rest a peer can supply, and which dependencies come over a
-/// link rather than off the spill tier or out of a rebuild.
 #[derive(Clone, Debug)]
 struct Plan {
     ns: u64,
@@ -2072,25 +2189,16 @@ struct Plan {
     chain_src: Option<Source>,
     chain_bytes: u64,
     deps: Vec<(usize, Source)>,
-    /// Bytes this node would have to admit, per class, which is what the displacement term
-    /// prices -- per class because the classes land in different pools.
+
     need: Need,
 }
 
 use crate::tele::Need;
 
-/// A residency question names a blob by its 32-byte id and its size.
 const QUERY_BYTES_PER_BLOB: u64 = 40;
 
-/// An argmin's per-candidate payload for a routing hook: small, the column Phase 0's hook
-/// table is denominated in. `ext_proc` has no sample at this size -- its floor is a 367 B
-/// header map -- so a `Sidecar` charge here is `boundary::measure`'s fit extrapolated down,
-/// exactly as the published hook table is (`phase-8.md` §4.2).
 pub const HOOK_BYTES: u64 = 64;
 
-/// Dispatch payload once a target is chosen. Both candidate rungs (`UnixSocket`,
-/// `TcpLoopback`) are effectively flat in payload size, so this choice moves the dispatch
-/// charge by under 1% either way (`phase-8.md` §4.3).
 pub const DISPATCH_BYTES: u64 = 1024;
 
 #[cfg(test)]
@@ -2115,17 +2223,8 @@ mod tests {
         Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored)
     }
 
-    /// P1, `phase-8.md` §1.1: on a trace with no gangs, `run_here` is called exactly once per
-    /// served request, so the realized tax must match `hook x decisions + dispatch-delta x
-    /// dispatches` exactly -- there is no mechanism between the charge sites and
-    /// `Cost::total_ns()` for it to be anything else. A gang's worst-agent-wins aggregation is
-    /// what breaks the equality when fan-out is present (`phase-8.md`'s tax-table doc comment);
-    /// this test isolates the claim from that complication.
     #[test]
-    #[allow(
-        clippy::cast_possible_wrap,
-        reason = "nanosecond totals over a 500-op trace, nowhere near i64::MAX"
-    )]
+    #[allow(clippy::cast_possible_wrap)]
     fn sidecar_tax_matches_closed_form_without_fanout() {
         let hook = Crossing {
             fixed_ns: 36_000.0,
@@ -2177,9 +2276,7 @@ mod tests {
             side.dispatches, side_served,
             "one dispatch per served request without gangs"
         );
-        // The closed form sums hooks over *every* decision but totals only served requests,
-        // so a refusal would break the equality for a reason that has nothing to do with the
-        // data path. State the fixture's precondition rather than relying on it.
+
         assert_eq!(
             side.decisions,
             trace.len() as u64,
@@ -2197,21 +2294,12 @@ mod tests {
         );
     }
 
-    /// A fan-out-free, tool-call-free, non-saturated trace: no gang ever reaches
-    /// `serve_gang`, no `run_tool` call ever perturbs `moved_by_congestion` behind the
-    /// spans' backs, and the `machine()` fixture never calls `set_arrival_rate`, so the
-    /// engine model is off and no decode can saturate. The one fixture every regret test
-    /// below needs, so its preconditions are named once.
     fn regret_fixture(seed: u64, ops: u64) -> Vec<Request> {
         Workload::new(seed, ops, 1.0)
             .with_tool_profile(0.0, 0)
             .collect()
     }
 
-    /// P3, `phase-2.md` §1.3, §4.2: on `regret_fixture`, under `Control::Unified`, `R(p)` must
-    /// equal `Cost::service_ns()` exactly at the policy's own node -- there is no mechanism for
-    /// it to be otherwise, since both walk the same plan against the same truth and
-    /// displacement is billed to nobody. Equivalently: the execution gap is zero on every span.
     #[test]
     fn execution_gap_is_zero_under_unified_and_non_saturated() {
         let mut mach = machine(4);
@@ -2240,18 +2328,6 @@ mod tests {
         }
     }
 
-    /// P3's identity holds exactly under the ample-capacity fixture every other regret test
-    /// uses (`execution_gap_is_zero_under_unified_and_non_saturated`). Under a *deliberately*
-    /// tight pool it does not, and the reason is real rather than a mechanical bug: `plan`
-    /// prices `req.chain` and `req.requires` independently against one snapshot of residency,
-    /// while `run_here` materialises the chain first and the dependencies second, so an
-    /// admission on one side can evict state the other side's price assumed would still be
-    /// there when eviction pressure is high enough for that to happen. This is not the belief
-    /// staleness `phase-2.md` names -- both reads still see the same, current, true state --
-    /// it is a same-request ordering effect `plan`'s independent-pricing shape cannot see, and
-    /// it is new enough that this phase does not attempt to close it (`phase-2.md` rule 1:
-    /// measure, do not repair). The identity's scope is therefore "ample capacity", stated
-    /// here as a boundary rather than left to be found the expensive way.
     #[test]
     fn execution_gap_has_a_bounded_residual_under_a_deliberately_tight_pool() {
         let bands = [0u8; BlobKind::N];
@@ -2284,9 +2360,6 @@ mod tests {
              whether this is still the same-request ordering effect or a new one"
         );
         for s in &mach.spans {
-            // Even where it fires, execution is the whole gap: heuristic, belief and model
-            // stay exactly as the identity predicts, so the residual is isolated to the one
-            // mechanism named above and does not leak into the other three.
             if s.regret.execution != 0 {
                 assert_eq!(s.regret.heuristic, 0, "{s:?}");
                 assert_eq!(s.regret.belief, 0, "{s:?}");
@@ -2295,9 +2368,6 @@ mod tests {
         }
     }
 
-    /// `phase-2.md` §1.2: `execution + heuristic + belief + model == total` on every decision,
-    /// not just on the pure `oracle::decompose` unit tests -- this is the same claim proven
-    /// through `Machine`'s own wiring rather than the function in isolation.
     #[test]
     fn regret_decomposition_sums_to_total_on_every_span() {
         let mut mach = machine(4);
@@ -2316,13 +2386,6 @@ mod tests {
         }
     }
 
-    /// `phase-2.md` §1.2: the belief gap is `R(m_b) - R(m_t)`, zero exactly when the argmin
-    /// taken over belief agrees with the argmin taken over truth -- which `Control::Unified`
-    /// and `Control::Query` both guarantee, since neither ever hands the scheduler a stale
-    /// view. `Control::Gossip` is what first makes this nonzero, and that is Phase 4's slot to
-    /// fill, not this test's to assert on -- a snapshot view a few requests old need not
-    /// actually diverge from truth on any given decision in a small trace, so asserting
-    /// nonzero here would be asserting a property of the trace, not of the mechanism.
     #[test]
     fn belief_gap_is_zero_under_unified_and_query() {
         let trace = regret_fixture(4, 600);
@@ -2343,10 +2406,6 @@ mod tests {
         }
     }
 
-    /// `phase-2.md` §4.4: `decided_by`'s one exact reduction, per `span.rs`'s doc comment --
-    /// the count of spans decided by the last rung must equal `moved_by_congestion` itself,
-    /// computed the ordinary way. `regret_fixture` excludes tool calls so `run_tool`'s own
-    /// `best_scored` calls cannot move `moved_by_congestion` behind the spans' backs.
     #[test]
     fn decided_by_reduces_to_moved_by_congestion() {
         let mut mach = machine(4);
@@ -2363,14 +2422,10 @@ mod tests {
         assert_eq!(from_spans, mach.moved_by_congestion);
     }
 
-    /// `phase-2.md` §1.5: a refused request is counted as feasibility regret only when some
-    /// other candidate, priced against truth, could actually have admitted it -- not simply
-    /// because the request was refused.
     #[test]
     fn feasible_elsewhere_requires_a_genuinely_admitting_candidate() {
         let bands = [0u8; BlobKind::N];
-        // Every candidate is equally, uniformly too small: no candidate can ever admit
-        // anything, so a refusal must never be counted as feasibility regret.
+
         let mem = NodeMemory {
             hbm: 0,
             ddr: 1,
@@ -2393,10 +2448,6 @@ mod tests {
         assert_eq!(mach.feasibility_regret, 0);
     }
 
-    /// `phase-2.md` §1.8, §4.6: `locality_coupled_decisions` is one per scored decision (the
-    /// same denominator `scored_decisions` counts), and on a flow-aware, multi-node fixture at
-    /// least one decision must be one the handoff term alone moves -- the mechanism has
-    /// something to find, not merely somewhere to record a zero.
     #[test]
     fn locality_coupled_counts_match_scored_decisions_and_can_be_nonzero() {
         let mut mach = machine(4);
@@ -2530,5 +2581,409 @@ mod tests {
                 Reserve::Prompt => assert!(n > 0, "the fixture must overcommit under none"),
             }
         }
+    }
+
+    fn stream_machine(partition: u64, offload: u64, spill: u64) -> Machine {
+        let bands = [0u8; BlobKind::N];
+        let mem = NodeMemory {
+            hbm: 4 << 30,
+            ddr: 8 << 30,
+            nvme: 64 << 30,
+            hbm_quota: Quota::open(4 << 30, bands),
+            ddr_quota: Quota::open(8 << 30, bands),
+            can_decode: true,
+            kv: Some(crate::cache::EngineKv {
+                partition,
+                offload,
+                spill,
+                clairvoyant: false,
+            }),
+        };
+        let topo = Topology::cluster(4, 1, mem.ddr, Distance::Rack, Crossing::default());
+        Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored)
+    }
+
+    fn replay_matches_every_tier(mach: &mut Machine, replicas: &mut [crate::stream::Index]) {
+        use crate::stream::Medium;
+        for (d, replica) in replicas.iter_mut().enumerate() {
+            for event in mach.domains[d].take_kv_events() {
+                replica.apply(&event);
+            }
+            for medium in Medium::ALL {
+                assert_eq!(
+                    replica.sorted_ids(medium),
+                    mach.domains[d].kv_ids(medium),
+                    "domain {d}, {medium:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_event_stream_reproduces_every_tier_after_every_request() {
+        use crate::stream::{Index, Medium};
+        let mut mach = stream_machine(64 << 20, 32 << 20, 48 << 20);
+        mach.record_kv_events(true);
+        mach.set_state_transfer(true);
+        mach.set_flow_aware(true);
+        mach.set_hold_decodes(true);
+        mach.set_shared_l2(Some(256 << 20));
+        mach.set_arrival_rate(250.0);
+        let mut replicas = vec![Index::default(); 4];
+        let mut totals = [0usize; 3];
+        for (i, req) in decode_trace(3, 2_500).iter().enumerate() {
+            if i == 1_500 {
+                mach.drain(1);
+            }
+            mach.serve_request(req);
+            replica_totals(&mach, &mut totals);
+            replay_matches_every_tier(&mut mach, &mut replicas);
+        }
+        assert!(
+            totals.iter().all(|&t| t > 0),
+            "the fixture must populate every tier, or the invariant is untested: {totals:?}"
+        );
+        let evicted = mach
+            .domains
+            .iter()
+            .map(|h| h.evicted()[BlobKind::KvBlock.idx()])
+            .sum::<u64>();
+        assert!(evicted > 0, "the fixture must evict");
+        assert_eq!(
+            replicas[1].len(Medium::Gpu),
+            0,
+            "the drained node's stream cleared it"
+        );
+    }
+
+    fn replica_totals(mach: &Machine, totals: &mut [usize; 3]) {
+        use crate::stream::Medium;
+        for h in &mach.domains {
+            for medium in Medium::ALL {
+                totals[medium.idx()] = totals[medium.idx()].max(h.kv_ids(medium).len());
+            }
+        }
+    }
+
+    #[test]
+    fn a_node_that_never_records_emits_nothing() {
+        let mut mach = stream_machine(64 << 20, 32 << 20, 48 << 20);
+        mach.set_arrival_rate(250.0);
+        for req in &decode_trace(3, 300) {
+            mach.serve_request(req);
+        }
+        assert!(
+            mach.domains
+                .iter_mut()
+                .all(|h| h.take_kv_events().is_empty())
+        );
+    }
+
+    fn gate_machine(control: Control, belief: bool) -> Machine {
+        let mut mach = stream_machine(64 << 20, 32 << 20, 48 << 20);
+        mach.set_control(control, Crossing::default());
+        mach.set_state_transfer(true);
+        mach.set_flow_aware(true);
+        mach.set_hold_decodes(true);
+        mach.set_shared_l2(Some(512 << 20));
+        mach.set_arrival_rate(250.0);
+        if belief {
+            mach.set_belief(Conditions::exact());
+        }
+        mach
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn an_exact_belief_changes_nothing_and_equals_the_truth_after_every_request() {
+        use crate::stream::Medium;
+        for control in [
+            Control::Unified,
+            Control::Query,
+            Control::Gossip { period: 50 },
+        ] {
+            let mut plain = gate_machine(control, false);
+            let mut seen = gate_machine(control, true);
+            for (i, req) in decode_trace(3, 2_500).iter().enumerate() {
+                if i == 1_500 {
+                    plain.drain(1);
+                    seen.drain(1);
+                }
+                let a = plain.serve_request(req);
+                let b = seen.serve_request(req);
+                if !matches!(control, Control::Gossip { .. }) {
+                    assert_eq!(
+                        format!("{a:?}"),
+                        format!("{b:?}"),
+                        "{control:?} request {i}"
+                    );
+                }
+                let observer = seen.observer().expect("the belief is on");
+                for d in 0..4 {
+                    let belief = observer.belief(d);
+                    for medium in Medium::ALL {
+                        assert_eq!(
+                            belief.index().sorted_ids(medium),
+                            seen.domains[d].kv_ids(medium),
+                            "{control:?} request {i} domain {d} {medium:?}"
+                        );
+                    }
+                    assert_eq!(
+                        belief.gpu_bytes(),
+                        belief.index().bytes(Medium::Gpu),
+                        "{control:?} request {i} domain {d}: nothing optimistic outlives its window"
+                    );
+                    for id in seen.domains[d].kv_ids(Medium::Gpu) {
+                        assert_eq!(observer.survival(d, &id), 1.0);
+                    }
+                }
+            }
+            if matches!(control, Control::Gossip { .. }) {
+                continue;
+            }
+            for (name, x, y) in [
+                ("fetches", plain.fetches, seen.fetches),
+                ("rebuilds", plain.rebuilds, seen.rebuilds),
+                ("stale_fetches", plain.stale_fetches, seen.stale_fetches),
+                ("decisions", plain.decisions, seen.decisions),
+                (
+                    "held_by_affinity",
+                    plain.held_by_affinity,
+                    seen.held_by_affinity,
+                ),
+                (
+                    "moved_by_displacement",
+                    plain.moved_by_displacement,
+                    seen.moved_by_displacement,
+                ),
+                ("moved_by_flow", plain.moved_by_flow, seen.moved_by_flow),
+                ("moved_by_load", plain.moved_by_load, seen.moved_by_load),
+                (
+                    "moved_by_congestion",
+                    plain.moved_by_congestion,
+                    seen.moved_by_congestion,
+                ),
+                ("preemptions", plain.preemptions(), seen.preemptions()),
+            ] {
+                assert_eq!(x, y, "{control:?} {name}");
+            }
+            assert!(
+                plain.preemptions() > 0 || plain.fetches > 0,
+                "{control:?}: the fixture must exercise something"
+            );
+        }
+    }
+
+    #[test]
+    fn an_eviction_without_its_event_changes_no_telemetry_read() {
+        use crate::stream::Medium;
+        use crate::tier::Tier;
+        let mut mach = gate_machine(Control::Unified, true);
+        for req in &decode_trace(3, 600) {
+            mach.serve_request(req);
+        }
+        let d = (0..4)
+            .max_by_key(|&d| mach.domains[d].kv_ids(Medium::Gpu).len())
+            .expect("four domains");
+        let gpu = mach.domains[d].kv_ids(Medium::Gpu);
+        assert!(gpu.len() > 4, "the fixture must leave blocks resident");
+        let victim = gpu[gpu.len() / 2];
+        let meta = BlobMeta {
+            kind: BlobKind::KvBlock,
+            bytes: crate::work::KV_BLOCK_BYTES,
+            parent: None,
+            recompute_ns: crate::work::KV_BLOCK_NS,
+        };
+        let need = [meta.bytes, 0, 0, 0];
+        let none = [0u64; BlobKind::N];
+        let reads = |m: &Machine| {
+            let t = m.telemetry(d);
+            (
+                t.resident(&victim, BlobKind::KvBlock),
+                t.held(&victim, BlobKind::KvBlock),
+                t.resident_bytes(BlobKind::KvBlock),
+                t.local_ns(&victim, &meta),
+                t.displacement(&need, &none).to_bits(),
+                t.displacement_in(Tier::Hbm, &need, &none).to_bits(),
+                t.marginal_price(Tier::Hbm).to_bits(),
+            )
+        };
+        let before = reads(&mach);
+        assert!(before.0 && before.1);
+        assert!(mach.domains[d].evict_unrecorded(&victim));
+        assert!(!mach.domains[d].is_hot(&victim, BlobKind::KvBlock));
+        assert_eq!(reads(&mach), before);
+        let truth_only = Telemetry::new(&mach.domains[d], &mach.engines[d]);
+        assert!(!truth_only.resident(&victim, BlobKind::KvBlock));
+    }
+
+    #[test]
+    fn every_scoring_rule_makes_the_same_decisions_on_an_exact_belief() {
+        use crate::belief::Scoring;
+        let trace = decode_trace(3, 1_200);
+        let mut plain = gate_machine(Control::Unified, false);
+        let reference: Vec<String> = trace
+            .iter()
+            .map(|req| format!("{:?}", plain.serve_request(req)))
+            .collect();
+        for scoring in [
+            Scoring::FaceValue,
+            Scoring::Expected,
+            Scoring::Quantile(0.5),
+            Scoring::Quantile(0.9),
+            Scoring::Quantile(0.99),
+            Scoring::Slo,
+        ] {
+            let mut seen = gate_machine(Control::Unified, true);
+            seen.set_scoring(scoring);
+            for (i, req) in trace.iter().enumerate() {
+                assert_eq!(
+                    format!("{:?}", seen.serve_request(req)),
+                    reference[i],
+                    "{scoring:?} request {i}"
+                );
+            }
+            assert_eq!(seen.moved_by_load, plain.moved_by_load, "{scoring:?}");
+            assert_eq!(seen.held_by_affinity, plain.held_by_affinity, "{scoring:?}");
+        }
+    }
+
+    #[test]
+    fn the_truth_view_prices_from_the_truth_while_the_belief_view_keeps_believing() {
+        use crate::belief::Episode;
+        use crate::stream::Medium;
+        let mut mach = gate_machine(Control::Unified, false);
+        mach.set_shared_l2(None);
+        mach.set_state_transfer(false);
+        mach.set_belief(Conditions {
+            episodes: vec![Episode {
+                node: 0,
+                from_ns: u64::MAX - 1,
+                until_ns: u64::MAX,
+            }],
+            ..Conditions::exact()
+        });
+        for req in &decode_trace(3, 600) {
+            mach.serve_request(req);
+        }
+        let d = (0..4)
+            .max_by_key(|&d| mach.domains[d].kv_ids(Medium::Gpu).len())
+            .expect("four domains");
+        let gpu = mach.domains[d].kv_ids(Medium::Gpu);
+        let victim = gpu[gpu.len() / 2];
+        let meta = BlobMeta {
+            kind: BlobKind::KvBlock,
+            bytes: crate::work::KV_BLOCK_BYTES,
+            parent: None,
+            recompute_ns: crate::work::KV_BLOCK_NS,
+        };
+        let req = Request {
+            phase: 0,
+            chain: vec![(victim, meta)],
+            requires: Vec::new(),
+            hint: None,
+            completes: None,
+            exec_ns: 0,
+            tokens: 0,
+            gang: None,
+            produces: Vec::new(),
+            max_tokens: 0,
+            slo: crate::work::Slo::Interactive,
+        };
+        assert!(mach.domains[d].evict_unrecorded(&victim));
+        let believed = mach.plan(d, &req.view(0), View::Belief);
+        let actual = mach.plan(d, &req.view(0), View::Truth);
+        assert_eq!(believed.local_depth, 1);
+        assert_eq!(believed.ns, 0);
+        assert_eq!(actual.local_depth, 0);
+        assert_eq!(actual.ns, mach.domains[d].local_ns(&victim, &meta));
+        assert!(actual.ns > 0);
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn on_an_exact_belief_the_instruments_read_zero_and_every_prediction_is_certain() {
+        use crate::instruments::CERTAIN;
+        let mut mach = gate_machine(Control::Unified, true);
+        mach.set_instrument(true);
+        mach.set_regret(true);
+        for req in &decode_trace(3, 1_500) {
+            mach.serve_request(req);
+        }
+        let i = &mach.instruments;
+        assert!(i.decisions > 100, "{}", i.decisions);
+        assert_eq!(i.exposed_any, 0);
+        assert_eq!(i.gaps(), 0);
+        assert_eq!(i.phantom_share, 0.0);
+        assert_eq!(i.miss_share, 0.0);
+        assert!(i.divergence_samples > 0);
+        assert!(i.all.total() > 0);
+        assert_eq!(i.all.bins[CERTAIN].n, i.all.total());
+        assert_eq!(i.all.bins[CERTAIN].resident, i.all.total());
+        assert_eq!(i.chosen.bins[CERTAIN].resident, i.chosen.total());
+    }
+
+    #[test]
+    fn a_lagged_belief_is_exposed_and_its_predictions_are_not_all_certain() {
+        use crate::belief::{LoadSource, Recovery};
+        use crate::instruments::CERTAIN;
+        let mut mach = gate_machine(Control::Unified, false);
+        mach.set_belief(Conditions {
+            cadence: true,
+            lag_ns: 30_000,
+            loss: 0.05,
+            recovery: Recovery::None,
+            period_ns: 1_000_000_000,
+            episodes: Vec::new(),
+            seed: 1,
+            load: LoadSource::Path,
+        });
+        mach.set_instrument(true);
+        for req in &decode_trace(3, 2_500) {
+            mach.serve_request(req);
+        }
+        let i = &mach.instruments;
+        assert!(
+            i.exposed_any > 0,
+            "loss without recovery must leave phantoms"
+        );
+        assert!(i.phantom_share > 0.0);
+        assert!(i.all.bins[CERTAIN].n < i.all.total());
+        assert_eq!(
+            i.all.bins[CERTAIN].resident, i.all.bins[CERTAIN].n,
+            "a phantom with no unapplied step behind it is a reconciliation defect"
+        );
+    }
+
+    #[test]
+    fn the_score_cannot_see_the_exact_output_length_under_observables() {
+        let request = |tokens: u64| Request {
+            phase: 0,
+            chain: Vec::new(),
+            requires: Vec::new(),
+            hint: None,
+            completes: None,
+            exec_ns: 0,
+            tokens,
+            gang: None,
+            produces: Vec::new(),
+            max_tokens: 900,
+            slo: crate::work::Slo::Interactive,
+        };
+        let mut mach = gate_machine(Control::Unified, false);
+        assert_eq!(mach.view_of(&request(50)).tokens, 50);
+        assert_eq!(mach.view_of(&request(200)).tokens, 200);
+        mach.set_observables(true);
+        assert_eq!(mach.view_of(&request(50)).tokens, 900);
+        assert_eq!(mach.view_of(&request(200)).tokens, 900);
+        assert_eq!(mach.view_of(&request(0)).tokens, 0);
+        for req in &decode_trace(3, 400) {
+            mach.serve_request(req);
+        }
+        assert_eq!(
+            mach.view_of(&request(50)).tokens,
+            mach.view_of(&request(200)).tokens
+        );
+        assert_ne!(mach.view_of(&request(50)).tokens, 900);
     }
 }

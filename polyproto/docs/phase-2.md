@@ -574,7 +574,8 @@ have to re-specify the cluster to say anything.
   decision, not per run -- a per-run assertion passes on cancelling errors.
 - **The two zero slots are zero.** Under `Unified` and `Query`, execution and belief gaps are
   identically zero across a full run. Under `Gossip` at least one is not. This is the test that
-  Phase 4 will delete, which is what makes it worth writing now.
+  Phase 4 will delete, which is what makes it worth writing now. *(Phase 4 kept it instead: it holds
+  unchanged on the no-belief path and is the regression under the gate, `phase-4.md` §4.12.)*
 - **Spans reduce to the existing counters.** `decided_by` aggregated over spans equals
   `moved_by_displacement`, `moved_by_flow`, `moved_by_load`, `moved_by_congestion` exactly.
 - **The clairvoyant policy is clairvoyant.** On a fixture whose reference stream is known, it evicts

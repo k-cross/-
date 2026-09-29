@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 pub struct Trial {
     pub bands: [u8; BlobKind::N],
     pub flows: FlowMode,
-    /// Accelerator memory; zero models a unified-memory host.
+
     pub hbm: u64,
     pub dram: u64,
     pub nvme: u64,
@@ -80,7 +80,7 @@ pub struct Report {
     pub flow_e2e_ns: u64,
     pub prewarmed_bytes: u64,
     pub prewarm_ns: u64,
-    /// `phase-1.md` §4.4's dynamic census, per census-marked entry point.
+
     pub engine_ops: crate::cache::EngineOps,
     pub kv_mean: [u64; 3],
     pub refused_by_router: [u64; BlobKind::N],
@@ -106,8 +106,6 @@ impl Report {
         }
     }
 
-    /// Fraction of *started* tasks whose downstream stage could not be served. A gated task
-    /// never starts, so this measures wasted upstream work, not task success.
     #[must_use]
     pub fn broken_rate(&self) -> f64 {
         if self.flow_started == 0 {
@@ -117,8 +115,6 @@ impl Report {
         }
     }
 
-    /// Fraction of *attempted* tasks that completed. Counts gated tasks as failures, so a
-    /// gate cannot win by refusing everything.
     #[must_use]
     pub fn task_completion(&self) -> f64 {
         if self.flow_attempted == 0 {
@@ -154,11 +150,6 @@ pub fn trace(t: Trial) -> Vec<crate::work::Request> {
     }
 }
 
-/// `Policy::Clairvoyant`'s reference-stream index, built once from the full trace before a run
-/// starts: for every blob referenced in a chain or a dependency set, the ops at which it is
-/// referenced, in order. Positions are counted the same way `run_on`'s own loop counts --
-/// skipping gang requests, which a single ledger never processes -- so they stay aligned with
-/// the sequence of `Hierarchy::access`/`access_set` calls the index is consumed by.
 #[must_use]
 fn clairvoyant_index(trace: &[crate::work::Request]) -> HashMap<BlobId, VecDeque<u64>> {
     let mut index: HashMap<BlobId, VecDeque<u64>> = HashMap::new();
@@ -175,21 +166,17 @@ fn clairvoyant_index(trace: &[crate::work::Request]) -> HashMap<BlobId, VecDeque
     index
 }
 
-/// How a trial budgets memory between classes.
 #[derive(Clone, Copy, Debug)]
 pub enum Budget {
-    /// Per-class floors as fractions of a pool, soft or hard.
     Split {
         split: [f64; BlobKind::N],
         hard: bool,
     },
-    /// No floors at all.
+
     Open,
 }
 
 impl Budget {
-    /// The budget for host memory: the split as given. Beside an accelerator, the classes it
-    /// hosts are offloads and give up host bytes first.
     fn host(self, capacity: u64, bands: [u8; BlobKind::N], beside_hbm: bool) -> Quota {
         let q = match self {
             Self::Split { split, hard } => Quota::from_split(capacity, split, bands, hard),
@@ -198,11 +185,6 @@ impl Budget {
         if beside_hbm { q.offloaded() } else { q }
     }
 
-    /// The budget for accelerator memory: the split's KV-to-weights ratio over the classes
-    /// that actually live there, with the same share of the pool reserved as the split
-    /// reserves in total. Applying the split verbatim would strand the accelerator budget of
-    /// host-only classes, and a hard partition would lose most of the pool to state that can
-    /// never occupy it.
     fn accelerator(self, capacity: u64, bands: [u8; BlobKind::N]) -> Quota {
         let Self::Split { split, hard } = self else {
             return Quota::open(capacity, bands);
@@ -241,8 +223,6 @@ pub fn grant(t: Trial, budget: Budget, arm: EngineArm, off: &Report) -> EngineKv
     grant_for(&memory_for(t, budget, None), off.kv_mean, arm)
 }
 
-/// `phase-3.md` §1.11 for any node: in each pool, KV's floor where the budget names one,
-/// else the mean KV occupancy the correction-off run measured there.
 #[must_use]
 pub fn grant_for(mem: &NodeMemory, off: [u64; 3], arm: EngineArm) -> EngineKv {
     let split = mem.hbm > 0;
@@ -275,12 +255,7 @@ pub fn run(label: &str, t: Trial, budget: Budget) -> Report {
     run_on(label, t, budget, &trace(t))
 }
 
-/// The request stream is a pure function of (seed, ops, vol), so a sweep over quotas can
-/// generate it once instead of rebuilding an identical trace for every candidate.
 #[must_use]
-///
-/// With split memory one budget governs both pools: in HBM it sets KV against weights, in DDR
-/// it sets function cells and service heaps against what the accelerator has offloaded.
 pub fn run_on(label: &str, t: Trial, budget: Budget, trace: &[crate::work::Request]) -> Report {
     let Some(arm) = t.fix.engine else {
         return run_with(label, t, budget, trace, None);
@@ -297,7 +272,7 @@ pub fn run_on(label: &str, t: Trial, budget: Budget, trace: &[crate::work::Reque
 }
 
 #[must_use]
-#[allow(clippy::too_many_lines, reason = "one request loop, tallied in place")]
+#[allow(clippy::too_many_lines)]
 pub fn run_with(
     label: &str,
     t: Trial,
@@ -329,12 +304,8 @@ pub fn run_with(
         (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut flow_attempted = 0u64;
 
-    // Counts exactly what `clairvoyant_index` counted -- non-gang requests, in order -- so
-    // the ledger's notion of "already in the past" and the index's positions are the same
-    // number by construction rather than by coincidence.
     let mut op = 0u64;
     for req in trace {
-        // Gangs need somewhere to be placed across; a single ledger has no second node.
         if req.gang.is_some() {
             continue;
         }
@@ -349,8 +320,6 @@ pub fn run_with(
             && t.flows == FlowMode::Gate
             && !h.can_satisfy(hint)
         {
-            // Refusing the upstream must also cancel the task's downstream stage, or the
-            // gate "avoids" work that still runs and the saving is imaginary.
             gated_tasks.insert(hint.task);
             gated += 1;
             flow_attempted += 1;
@@ -607,8 +576,6 @@ mod tests {
         }
     }
 
-    // GDSF's inflation is per pool, so a KV eviction reorders weights even behind a hard
-    // partition; only an LRU ledger leaves the weights row nothing to move it.
     #[test]
     fn census_weightshard_row_is_unchanged_across_the_bit_under_hard_lru_partitions() {
         let t = engine(Trial {

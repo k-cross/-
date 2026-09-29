@@ -5,8 +5,6 @@ use std::path::Path;
 
 pub const DIRECT_ALIGN: usize = 4096;
 
-/// # Errors
-/// Returns the OS error if the spill file cannot be opened.
 #[cfg(target_os = "linux")]
 pub fn open_direct(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -27,8 +25,6 @@ pub fn open_direct(path: &Path) -> io::Result<File> {
         })
 }
 
-/// # Errors
-/// Returns the OS error if the spill file cannot be opened, or if `F_NOCACHE` is refused.
 #[cfg(not(target_os = "linux"))]
 pub fn open_direct(path: &Path) -> io::Result<File> {
     let f = OpenOptions::new()
@@ -37,7 +33,7 @@ pub fn open_direct(path: &Path) -> io::Result<File> {
         .create(true)
         .truncate(true)
         .open(path)?;
-    // Without F_NOCACHE the unified buffer cache absorbs the I/O and we measure DRAM, not the device.
+
     #[cfg(target_os = "macos")]
     {
         // SAFETY: fd is owned by `f` and valid for the duration of this call.
@@ -69,8 +65,7 @@ pub fn sysctl_u64(name: &str) -> Option<u64> {
     if rc != 0 {
         return None;
     }
-    // Some keys are 32-bit (cpu counts) and some 64-bit (memsize); interpret by the width
-    // the kernel reports back rather than assuming.
+
     match len {
         4 => Some(u64::from(u32::try_from(out & 0xFFFF_FFFF).ok()?)),
         8 => Some(out),
@@ -84,8 +79,6 @@ pub fn sysctl_u64(_name: &str) -> Option<u64> {
     None
 }
 
-/// Scheduling class, which on Apple Silicon is what actually steers a thread to the
-/// performance or efficiency cluster -- affinity hints are advisory and largely ignored.
 #[derive(Clone, Copy, Debug)]
 pub enum Cluster {
     Performance,
@@ -116,8 +109,6 @@ pub fn pin_cluster(_c: Cluster) -> bool {
     false
 }
 
-/// NUMA nodes visible to the host, with the kernel's own distance matrix where it exposes
-/// one. Returns a single node when the platform has no NUMA concept.
 #[must_use]
 pub fn numa_nodes() -> Vec<(u8, Vec<u8>)> {
     #[cfg(target_os = "linux")]

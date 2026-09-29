@@ -269,7 +269,10 @@ precise-versus-approximate split:
 - **`Events { loss }`** -- an approximate per-blob index from a KV event stream: fresh, lossy,
   probabilistic.
 
-Replacing `Gossip` with these two is a correctness fix, not a refinement.
+Replacing `Gossip` with these two is a correctness fix, not a refinement. Measured
+(`phase-4.md` P5, §9): under `--belief` the engine's KV comes from the channel and `Gossip` keeps
+only owned state; the scored arm barely notices, and residency-greedy's result flips sign between the
+published partition (+21%) and half of it (-30%).
 
 #### Step-aligned ingestion over ZMQ IPC
 
@@ -705,6 +708,10 @@ coupling-tier-1 win survives when the hint is an estimate?** Announce currently 
 latency against a perfect oracle. Against an EWMA with real variance it buys less, and the amount
 it loses is the honest value of the mechanism.
 
+**Output length is the second cheat here, and for the score a mean does close it** (`phase-4.md` §1.9,
+P6): the observed running mean is within 0.13% of the exact length on this workload, and the tail
+quantile §1's admission wants is a separate consumer. What follows is still true of that consumer.
+
 **Output length is the second cheat here, and a mean will not close it.** The score reads exact
 `req.tokens` today; both consumers want more than its average. §1's admission reserves
 latency-bearing classes against a **high quantile** of remaining output, and §3.7 scores each class
@@ -781,12 +788,17 @@ directive-plus-belief architecture tracks reality. Report it, do not smooth it:
 Divergence(e, t) = |Belief(e) \ Actual(e)| / |Belief(e)|
 ```
 
-It spikes on three things: eviction cascades the engine runs between batches; telemetry drops (a
-`seq` gap, after which the router's eviction count is a lower bound); and ignored retention
-directives. Tracking it isolates whether a routing mistake came from a bad cost model or from a
+It spikes on four things: eviction cascades the engine runs between batches; telemetry drops (a
+`seq` gap, after which the router's eviction count is a lower bound); ignored retention
+directives; and **preemption**, which an eviction-centric stream never reports -- the router believes
+blocks of a sequence the engine could not place until that step's batch arrives without their stores
+(`phase-4.md` §1.6). `Belief::apply` reconciles them by the absence of the store. Tracking it isolates whether a routing mistake came from a bad cost model or from a
 belief that drifted.
 
 ### 3.7 Confidence has to reach the argmin
+
+**Status: built and measured** (`src/belief.rs`, `Machine::plan`, `phase-4.md`); the estimator and the
+rules below are implemented as specified, per block rather than per prefix (`phase-4.md` §1.8).
 
 §1 requires inferred quantities to carry a confidence. §1's telemetry detects a sequence gap. §3.6
 publishes divergence. **None of it changes a placement.** `Machine::plan` takes an argmin over
@@ -865,6 +877,14 @@ continuous congestion term damps that or hysteresis is needed is a measurement, 
 And the turnover estimator is crude -- uniform stack rank is a convenient lie -- so Phase 4
 publishes `P(resident)` against realised hit rate as a calibration curve, the cheapest available
 test of whether the belief means anything at all.
+
+**Measured (`phase-4.md` §2, §9).** Two of this section's claims changed. The failure mode -- "the
+router herds onto whichever node has stopped reporting" -- does not occur on the integrated path, where
+load is read from the traffic the router carries rather than from telemetry; it occurs for a router that
+reads load from the stream, and by luck of the node's load when it went quiet. And the turnover estimator
+is neither the under-confident curve the pre-measurement suggested nor calibrated: it is close to the
+diagonal with replay and no loss, and over-confident where a dropped batch is never recovered, because the
+unknown evictions concentrate on the stalest blocks.
 
 This also turns an accident into a principle. §1 measured that residency-greedy gets *better* as its
 view goes stale, because staleness happens to stop it concentrating. Pricing the belief as a
@@ -1596,6 +1616,38 @@ crossing is free at 40-100 Hz whichever boundary carries it.
   costs -- including the failure mode §3.7 names, where a mean over an exact belief herds onto the
   node that went quiet. Watch for flapping at the quantile threshold.
 - **Risk:** low; contained, and replaces a mechanism known to be unphysical. **Size:** medium.
+
+**Status: implemented and measured.** `phase-4.md` §2's nine predictions, checked with `polyphonic belief`
+(reproducible from the seed) and `distributed --engine-cache --belief`:
+
+- **The answer is small, and the reason is the finding.** A partition that turns over every ~3.4 s, read
+  through a channel with the engine's own cadence, a rack-to-region hop, up to 20% batch loss and no
+  recovery at all, moves mean service by at most 0.16% and p99 by 0.15% against the exact view -- while the
+  belief is wrong about a third to three-fifths of the time. Replay recovery keeps it within 0.075%.
+- **P1 confirmed**: 0.011% at rack, 0.023% at region, with 0.13-0.48% of KV decisions exposed at rack and
+  1.5-4.1% at region.
+- **P2 confirmed for replay, wrong for the other columns**: periodic recovery at 20% loss is within 0.15%
+  (predicted beyond 0.3%). Recovery policy moves the phantom share (0.13% under replay to 37% under none at
+  20% loss) and does not move service.
+- **P3 half wrong**: the calibration curve is close to the diagonal with replay and no loss, and
+  **over-confident** with loss and no recovery (0.96 predicted, 0.70 realised at half the partition),
+  because the unknown evictions land on the stale blocks an LRU takes first, not uniformly. `quantile 0.9`
+  does not show the largest discount-led gap.
+- **P4**: silence does not herd the integrated router (within 1.7pp of baseline under `face-value`, exactly at
+  it under `expected` and `quantile`); a stream-fed load herds or starves by luck of the node's load, and
+  adding the router's own dispatches starves the silent node (1.6-4.8% of KV decisions against ~25%, +3.1% service at 8 s).
+  `P(resident)` changes none of it.
+- **P5**: retiring `Gossip`'s engine half leaves the scored arm within 0.05% and costs residency-greedy 21%
+  at the published partition -- and *helps* it by 30% at half the partition. The staleness was a crutch in
+  one regime and a handicap in the other.
+- **P6 confirmed**: the observed mean output length is within 0.13% of the exact one, and better.
+- **P7 confirmed** on service p99 (stall p99 moves only under `slo`, and only in direction), **P8 wrong** (the
+  chosen node is not over-confident relative to the field), **P9 confirmed at `q = 0.9`**, with churn under
+  `q = 0.99` rising with unrepaired loss (37% to 43%), and its migration half untestable as instrumented.
+- **Not built**: divergence by cause, and two-tier admission.
+
+Whether `--belief` becomes the default under `--engine-cache` is deferred; the bit stays off and every
+result above is an A/B against the run without it.
 
 ### Phase 5 -- Influence: retention directives
 

@@ -1,17 +1,3 @@
-//! Continuous batching, which is why a decode step has no fixed cost.
-//!
-//! A serving engine runs every resident sequence through one step at a time. The step reads
-//! the weights once whatever the batch size, so a second sequence is nearly free and the
-//! sixty-fourth is not free at all: per-token latency rises with occupancy while throughput
-//! saturates. A scheduler that models decode as a constant cannot see the only tradeoff
-//! inference routing exists to make -- send work to the node holding its prefix, or to the
-//! node that is not already full.
-//!
-//! Constants are **modelled**. `STEP_BASE_NS` is the weight-read floor of a step and
-//! `STEP_PER_SEQ_NS` the attention and KV-read cost each extra sequence adds; the base is
-//! chosen so a batch of one matches the flat 125 tok/s the workload used before, which keeps
-//! the unbatched arm comparable. Replace both from a real engine before quoting a result.
-
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
 
@@ -21,13 +7,9 @@ use crate::tier::TierSpec;
 pub const STEP_BASE_NS: u64 = 7_000_000;
 pub const STEP_PER_SEQ_NS: u64 = 40_000;
 pub const MAX_BATCH: usize = 64;
-/// Utilisation at which the congestion toll stops growing. The toll diverges at full
-/// occupancy, and a finite cap keeps a saturated node expensive rather than infinite, so an
-/// argmin over a cluster where *every* node is full still has an answer.
+
 const UTILISATION_CAP: f64 = 0.95;
 
-/// What one decode admission cost: time spent waiting for a slot, time spent decoding, and
-/// the batch it landed in.
 #[derive(Clone, Copy, Debug)]
 pub struct Decode {
     pub queue_ns: u64,
@@ -38,7 +20,7 @@ pub struct Decode {
 #[derive(Debug)]
 pub struct Engine {
     max_batch: usize,
-    /// Completion times of sequences still occupying a slot, soonest first.
+
     inflight: BinaryHeap<Reverse<u64>>,
     pub queue_ns: u64,
     pub batch_sum: u64,
@@ -73,8 +55,6 @@ impl Engine {
         }
     }
 
-    /// Sequences still resident at `now_ns`. Read-only so placement can price every candidate
-    /// engine before committing to one.
     #[must_use]
     pub fn load(&self, now_ns: u64) -> usize {
         self.inflight
@@ -83,15 +63,13 @@ impl Engine {
             .count()
     }
 
-    /// What admitting this decode here would cost, without admitting it. Queueing is included
-    /// because a saturated engine turns a cache hit into a wait, and that is precisely the
-    /// case where the node holding the prefix is the wrong node.
-    ///
-    /// `reserved` counts sequences already promised to this engine but not yet admitted --
-    /// the siblings of a fan-out being placed together, which will join the same batch.
     #[must_use]
     pub fn projected_ns(&self, now_ns: u64, tokens: u64, reserved: usize) -> u64 {
-        let live = self.load(now_ns) + reserved;
+        self.projected_live(now_ns, tokens, self.load(now_ns) + reserved)
+    }
+
+    #[must_use]
+    pub fn projected_live(&self, now_ns: u64, tokens: u64, live: usize) -> u64 {
         let wait = if live < self.max_batch {
             0
         } else {
@@ -102,38 +80,18 @@ impl Engine {
         wait + tokens * Self::step_ns(live.min(self.max_batch - 1) + 1)
     }
 
-    /// What admitting this decode here would cost *everyone else already decoding*.
-    ///
-    /// Joining a batch of `live` widens every one of those sequences' steps by
-    /// `STEP_PER_SEQ_NS` for as long as this one overlaps them. `projected_ns` prices only
-    /// the private half of that -- what the existing batch does to me -- and a scheduler that
-    /// sees only the private half will happily pile work onto the node that is already
-    /// deepest, because joining a full batch costs the joiner barely more than joining an
-    /// empty one. The social half is convex in occupancy, which is what makes it a gradient
-    /// away from hot nodes rather than a tiebreak.
-    ///
-    /// Overlap is approximated by this request's own length. The exact quantity needs every
-    /// in-flight sequence's remaining tokens, which is a step-accurate simulation; the
-    /// approximation keeps the term's shape, which is what decides placements.
-    ///
-    /// The widening alone is linear in occupancy, and a linear toll cannot represent the knee:
-    /// the thing that actually hurts near capacity is not wider steps but the wait every
-    /// *future* arrival inherits once the batch fills, which grows like `1 / (1 - u)`. That is
-    /// the shape of the classical congestion toll on a queue, and it is applied here as a
-    /// factor on the widening so that the two agree where the queue is empty -- at low
-    /// utilisation this is the linear term, unchanged -- and part company exactly where
-    /// placement starts to matter.
     #[must_use]
     pub fn congestion_ns(&self, now_ns: u64, tokens: u64, reserved: usize) -> u64 {
-        let live = self.load(now_ns) + reserved;
+        self.congestion_live(tokens, self.load(now_ns) + reserved)
+    }
+
+    #[must_use]
+    pub fn congestion_live(&self, tokens: u64, live: usize) -> u64 {
         let u = (live as f64 / self.max_batch as f64).min(UTILISATION_CAP);
         let widening = live as u64 * STEP_PER_SEQ_NS * tokens;
         (widening as f64 / (1.0 - u)) as u64
     }
 
-    /// Admit one sequence. The batch is sampled once at admission and held for the whole
-    /// decode rather than re-evaluated per step: a step-accurate engine is a different
-    /// simulation, and the error is second-order next to modelling no batch at all.
     pub fn decode(&mut self, arrival_ns: u64, tokens: u64) -> Decode {
         self.retire(arrival_ns);
         let mut start = arrival_ns;
@@ -182,8 +140,6 @@ struct Block {
     pins: u32,
 }
 
-// Not a `TierPool` configured as LRU: that would still compile at every call site Phase 1
-// census-marked, and the point is that those sites stop compiling (phase-3.md §1.1).
 #[derive(Debug)]
 pub struct EngineCache {
     capacity: u64,
@@ -447,6 +403,11 @@ impl EngineCache {
         self.held.clear();
         self.used = 0;
         self.pinned = 0;
+    }
+
+    #[must_use]
+    pub fn price_of(&self, meta: &BlobMeta) -> f64 {
+        self.loss_per_byte(meta)
     }
 
     #[must_use]

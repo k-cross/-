@@ -1,9 +1,3 @@
-//! Compute units, memory domains, and the links between them.
-//!
-//! The ledger decides *what* stays resident; the topology decides *where* it is and what it
-//! costs to reach from a given compute unit. Placement and routing are one decision only if
-//! both are visible to the same scheduler.
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum UnitKind {
     Performance,
@@ -13,11 +7,10 @@ pub enum UnitKind {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DomainKind {
-    /// Directly attached, load/store reachable.
     Dram,
-    /// Device-attached; reachable only by DMA.
+
     Vram,
-    /// Another socket or host: coherent over a fabric, or not at all.
+
     Remote,
 }
 
@@ -26,7 +19,7 @@ pub struct ComputeUnit {
     pub id: u8,
     pub kind: UnitKind,
     pub cluster: u8,
-    /// Domain this unit reaches with no interconnect hop.
+
     pub home: u8,
 }
 
@@ -37,14 +30,11 @@ pub struct MemoryDomain {
     pub capacity: u64,
 }
 
-/// A path from a compute unit to a memory domain.
 #[derive(Clone, Copy, Debug)]
 pub struct Link {
     pub latency_ns: u64,
     pub ns_per_byte: f64,
-    /// Coherent links are traversed by reference; non-coherent ones require a copy. This is
-    /// the single most consequential bit in the graph -- it decides whether co-placement
-    /// saves a pointer dereference or a full materialisation.
+
     pub coherent: bool,
 }
 
@@ -72,8 +62,6 @@ pub struct Topology {
 }
 
 impl Topology {
-    /// # Panics
-    /// Panics if `links` is not exactly `units.len() * domains.len()` entries.
     #[must_use]
     pub fn new(units: Vec<ComputeUnit>, domains: Vec<MemoryDomain>, links: Vec<Link>) -> Self {
         assert_eq!(
@@ -98,7 +86,6 @@ impl Topology {
         self.link(unit, domain).cost_ns(bytes)
     }
 
-    /// Unit that can reach this blob set most cheaply given where it already lives.
     #[must_use]
     pub fn best_unit(&self, placed: &[(usize, u64)]) -> usize {
         (0..self.units.len())
@@ -111,9 +98,6 @@ impl Topology {
             .unwrap_or(0)
     }
 
-    /// A machine with `sockets` memory domains and `per_socket` units each, plus an optional
-    /// non-coherent accelerator domain. Link constants are **modelled**, not measured --
-    /// re-derive them per host before trusting any result that depends on them.
     #[must_use]
     pub fn synthetic(sockets: usize, per_socket: usize, dram_per_socket: u64) -> Self {
         let mut units = Vec::new();
@@ -139,8 +123,6 @@ impl Topology {
                 links.push(if u.home == d.id {
                     Link::local(1.0 / 28.0)
                 } else {
-                    // Cross-socket: UPI/Infinity-Fabric class -- coherent, but ~2x the
-                    // per-byte cost and a real hop latency.
                     Link {
                         latency_ns: 120,
                         ns_per_byte: 1.0 / 14.0,
@@ -154,9 +136,6 @@ impl Topology {
 }
 
 impl Topology {
-    /// Probe the host. Reports what the machine actually exposes -- which on a unified-memory
-    /// laptop is one memory domain and two compute clusters, and on a multi-socket server is
-    /// the kernel's NUMA node set with its own distance matrix.
     #[must_use]
     pub fn discover() -> Self {
         use crate::plat::{numa_nodes, sysctl_u64};
@@ -209,8 +188,6 @@ impl Topology {
             }
         }
 
-        // Kernel distances are relative (10 == local); scale them against a local link until
-        // the real per-byte costs are measured on the host.
         let mut links = Vec::with_capacity(units.len() * domains.len());
         for u in &units {
             for d in &domains {
@@ -230,19 +207,14 @@ impl Topology {
     }
 }
 
-/// How far apart two nodes are. The constants below are **modelled**, not measured -- this
-/// host is a laptop. They are round numbers from published cloud-provider latency floors and
-/// should be replaced with probe data before any result that depends on them is trusted. The
-/// per-crossing *boundary* cost added on top of these is measured (see `crate::boundary`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Distance {
-    /// Same host, different socket. Coherent: reachable by load/store.
     Socket,
-    /// Same rack, one leaf switch.
+
     Rack,
-    /// Same region, different availability zone.
+
     Zone,
-    /// Different region.
+
     Region,
 }
 
@@ -257,8 +229,6 @@ impl Distance {
         }
     }
 
-    /// Inverse bandwidth. A rack link is 25 `GbE`; a zone link is metered lower; a region link
-    /// is lower still and is the one where bulk state movement stops being an option.
     #[must_use]
     pub fn ns_per_byte(self) -> f64 {
         match self {
@@ -306,9 +276,6 @@ impl std::str::FromStr for Distance {
 }
 
 impl Topology {
-    /// A cluster of separate hosts at a given distance. One memory domain per node, because
-    /// a node's DRAM is the unit another node cannot address: crossing is a copy, and the
-    /// copy is charged the measured transport tax on top of the modelled link.
     #[must_use]
     pub fn cluster(
         nodes: usize,

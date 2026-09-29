@@ -1,3 +1,5 @@
+mod belief_cmd;
+
 use clap::{Parser, Subcommand};
 use polyphonic::admit::Reserve;
 use polyphonic::arms::{Budget, Correction, EngineArm, Report, Trial, mean_ms, run, run_on, trace};
@@ -168,6 +170,8 @@ enum Cmd {
         p3: Correct,
         #[command(flatten)]
         bits: ClusterBits,
+        #[command(flatten)]
+        belief: BeliefArgs,
     },
 
     /// One model host and one agent-framework host, swept from same-socket to cross-region.
@@ -342,6 +346,36 @@ enum Cmd {
         p3: Correct,
     },
 
+    /// What routing quality costs when residency is a lossy belief: phase-4.md §4.10's sweeps.
+    /// Charges no control crossing, so every number is reproducible from the seed
+    Belief {
+        #[arg(long, default_value_t = 4)]
+        nodes: usize,
+        #[arg(long, default_value_t = 3)]
+        units_per_node: usize,
+        #[arg(long, default_value = "16GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        #[arg(long, default_value = "32GiB", value_parser = parse_bytes)]
+        dram: u64,
+        #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
+        nvme: u64,
+        #[arg(long, default_value_t = 15_000)]
+        ops: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value_t = 250.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 0.10)]
+        fanout: f64,
+        /// Sections to run, comma-separated: gate, lag, loss, silence, calibration, gossip,
+        /// observables, slo
+        #[arg(
+            long,
+            default_value = "gate,lag,loss,silence,calibration,gossip,observables,slo"
+        )]
+        sections: String,
+    },
+
     /// The price of the engine boundary: phase-3.md §4.11's sweeps, per class and at p99.
     /// Charges no control crossing, so every number is reproducible from the seed
     Price {
@@ -403,6 +437,134 @@ struct Correct {
     /// Partition per node, overriding --kv-scale
     #[arg(long, value_parser = parse_bytes)]
     kv_partition: Option<u64>,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum RecoveryArg {
+    Replay,
+    Periodic,
+    None,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum LoadArg {
+    Path,
+    Stream,
+    StreamPlusDispatch,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum ScoringArg {
+    FaceValue,
+    Expected,
+    Quantile,
+    Slo,
+}
+
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct BeliefArgs {
+    /// Router reads engine KV through a lossy event stream instead of the truth (needs
+    /// --engine-cache and --rate; phase-4.md)
+    #[arg(long)]
+    belief: bool,
+    /// Fraction of engine step batches dropped in transit
+    #[arg(long, default_value_t = 0.0)]
+    loss: f64,
+    /// How a dropped batch is recovered
+    #[arg(long, value_enum, default_value_t = RecoveryArg::Replay)]
+    recovery: RecoveryArg,
+    /// Seconds each node's stream goes silent, one staggered episode per node
+    #[arg(long, default_value_t = 0.0)]
+    silence: f64,
+    /// How the score prices a believed block
+    #[arg(long, value_enum, default_value_t = ScoringArg::FaceValue)]
+    scoring: ScoringArg,
+    /// Survival a block needs to count as present under --scoring quantile
+    #[arg(long, default_value_t = 0.9)]
+    quantile: f64,
+    /// Where the score reads engine occupancy: the router's own in-flight count, or the stream
+    #[arg(long, value_enum, default_value_t = LoadArg::Path)]
+    load: LoadArg,
+    /// The score sees the observed mean output length, not the exact one
+    #[arg(long)]
+    observables: bool,
+    /// Fraction of sessions that declare a throughput objective instead of an interactive one
+    #[arg(long, default_value_t = 0.0)]
+    throughput: f64,
+    /// An instantaneous, lossless channel: the gate, where the belief must equal the truth
+    #[arg(long)]
+    exact: bool,
+}
+
+impl BeliefArgs {
+    const OFF: Self = Self {
+        belief: false,
+        loss: 0.0,
+        recovery: RecoveryArg::Replay,
+        silence: 0.0,
+        scoring: ScoringArg::FaceValue,
+        quantile: 0.9,
+        load: LoadArg::Path,
+        observables: false,
+        throughput: 0.0,
+        exact: false,
+    };
+
+    fn scoring(self) -> polyphonic::belief::Scoring {
+        use polyphonic::belief::Scoring;
+        match self.scoring {
+            ScoringArg::FaceValue => Scoring::FaceValue,
+            ScoringArg::Expected => Scoring::Expected,
+            ScoringArg::Quantile => Scoring::Quantile(self.quantile),
+            ScoringArg::Slo => Scoring::Slo,
+        }
+    }
+
+    fn conditions(
+        self,
+        nodes: usize,
+        lag_ns: u64,
+        span_ns: u64,
+        seed: u64,
+    ) -> polyphonic::belief::Conditions {
+        use polyphonic::belief::{Conditions, Episode, LoadSource, Recovery};
+        if self.exact {
+            return Conditions::exact();
+        }
+        let duration = (self.silence * 1e9) as u64;
+        let episodes = if duration == 0 {
+            Vec::new()
+        } else {
+            (0..nodes)
+                .map(|node| {
+                    let from_ns = span_ns * (node as u64 + 1) / (nodes as u64 + 1);
+                    Episode {
+                        node,
+                        from_ns,
+                        until_ns: from_ns + duration,
+                    }
+                })
+                .collect()
+        };
+        Conditions {
+            cadence: true,
+            lag_ns,
+            loss: self.loss,
+            recovery: match self.recovery {
+                RecoveryArg::Replay => Recovery::Replay,
+                RecoveryArg::Periodic => Recovery::Periodic,
+                RecoveryArg::None => Recovery::None,
+            },
+            period_ns: 1_000_000_000,
+            episodes,
+            seed,
+            load: match self.load {
+                LoadArg::Path => LoadSource::Path,
+                LoadArg::Stream => LoadSource::Stream,
+                LoadArg::StreamPlusDispatch => LoadSource::StreamPlusDispatch,
+            },
+        }
+    }
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -559,11 +721,7 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Band-lexicographic objective: the most latency-critical band first, the most sacrificial
-/// last, so a configuration is preferred if it improves a higher band even at the cost of a
-/// lower one.
 fn prefer(a: &Report, b: &Report, bands: [u8; BlobKind::N]) -> bool {
-    // Throughput before latency: a config may not buy a faster band by dropping requests.
     let (ga, gb) = (a.goodput(), b.goodput());
     if (ga - gb).abs() > 0.02 {
         return ga > gb;
@@ -612,7 +770,6 @@ fn best_split(t: Trial, hard: bool, step: f64) -> (Report, [f64; BlobKind::N]) {
     for a in 1..n {
         for b in 1..n - a {
             for c in 1..n - a - b {
-                // splits sum to less than n; the remainder is shared slack
                 for d in 1..n - a - b - c {
                     let split = [a, b, c, d].map(|x| x as f64 / n as f64);
                     let r = run_on("", t, Budget::Split { split, hard }, &stream);
@@ -638,17 +795,6 @@ fn memory_label(hbm: u64, dram: u64) -> String {
     }
 }
 
-/// One node's memory for the multi-node experiments.
-///
-/// Split memory budgets each pool for what lives in it. HBM carries KV against weights; the
-/// weights floor holds two whole models, since one model is two 512 MiB shards and a floor
-/// under that thrashes on something no policy can repair. DDR carries function cells and
-/// service heaps, with modest floors for what the accelerator offloads. Unified memory keeps
-/// the one-pool split the earlier rounds used, so the comparison is against what was there.
-/// `hard` partitions every class at its floor: each class owns a fixed slice and may not
-/// borrow from another's. That is what separate orchestrators owning separate budgets looks
-/// like -- an inference gateway with a fixed KV allocation beside a `FaaS` control plane with
-/// a fixed warm pool, neither able to see or lend to the other.
 fn node_memory(hbm: u64, ddr: u64, nvme: u64, bands: [u8; BlobKind::N], hard: bool) -> NodeMemory {
     if hbm == 0 {
         let q = Quota::from_split(ddr, [0.10, 0.12, 0.50, 0.26], bands, hard);
@@ -743,17 +889,8 @@ fn arm_row(r: &Report) {
     );
 }
 
-/// Dependent-load latency over a working set. Bandwidth is memory-bound and identical
-/// across clusters; what differs is how far up the hierarchy a given working set still fits,
-/// which is exactly the "what does this state cost me to reach" question.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "experiment knobs, all surfaced on the CLI"
-)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one table per combination of drain bits"
-)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn placement(
     sockets: usize,
     units_per_socket: usize,
@@ -794,8 +931,6 @@ fn placement(
         println!();
     }
 
-    // Cross-socket links are coherent and cheap, so this is the topology where shipping
-    // state should beat rebuilding it almost always. Whether it does is the point of the row.
     let modes = [
         (Placement::Blind, false),
         (Placement::Sticky, false),
@@ -804,8 +939,7 @@ fn placement(
         (Placement::Scored, false),
         (Placement::Scored, true),
     ];
-    // `phase-3.md` risk 8: a drain moves for the lost KV migration, the spill fix and the
-    // partition at once, so each combination of the two bits gets its own table.
+
     let mut tables = vec![(false, drain_spill)];
     if drain_spill {
         tables.insert(0, (false, false));
@@ -938,8 +1072,7 @@ fn chase_latency(bytes: usize, cluster: polyphonic::plat::Cluster) -> f64 {
         if steps < 2 {
             return f64::NAN;
         }
-        // A single cycle visiting one slot per cache line, in scrambled order so the
-        // prefetcher cannot follow it.
+
         let mut order: Vec<usize> = (0..steps).map(|i| i * stride).collect();
         let mut rng = polyphonic::rng::Rng::new(0x5EED);
         for i in (1..steps).rev() {
@@ -1054,8 +1187,7 @@ fn topology(bytes: u64, iters: u32) {
             format!("{ws_mib} MiB")
         );
     }
-    // Real cluster separation is consistent in direction; ratios that flip sign across
-    // working sets are dispersion, not signal.
+
     let separated = slower >= probes.len() - 1 || faster >= probes.len() - 1;
 
     println!(
@@ -1077,14 +1209,8 @@ fn topology(bytes: u64, iters: u32) {
     }
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "experiment knobs, all independent"
-)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one table per side of the correction"
-)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn flows_report(
     hbm: u64,
     dram: u64,
@@ -1147,8 +1273,7 @@ fn flows_report(
         row(label(mode), &r);
         off.push(r);
     }
-    // `phase-2.md` §1.7, §4.5: eviction quality alone, blind to flows so it is not confounded
-    // with prewarm's own effect -- a signed difference against `blind`, not a regret.
+
     if clairvoyant {
         let trial = Trial {
             flows: FlowMode::Blind,
@@ -1161,8 +1286,6 @@ fn flows_report(
         return;
     }
 
-    // `phase-3.md` §1.8, P6: announce with its KV half removed, on the ledger's own side of
-    // the bit, splits the published margin by class before the correction changes anything.
     let host_only = run(
         "",
         Trial {
@@ -1214,10 +1337,7 @@ fn flows_report(
     );
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "experiment knobs, all independent"
-)]
+#[allow(clippy::too_many_arguments)]
 fn volatility_sweep(
     hbm: u64,
     dram: u64,
@@ -1235,10 +1355,6 @@ fn volatility_sweep(
         "volatility", "hard-partition (ms)", "soft-floor (ms)", "advantage"
     );
     if clairvoyant {
-        // `no-floor` is printed beside `clairvoyant` because it is the only budget-matched
-        // comparator: both are `Budget::Open`, so their difference is eviction quality and
-        // nothing else. Against the swept `soft-floor` the same subtraction would be
-        // dominated by budget policy (see `residency_report`).
         print!(
             " {:>16} {:>16} {:>12}",
             "no-floor (ms)", "clairvoyant (ms)", "vs no-floor"
@@ -1273,8 +1389,7 @@ fn volatility_sweep(
             "{v:>10.1} {hm:>18.3} {sm:>16.3} {:>11.1}%",
             100.0 * (hm - sm) / hm
         );
-        // `phase-2.md` §1.7: the open-budget pair, so only eviction quality differs between
-        // the two columns compared. Neither is comparable to the swept arms to their left.
+
         if clairvoyant {
             let t_clair = Trial {
                 policy: Policy::Clairvoyant,
@@ -1306,17 +1421,8 @@ fn volatility_sweep(
     }
 }
 
-/// `phase-1.md` §4.5: print the ownership predicate and the census, so both are
-/// reproducible from a single command rather than quoted from a build log or a table in
-/// a doc.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "experiment knobs, all independent"
-)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "the table, then the census on each side of the bit"
-)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn ownership_report(
     hbm: u64,
     dram: u64,
@@ -1556,14 +1662,8 @@ fn per_req(r: &Report) -> f64 {
     mean_ms(r.total_ns, r.served.iter().sum())
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "experiment knobs, all independent"
-)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one table per published comparison, printed in sequence"
-)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn residency_report(
     hbm: u64,
     dram: u64,
@@ -1620,10 +1720,6 @@ fn residency_report(
         100.0 * (soft.goodput() - hard.goodput())
     );
     if let Some(c) = &clair {
-        // Against `no-floor`, not against `soft-floor`: both run `Budget::Open`, so this
-        // isolates eviction quality, which is the only thing the arm exists to measure.
-        // Dividing by the swept `soft-floor` instead would report the budget-policy gap --
-        // far the larger effect here -- under an eviction-quality label.
         let cm = per_req(c);
         let om = per_req(&open);
         println!(
@@ -1704,10 +1800,7 @@ fn residency_report(
     }
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "one arm per subcommand, nothing else"
-)]
+#[allow(clippy::too_many_lines)]
 fn main() {
     match Cli::parse().cmd {
         Cmd::Residency {
@@ -1756,6 +1849,7 @@ fn main() {
             flow_payload,
             p3,
             bits,
+            belief,
         } => distributed(
             nodes,
             units_per_node,
@@ -1775,6 +1869,7 @@ fn main() {
             flow_payload,
             p3,
             bits,
+            belief,
         ),
         Cmd::CodeReview {
             hbm,
@@ -1922,6 +2017,29 @@ fn main() {
         } => {
             ownership_report(hbm, dram, nvme, ops, seed, bands_of(&bands), p3);
         }
+        Cmd::Belief {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            rate,
+            fanout,
+            sections,
+        } => belief_cmd::run(&belief_cmd::Env {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            rate,
+            fanout,
+            sections,
+        }),
         Cmd::Price {
             nodes,
             units_per_node,
@@ -2002,10 +2120,7 @@ fn boundary(repeat: usize) {
     hook_cost_table(&l);
 }
 
-#[allow(
-    clippy::cast_possible_wrap,
-    reason = "nanosecond counts, nowhere near i64::MAX"
-)]
+#[allow(clippy::cast_possible_wrap)]
 fn step_deltas(l: &polyphonic::boundary::Ladder) {
     use polyphonic::boundary::Boundary;
 
@@ -2062,9 +2177,7 @@ fn step_deltas(l: &polyphonic::boundary::Ladder) {
         let (Some(a), Some(b)) = (at(lo), at(hi)) else {
             continue;
         };
-        // Signed on purpose: if a "later" rung lands cheaper than the one before it (an
-        // ext_proc callout beating gRPC unary, say), that inversion is a finding and
-        // clamping it to zero would hide it.
+
         let delta = b as i64 - a as i64;
         println!(
             "  {what:<38}{:>10.2} us   {:>6.1}x",
@@ -2073,8 +2186,6 @@ fn step_deltas(l: &polyphonic::boundary::Ladder) {
         );
     }
 
-    // Every rung this paragraph divides by has to be present: substituting 0 for a rung
-    // that failed to measure turns the subtractions below into an overflow, not a summary.
     let (Some(total), Some(ring), Some(unix), Some(pipe), Some(tcp)) = (
         at(Boundary::Grpc),
         at(Boundary::Ring),
@@ -2097,16 +2208,11 @@ fn step_deltas(l: &polyphonic::boundary::Ladder) {
     }
 }
 
-/// `N x fixed_ns` is the per-placement tax; `1e9 / (N x fixed_ns)` is the single-thread
-/// decision-rate ceiling it implies -- the form of §2.2's claim that needs no workload, no
-/// `exec_ns`, and no simulator.
 fn hook_cost_table(l: &polyphonic::boundary::Ladder) {
     use polyphonic::boundary::{Boundary, SIZES};
 
     let payload = SIZES[0] as u64;
-    // `Ring` is "threads", not "process": `ring()` spins two threads over one address
-    // space, so this rung prices a cross-core crossing and not an isolation boundary. A
-    // ring between real processes would pay mapping and a second scheduler domain on top.
+
     let rows: [(Boundary, &str); 5] = [
         (Boundary::Native, "none"),
         (Boundary::Wasm, "sandbox"),
@@ -2162,23 +2268,21 @@ struct ClassTally {
     decide: [u64; BlobKind::N],
     ops: [u64; BlobKind::N],
     warm: [u64; BlobKind::N],
-    /// Service time of warm requests only. A warm invocation is the regime where an overhead
-    /// measured in tens of microseconds stops being a rounding error.
+
     warm_ns: [u64; BlobKind::N],
-    /// `owned-and-observed.md` §3.5's acquisition regime, over every served request
-    /// regardless of class -- `Regime::idx`'s four exclusive buckets, summing to `served`.
+
     regime: [u64; polyphonic::oracle::REGIME_COUNT],
     samples: [Vec<u64>; BlobKind::N],
     chat: Vec<u64>,
     stage: Vec<u64>,
     produced: [u64; 2],
+    slo_service: [Vec<u64>; 2],
+    slo_stall: [Vec<u64>; 2],
 }
 
 type ClassRow<'a> = (&'a str, ClassTally);
 type ClassRows<'a> = [ClassRow<'a>];
 
-/// Service time is the denominator that matters: an overhead is only ever a fraction of the
-/// work it decorates, and a warm invocation has almost no work.
 fn class_table(rows: &ClassRows<'_>) {
     println!("\n  per class: mean service time (ms) / share spent deciding / warm rate");
     print!("  {:<18}", "arm");
@@ -2203,11 +2307,6 @@ fn class_table(rows: &ClassRows<'_>) {
     regime_table(rows);
 }
 
-/// `owned-and-observed.md` §3.5: how a served request's state was actually acquired -- resident
-/// already, waited for a decode slot, fetched over a link, or rebuilt locally. Exclusive and
-/// exhaustive over the same requests `class_table` reports, so the four shares sum to 100%
-/// (modulo rounding), unlike the materialisation counters `state_terms` prints, which are per
-/// blob and can exceed the request count.
 fn regime_table(rows: &ClassRows<'_>) {
     use polyphonic::oracle::Regime;
     println!("  acquisition regime (share of served requests):");
@@ -2237,9 +2336,7 @@ struct Arm {
     placement: Placement,
     flow: bool,
     control: Control,
-    /// May a node pull missing state off a peer instead of rebuilding it? Held apart from
-    /// placement so the two can be attributed separately: one decides where work runs, the
-    /// other decides how its state gets there once that is settled.
+
     transfer: bool,
 }
 
@@ -2293,13 +2390,9 @@ fn distributed_arms(gossip_period: u64) -> Vec<Arm> {
     ]
 }
 
-/// How the three acquisition routes actually split, what the engine did with the load, and
-/// how fan-outs and their tool calls were placed. Printed for every arm because an arm that never
-/// fetches and an arm that cannot fetch produce the same stall number for opposite reasons.
 fn state_terms(mach: &polyphonic::machine::Machine, served: u64) {
     let pct = |n: u64| 100.0 * n as f64 / served.max(1) as f64;
-    // Shares of materialisations, not of requests: a request whose chain was already
-    // resident acquired nothing, and counting it would hide the split this line is for.
+
     let acts = (mach.fetches + mach.rebuilds).max(1) as f64;
     print!(
         "{:<22} acquired: {:.1}% fetched ({:.1} GiB), {:.1}% rebuilt, {:.1}% stale",
@@ -2310,8 +2403,6 @@ fn state_terms(mach: &polyphonic::machine::Machine, served: u64) {
         pct(mach.stale_fetches),
     );
     if mach.mean_batch() > 0.0 {
-        // Per decode rather than as a share of stall: a fan-out's stall is its slowest
-        // agent's, but every agent queued, so the share stops meaning anything once agents run.
         print!(
             "; batch {:.1}, queue {:.2} ms/decode, {:.1}% of decodes arrived saturated",
             mach.mean_batch(),
@@ -2337,8 +2428,6 @@ fn state_terms(mach: &polyphonic::machine::Machine, served: u64) {
     }
 }
 
-/// Mean spread of each term across candidate nodes. An argmin is decided by spread alone, so
-/// this is what says whether a term can ever outvote another one.
 fn term_spread(mach: &polyphonic::machine::Machine) {
     use polyphonic::machine::TERM_LABELS;
     let n = mach.scored_decisions.max(1) as f64;
@@ -2366,10 +2455,6 @@ fn score_terms(mach: &polyphonic::machine::Machine, served: u64) {
     );
 }
 
-/// `phase-2.md` §4.8: the regret decomposition, feasibility regret, and coupled % on both
-/// axes. Only meaningful when `Machine::set_regret(true)` was on for this run -- `mach.spans`
-/// is empty otherwise, and this prints a line saying so rather than a table of zeros that
-/// would read as a real measurement.
 fn regret_report(mach: &polyphonic::machine::Machine) {
     if mach.spans.is_empty() {
         println!(
@@ -2455,10 +2540,6 @@ fn cluster_header(
     );
 }
 
-/// Resolve a `--crossing` name against the measured ladder, returning what it was actually
-/// charged at as well as the cost. `wasm` and `extproc` only exist when their features are
-/// compiled in, and the fallback is two orders of magnitude more expensive than either, so
-/// the substitution is named rather than made silently.
 fn crossing_of(
     l: &polyphonic::boundary::Ladder,
     name: &str,
@@ -2506,6 +2587,8 @@ struct Scenario {
     regret: bool,
     p3: Correct,
     bits: ClusterBits,
+    belief: BeliefArgs,
+    lag_ns: u64,
 }
 
 fn distributed_run(
@@ -2523,7 +2606,16 @@ fn distributed_run(
     mach.set_fanout_atomic(true);
     mach.set_regret(sc.regret);
     sc.p3.setup(&mut mach, sc.bits);
-    let workload = polyphonic::work::Workload::with_fanout(sc.seed, sc.ops, 1.0, sc.fanout);
+    mach.set_observables(sc.belief.observables);
+    if sc.belief.belief && memory.kv.is_some() {
+        let span_ns = (sc.ops as f64 / sc.rate.max(f64::MIN_POSITIVE) * 1e9) as u64;
+        let nodes = topo.domains.len();
+        mach.set_belief(sc.belief.conditions(nodes, sc.lag_ns, span_ns, sc.seed));
+        mach.set_scoring(sc.belief.scoring());
+        mach.set_instrument(true);
+    }
+    let workload = polyphonic::work::Workload::with_fanout(sc.seed, sc.ops, 1.0, sc.fanout)
+        .with_throughput(sc.belief.throughput);
     let workload = match sc.flow_payload {
         Some(bytes) => workload.with_flow_payload(bytes),
         None => workload,
@@ -2603,14 +2695,8 @@ fn correction_terms(mach: &polyphonic::machine::Machine, r: &ArmRun, bits: Clust
     println!();
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "experiment knobs, all independent"
-)]
-#[allow(
-    clippy::too_many_lines,
-    reason = "one table per side of the correction"
-)]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn distributed(
     nodes: usize,
     units_per_node: usize,
@@ -2630,9 +2716,14 @@ fn distributed(
     flow_payload: Option<u64>,
     p3: Correct,
     bits: ClusterBits,
+    belief: BeliefArgs,
 ) {
     use polyphonic::topo::{Distance, Topology};
 
+    if belief.belief && !(p3.engine_cache && rate > 0.0) {
+        println!("--belief needs --engine-cache and a positive --rate");
+        return;
+    }
     let ladder = polyphonic::boundary::measure(repeat);
     let Some((crossing, cost)) = crossing_of(&ladder, crossing) else {
         println!("no boundary rung available");
@@ -2659,10 +2750,10 @@ fn distributed(
         regret,
         p3,
         bits,
+        belief,
+        lag_ns: 0,
     };
 
-    // Residency routing and flow co-placement are separate mechanisms that were previously
-    // bundled into one arm. Split so the win can be attributed to one of them.
     let mut warm_seen = [(0u64, 0u64); BlobKind::N];
     let arms = distributed_arms(gossip_period);
 
@@ -2672,6 +2763,10 @@ fn distributed(
             continue;
         };
         let topo = Topology::cluster(nodes, units_per_node, per_node, dist, cost);
+        let sc = Scenario {
+            lag_ns: dist.one_way_ns(),
+            ..sc
+        };
         println!(
             "== {} : {:.0} us hop, {:.2} ns/byte ==",
             dist.label(),
@@ -2722,24 +2817,8 @@ fn distributed(
     crossover(&ladder, cost, &warm_seen);
 }
 
-/// One model host and one agent-framework host, swept from same-socket to cross-region.
-///
-/// The two nodes are deliberately unequal. Node 0 has the accelerator and is the only place a
-/// decode can run. Node 1 has host memory and no engine at all, which is what an agent
-/// framework actually runs on: it holds the orchestrator process and its tool-call cells, and
-/// every reasoning step it wants has to cross the link to node 0 and come back.
-///
-/// `set_tool_anchor(1)` pins the recorded origin of each tool call to the agent host rather
-/// than to wherever the model ran the turn that asked for it. Without it, a tool call's
-/// flow-affinity would pull it toward the accelerator, which is only right when the
-/// orchestrator and the engine share a host -- exactly what this topology says they do not.
-/// Tool calls still *may* ship to node 0 when the score says a warm cell there beats a local
-/// restore; the anchor makes staying home the default, not the only option.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "experiment knobs, all independent"
-)]
-#[allow(clippy::too_many_lines, reason = "one scenario, printed in full")]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn code_review(
     hbm: u64,
     model_ddr: u64,
@@ -2775,8 +2854,7 @@ fn code_review(
     };
 
     let model_mem = node_memory(hbm, model_ddr, nvme / 2, bands, hard_pools);
-    // No accelerator and no engine: `FaaS` cells and service heaps only. Its DDR budget is the
-    // host split with the accelerator classes' floors left open, since neither can land here.
+
     let agent_mem = NodeMemory {
         hbm: 0,
         ddr: agent_ddr,
@@ -2816,8 +2894,7 @@ fn code_review(
             println!("skipping unknown distance {name}");
             continue;
         };
-        // `dram_per_node` only sizes the topology's domain records; the ledger's real budgets
-        // come from `memory_at`, which differs per node.
+
         let topo = Topology::cluster(NODES, units_per_node, model_ddr, dist, cost);
         println!(
             "== {} : {:.0} us hop, {:.2} ns/byte ==",
@@ -2849,9 +2926,7 @@ fn code_review(
             mach.set_tool_anchor(Some(AGENT));
             mach.set_regret(regret);
             p3.setup(&mut mach, bits);
-            // Every reasoning request starts at the agent host and its answer returns there.
-            // The context delta going in is dominated by the last tool result the agent
-            // gathered, so that is what sizes the trip.
+
             mach.set_origin(Some((AGENT, tool_payload)));
             let (t, total, served, offered) = drive(
                 &mut mach,
@@ -2874,9 +2949,7 @@ fn code_review(
             let label = a.label;
             let stall = mean_ms(r.total, r.served);
             let service = mean_ms(r.t.service.iter().sum(), r.served);
-            // A task is "split" when its downstream stage did not run where its upstream did.
-            // Here that is the agent host keeping its own tool call, so the complement is the
-            // share of tool calls that stayed home.
+
             let stages = (mach.split_tasks + mach.joined_tasks).max(1);
             println!(
                 "{label:<22} {service:>11.3}ms {stall:>10.3}ms {:>8.1}% {:>9.3}ms {:>9.1}% \
@@ -2931,9 +3004,6 @@ fn code_review(
     crossover(&ladder, cost, &warm_seen);
 }
 
-/// Run one configured machine over any request stream, tallying per class. Shared by every
-/// experiment so a comparison can never accidentally be between two different accounting
-/// rules; callers build whatever `Workload` shape the scenario calls for.
 fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
     mach: &mut polyphonic::machine::Machine,
     rate: f64,
@@ -2956,6 +3026,10 @@ fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
         t.decide[k] += c.decide_ns;
         t.ops[k] += 1;
         t.samples[k].push(c.service_ns());
+        if k == BlobKind::KvBlock.idx() && req.tokens > 0 {
+            t.slo_service[req.slo.idx()].push(c.service_ns());
+            t.slo_stall[req.slo.idx()].push(c.total_ns());
+        }
         if k == BlobKind::KvBlock.idx() {
             let out: u64 = req.produces.iter().map(|(_, m)| m.bytes).sum();
             if req.completes.is_some() {
@@ -2966,7 +3040,7 @@ fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
                 t.produced[0] += out;
             }
         }
-        // Warm means the ledger had everything: no fetch, no recompute, just the work.
+
         if c.transfer_ns == 0 && c.recompute_ns == 0 {
             t.warm[k] += 1;
             t.warm_ns[k] += c.service_ns();
@@ -2977,12 +3051,6 @@ fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
     (t, total, served, offered)
 }
 
-/// What all-or-nothing fan-out admission is worth, measured rather than argued.
-///
-/// The baseline is the same agents admitted one at a time, which is what a per-request
-/// scheduler does when nobody told it the requests belong together. An orchestrator missing
-/// one agent cannot resume, so every agent that did run was work for nothing -- and it ran on
-/// engines and memory that other requests needed.
 fn fanout_admission(topo: &polyphonic::topo::Topology, memory: NodeMemory, sc: Scenario) {
     if sc.fanout <= 0.0 {
         return;
@@ -3220,10 +3288,7 @@ fn signed(off: f64, on: f64) -> f64 {
     100.0 * (on - off) / off.abs().max(f64::MIN_POSITIVE)
 }
 
-#[allow(
-    clippy::too_many_lines,
-    reason = "six sweeps, printed in the order phase-3.md lists them"
-)]
+#[allow(clippy::too_many_lines)]
 fn price(a: &PriceArgs) {
     use polyphonic::topo::{Distance, Topology};
     let Ok(dist) = a.distance.trim().parse::<Distance>() else {
@@ -3525,6 +3590,8 @@ fn price(a: &PriceArgs) {
                 shared_l2: None,
                 no_displacement: false,
             },
+            belief: BeliefArgs::OFF,
+            lag_ns: 0,
         };
         let cell = |p3: Correct| -> String {
             let mut out = Vec::with_capacity(2);
@@ -3609,9 +3676,6 @@ fn price(a: &PriceArgs) {
     }
 }
 
-/// The boundary tax is not a fixed overhead, it is a fraction -- and the fraction depends
-/// entirely on how long the work being scheduled takes. The ladder is measured; this only
-/// divides it by service times spanning a warm `FaaS` invocation to a full prefill.
 fn crossover(
     ladder: &polyphonic::boundary::Ladder,
     grpc: polyphonic::boundary::Cost,
@@ -3662,21 +3726,12 @@ fn crossover(
     }
 }
 
-/// One arm of the data-path sweep: which `DataPath` it runs, and the hook crossing it
-/// charges. `phase-8.md` §1.3 keeps the sidecar's two deployment shapes -- a stream it gets
-/// to keep open, and Envoy's documented default of a stream per request -- apart from the
-/// per-candidate multiplier `SidecarPluggable` prices, because charging the second to the
-/// first would overstate a deployed sidecar's tax by the candidate count.
 struct PathArm {
     label: &'static str,
     path: DataPath,
     hook: polyphonic::boundary::Cost,
 }
 
-/// The arms, or `None` if the `ext_proc` rung they all need was not built (needs
-/// `--features grpc`). The stream-per-request arm needs a second measurement -- a single
-/// figure from `Ladder::extra`, produced by a runtime probe that can fail on its own -- so
-/// its absence drops that one row rather than the whole experiment.
 fn path_arms(l: &polyphonic::boundary::Ladder) -> Option<Vec<PathArm>> {
     use polyphonic::boundary::{Boundary, Cost, EXTPROC_STREAM_OPEN};
     let reuse = l.get(Boundary::ExtProc)?;
@@ -3712,10 +3767,6 @@ fn path_arms(l: &polyphonic::boundary::Ladder) -> Option<Vec<PathArm>> {
     Some(arms)
 }
 
-/// One arm's outcome: what the tax, crossover and fleet-ceiling tables are computed from.
-/// `total_ns` is the sum `drive()` already reports, which is `Cost::total_ns()` summed over
-/// every served request -- the routing hook and the dispatch hop are inside it, execution is
-/// not, so a difference between two arms' means is exactly their tax difference.
 struct PathRun {
     served: u64,
     total_ns: u64,
@@ -3733,29 +3784,16 @@ impl PathRun {
         self.candidates_seen as f64 / self.decisions.max(1) as f64
     }
 
-    /// Dispatches per served request -- not always 1: a gang's agents and their tool calls
-    /// each dispatch separately while the gang itself is one served item.
     fn dispatch_mult(&self) -> f64 {
         self.dispatches as f64 / self.served.max(1) as f64
     }
 
-    /// Mean stall per served request. Every tax in the two tables below is a difference of
-    /// two of these, so it is defined once rather than per table.
     fn mean_ns(&self) -> f64 {
         self.total_ns as f64 / self.served.max(1) as f64
     }
 }
 
-/// `docs/phase-8.md`: the data path as an arm. Every row runs the same trace through the
-/// same placement policy at the same control model (`Unified` -- §3.1 of the plan explains
-/// why mixing this with `Control::Query` would double-charge a crossing, since llm-d's
-/// Endpoint Picker holds its own residency view and still pays a callout to reach it). The
-/// only thing that varies is who pays the routing hook and the dispatch hop, and what each
-/// costs.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "experiment knobs, all independent"
-)]
+#[allow(clippy::too_many_arguments)]
 fn data_path(
     nodes: usize,
     units_per_node: usize,
@@ -3775,9 +3813,6 @@ fn data_path(
     use polyphonic::machine::Machine;
     use polyphonic::topo::{Distance, Topology};
 
-    // Everything that can be checked without the ladder is checked before it: `measure`
-    // spends seconds per repetition on microbenchmarks and gRPC servers, and a typo in a
-    // flag should not cost a full run to discover.
     let Ok(dist) = distance.trim().parse::<Distance>() else {
         println!("unknown distance {distance}");
         return;
@@ -3835,8 +3870,7 @@ fn data_path(
         "{:<28}{:>13}{:>12}{:>8}{:>9}",
         "arm", "service/req", "stall/req", "served", "d"
     );
-    // The trace is deterministic in `seed` and identical for every arm; generating it once
-    // keeps three quarters of the blake3 chaining out of the loop.
+
     let trace: Vec<_> = polyphonic::work::Workload::with_fanout(seed, ops, 1.0, fanout).collect();
     let mut class_rows: Vec<ClassRow<'static>> = Vec::new();
     let mut runs: Vec<PathRun> = Vec::new();
@@ -3879,10 +3913,6 @@ fn data_path(
     fleet_ceiling_table(&ladder, rate, nodes, runs[0].d());
 }
 
-/// One arm's tax, priced two ways. `bound_ns` is the closed form from the measured ladder,
-/// `realized_ns` the difference of two simulated means. `phase-8.md` §4.5 requires both:
-/// "P1 is the assertion that they agree; printing only one of them would make P1
-/// unfalsifiable."
 struct PathTax {
     label: &'static str,
     hook_label: String,
@@ -3892,8 +3922,6 @@ struct PathTax {
     realized_ns: f64,
 }
 
-/// Price every non-baseline arm against `runs[0]`, once, so the tax the tax table prints and
-/// the tax the crossover table divides by cannot drift apart.
 fn path_taxes(
     arms: &[PathArm],
     runs: &[PathRun],
@@ -3932,19 +3960,6 @@ fn path_taxes(
         .collect()
 }
 
-/// The control-plane tax each sidecar arm pays: `d`, `disp` (dispatches per served request,
-/// exactly tracked because it is not always 1 -- a gang's agents and their tool calls each
-/// dispatch separately) and `hook x d + dispatch-delta x disp` as an *upper bound*, next to
-/// the simulator's own realized mean -- `phase-8.md`'s P1 check.
-///
-/// The bound is not tight when `fanout > 0`, and that gap is itself a finding, not noise:
-/// `serve_gang` reports only its slowest agent's cost (every agent runs, but the orchestrator
-/// waits on the one that gates it), so every agent still pays its own dispatch charge --
-/// counted in `disp` -- while only the slowest agent's charge reaches the stall that feeds
-/// `total_ns`. A second, opposite gap sits underneath it: `serve_gang` charges one routing
-/// hook for a fan-out whose agents `place_agent` scores one argmin at a time, so the hook
-/// side of `d` is *under*-counted by the agent multiplier. Both scale with the fan-out rate,
-/// so the gap alone cannot tell them apart.
 fn tax_table(taxes: &[PathTax]) {
     println!(
         "\ncontrol-plane tax, from the measured ladder (parse term dropped -- phase-8.md §1.2)\n"
@@ -3966,17 +3981,6 @@ fn tax_table(taxes: &[PathTax]) {
     }
 }
 
-/// The crossover against the integrated path: the service time at which each arm's tax
-/// passes 5% and 1% of a request. `S* = T x (1/f - 1)` for a per-request tax `T` -- §1.1 of
-/// `phase-8.md`: there is no mechanism for the simulator to produce anything but this, so the
-/// number needs no sweep to compute, only to report from the realized `T` the tax table
-/// printed. Both tables read the same `PathTax`, so the tax quoted and the tax divided by
-/// cannot drift apart.
-///
-/// `--tax-us` substitutes a hand-supplied `T` for a host this prototype has never measured.
-/// It is read as a **per-request** tax, since that is what the formula divides by -- a
-/// per-crossing seam cost measured elsewhere has to be scaled by this workload's own
-/// multipliers first, which is why `d` is printed with the table rather than applied silently.
 fn crossover_table(taxes: &[PathTax], tax_us: Option<f64>, d: f64) {
     println!(
         "\ncrossover against the integrated path (S* = T x (1/f - 1), at d = {d:.2} decisions/request)\n"
@@ -4028,12 +4032,6 @@ fn format_ns_label(ns: f64) -> String {
     }
 }
 
-/// The fleet size at which one unsharded scheduler saturates: `N_max = sqrt(1e9 / (lambda x d
-/// x c))` for a hook costing `c` ns/crossing at `phase-8.md` §1.4/§4.6's 64 B payload. Two
-/// assumptions are printed with it, because a reader who does not see them will read a
-/// ceiling where there is a design choice: one scheduler thread, and every active node
-/// scored -- sharding or pruning candidates divides the work by the shard count or the prune
-/// ratio instead.
 fn fleet_ceiling_table(l: &polyphonic::boundary::Ladder, rate: f64, nodes: usize, d: f64) {
     use polyphonic::boundary::{Boundary, SIZES};
 

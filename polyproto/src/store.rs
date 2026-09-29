@@ -20,8 +20,6 @@ pub struct Bytes {
 unsafe impl Send for Bytes {}
 
 impl Bytes {
-    /// # Panics
-    /// Panics if `len` rounded up to page alignment overflows a valid `Layout`.
     #[must_use]
     pub fn new(len: usize) -> Self {
         let len = len.next_multiple_of(DIRECT_ALIGN).max(DIRECT_ALIGN);
@@ -39,7 +37,6 @@ impl Bytes {
         self.layout.size()
     }
 
-    /// Always false: an allocation is never zero-length, the minimum is one page.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         false
@@ -115,8 +112,6 @@ pub struct Store {
 }
 
 impl Store {
-    /// # Errors
-    /// Returns the OS error if the backing spill file cannot be created or opened.
     pub fn open(path: &Path, cap: u64) -> std::io::Result<Self> {
         let file = open_direct(path)?;
         Ok(Self {

@@ -5,11 +5,7 @@ use polyphonic::blob::BlobKind;
 use polyphonic::cache::{Hierarchy, NodeMemory, Policy, Quota, accelerated};
 use polyphonic::flow::FlowHint;
 
-#[allow(
-    clippy::pedantic,
-    clippy::result_large_err,
-    reason = "tonic-generated code"
-)]
+#[allow(clippy::pedantic, clippy::result_large_err)]
 pub mod pb {
     tonic::include_proto!("admission");
 }
@@ -24,9 +20,6 @@ const NVME: u64 = 64 << 30;
 const WARMUP_OPS: u64 = 6000;
 const ITERS: usize = 3000;
 
-/// What the ledger would tell a remote asker: the hot set, and what each pool could still give
-/// up. The two pools are separate budgets, so a remote answer has to carry both or it answers
-/// a different question from the in-process one.
 struct Downstream {
     resident: HashSet<[u8; 32]>,
     reclaimable_hbm: u64,
@@ -42,8 +35,6 @@ impl Admission for Downstream {
         let r = req.into_inner();
         let (mut missing_hbm, mut missing_ddr) = (0u64, 0u64);
         for b in &r.downstream {
-            // A malformed id must not silently hash to zeros and report as non-resident:
-            // that answers a different question than the one asked.
             let key: [u8; 32] = b.id.as_slice().try_into().map_err(|_| {
                 tonic::Status::invalid_argument(format!(
                     "blob id must be 32 bytes, got {}",
@@ -86,7 +77,6 @@ fn report(name: &str, mut ns: Vec<u64>) -> u64 {
     p50
 }
 
-/// Build a genuinely populated ledger, and collect the flow hints the gate would query on.
 fn populate() -> (Hierarchy, Vec<FlowHint>, Vec<u64>) {
     let bands = [0u8, 1, 2, 1];
     let mut h = Hierarchy::new(
@@ -151,7 +141,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "admission query", "p50 (us)", "p99 (us)", "p999 (us)"
     );
 
-    // 1. in-process: the ledger answers its own question
     let mut direct = Vec::with_capacity(ITERS);
     for i in 0..ITERS {
         let hint = &hints[i % hints.len()];
@@ -162,7 +151,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let p50_direct = report("in-process (direct call)", direct);
 
-    // 2. real gRPC over TCP loopback: the sidecar/extender shape
     let resident: HashSet<[u8; 32]> = h.hot_ids().map(|id| *id.as_bytes()).collect();
     let svc = Downstream {
         resident,
@@ -202,7 +190,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let p50_rpc = report("gRPC unary (TCP loopback)", rpc);
 
-    // 3. raw loopback echo with the same payload: the transport floor under gRPC
     let floor = raw_tcp_floor(wire_bytes).await?;
     let p50_floor = report("raw TCP echo (same payload)", floor);
 
@@ -216,9 +203,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Does the boundary matter? Only relative to the work each decision governs. `access` is
-/// measured directly; the gRPC column is an extrapolation of what it would cost if each
-/// in-process decision instead crossed a sidecar boundary.
 fn decision_rates(h: &Hierarchy, access_ns: &[u64], p50_rpc: u64) {
     let mut sorted = access_ns.to_vec();
     sorted.sort_unstable();
@@ -249,8 +233,7 @@ async fn raw_tcp_floor(payload_bytes: usize) -> Result<Vec<u64>, Box<dyn std::er
     tokio::spawn(async move {
         let (mut sock, _) = listener.accept().await.expect("accept");
         sock.set_nodelay(true).ok();
-        // Reply once per logical message, not once per read(): a payload split across two
-        // reads would otherwise pre-buffer a reply and make the next RTT look near-zero.
+
         let mut buf = vec![0u8; payload_bytes];
         loop {
             if sock.read_exact(&mut buf).await.is_err() {

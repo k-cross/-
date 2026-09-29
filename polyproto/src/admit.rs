@@ -80,8 +80,6 @@ impl Reservations {
             .sum()
     }
 
-    /// Would `req` fit in `capacity` on top of what is committed here and what `staged`
-    /// fan-out siblings (their block ids, and the bytes they add) will claim?
     #[must_use]
     pub fn admits(
         &self,

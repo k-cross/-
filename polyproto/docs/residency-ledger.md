@@ -1265,6 +1265,54 @@ hop, the seek and the `PCIe` launch once, so two blocks already beat a rebuild.
 8.6-11.6 GiB on the ledger). The effect on stall is arm-dependent and small beside the drain's own:
 `scored + fetch` 16.36 -> 14.60 ms, `scored` 15.03 -> 17.14 ms.
 
+### Belief: what routing costs when residency is lossy
+
+`phase-4.md`, implemented. With `--engine-cache` the router still read the engine's KV exactly
+(`belief` was zero by test). `--belief` replaces that read with a belief fed by the engine's own event
+stream: batches at the engine's step, a one-way hop of the distance's latency, optional loss, and one of
+three recoveries -- replay by sequence number, a periodic snapshot, or none. Every number below is
+`polyphonic belief` (seed 1, 15k ops, no control crossing, scored + fetch, rack unless stated), marked
+against the same run with the exact view. `distributed --belief` runs the same channel across all eleven
+arms and is not reproducible run to run, like the rest of `distributed`.
+
+**The belief costs almost nothing, at every point measured.** Mean service against the exact view:
++0.000% / -0.011% at rack, +0.000% / -0.002% at zone and +0.023% / -0.021% at region (published defaults /
+half the partition with decode output held), with 0.13-0.48% of KV decisions exposed to a phantom at rack
+and 1.5-4.1% at region. Loss to 20% with replay recovery stays within 0.075%; a periodic snapshot within
+0.15%; **no recovery at all within 0.16%**, with the belief wrong about 37% of the time at the published
+partition and 60% at half of it. The regret decomposition agrees: `belief` is 0-1.7k ns/decision here
+against the gossiped arm's 887k. The recovery policy changes how wrong the belief is (0.13% phantom entries
+under replay, 37% under none, at 20% loss) and not what it costs.
+
+**The reason is structural, and the pre-measurements found half of it.** The terms that would have to be
+fooled for the scored arm to concentrate on a quiet node -- `engine` and `congestion` -- read the in-flight
+count, which the integrated router knows exactly because it carries every request and response.
+Silencing a node for 8 s moves almost nothing (its share of KV decisions inside the episode is 26.5% against 24.8% outside under `face-value`, 25.1% against 25.0% under `quantile 0.9`). A router
+that reads load from the stream instead herds or starves depending on the node's load when it went quiet,
+and one that adds its own dispatches to the last report starves the silent node every time (1.6-4.8% of KV
+decisions against ~25%, mean service +3.1% at 8 s). `P(resident)` -- pricing the belief as a probability --
+changes none of the stream-load cases and only removes a 1.5pp attraction on the path.
+
+**The estimator is not calibrated where it would matter.** Close to the diagonal with replay and no loss
+(0.865 predicted, 0.929 realised); **over-confident** where a dropped batch is never recovered (0.959
+predicted, 0.695 realised at half the partition, 5% loss), because the unknown evictions land on the blocks an
+LRU takes first. The chosen node is not worse than the field (0.721 against 0.695), so the argmin is not
+exploiting the miscalibration; it is merely not being hurt by it.
+
+**Gossip.** Engine KV from the channel instead of the snapshot: `scored + fetch, gossiped` within 0.05%; `both,
+gossiped` **+21.1%** at the published partition (676.4 -> 818.9 ms, the staleness was suppressing herding)
+and **-29.6%** at half of it (1047.3 -> 737.7 ms, the staleness was routing onto evicted prefixes). Every
+gossip result above is a result about an informer cache over owned state in one regime.
+
+**RequestView.** The score reading the observed mean output length instead of the exact one moves mean
+service by -0.03% to -0.13% and p99 by up to -0.35%: closing the cheat costs nothing on this workload, where
+output length is independent of everything the router can see, so no estimator can beat the mean here.
+
+**The declared SLO buys nothing a user would see.** `expected`, `quantile 0.9` and `slo` land within 1% of
+each other on service p99 for both classes under 5% loss with no recovery and under 2 s of silence, on three
+seeds. Interactive stall p99 drops off its ~45 ms plateau (to 18-25 ms) only under `slo`, in one of its two
+conditions on each seed and in none of the other twelve cells -- a direction with no measurable size.
+
 ## Method
 
 **On the fairness caveat.** Every comparison above between arms this repository wrote is a delta
@@ -1357,7 +1405,9 @@ caveats. Its Phase 3 has corrected the mistake underneath every memory result he
 *allocated* KV, when the architecture is explicit that an engine like vLLM owns that memory -- as a
 bit rather than a rewrite, and *Engine allocation* above says which results shrank. Budgets
 survived and grew; per-eviction host-DDR arbitration and KV prewarm did not. Phase 4 is next on
-that chain: the router's view of the engine cache becomes a belief rather than a read.
+that chain: the router's view of the engine cache becomes a belief rather than a read. It did, and
+*Belief* above says what that cost: almost nothing, for a structural reason. Phase 5 (retention
+directives) is next.
 
 ## Not built
 
@@ -1401,3 +1451,8 @@ computed.
 | optimistic admission moves its cost onto another class | **class-blind, not class-shifted** — the preempted arrival pays; chat turns and task stages lose p99 about equally |
 | a better block manager is worth asking for | ~3% of stall at 17–23pp KV hit, at every partition size — more than the partition's size moves the A/B below 1x |
 | shared L2 tier | fires on KV within a rack, on weights only from zone out |
+| the router's view of the engine's KV can be a lossy belief | **yes, at almost no cost** -- within 0.16% of the exact view at 20% batch loss with no recovery, within 0.075% with replay; the belief is wrong 37-60% of the time in the worst cell and it does not show |
+| silence reads as calm and herds the router onto a quiet node | **not on the integrated path**, where load comes from the traffic; a stream-fed load herds or starves by luck, and adding the router's own dispatches starves the node (+3.1% service at 8 s) |
+| `P(resident)` as `1 - V/B` is calibrated | **no** -- near the diagonal with replay, over-confident (0.96 predicted, 0.70 realised) with unrecovered loss |
+| the gossip result is about engine telemetry | **retracted** -- it was about an informer cache over owned state in one regime; engine KV from the channel moves residency-greedy +21% at the published partition and -30% at half of it |
+| the score can stop reading the exact output length | **yes** -- the observed mean is within 0.13% and better; a quantile of it is not wanted |
