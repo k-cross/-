@@ -1554,6 +1554,8 @@ sequence.
 
 ### Phase 5 -- Influence: retention directives
 
+Implementation plan: [`phase-5.md`](phase-5.md), which states its predictions before the run.
+
 Emit RFC-0001-shaped directives on the request path, with two engine arms: honours, and ignores.
 Directives are advisory by construction -- §1 removed any ability to hold a block against the
 engine's will -- so the `ignores` arm is not a pessimistic sweep, it is §3.6's third divergence
