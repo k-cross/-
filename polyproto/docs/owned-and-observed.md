@@ -80,28 +80,82 @@ and a deadline on any action it drives. §3.7 is where the first two stop being 
 a decision -- as one object, since a residency belief's confidence *is* its decay -- which today
 they do not. The third is §3.3.
 
+### Owned is not durable
+
+The three categories say who decided a fact and how fresh it is. They do not say whether it must
+survive a crash, and "owned" reads as though it must. Kubernetes answers that once, for everything
+-- every object durable, linearizable and watched in etcd -- and that is the answer that fails
+under churn. Google's AX moved task state out of custom resources into Redis because "storing
+millions of short-lived tasks as Kubernetes CRDs pushes etcd past its comfort zone (single-digit GB
+storage limits, write-rate bottlenecks, control plane degradation)"
+([`DESIGN.md`](https://github.com/google/ax/blob/main/DESIGN.md)); Kyverno moved its policy
+reports into a separate database for the same reason. Neither bought a faster etcd. Each moved one
+class of state into a store chosen for that class, in its own failure domain.
+
+So durability is a column of its own, with one value per clock:
+
+| durability | changes | holds | lives in |
+|---|---|---|---|
+| **soft** | per decision | admission, placement, flow graph, directives with a TTL, staged reservations, all inferred state | process memory, rebuilt from node agents and engines on restart |
+| **logged** | per session transition | `SideEffecting` intents, suspended-session records, approval pauses, per-tenant usage | an append-only log in its own failure domain: a second FoundationDB cluster (§8) |
+| **record** | per provisioning change | membership and leases, quotas, tenancy, partition sizes, model placement | the system of record (§8), strictly serializable, low rate |
+
+§2.2's rule decides the first row. A consensus commit costs at least an fsync and a quorum round
+trip -- hundreds of microseconds at best and low milliseconds typically, **on published figures,
+not measured here** -- roughly 5-100x the 44-75 us per request §2.3 measures for the sidecar path
+this document removes. Group commit raises throughput, not latency; writing behind removes the
+latency and leaves process memory as the authority, which is the soft tier by another name. And
+§2.6 puts the data path in the scheduler's address space, so per-request state is **fate-shared**
+with the connections it describes: persisting it records requests that died with the process.
+
+Throughput is not the objection -- a scale-out store absorbs the write rate. Latency on the path
+is, and so is blast radius: one store holding every row lets a surge of session state take
+membership and quotas down with it, which is the half of the etcd lesson a faster store does not
+touch.
+
+**`authority` is the per-request classifier** (§4). `ReadOnly` and `DraftOnly` are defined by zero
+rollback and zero compensation, so after a crash they are simply redone. `SideEffecting` is the one
+class that writes to the log before dispatch, and it can afford to: the external action dwarfs a
+commit, and a side effect run twice is a correctness failure rather than a cost.
+
+**The column assumes a failure model, which this document had not stated.** A scheduler crash loses
+soft state and the streams in flight through it; restart rebuilds residency and load from node
+agents and engines, which hold the facts, and node agents' backpressure (§2.4) bounds what a
+rebuilding scheduler can over-admit. An engine crash drops its KV, so every belief about it goes to
+`P(resident) = 0` and its in-flight requests face §2.6's retry question. A node is dead when its
+lease in the record expires -- which makes liveness **owned**, not observed: "is this replica still
+serving" is a correctness question by the second test above, and two schedulers must never hand out
+one node's capacity. Utilisation and power stay observed.
+
+The rates in the table are asserted, not measured. Counting owned-state changes per tier per
+simulated second -- mostly from counters the runs already keep, `decisions` and `dispatches` among
+them -- is what would check that the tiers sit orders of magnitude apart.
+
 ### Where polyproto's state falls
 
-| state | category | where it is now |
-|---|---|---|
-| per-blob residency, host classes (`Snapshot`, `ServiceHeap`) | **owned** | `TierPool.entries` |
-| per-blob residency, engine classes (`KvBlock`, `WeightShard`, offloaded KV) | **inferred** | **wrong** -- `TierPool.entries` claims it as owned |
-| quotas: floors, bands, limits | **owned** | `Quota`, operator config |
-| admission outcome, refusals | **owned** | `Admission`, `TierPool.refused` |
-| gang membership, staged reservations | **owned** | `staged_*`, `cancelled` |
-| retention directives it issued | **owned** | `Entry.expect` today; needs `retain_until` |
-| placement decisions, flow graph | **owned** | `upstream`, `tool_anchor`, `origin` |
-| shadow price per pool | **inferred** | `TierPool::marginal_price` (already an estimate) |
-| regret rate per class | **inferred** | `TierPool::regret_rate` (already learned, ghost list) |
-| per-tool re-arrival gap | **inferred** | **missing** -- `sched_lm`'s `ToolGapIndex` |
-| P(turn calls a tool), which tool, payload | **inferred** | **cheated** -- `FlowHint.probability` is `1.0` |
-| output length of a decode | **inferred** | **cheated** -- score reads exact `req.tokens` |
-| peer residency | **inferred** | **cheated** -- `Gossip` gives a stale *exact* set |
-| tenant identity and per-tenant quota | **owned** | **missing** -- §3.8 |
-| workload class | **inferred** | **missing** -- §4 |
-| realised TTFT / ITL, batch occupancy | **observed** | modelled internally instead |
-| engine prefix-cache hit rate | **observed** | **conflated** with owned residency |
-| node health, utilisation, power | **observed** | absent |
+| state | category | durability | where it is now |
+|---|---|---|---|
+| per-blob residency, host classes (`Snapshot`, `ServiceHeap`) | **owned** | soft | `TierPool.entries` |
+| per-blob residency, engine classes (`KvBlock`, `WeightShard`, offloaded KV) | **inferred** | soft | **wrong** -- `TierPool.entries` claims it as owned |
+| quotas: floors, bands, limits | **owned** | record | `Quota`, operator config |
+| admission outcome, refusals | **owned** | soft | `Admission`, `TierPool.refused` |
+| gang membership, staged reservations | **owned** | soft; logged when `SideEffecting` | `staged_*`, `cancelled` |
+| retention directives it issued | **owned** | soft | `Entry.expect` today; needs `retain_until` |
+| placement decisions, flow graph | **owned** | soft | `upstream`, `tool_anchor`, `origin` |
+| partition sizes, model placement | **owned** | record | fixed config (Phase 3); a decision in Phase 6 |
+| side-effect intents, suspended sessions, approval pauses | **owned** | logged | **missing** -- §4 |
+| shadow price per pool | **inferred** | soft | `TierPool::marginal_price` (already an estimate) |
+| regret rate per class | **inferred** | soft | `TierPool::regret_rate` (already learned, ghost list) |
+| per-tool re-arrival gap | **inferred** | soft | **missing** -- `sched_lm`'s `ToolGapIndex` |
+| P(turn calls a tool), which tool, payload | **inferred** | soft | **cheated** -- `FlowHint.probability` is `1.0` |
+| output length of a decode | **inferred** | soft | **cheated** -- score reads exact `req.tokens` |
+| peer residency | **inferred** | soft | **cheated** -- `Gossip` gives a stale *exact* set |
+| tenant identity and per-tenant quota | **owned** | record | **missing** -- §3.8 |
+| workload class | **inferred** | soft | **missing** -- §4 |
+| node liveness and membership | **owned** | record | **missing** -- a lease; see *Owned is not durable* |
+| realised TTFT / ITL, batch occupancy | **observed** | -- | modelled internally instead |
+| engine prefix-cache hit rate | **observed** | -- | **conflated** with owned residency |
+| node utilisation, power | **observed** | -- | absent |
 
 Two entries are already inferred, for good reasons. `marginal_price` is a deliberate estimate
 because a faithful dry run costs as much as the eviction it prices. `regret_rate` is measured from
@@ -501,14 +555,21 @@ about speed.
 Polyproto still has two processes, a global scheduler and a node agent. What changes is where the
 seam falls, and it falls where §1 puts the memory seam:
 
-| | §1: who owns the bytes | §2: who owns the decision |
-|---|---|---|
-| **macro / global** | HBM partition sizing, model placement | cross-node routing, P/D pairing, gang admission |
-| **micro / local** | KV block allocation and eviction (engine) | dispatch, backpressure, policy hooks (node agent) |
+| | clock | §1: who owns the bytes | §2: who owns the decision | state (§1) |
+|---|---|---|---|---|
+| **provisioning** | seconds to minutes | HBM partition sizing, model placement | replica counts, the P:D ratio, which tenants share a replica set | record |
+| **routing** | per request | -- | cross-node routing, P/D pairing, gang admission | soft |
+| **local** | per request, per step | KV block allocation and eviction (engine) | dispatch, backpressure, policy hooks (node agent) | soft, and the engine's own |
 
 A decision goes to the tier holding the state it needs, and the tier boundary is crossed at the
 rate of the **coarser** tier. The sidecar pattern inverts this: it cuts the path at a seam every
 request must cross, rather than at one only globally-informed decisions cross.
+
+This table had two rows, and its global row held two clocks: partition sizing moves over seconds to
+minutes, §1's provisioning loop, while routing moves per request. §1's two control loops already
+told them apart. The table has to as well, because the clock decides where the state lives:
+provisioning and routing can share the global process, but only provisioning writes to the system
+of record, and nothing on the request path waits for it.
 
 ### 2.5 Prefill/decode: pair the request, size the fleet
 
@@ -524,7 +585,7 @@ applied to a gang of two with a direction.
 **Per fleet**, prefill is FLOPs-bound and decode is memory-bandwidth-bound, so the right **P:D
 replica ratio** shifts with traffic shape: long prompts and short outputs want more prefill
 capacity; agent turns with short prompts and long generations want less. That is a slow capacity
-decision, so it sits in §2.4's macro tier and in Phase 6. Per-request pairing without it only
+decision, so it sits in §2.4's provisioning tier and in Phase 6. Per-request pairing without it only
 distributes the imbalance evenly.
 
 The obvious objection: §1 removed the ability to refuse a per-block KV admission, so how can a pair
@@ -944,8 +1005,8 @@ So fairness on KV is purchasable only in units of partition, at three named pric
 weights, lost cross-tenant prefix sharing, and narrower batches. There is no hint-shaped
 workaround. And because the quantum is that large, the realistic unit below a handful of tenants
 per model is a **replica**, which makes tenancy a question of *which tenants share a replica set* --
-a routing and capacity decision, in §2.4's macro tier, and the reason Phase 6 settles isolation and
-sizing in one act rather than two.
+a routing and capacity decision, in §2.4's provisioning tier, and the reason Phase 6 settles
+isolation and sizing in one act rather than two.
 
 **The quota axis is missing.** `Quota` is per *class*: `band`, `floor` and `limit` are all
 `[_; BlobKind::N]`. Soft tenancy needs a second axis per tenant, and the two interact the standard
@@ -1374,6 +1435,103 @@ Worst first.
 - **Weights become orchestration rather than caching** (Phase 6) -- more realistic, and a capability
   no arm has today.
 
+### The system of record
+
+**FoundationDB**, chosen over TiKV, etcd and CockroachDB against five requirements -- four from
+§1's durability tiers, one from Oxide's experience -- rather than from a benchmark:
+
+1. **Strict serializability for invariants.** The record holds quotas, capacity and membership, the
+   tier whose job is invariants. Under snapshot isolation a quota check write-skews: two admissions
+   read a tenant's usage, both see room, both write different keys, both commit. FoundationDB's
+   read conflict ranges reject the second by default; TiKV's Percolator transactions are snapshot
+   isolation and need the read keys locked (`lock_keys`) or funnelled through a shared counter.
+2. **Small values, bytes elsewhere.** A record row is a quota, a lease, a partition size. Anything
+   larger -- WASM extension modules, model manifests, snapshots -- goes to object storage with a
+   content hash in the record, as Agent Substrate does with its snapshots. FoundationDB's 100 KB
+   value limit then never binds, and a value near it is a design smell.
+3. **No transaction spans a physical action.** Loading weights takes 5-30+ seconds (§1) and moving
+   a tenant between replica sets longer, and no store's transaction spans either. Macro actions are
+   state machines of short transactions, and the Phase 6 planner reads, computes outside any
+   transaction, and commits behind a version check -- FoundationDB's own advice for its 5-second
+   limit, and the pattern Kubernetes already follows with `resourceVersion` on etcd's narrower
+   transactions.
+4. **Leases built in a layer.** FoundationDB has no leases and watches single keys: membership
+   leases use read versions as a clock, and change notification is a versionstamped log plus a
+   watch on one key.
+5. **A license its owner has no reason to change.** Apache 2.0, held by an owner with no database
+   business to monetise. CockroachDB's relicensing, below, is the case this rules out.
+
+Two more count against TiKV. Its Rust client describes itself as "not suitable for production use"
+([`client-rust`](https://github.com/tikv/client-rust)) -- the mature client is Go's -- so a Rust
+server's leverage runs the other way for a Rust caller; and without TiDB the application is its own
+MVCC garbage collector. Against etcd the deciding property is **size**, not write rate, which the
+tiers already took out of the record: registrations for agent fleets at Agent Substrate's target of
+hundreds of millions are far past etcd's recommended 8 GB.
+
+Against CockroachDB the evidence is Oxide's. Their
+[RFD 53](https://rfd.shared.oxide.computer/rfd/0053) is the closest published requirements
+document to this record: strong consistency "within a particular scope (e.g., within a datacenter
+or region)", optimistic concurrency "similar to HTTP conditional requests", hands-off operation,
+zero planned downtime, online schema migration. Its design point is the instance lifecycle -- 1.2
+to 1,670 requests per second, ~150 ms per access, ~100 GiB at 1,000 racks -- which is this
+document's record tier with nothing faster beside it, because RFD 53 predates inference and agent
+scheduling as a common control-plane concern. Oxide chose CockroachDB, and the choice has since
+become a fork: Cockroach Labs went proprietary in November 2024, Oxide found the free tier's revenue
+cap and mandatory telemetry "entirely unacceptable", and it now self-maintains 22.1/22.2 and "will
+not upgrade CockroachDB beyond 22.2" ([RFD 508](https://rfd.shared.oxide.computer/rfd/0508)) --
+the maintenance of a database without the fit of one built for them. CockroachDB's multi-region SQL
+is still the most developed of the candidates and would express this section's per-region and
+global split in one cluster; if SQL comes to matter, YugabyteDB, also on Oxide's shortlist, is the
+openly licensed form of that idea.
+
+**Multi-region is a property of the tiers, not of the store.** FoundationDB's multi-region mode
+keeps data in at most two regions and commits in one of them. Satellites hold the latest commits in
+a second datacenter of the active region, so losing the primary datacenter loses nothing
+acknowledged; but every transaction from the other region pays a WAN round trip for its read
+version and its commit, and a region cut off from the active one cannot run a transaction at all.
+That is disaster recovery rather than active-active -- still more than etcd, whose quorum across
+regions puts the WAN on every write.
+
+So the shape is **a record per region** for what must keep working through a WAN partition --
+leases above all, since a lease renewed across the WAN expires when the WAN does -- and **a global
+record**, in the two-region mode, for tenancy, the model catalogue and each region's **budget**.
+The global tier sizes regional budgets on the provisioning clock and each region admits within its
+own: §1's capacity-versus-allocation seam, one level up. `README.md`'s "spin up resources close to
+that region" is a decision on that clock, the one clock where a WAN round trip is affordable.
+
+**Build the layer, not the database.** RFD 53 rejects FoundationDB as "more of a foundation for
+building a custom storage system than a full-featured system", with indexes "significantly more
+work for our 1.0 product". For a fit-for-purpose store that is the reason to choose it. RFD 53 also
+weighs building on Raft in Rust and finds it "likely quite expensive and not substantially simpler
+than the problem that many existing distributed database technologies seek to solve", which holds
+here too: consensus, storage, recovery and transactions are generic, take years of fault testing to
+trust, and would put a new database's correctness under every orchestration claim in this
+document. What is specific to polyproto is the data model, and that is what a layer holds:
+
+- **Typed records with secondary indexes** -- by tenant, by region, by lease expiry.
+- **Leases**, on read versions (requirement 4).
+- **A change feed**, the versionstamped log the scheduler follows.
+- **Capacity budgets.** The global record grants each region a budget per tenant, model and
+  accelerator class, and the region admits within it -- the inference and multi-region piece no
+  general-purpose store supplies.
+- **Selective replication** of the global record into each regional one, driven by the change feed,
+  so tenancy and catalogue reads stay regional despite the two-region limit; the global record
+  changes only on the provisioning clock. This is RFD 53's "logical replication of chunks of the
+  namespace", in this document's shape.
+
+The layer is Rust, which is where the leverage credited to TiKV actually lands, and
+[`foundationdb-simulation`](https://docs.rs/foundationdb-simulation/latest/foundationdb_simulation/)
+runs Rust workloads inside FoundationDB's deterministic simulator (fdbserver 7.4.6 or newer), so the
+layer is tested under the same fault injection as the store beneath it -- this repository's
+simulate-first method, one level down.
+
+**The logged tier is FoundationDB too** -- a second cluster, appending with versionstamps, so one
+technology spans two failure domains; AX chose Redis for the same tier. It stays FoundationDB until
+evidence says otherwise, and the evidence that would is §1's per-tier count showing FoundationDB
+cannot carry the rate. A purpose-built log is the one place building below the layer could pay, and
+that count is what would justify it. The simulator models no store at all, so no result here
+depends on the choice.
+
 ### Security: what the architecture answers, what a prototype defers
 
 This is a prototype, so production hardening is out of scope. What is worth recording is which
@@ -1663,8 +1821,8 @@ source turned into an experiment.
 
 ### Phase 6 -- Macro authority: placement, partitions, tenancy
 
-The slow, coarse, orchestrator-owned decisions -- §2.4's macro tier, and between them everything
-Phase 3 froze.
+The slow, coarse, orchestrator-owned decisions -- §2.4's provisioning tier, and between them
+everything Phase 3 froze.
 
 Weight shards stop being per-request cache entries: the orchestrator decides which models load
 where on a slow timescale, with load and unload costs, through a model-agnostic interface (size,
