@@ -14,17 +14,20 @@ unified memory for comparison.
 > A single scheduler that owns FaaS, AI inference, and long-running compute beats three
 > best-in-class specialists, *on the boundaries between them*.
 
-Two tiers of cross-workload win, and only one is a moat:
+Two coupling tiers of cross-workload win (`owned-and-observed.md` §6 explains the qualifier), and
+only one is a moat:
 
-- **Tier 1 — information sharing.** "The function will call inference, so prewarm the model."
-  A siloed stack retrofits this with a hint API.
-- **Tier 2 — joint decisions.** Cannot be expressed as a hint without becoming a distributed
-  agreement problem: co-placement fused with routing, preemption across classes, and **one
-  memory ledger arbitrating every workload's state at once.** On datacenter hardware
-  that is one ledger over two pools, and the pools meet only where the accelerator
-  offloads into host memory. See *Memory pools*.
+- **Coupling tier 1 — information sharing.** "The function will call inference, so prewarm the
+  model." A siloed stack retrofits this with a hint API.
+- **Coupling tier 2 — joint decisions.** Cannot be expressed as a hint without becoming a
+  distributed agreement problem: co-placement fused with routing, preemption across classes, and
+  **one memory ledger over every class the orchestrator owns**, sizing the partitions engines
+  allocate within. On datacenter hardware that is one ledger over two pools, and the pools meet
+  only where the accelerator offloads into host memory. See *Memory pools*.
 
-This document is about Tier 2, specifically the ledger.
+This document is about coupling tier 2, specifically the ledger. By default the ledger also
+allocates the engine's KV, which `owned-and-observed.md` §1 disclaims; `--engine-cache` is the
+corrected side, and *Engine allocation* says what it changes.
 
 ## The model
 
@@ -66,14 +69,12 @@ restore_ns(bytes) = 4 ms                              # VMM setup, device restor
                   + bytes × 0.15 × 1.0 ns/byte        # touched working set, UFFD page-in
 ```
 
-The merkle lineage `H(image, init_result, env)` was always Firecracker-shaped: a serialised
-memory image with ancestry. The old constant, 200 ms / 32 MiB charged linearly, was a cold
-*container* start, which is a different substrate. Demand-paged restore costs a fixed few
-milliseconds plus the pages actually touched, so it is roughly **flat** in image size. The
-footprint stays the whole guest image, because a warm cell holds all of it. So a snapshot is
-now big to hold and cheap to rebuild, which is exactly the profile of something to evict
-first. v8 isolates are explicitly not modelled: they would be a third answer, with no image
-to restore.
+The merkle lineage `H(image, init_result, env)` is Firecracker-shaped: a serialised memory image
+with ancestry. Demand-paged restore costs a fixed few milliseconds plus the pages actually touched,
+so it is roughly **flat** in image size, while the footprint stays the whole guest image, because
+a warm cell holds all of it. So a snapshot is big to hold and cheap to rebuild, which is exactly
+the profile of something to evict first. v8 isolates are explicitly not modelled: they would be a
+third answer, with no image to restore.
 
 A long-running replica is a blob whose recompute cost is its cold start. Scale-up and
 scale-down are admission and eviction — which is what puts an autoscaler and a KV-cache
@@ -106,8 +107,8 @@ exists for host workloads, and an offload is a cache of state whose real home is
 Eviction runs HBM → DDR → NVMe and costs the request nothing; promotion runs back up and is
 charged. PCIe is **modelled**; this host has no link to measure.
 
-`--hbm 0` collapses the node to one pool, where every class competes in DDR directly. That
-is the Apple-silicon model the earlier rounds ran on, and it is kept for comparison only.
+`--hbm 0` collapses the node to one pool, where every class competes in DDR directly. That is
+the Apple-silicon model, kept for comparison only.
 
 ### Monotone residency invariant
 
@@ -146,21 +147,18 @@ The cost term alone predicts something non-obvious:
 | Weight shard | 512 MiB | 4 s | **7.45** |
 | Service heap | 384 MiB | 15 s | **37.3** |
 
-**Warm microVM cells are the cheapest bytes to rebuild** once restore is modelled as
-Firecracker actually does it. Under the cold-container constant they were 5.96 ns/byte.
+**Warm microVM cells are the cheapest bytes to rebuild**, with restore modelled as Firecracker
+actually does it.
 
-An earlier version of this section compared them with KV blocks as if the two competed for
-the same bytes, and concluded the warm pool was hoarding memory that KV should have. **That
-only holds on unified memory.** In a datacenter node, cells live in DDR and hot KV lives in
-HBM. The comparison that remains real is against *offloaded* KV in DDR. There the cell's low
-rebuild cost and the offload's low promote cost are both cheap, and the offload yields first
-by band. Two consequences survive the split:
+**Cells and hot KV do not compete for bytes on datacenter hardware.** Cells live in DDR and hot KV
+in HBM; only on unified memory would the warm pool be holding memory KV wants. The comparison that
+is real is against *offloaded* KV in DDR, where the cell's low rebuild cost and the offload's low
+promote cost are both cheap, and the offload yields first by band. Two consequences:
 
 - **Bigger cells are cheaper per byte to evict** (0.39 → 0.21 across the size range), because
-  the fixed restore cost amortises. Under a linear model, size was neutral.
-- **Keep-alive matters less than it used to.** In the single-node arbitration run, FaaS
-  costs 4–5 ms of stall per request whatever the snapshot hit rate, because a restore is
-  cheap.
+  the fixed restore cost amortises.
+- **Keep-alive matters little.** In the single-node arbitration run, FaaS costs 4–5 ms of stall
+  per request whatever the snapshot hit rate, because a restore is cheap.
 
 `freq` still cuts the other way. A hot function is reused hard, so the outcome is contested
 per function rather than settled per class.
@@ -169,8 +167,8 @@ per function rather than settled per class.
 
 Phase 1 ([`phase-1.md`](phase-1.md)) names `owned-and-observed.md` §1's ownership table as a type,
 `own::authority(kind, tier, question)` in [`own.rs`](../src/own.rs), and puts a census behind it: a
-compiler-generated count of call sites that assume allocation authority over engine-owned state
-today. No architectural change -- the deliverable is that nothing changed, checked, plus a number.
+compiler-generated count of the entry points that assume allocation authority over engine-owned
+state.
 
 **The table.** Total over four classes, three tiers, two questions -- twenty-four cells, all
 `Orchestrator` on the capacity question, `Engine` on allocation for `KvBlock` and `WeightShard` in
@@ -192,21 +190,17 @@ points `phase-1.md` §1.5 and §1.6 name:
 `Hierarchy::{admit,anticipate,touch,demote,forget_cold,drop_superseded,spill_displaced,drain}_engine`,
 `Quota::{floor,limit,band}_of_engine`, and `Quota::set_band_engine` — the one place the orchestrator
 *writes* an engine class's eviction band rather than reading it. The thirteenth is
-`Hierarchy::reprice_engine`, added by Phase 2's clairvoyant arm, which writes an eviction priority
-into an engine-allocated entry; this section said 12 until `phase-3.md` §1.10 counted again. Phase 3
-adds none -- every engine-cache path is reached before any `_engine` body. This is below the 10–25 predicted
-in `phase-1.md` §2 (P2), and the reason is the counting mechanism rather than the ledger being
-simpler than expected: `#[deprecated]` fires once per named item, so a dispatcher's one call to its
-census-marked sibling is one warning no matter how many external callers route through the
-dispatcher. Twelve is a count of *split entry points*, not of call sites into them.
+`Hierarchy::reprice_engine`, from Phase 2's clairvoyant arm, which writes an eviction priority into
+an engine-allocated entry. Phase 3 adds none -- every engine-cache path is reached before any
+`_engine` body. Thirteen is a count of *split entry points*, not of call sites into them:
+`#[deprecated]` fires once per named item, so a dispatcher's one call to its census-marked sibling
+is one warning no matter how many external callers route through the dispatcher.
 
 **`machine.rs`'s share is 0, and this is a real finding, not an artifact of the counting
 mechanism.** Every ledger read the scheduler makes is a residency or cost *query* --
-`is_hot`/`holds` (now `Telemetry::resident`/`held`, or `ground_truth_holds` on the execution path),
-`local_ns`, `displacement`, `could_admit` -- never an allocation *decision*. `owned-and-observed.md`
-§8 called `machine.rs`'s share of the Phase 3 correction "moderate, mechanical"; the census confirms
-the "moderate" more precisely than §8 asserted it: there is no allocation authority in this file to
-begin with, so there is nothing here for Phase 1 to have found.
+`Telemetry::resident`/`held`, `ground_truth_holds` on the execution path, `local_ns`,
+`displacement`, `could_admit` -- never an allocation *decision*. There is no allocation authority in
+this file to disclaim.
 
 **Dynamic census: four to five orders of magnitude above the static count.** `polyphonic ownership`
 on its default 15,000-op trace (4 GiB HBM / 8 GiB DDR, `Budget::Open`, announce flows, seed 1), one
@@ -219,53 +213,24 @@ counter per census-marked entry point:
 | faas / service | 0 | 0 | 0 | 0 | 0 | 0 | 0 | **0** |
 
 `forget_cold` and `superseded` are the same removal from two directions — after an admission
-(`announce`, `supply`) and after a promotion (`materialise`) — and the 2,474 : 59,904 split is
-exactly the shape of the bug described below: the small column is the path that was counted, the
-large one the path that was not.
+(`announce`, `supply`) and after a promotion (`materialise`).
 
-The static count says how much *code* Phase 3 has to change; this says how much of the simulator's
-*behaviour*, today, rests on the authority Phase 3 disclaims. `drain` is an eighth counter, zero
-here because a single-node trace never retires a domain; it fires from `Machine::drain`, which is
-the largest single assumption of the disclaimed authority in the simulator — it relocates an entire
-engine's KV cache by orchestrator fiat.
+The static count says how much *code* the correction touches; this says how much of the
+simulator's *behaviour* rests on the authority `owned-and-observed.md` §1 disclaims. `drain` is an
+eighth counter, zero here because a single-node trace never retires a domain; on the ledger side it
+fires from `Machine::drain`, which relocates an entire engine's KV cache by orchestrator fiat.
 
-**The split by entry point is a Phase 3 finding in its own right: admission is under a third of
-it.** Demotion matches admission one for one, the cascade spill matches it again, and
-superseded-copy removal — dropping the DDR or NVMe copy once a blob is promoted back — is
-two-thirds of it. An engine-cache model that replaces admission and leaves the offload and promote
-paths alone would cover well under half of what this ledger does on the engine's behalf.
+**Admission is under a third of it.** Demotion matches admission one for one, the cascade spill
+matches it again, and superseded-copy removal — dropping the DDR or NVMe copy once a blob is
+promoted back — is two-thirds of it. So the engine-cache model (*Engine allocation*) covers the
+offload and promote paths as well as admission; one that replaced admission alone would cover well
+under half of what the ledger does on the engine's behalf.
 
-**This number was wrong twice before it was right, and neither error was visible from inside the
-census.** The first version counted only admissions (20,139 for `KvBlock`). The second split five
-entry points and reported 201,259 — but `materialise` was still dropping superseded copies inline
-rather than through the dispatcher, so every offload and spill *hit* went uncounted and
-`forget_cold` read 2,474 against its true 62,378; and `demote_body` was spilling DDR victims past
-its own dispatcher, leaving the whole eviction cascade unattributed. Both gaps were found by
-walking the call graph against the dispatcher list, not by any check failing. `phase-1.md` §4.4
-records the pattern, since Phase 3 will be adding engine-state paths under the same conditions.
-
-**A pre-existing defect this surfaced and deliberately did not fix.** `Hierarchy::drain_all` empties
-`hbm` and `ddr` and returns what it took; it does not touch `nvme`. So when `Machine::drain` drains
-a domain, anything that had been spilled to that node's spill tier is neither returned to the
-caller nor migrated — the domain leaves `active` still holding it, and no `holds()` or `is_hot()`
-will ever report it again. `machine.rs`'s "The bytes survive" comment on `drain` is false for
-spilled state. This predates Phase 1 and fixing it would change `drain_at` results, which Phase 1
-may not do; it belongs to Phase 2, where the oracle makes a corrected baseline measurable. Recorded
-here rather than in a code comment because it is a finding, not an explanation of what the code does.
-*Phase 2 did not take it; Phase 3 fixed it behind its own bit, `placement --drain-spill`, so its
-effect is attributable: it more than doubles the bytes a drain migrates (11.5 -> 25.8 GiB for
-`blind`) and moves stall by at most 0.02 ms on any arm. Phase 3 also found that `--drain-at` was not
-reproducible at all -- drained entries left in `HashMap` order and were assigned destinations by
-position -- and fixed that unconditionally (`phase-3.md` §8.1).*
-
-**Byte-identity.** `residency`, `flows`, `placement` (split and unified memory) and `volatility`
-diff byte-for-byte before and after, at a reduced `--ops` and at a second seed, checked after each
-of `phase-1.md` §4's four work items rather than only once at the end. `distributed`, `code-review`
-and `data-path` cannot be part of this set at all -- each prints `boundary::measure`'s live host
-timing inline with its served-request numbers, so two back-to-back runs of any of them differ before
-this phase touches a line, confirmed by running the baseline capture against itself before any code
-changed. They still get a structural smoke run (same node/served/refused counts, same arm labels)
-after each work item.
+**Drain and the spill tier.** By default `Hierarchy::drain_all` empties `hbm` and `ddr` and returns
+what it took, but leaves `nvme`, so state spilled on a drained node is neither returned nor
+migrated. `placement --drain-spill` fixes that behind its own bit, so its effect stays attributable:
+it more than doubles the bytes a drain migrates (11.5 -> 25.8 GiB for `blind`) and moves stall by at
+most 0.02 ms on any arm.
 
 ## Serving engines
 
@@ -279,16 +244,14 @@ step_ns(batch) = STEP_BASE_NS + (batch - 1) × STEP_PER_SEQ_NS     # 7 ms + 40 �
 
 `Engine` holds one of these per domain, tracks in-flight sequences against an arrival clock
 set by `--rate`, and queues a request that finds the batch at `MAX_BATCH`. Constants are
-**modelled**; the base is chosen so a batch of one reproduces the flat 125 tok/s the workload
-used before, which keeps the unbatched arm comparable. Batch is sampled once at admission and
-held for the sequence — a step-accurate engine is a different simulation, and the error is
-second-order next to modelling no batch at all.
+**modelled**; the base is chosen so a batch of one runs at 125 tok/s, the flat rate decode costs
+with the engine off. Batch is sampled once at admission and held for the sequence — a step-accurate
+engine is a different simulation, and the error is second-order next to modelling no batch at all.
 
 This is not a refinement. **Modelling decode as a constant makes the central inference
 scheduling tradeoff invisible**, because the reason to route by KV prefix is to avoid the
-recompute a *full* node would force, and a node cannot be full if occupancy has no cost. With
-`--rate 0` the engine is off and the older results reproduce; every claim below about
-placement depends on it being on.
+recompute a *full* node would force, and a node cannot be full if occupancy has no cost. `--rate 0`
+turns the engine off; every claim below about placement depends on it being on.
 
 ### The congestion toll
 
@@ -410,8 +373,7 @@ inference rather than a workload of its own.
   result blocks per agent handed back from wherever the agents ran. All of these shapes are
   **modelled**, and they are the numbers most worth replacing with traces from a real agent
   framework. Fan-outs add roughly half again as much decode load, which is why
-  `distributed` defaults to 250 req/s rather than 350. `--fanout 0` reproduces the
-  pre-fan-out results within the measured-crossing noise between runs.
+  `distributed` defaults to 250 req/s rather than 350. `--fanout 0` turns them off.
 - **FaaS** — function invocations. **Warm** when the snapshot is still resident, which is the
   ledger's decision rather than the workload's: the body runs either way, in 40–200 µs. 45%
   of invocations call into inference.
@@ -444,12 +406,10 @@ or "the gate eliminates broken tasks" is definitional.
 
 ## Boundary costs
 
-Measured on the host, not modelled. One run of
+Measured on the host, not modelled. Every row is from one run of
 `cargo run --release --features grpc,wasm -- boundary --repeat 10`, best-of-10 per rung, timer
-overhead subtracted from the per-operation rungs. Phase 0 ([`phase-0.md`](phase-0.md)) added
-the `wasm` and `ext_proc` rows and re-timed `Ring`; **every row is from that one fresh run**,
-so the untouched rungs differ from their previously published values by ordinary run-to-run
-noise.
+overhead subtracted from the per-operation rungs. The `wasm` and `ext_proc` rungs are Phase 0's
+([`phase-0.md`](phase-0.md)).
 
 | boundary | 64 B | 1 KiB | 8 KiB | ns/byte | spread |
 |---|---|---|---|---|---|
@@ -466,9 +426,7 @@ noise.
 **`ext_proc` has no 64 B cell, and the dash is the point.** A realistic gateway header map at
 a fixed field count encodes to **367 bytes** before any filler is added, so this rung's floor
 is above the ladder's smallest payload and padding cannot go downwards. The fit is over the
-two achievable sizes and its 64 B figures below are extrapolations, labelled as such. An
-earlier version of this table reported a 64 B ext_proc cell; it was a 367-byte message wearing
-a 64-byte label, which put the missing 303 bytes of marshalling into the intercept.
+two achievable sizes and its 64 B figures below are extrapolations, labelled as such.
 
 Two more figures, priced once rather than swept across sizes, because what they charge for is
 opening something rather than moving bytes through it:
@@ -478,24 +436,17 @@ opening something rather than moving bytes through it:
 | wasm: fresh instance + one call | 9483 | per-call isolation instead of a shared warm instance |
 | ext_proc: stream open + first callout | 63066 | Envoy's default `ext_proc` config — a stream per HTTP request |
 
-`spread` is worst run over best. The ring rung used to carry the ladder's worst spread —
-**4.2×** — because it was timed per operation against a ~35 ns timer, a 1.5:1
-signal-to-instrument ratio. Batch-timing it the way `native()` and `syscall()` already are
-tightens that; the price is that, like those two, it no longer reports a tail (p99 "—").
-Old and new, side by side, so the correction is visible rather than silently overwritten:
+`spread` is worst run over best. The ring rung is batch-timed, like `native()` and `syscall()`,
+because timing it per operation against a ~35 ns timer gives a 1.5:1 signal-to-instrument ratio;
+like those two it reports no tail (p99 "—").
 
-| | 64 B / 1 KiB / 8 KiB | spread |
-|---|---|---|
-| per-operation (retired) | 52 / 65 / 232 ns | 4.2× |
-| batched (current) | 70 / 78 / 180 ns | 1.2–1.8× across runs |
-
-No conclusion here rested on the spread's *size*, only on the ladder's *ordering*, which is
-unchanged. Two rungs are worth distrusting individually: WASM and the ring now trade the
-noisiest spot run to run (1.2–2.8×), and the **unix socket rung is not monotone in payload** —
-it came back 5733 / 5524 / 5233 here and 5983 / 7441 / 6649 on an earlier run, wandering by
-more than its own payload term in both directions. The step it feeds ("waking a blocked
-thread") moved between 5.07 µs and 6.97 µs across runs on that instability alone. **The
-ordering is still the robust result; no single constant here should be quoted to two digits.**
+No conclusion here rests on a spread's *size*, only on the ladder's *ordering*. Two rungs are
+worth distrusting individually: WASM and the ring trade the noisiest spot run to run
+(1.2–2.8×), and the **unix socket rung is not monotone in payload** — it came back
+5733 / 5524 / 5233 here and 5983 / 7441 / 6649 on another run, wandering by more than its own
+payload term in both directions. The step it feeds ("waking a blocked thread") moves between
+5.07 µs and 6.97 µs across runs on that instability alone. **The ordering is the robust result;
+no single constant here should be quoted to two digits.**
 
 What each step adds, at 1 KiB:
 
@@ -531,12 +482,11 @@ Five things to design against:
    decisions matters more than shrinking them.
 5. **WASM lands below the ring, not beside it, and `ext_proc` only beats gRPC unary on a
    stream it gets to keep open.** A warm sandboxed call (13–25 ns) undercuts the shared-memory
-   ring (70–78 ns) — `phase-0.md`'s P1 predicted this and it held, so a sandboxed hook belongs
-   in the argmin on its own measured row rather than borrowing the ring's number. `ext_proc` on
-   an already-open stream is real savings against gRPC unary (36 µs vs 48 µs fixed, ~26%
-   cheaper) — P2's "if right" case. But Envoy's documented default opens a new stream per HTTP
-   request, and that shape measures at 63 µs, *above* gRPC unary — P2's "if wrong" case, and
-   the more realistic one for an unmodified sidecar deployment.
+   ring (70–78 ns), so a sandboxed hook belongs in the argmin on its own measured row.
+   `ext_proc` on an already-open stream is real savings against gRPC unary (36 µs vs 48 µs
+   fixed, ~26% cheaper). But Envoy's documented default opens a new stream per HTTP request, and
+   that shape measures at 63 µs, *above* gRPC unary — the more realistic shape for an unmodified
+   sidecar deployment.
 
 ### Policy hook cost in an argmin
 
@@ -561,28 +511,12 @@ crossing, and a ring between real processes would pay mapping and a second sched
 top of this. And `ext_proc`'s row is its fit **extrapolated down** to 64 B from a 367 B floor,
 for the reason given above.
 
-`ext_proc` at 4 nodes (142 µs) still exceeds the ~129 µs warm-FaaS figure this document uses
-below, but the margin has fallen from 69 µs — what the borrowed 49 µs unary figure implied —
-to about **13 µs**, one config change (stream reuse) away from crossing under it. At a fleet of
-32 or 128, `ext_proc` and gRPC unary both push the scheduler's decision rate below a plausible
-cluster request rate; `Native` and `Wasm` do not.
-
-### Where it bites: the denominator
-
-The tax is a fraction, and the fraction is set by how long the scheduled work takes. At 4
-decisions per request, against service times measured in the workload itself:
-
-| work being scheduled | over gRPC | over a shared ring |
-|---|---|---|
-| **warm FaaS invocation (measured: 129 µs)** | **60.1%** | 0.23% |
-| **warm service request (measured: 256 µs)** | **43.1%** | 0.12% |
-| 1 ms of work | 16.2% | 0.03% |
-| 100 ms of work | 0.2% | 0.00% |
-
-**For a warm invocation, 43–60% of the request is the control plane talking to itself.** For
-an agent turn that spends a second in decode, it is a rounding error. The zero-cost-extension
-thesis is not wrong, it is *conditional*, and the condition is sharp: put the extension
-boundary where decisions are coarse, never inside the ledger's hot path.
+`ext_proc` at 4 nodes (142 µs) already exceeds a warm FaaS invocation's modelled ~129 µs. At a
+fleet of 32 or 128, `ext_proc` and gRPC unary both push the scheduler's decision rate below a
+plausible cluster request rate; `Native` and `Wasm` do not. So the zero-cost-extension claim is
+*conditional* on the boundary, and the condition is sharp: an out-of-process hook belongs where
+decisions are coarse, while a native or warm WASM hook can run inside the argmin. *Data path*
+turns the per-request share into a crossover.
 
 ## Data path
 
@@ -628,14 +562,10 @@ sweep needed, §1.1 of `phase-8.md`:
 | sidecar (stream/request) | **1.42 ms** | **7.42 ms** |
 | sidecar, pluggable policy | 2.81 ms | 14.67 ms |
 
-Repeats of the same run land the stream-reuse crossover at 0.83–0.90 ms / 4.34–4.71 ms, the
-stream/request crossover at 1.38–1.43 ms / 7.18–7.43 ms, and the pluggable-policy crossover at
-2.81–3.04 ms / 14.67–15.83 ms — host noise on this machine, not a different result; the *existence* of the crossover is the claim, its position moves with the host
-(`owned-and-observed.md` §7). Against §2.3's prediction of ~1.0–1.6 ms / ~5.2–7.9 ms from a
-borrowed 52–79 µs tax with an unexplained ~6.9 µs parse term folded in: dropping that term
-(`phase-8.md` §1.2) predicted 46.1 / 73.1 µs and 0.88–1.39 ms / 4.56–7.23 ms, and the measured
-43.97–74.97 µs and 0.84–1.42 ms / 4.35–7.42 ms land within a few percent of that correction —
-confirming the correction, not the original estimate.
+Four runs land the stream-reuse crossover at 0.83–0.90 ms / 4.34–4.71 ms, the stream/request
+crossover at 1.38–1.43 ms / 7.18–7.43 ms, and the pluggable-policy crossover at 2.81–3.04 ms /
+14.67–15.83 ms — host noise on this machine, not a different result. The *existence* of the
+crossover is the claim; its position moves with the host (`owned-and-observed.md` §7).
 
 **Fleet size at which one unsharded scheduler saturates**, `N_max = √(1e9 / (λ·d·c))` for a hook
 costing `c` ns/crossing at 64 B, `λ = 62.5` req/s/node, `d = 1.23` measured:
@@ -711,28 +641,28 @@ cost(node) = acquire_ns                     # cheapest of resident / fetch / spi
            + congestion_ns                  # what it does to the batch it joins
 ```
 
-Minimised, not maximised. The earlier form scored the recompute a node's residency *avoided*,
-which is the same decision by a constant whenever rebuilding is the only way to get state —
-and stops being the same decision the moment shipping it is an option, because what a node
-avoids no longer determines what the request costs there.
+Minimised, not maximised: the score is what the request costs at each node. Scoring the
+recompute a node's residency *avoids* instead is the same decision only while rebuilding is the
+only way to get state; once shipping it is an option, what a node avoids no longer determines
+what the request costs there.
 
 `TierPool::marginal_price` is the *expected* cost per byte of the cheapest state the pool
 would give up, and `Hierarchy::displacement` charges each pool's shortfall at that pool's
 price. It peeks each reclaimable class's heap top in the same band order `pick_class`
 reclaims in, abstaining on a stale or pinned top. It is an estimate on purpose: a faithful
-dry run costs as much as the eviction itself, per candidate, per request. Three corrections
+dry run costs as much as the eviction itself, per candidate, per request. Three properties
 make it a price rather than a number:
 
 - **Recovery, not rebuild.** An evicted blob moves down a tier rather than vanishing, so
   wanting it back costs the cheaper of a rebuild or a recovery from that tier: PCIe from DDR
   for HBM, the spill tier for DDR. Priced as a rebuild, a weight shard pushed off a full
-  accelerator cost 4 s, where the real cost is a 21 ms promote. Once fetching made full
-  accelerators candidates, that error dominated every other term.
+  accelerator would cost 4 s where the real cost is a 21 ms promote -- an error that dominates
+  every other term once fetching makes full accelerators candidates.
 - **Units on the fallback.** When nothing is reclaimable, the price is the last price
-  actually paid, in ns/byte. It used to fall back to `inflation`, a GDSF priority that only
-  ever grows. On unified memory the fallback was rarely hit. Under split memory the
-  accelerator's two classes often both sit at their floors. The fetch arm's displacement
-  spread then read **26–49 s**, and fell to 14 ms once the units were fixed.
+  actually paid, in ns/byte -- not `inflation`, a GDSF priority that only ever grows. Under
+  split memory the accelerator's two classes often both sit at their floors, so the fallback
+  is hit often, and with the wrong units the fetch arm's displacement spread reads **26–49 s**
+  instead of 14 ms.
 - **Expected, because evicted state only costs anything if someone wants it back.** Each
   class's loss per byte is multiplied by its **measured regret rate**: the fraction of its evictions
 that were later requested again. That comes from a bounded ghost list of recently evicted
@@ -740,13 +670,12 @@ ids, which is ARC's ghost cache used for pricing instead of admission. The rate 
 as `(regrets + 1) / (evictions + 1)`, so a pool with no history prices displacement at the
 full recompute cost, as before, and converges on the observed rate as evidence accumulates.
 
-Without the discount, displacement priced every evicted byte as a certain rebuild. Its mean
-spread across candidate nodes was **3.5 s against 68 ms** for engine and congestion
-combined. An argmin decides on spread, so neither load term could win anything but ties:
-`moved by load` read 0.0%. The discount alone cut displacement spread 4×; the convex toll did
-the rest. `term spread` in the `distributed` output reports the mean spread of every term,
-because a term whose spread is an order of magnitude under another's is a comment, not a
-policy.
+Without the discount, displacement prices every evicted byte as a certain rebuild, and its mean
+spread across candidate nodes (**3.5 s**) swamps engine and congestion combined (**68 ms**). An
+argmin decides on spread, so neither load term wins anything but ties: `moved by load` reads 0.0%.
+The discount cuts displacement spread 4×, and the convex toll does the rest. `term spread` in the
+`distributed` output reports the mean spread of every term, because a term whose spread is an
+order of magnitude under another's is a comment, not a policy.
 
 Two rules the score needs to be a decision rather than a suggestion:
 
@@ -758,19 +687,19 @@ Two rules the score needs to be a decision rather than a suggestion:
 
 ## Results
 
-All numbers below are split memory unless marked unified. Two methodology changes since the
-previous round apply to everything here:
+All numbers below are split memory unless marked unified, and run with the ledger allocating KV
+unless marked **engine**: *Engine allocation* and *Belief* give the corrected side. Two rules apply
+to everything here:
 
 - **Service time leads.** Once decode cost depends on the batch a request joins, placement
-  moves execution as well as waiting. `stall` excludes execution, so on its own it
-  misreports which arm is better. The `distributed` table now leads with end-to-end
-  `service/req`. It also shows fan-out completion, because arms that refuse the most
-  expensive work look faster than they are.
-- **Baselines filter before they choose.** The unscored policies used to send every sibling
-  to one node and refuse whenever the siblings did not fit there. Under split memory that
-  meant 55% of fan-outs, a failure no real system has. They now filter infeasible nodes
-  first, as a Kubernetes filter phase or a model-aware inference router would, and apply
-  their rule to what remains.
+  moves execution as well as waiting. `stall` excludes execution, so on its own it misreports
+  which arm is better. The `distributed` table leads with end-to-end `service/req`, and shows
+  fan-out completion, because arms that refuse the most expensive work look faster than they
+  are.
+- **Baselines filter before they choose.** The unscored policies filter infeasible nodes first,
+  as a Kubernetes filter phase or a model-aware inference router would, and apply their rule to
+  what remains. Without the filter they send every sibling to one node and refuse whenever the
+  siblings do not fit there -- 55% of fan-outs under split memory, a failure no real system has.
 
 ### Memory arbitration
 
@@ -809,7 +738,7 @@ Single node, 15k requests, identical quota and trace. Critical-path only.
 **Announce relocates work; it does not eliminate it.** Task latency improves 11% (split) to
 18% (unified), and net work is slightly worse in both. The gate fires once per flow task
 against a break-even budget of milliseconds, and a gRPC crossing is far under it, so **the
-gate is Tier 1.**
+gate is coupling tier 1.**
 
 ### Placement across load
 
@@ -856,18 +785,12 @@ specialist (`flow only`).** Two behaviours still emerge without being told:
 - **Tool placement flips at the region boundary.** Within a zone, the score runs 70% of
   calls wherever the function is warm, at the same ~1.8 ms a hash router achieves. Across a
   region it runs all of them beside the agent, at 4.6 ms, where hashing pays **46 ms**.
-  Last round's claim that the score's tool calls are 3× cheaper within a zone does not
-  survive: hashing lands on warm cells just as often.
 
 **State transfer is roughly neutral.** Fetch ships 26–35 GiB at socket and rack and costs
 about 1.5 ms more stall. It improves balance enough that service time comes out equal or
-0.2% better. Across a zone or region it ships only weight shards (5–6 GiB), never KV.
-
-**Retracted: "state transfer taxes the FaaS warm pool."** Last round, fetch was 7–9% slower
-and function warm hits fell from 73% to 39%. Shipped KV copies were evicting microVM cells.
-Both effects came from putting KV and cells in one pool. With separate pools, function calls
-cost the same with and without fetch (1.07 vs 1.06 ms). With unified memory at matched
-capacity (48 GiB) the effect also disappears, so it was partly a capacity artifact as well.
+0.2% better. Across a zone or region it ships only weight shards (5–6 GiB), never KV. It leaves
+the FaaS warm pool alone: function calls cost the same with and without fetch (1.07 vs 1.06 ms),
+because shipped KV lands in HBM and cells live in DDR.
 
 **The split changes which specialist wins.** Under unified memory, the gossiped residency arm
 is the best specialist (508.7). Under split memory it is the worst but one (693.3): with
@@ -971,7 +894,7 @@ model host, 3 GiB DDR on the agent host. Best arm at each distance:
 | separate, non-borrowable budgets | **+4.0% service and 2.7pp of goodput, at every distance** |
 | distance, socket → region | +5.0% service; the round trip goes 0.20 ms → 61.17 ms |
 | cross-workload placement policy | +0.2% at socket, +0.5% at region |
-| control-plane RPC (`unified` → `rpc query`) | +0.02 ms/request; **33.7% of a warm `FaaS` invocation** |
+| control-plane RPC (`unified` → `rpc query`) | +0.02 ms/request; **33.7% of a warm `FaaS` invocation** (against its chosen `exec_ns`) |
 
 **Partitioning costs about as much as moving the agent host to another continent, and it costs
 it at every distance.** The two are comparable in size and independent in cause: one is a
@@ -990,7 +913,7 @@ the score keeps 58% of tool calls at home instead. Partitioning does not only mi
 eviction; it fences off capacity that exists, and forecloses the placement that would have used
 it.
 
-That inverts the earlier no-pressure result, where keeping tool calls local was right. Under
+That inverts the no-pressure result above, where keeping tool calls local was right. Under
 pressure the binding constraint is agent-host memory rather than link cost, so shipping wins --
 until region distance makes the link expensive enough to flip it back (65.7% local).
 
@@ -1064,11 +987,10 @@ argmin over its own belief), `belief` (the argmin was taken over a stale view), 
 cost function is not the realized charge). `--regret` on `distributed` and `code-review`,
 `--clairvoyant` on `residency`/`flows`/`volatility`.
 
-**On precision.** `distributed` embeds a live boundary measurement in its link costs, so it is not
-reproducible run to run -- two back-to-back runs here differ by ~1 ms of stall and several points of
-split rate. The ns figures below are one run, quoted to their printed precision but not stable in
-their last digits; the structural facts (which gaps are exactly zero, and the order-of-magnitude
-separation between arms) are what survive re-running.
+**On precision.** `distributed` is not reproducible run to run (*Method*). The ns figures below are
+one run, quoted to their printed precision but not stable in their last digits; the structural
+facts -- which gaps are exactly zero, and the order-of-magnitude separation between arms -- are
+what survive re-running.
 
 **The scored arm's entire regret is model gap.** 15k requests, rack, `distributed --regret`
 defaults:
@@ -1094,9 +1016,9 @@ value sits in the trajectory rather than the decision, not a defect in those arm
 
 `belief` is zero everywhere except under `Control::Gossip` (29.7M and 887K ns/decision for the two
 gossiped rows), which is the one mechanism built to produce a stale view. **`execution` is not zero
-merely because the view is exact**, and an earlier version of this section said it was: the arms
-with nonzero `execution` here are the arms with DDR eviction pressure, and their `belief` is exactly
-zero, so staleness cannot be the cause. See the residual paragraph at the end of this section.
+merely because the view is exact**: the arms with nonzero `execution` here are the arms with DDR
+eviction pressure, and their `belief` is exactly zero, so staleness cannot be the cause. See the
+residual paragraph at the end of this section.
 
 **A myopic oracle cannot see the falsification that already failed, and re-running it proves it.**
 The flow-payload sweep above, replayed through `--flow-payload` and `--regret` at region distance:
@@ -1108,45 +1030,34 @@ The flow-payload sweep above, replayed through `--flow-payload` and `--regret` a
 
 At 512 MiB `flow only` overtakes `scored` on service time while carrying tens of millions of ns of
 heuristic regret the whole way -- the metric's blind spot, reproduced on demand. (This sweep runs at
-6k ops with the `distributed` fanout/tool mix, not the falsification section's now-retracted engine
-model, so the two tables are not comparable cell for cell; the qualitative finding -- regret and
-service time can disagree in this specific, named way -- is what carries over.)
+6k ops with the `distributed` fanout/tool mix, not the falsification section's pre-batching model,
+so the two tables are not comparable cell for cell; the qualitative finding -- regret and service
+time can disagree in this specific, named way -- is what carries over.)
 
 **Coupled % is a statement about a regime, and at the published defaults the regime does not bind.**
 Memory coupling (host DDR: workload-driven evictions where the class evicted differs from the class
 being admitted, which is the trade a per-class quota's `pick_class` can never make) is **0.0% on
 every arm** at `distributed`'s defaults, over eviction counts of 0 to 2,265 -- there is almost no
 DDR pressure there, and none of what there is crosses classes. Tightened to 4 GiB DDR per node it
-was published here as **93.8-96.4% of 16k-24k evictions**, which does not reproduce: the commit
-before Phase 3, rebuilt and run with a fixed crossing, prints **54.1-85.4% of 4.5k-16.1k** across the
-eleven arms and three distances, and that is the baseline `phase-3.md` P2 measures against. Locality
-coupling (the scored arm's argmin against a silo's -- no handoff term, displacement in one pool) is
-0.8-1.7% of scored decisions in both regimes. So the axis behaves as §3.4 says it should: near zero
-where nothing binds, high where memory does,
+is **54.1-85.4% of 4.5k-16.1k evictions** across the eleven arms and three distances. Only
+workload-driven admissions count; the `HBM -> DDR` demotion path reaches `TierPool` through `offer`
+and is excluded, since spillover volume tracks accelerator sizing rather than the arbiter's policy.
+Locality coupling (the scored arm's argmin against a silo's -- no handoff term, displacement in one
+pool) is 0.8-1.7% of scored decisions in both regimes. So the axis behaves as
+`owned-and-observed.md` §3.4 says it should: near zero where nothing binds, high where memory does,
 and a single published figure would be a statement about a capacity choice rather than about an
 architecture.
-
-An earlier version of this paragraph reported 44.8-54.9% at the defaults and read a conclusion off
-it. That was an instrument defect: coupling was counted inside `TierPool::admit`, which the
-`HBM -> DDR` demotion path also reaches through `offer`, so spillover volume was being counted as
-arbitration and the figure tracked accelerator sizing rather than the arbiter's policy. The two
-paths are now separate and only the workload-driven one counts.
 
 **Clairvoyant eviction wins hit rate and loses slightly on cost.** `residency --clairvoyant` at its
 true defaults, compared against `no-floor` because both run the open budget and so differ only in
 eviction quality: no-floor 74.097 ms/req at 0.51 `KvBlock` hit rate, clairvoyant 76.828 ms/req at
 0.74 -- **+22.8pp hit rate for +3.7% stall/req**. `volatility --clairvoyant` reproduces +3.1-3.5% at
-every volatility level. The diagnostic did the job §1.7 built it for, and the answer is sharper for
-being small: GDSF gives up 22.8 points of hit rate to a perfect recency oracle and still comes out
-ahead on cost, because the hits it gives up are the cheap ones. Eviction-quality research is not
-where the next result is; cost-weighting is already doing the work.
-
-*(This figure was first published as +16.2pp and +96.1%, which was wrong in two independent ways: it
-divided the open-budget clairvoyant arm by the swept `soft-floor` arm, putting budget policy inside
-a number labelled eviction quality -- the budget-matched comparator was two rows above it in the
-same table -- and it came from a `--ops 5000` run described as "defaults". The comparator is fixed
-in the tool, which now prints the budget-matched line first and labels the soft-floor line as the
-two effects combined: `clairvoyant vs soft-floor` is +469.2%, and almost all of that is the budget.)*
+every volatility level. The diagnostic did the job `phase-2.md` §1.7 built it for, and the answer is
+sharper for being small: GDSF gives up 22.8 points of hit rate to a perfect recency oracle and still
+comes out ahead on cost, because the hits it gives up are the cheap ones. Eviction-quality research
+is not where the next result is; cost-weighting is already doing the work. The tool also prints
+`clairvoyant vs soft-floor` (+469.2%), labelled as two effects combined: almost all of it is the
+budget, which is why the budget-matched line above is the eviction-quality number.
 
 **A residual worth naming rather than hiding.** The nonzero `execution` gaps in the table above are
 not belief staleness -- both the oracle's read and the ledger's own plan see the same, current, true
@@ -1196,10 +1107,11 @@ HBM (§8.3 there).
 | soft over hard | **+31.6%** | **+36.2%** | | |
 
 **Soft floors beat hard partitions by more with the engine allocating**: +38.5% -> +44.5% at
-`residency`'s 60k-op defaults, and at every volatility level (`volatility`: 31.3-34.2% on the ledger,
-38.0-39.9% with the engine allocating, at every level from zero volatility to full swing). The mechanism is weights, as the ledger always
-said, and the bit strengthens it: the partition takes KV out of HBM arbitration and the weights
-inherit the slack. On unified memory, where the ledger ties (-4.0%), soft floors now win (+7.3%).
+`residency`'s 60k-op defaults, and at every volatility level (`volatility`: 31.3-34.2% on the
+ledger, 38.0-39.9% with the engine allocating, at every level from zero volatility to full swing).
+The mechanism is weights, as the ledger always said, and the bit strengthens it: the partition takes
+KV out of HBM arbitration and the weights inherit the slack. On unified memory, where the ledger
+ties (-4.0%), soft floors now win (+7.3%).
 
 **Host-DDR arbitration does not survive in its per-eviction form.** `distributed --regret`, 4 GiB
 DDR per node: memory coupling is **54.1-85.4%** of 4.5k-16.1k evictions on the ledger and
@@ -1223,10 +1135,10 @@ it reads can see that coming.
 | 0.50 GiB | 17.04% refused | 8.63% refused | 10.52% preempted |
 | 0.25 GiB | 25.28% refused | 20.74% refused | 1.66% refused, 27.97% preempted |
 
-Where the partition binds, the bracket is wide and each rule buys goodput with recompute or recompute
-with goodput. `bound`'s cost is mostly its ceiling (0.10% refused at 1x slack, 9.61% at 8x). The
-p99 cost of `none` lands on a session's own turns and on stages other work waits on about equally
-(+14% each at a quarter of the partition): class-blind, spread by arrival.
+Where the partition binds, the bracket is wide and each rule buys goodput with recompute or
+recompute with goodput. `bound`'s cost is mostly its ceiling (0.10% refused at 1x slack, 9.61% at
+8x). The p99 cost of `none` lands on a session's own turns and on stages other work waits on about
+equally (+14% each at a quarter of the partition): class-blind, spread by arrival.
 
 **Fan-out admission survives on the coarsened test** (`price` section 6, fan-outs completed per
 agent / all-or-nothing):
@@ -1243,16 +1155,16 @@ measured one: the crossing changes which models each node holds, and at that cap
 feasibility is a cliff (`phase-3.md` §8.4). The direction is robust; the size is not.
 
 **Announce was half KV.** `flows --engine-cache`: announce's task-latency margin is 10.7% on the
-ledger, 5.3% of which survives with KV prewarm removed -- KV carried **50%** of it, **71%** on unified
-memory (17.6% -> 5.1%). With the engine allocating, announce buys 9.0% (split) and 3.2% (unified).
-The coupling-tier-1 claim rests on writing into the engine's cache more than it said.
+ledger, 5.3% of which survives with KV prewarm removed -- KV carried **50%** of it, **71%** on
+unified memory (17.6% -> 5.1%). With the engine allocating, announce buys 9.0% (split) and 3.2%
+(unified). The coupling-tier-1 claim rests on writing into the engine's cache more than it said.
 
-**Where the boundary costs anything.** On the cluster -- `scored + fetch`, 250 req/s, where decode is
-~1 s of every inference request -- the bit moves mean service by -0.2% and p99 by -0.4%, and a 0.5x
-to 2x partition sweep moves it by at most 1.2%. On one node a clairvoyant block manager beats LRU by
-2.5-3.1% of stall at 17-23pp of KV hit rate at every partition size, while the partition itself
-moves the A/B by under a point between 0.5x and 1x; past 1.5x the partition eats the weights' own
-floor and a quarter of requests are refused, which is a sizing failure rather than a price.
+**Where the boundary costs anything.** On the cluster -- `scored + fetch`, 250 req/s, where decode
+is ~1 s of every inference request -- the bit moves mean service by -0.2% and p99 by -0.4%, and a
+0.5x to 2x partition sweep moves it by at most 1.2%. On one node a clairvoyant block manager beats
+LRU by 2.5-3.1% of stall at 17-23pp of KV hit rate at every partition size, while the partition
+itself moves the A/B by under a point between 0.5x and 1x; past 1.5x the partition eats the weights'
+own floor and a quarter of requests are refused, which is a sizing failure rather than a price.
 
 **A shared L2 tier fires on KV within a rack.** `distributed --shared-l2 64GiB`, a write-through LRU
 pool the size of the cluster's local `NVMe`: 1.5-20.7% of served requests read KV from it at rack,
@@ -1268,50 +1180,56 @@ hop, the seek and the `PCIe` launch once, so two blocks already beat a rebuild.
 ### Belief: what routing costs when residency is lossy
 
 `phase-4.md`, implemented. With `--engine-cache` the router still read the engine's KV exactly
-(`belief` was zero by test). `--belief` replaces that read with a belief fed by the engine's own event
-stream: batches at the engine's step, a one-way hop of the distance's latency, optional loss, and one of
-three recoveries -- replay by sequence number, a periodic snapshot, or none. Every number below is
-`polyphonic belief` (seed 1, 15k ops, no control crossing, scored + fetch, rack unless stated), marked
-against the same run with the exact view. `distributed --belief` runs the same channel across all eleven
-arms and is not reproducible run to run, like the rest of `distributed`.
+(`belief` was zero by test). `--belief` replaces that read with a belief fed by the engine's own
+event stream: batches at the engine's step, a one-way hop of the distance's latency, optional loss,
+and one of three recoveries -- replay by sequence number, a periodic snapshot, or none. Every number
+below is `polyphonic belief` (seed 1, 15k ops, no control crossing, scored + fetch, rack unless
+stated), marked against the same run with the exact view. `distributed --belief` runs the same
+channel across all eleven arms and is not reproducible run to run, like the rest of `distributed`.
 
 **The belief costs almost nothing, at every point measured.** Mean service against the exact view:
-+0.000% / -0.011% at rack, +0.000% / -0.002% at zone and +0.023% / -0.021% at region (published defaults /
-half the partition with decode output held), with 0.13-0.48% of KV decisions exposed to a phantom at rack
-and 1.5-4.1% at region. Loss to 20% with replay recovery stays within 0.075%; a periodic snapshot within
-0.15%; **no recovery at all within 0.16%**, with the belief wrong about 37% of the time at the published
-partition and 60% at half of it. The regret decomposition agrees: `belief` is 0-1.7k ns/decision here
-against the gossiped arm's 887k. The recovery policy changes how wrong the belief is (0.13% phantom entries
-under replay, 37% under none, at 20% loss) and not what it costs.
++0.000% / -0.011% at rack, +0.000% / -0.002% at zone and +0.023% / -0.021% at region (published
+defaults / half the partition with decode output held), with 0.13-0.48% of KV decisions exposed to a
+phantom at rack and 1.5-4.1% at region. Loss to 20% with replay recovery stays within 0.075%; a
+periodic snapshot within 0.15%; **no recovery at all within 0.16%**, with the belief wrong about 37%
+of the time at the published partition and 60% at half of it. The regret decomposition agrees:
+`belief` is 0-1.7k ns/decision here against the gossiped arm's 887k. The recovery policy changes how
+wrong the belief is (0.13% phantom entries under replay, 37% under none, at 20% loss) and not what
+it costs.
 
-**The reason is structural, and the pre-measurements found half of it.** The terms that would have to be
-fooled for the scored arm to concentrate on a quiet node -- `engine` and `congestion` -- read the in-flight
-count, which the integrated router knows exactly because it carries every request and response.
-Silencing a node for 8 s moves almost nothing (its share of KV decisions inside the episode is 26.5% against 24.8% outside under `face-value`, 25.1% against 25.0% under `quantile 0.9`). A router
-that reads load from the stream instead herds or starves depending on the node's load when it went quiet,
-and one that adds its own dispatches to the last report starves the silent node every time (1.6-4.8% of KV
-decisions against ~25%, mean service +3.1% at 8 s). `P(resident)` -- pricing the belief as a probability --
-changes none of the stream-load cases and only removes a 1.5pp attraction on the path.
+**The reason is structural.** The terms that would have to be fooled for the scored arm to
+concentrate on a quiet node -- `engine` and `congestion` -- read the in-flight count, which the
+integrated router knows exactly because it carries every request and response. Silencing a node for
+8 s moves almost nothing (its share of KV decisions inside the episode is 26.5% against 24.8%
+outside under `face-value`, 25.1% against 25.0% under `quantile 0.9`). A router that reads load from
+the stream instead herds or starves depending on the node's load when it went quiet, and one that
+adds its own dispatches to the last report starves the silent node every time (1.6-4.8% of KV
+decisions against ~25%, mean service +3.1% at 8 s). `P(resident)` -- pricing the belief as a
+probability -- changes none of the stream-load cases and only removes a 1.5pp attraction on the
+path.
 
-**The estimator is not calibrated where it would matter.** Close to the diagonal with replay and no loss
-(0.865 predicted, 0.929 realised); **over-confident** where a dropped batch is never recovered (0.959
-predicted, 0.695 realised at half the partition, 5% loss), because the unknown evictions land on the blocks an
-LRU takes first. The chosen node is not worse than the field (0.721 against 0.695), so the argmin is not
-exploiting the miscalibration; it is merely not being hurt by it.
+**The estimator is not calibrated where it would matter.** Close to the diagonal with replay and no
+loss (0.865 predicted, 0.929 realised); **over-confident** where a dropped batch is never recovered
+(0.959 predicted, 0.695 realised at half the partition, 5% loss), because the unknown evictions land
+on the blocks an LRU takes first. The chosen node is not worse than the field (0.721 against 0.695),
+so the argmin is not exploiting the miscalibration; it is merely not being hurt by it.
 
-**Gossip.** Engine KV from the channel instead of the snapshot: `scored + fetch, gossiped` within 0.05%; `both,
-gossiped` **+21.1%** at the published partition (676.4 -> 818.9 ms, the staleness was suppressing herding)
-and **-29.6%** at half of it (1047.3 -> 737.7 ms, the staleness was routing onto evicted prefixes). Every
-gossip result above is a result about an informer cache over owned state in one regime.
+**Gossip.** Engine KV from the channel instead of the snapshot: `scored + fetch, gossiped` within
+0.05%; `both, gossiped` **+21.1%** at the published partition (676.4 -> 818.9 ms, the staleness was
+suppressing herding) and **-29.6%** at half of it (1047.3 -> 737.7 ms, the staleness was routing
+onto evicted prefixes). Every gossip result above is a result about an informer cache over owned
+state in one regime.
 
-**RequestView.** The score reading the observed mean output length instead of the exact one moves mean
-service by -0.03% to -0.13% and p99 by up to -0.35%: closing the cheat costs nothing on this workload, where
-output length is independent of everything the router can see, so no estimator can beat the mean here.
+**RequestView.** The score reading the observed mean output length instead of the exact one moves
+mean service by -0.03% to -0.13% and p99 by up to -0.35%: closing the cheat costs nothing on this
+workload, where output length is independent of everything the router can see, so no estimator can
+beat the mean here.
 
-**The declared SLO buys nothing a user would see.** `expected`, `quantile 0.9` and `slo` land within 1% of
-each other on service p99 for both classes under 5% loss with no recovery and under 2 s of silence, on three
-seeds. Interactive stall p99 drops off its ~45 ms plateau (to 18-25 ms) only under `slo`, in one of its two
-conditions on each seed and in none of the other twelve cells -- a direction with no measurable size.
+**The declared SLO buys nothing a user would see.** `expected`, `quantile 0.9` and `slo` land within
+1% of each other on service p99 for both classes under 5% loss with no recovery and under 2 s of
+silence, on three seeds. Interactive stall p99 drops off its ~45 ms plateau (to 18-25 ms) only under
+`slo`, in one of its two conditions on each seed and in none of the other twelve cells -- a
+direction with no measurable size.
 
 ## Method
 
@@ -1333,6 +1251,12 @@ Reported every run: mean stall per *served* request, p99, goodput overall and pe
 per-class stall, stall by phase, share of stall by class, and **admission integrity** —
 `over_capacity`, per-class `refused`, `pinned_skips`. A nonzero `over_capacity` invalidates
 the run.
+
+**Reproducibility.** `residency`, `flows`, `placement`, `volatility`, `price` and `belief` are
+byte-reproducible from the seed. `distributed`, `code-review` and `data-path` are not: each embeds
+`boundary::measure`'s live host timing in its link costs, so two back-to-back runs differ by ~1 ms
+of stall and several points of split rate. Their structural facts -- which gaps are exactly zero,
+the order-of-magnitude separation between arms -- survive re-running; their last digits do not.
 
 ### Regime selection
 
@@ -1377,14 +1301,13 @@ favoured arm's margin is the easiest way to manufacture a result here.
 first-touch for DRAM, direct I/O (`F_NOCACHE` / `O_DIRECT`) for spill so the page cache cannot
 absorb it.
 
-| | guessed | measured |
-|---|---|---|
-| NVMe fixed latency | 90 µs | **113 µs** |
-| NVMe bandwidth | 3.0 GB/s | **7.8 GB/s** |
-| DRAM first-touch | 20 GB/s | **28 GB/s** |
+| constant | measured |
+|---|---|
+| NVMe fixed latency | **113 µs** |
+| NVMe bandwidth | **7.8 GB/s** |
+| DRAM first-touch | **28 GB/s** |
 
-Correcting the NVMe bandwidth guess moved a headline by 42%. The constants in `tier.rs` are a
-darwin/arm64 fit, not a law.
+The constants in `tier.rs` are a darwin/arm64 fit, not a law.
 
 **Modelled, not measured:** node link latency and bandwidth in `Distance`, PCIe between host
 and accelerator (`TierSpec::pcie`), the HBM/DDR capacities and splits, and the workload's
@@ -1397,21 +1320,15 @@ the decision loop.
 
 ## Next
 
-[`owned-and-observed.md`](owned-and-observed.md) is the design for the next step: a telemetry
-boundary separating state the orchestrator *owns* from what it *infers* and what it only
-*observes*, the workload taxonomy in [`taxo.md`](taxo.md) as a scheduler input rather than a
-document, and an oracle with regret and coupling metrics so results stop needing baseline
-caveats. Its Phase 3 has corrected the mistake underneath every memory result here -- the ledger
-*allocated* KV, when the architecture is explicit that an engine like vLLM owns that memory -- as a
-bit rather than a rewrite, and *Engine allocation* above says which results shrank. Budgets
-survived and grew; per-eviction host-DDR arbitration and KV prewarm did not. Phase 4 is next on
-that chain: the router's view of the engine cache becomes a belief rather than a read. It did, and
-*Belief* above says what that cost: almost nothing, for a structural reason. Phase 5 (retention
-directives) is next.
+[`owned-and-observed.md`](owned-and-observed.md) is the design this ledger is being corrected
+toward: what the orchestrator *owns*, *infers* and only *observes*, the data path, the workload
+taxonomy in [`taxo.md`](taxo.md) as a scheduler input, and the phase plan (§9 there). Phases 0-4
+and 8 are built, and their results are above. Phase 5, retention directives, is next.
 
 ## Not built
 
-No VMM, no WASM ABI, no exec rings, no edge agent, no live migration. The byte store is real
+No VMM, no WASM ABI, no exec rings, no edge agent, no live migration, and no system of record
+(FoundationDB is chosen, `owned-and-observed.md` §8). The byte store is real
 but exercised by `calibrate` only; the residency experiments run on the calibrated model
 rather than moving real bytes. `Topology::discover` probes the host but the host is one
 unified memory domain, so every cross-node constant is modelled and the HBM/DDR split exists
@@ -1439,11 +1356,11 @@ computed.
 | KV state transfer | roughly neutral end to end |
 | state transfer taxes the FaaS warm pool | **retracted** — a unified-memory and capacity artifact |
 | the score's handoff term prices co-placement | **fails** (pre-batching model, not re-run); the myopic regret oracle reproduces the same blind spot on demand — `flow only` beats `scored` on service time at 512 MiB while carrying far larger heuristic regret |
-| memory coupling | regime-bound — **0.0%** at the `distributed` defaults (nothing binds), **54–85%** at 4 GiB DDR/node (re-measured; 93.8–96.4% was published and does not reproduce); locality coupling 0.8–1.7% in both. **With the engine allocating KV, 0–26%** (0–2% on the scored arms): most of it was the ledger allocating the engine's offload |
+| memory coupling | regime-bound — **0.0%** at the `distributed` defaults (nothing binds), **54–85%** at 4 GiB DDR/node; locality coupling 0.8–1.7% in both. **With the engine allocating KV, 0–26%** (0–2% on the scored arms): most of it was the ledger allocating the engine's offload |
 | clairvoyant eviction vs GDSF | budget-matched: wins hit rate (+22.8pp), loses on cost (+3.7%) — GDSF gives up the *cheap* hits, so cost-weighting is already doing the work |
-| unified control plane beats RPC-queried | rounding error in aggregate; 43–60% of a warm invocation |
+| unified control plane beats RPC-queried | rounding error in aggregate (+0.02 ms/request); 33.7% of a warm `FaaS` invocation against its chosen `exec_ns` |
 | announce / anticipatory prewarm | 11–18% faster tasks, net work slightly worse — **half to three-quarters of it was KV prewarm**, which the engine does not let the orchestrator do; 3–9% with the engine allocating |
-| downstream-aware gate | Tier 1 — replicable by a hint API |
+| downstream-aware gate | coupling tier 1 — replicable by a hint API |
 | data path binds below ~1 ms, dissolves an order of magnitude above | holds — crossover 0.84–1.42 ms / 4.35–7.42 ms, measured tax not borrowed |
 | out-of-process hook caps scheduler fleet size | holds — ~20 nodes (`ext_proc`) vs ~1000 (`Wasm`), `d` measured not assumed |
 | the ledger allocates the engine's KV | **corrected** — `--engine-cache` hands allocation to an engine LRU inside an orchestrator-sized partition; off by default so every row above stays the ledger's |

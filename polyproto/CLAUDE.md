@@ -4,16 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Version control: Jujutsu, not Git
 
-This repo is a **colocated `jj` + Git repo** (`.jj/` alongside `.git/`). Use `jj`, not `git`, for
-history and commits:
+polyproto lives in a monorepo rooted at `~/src/delta`, a **colocated `jj` + Git repo** (`.jj/`
+alongside `.git/`) that holds other projects too. Use `jj`, not `git`, for history and commits:
 
 - `jj status`, `jj log`, `jj diff` — inspect state
 - `jj describe -m "..."` — set the working-copy commit message
 - `jj new` — start a new change
 
-The Git side currently has **zero commits**, so `git log`, `git show`, and any tooling built on them
-fail with `your current branch 'main' does not have any commits yet`. Reach for `jj log` instead.
-There is no Git remote configured yet.
+Commit messages are prefixed with the project, e.g. `[polyproto] Phase 4: implementation`.
 
 ## Build and test
 
@@ -32,11 +30,19 @@ without it the bare binary defaults to edition 2015 and rewrites 2024 code incor
 
 ## Project state
 
-`src/main.rs` is still the unmodified `cargo new` hello-world and `[dependencies]` is empty. There is
-no architecture in code yet — @README.md is the only record of design intent, and it is a manifesto
-rather than a spec. Read it before proposing structure, and treat its goals (WASM/ABI zero-cost
-extensions, VM-as-native-abstraction, unified scheduling across FaaS/AI/edge) as direction, not as
-implemented behavior.
+polyproto is a Rust simulator (the `polyphonic` binary) for testing the design in `docs/`: a
+residency ledger over HBM, host DDR and NVMe, a cluster topology, a batched serving-engine model,
+scored placement, and a measured boundary-cost ladder. The `grpc` and `wasm` features enable the
+gRPC/`ext_proc` and WASM rungs of that ladder; `census` marks the entry points that assume
+allocation authority over engine state.
+
+Start with `docs/prototype.md`, which maps the documents: @README.md is the direction (a manifesto,
+not a spec), `docs/owned-and-observed.md` the design and phase plan, `docs/residency-ledger.md` the
+model and its current results, and `docs/phase-N.md` one record per phase. The phase docs are
+historical records -- predictions stated before a run, then what was measured -- so they keep their
+results as measured; every other doc states only current decisions and results. Treat the README's
+goals (WASM/ABI zero-cost extensions, VM-as-native-abstraction, unified scheduling across
+FaaS/AI/edge) as direction, not as implemented behavior.
 
 The build system beyond Cargo is undecided. Do not introduce Buck2, Bazel, or a Cargo workspace
 without asking.

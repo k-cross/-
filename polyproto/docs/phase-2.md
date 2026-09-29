@@ -5,7 +5,12 @@ oracle, per-request regret decomposed into the things that cause it, a clairvoya
 baseline, the wait regime (§3.5), one span per request (§3.11), and coupled % on both axes §3.4
 defines.
 
-**Status: planned.** Nothing below is built. §2's predictions are stated before the run, per §7.
+**Status: implemented and measured.** The oracle and the four-gap decomposition are
+[`oracle.rs`](../src/oracle.rs) (`Machine::oracle_pick`, `finish_regret`), spans are
+[`span.rs`](../src/span.rs), and `--regret` / `--clairvoyant` print the decomposition, the regime
+mix and coupled % on both axes. §2's predictions were stated before the run and are annotated below
+with what was measured; the numbers are in [`residency-ledger.md`](residency-ledger.md)'s *Regret,
+oracle, coupling* section.
 
 Phase 2 changes no policy and no result. What it changes is **what a result is**: today every
 published number is a delta between two arms this repository wrote, so the comparison is only as

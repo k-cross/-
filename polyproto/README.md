@@ -25,3 +25,5 @@ Kubernetes is a great orchestrator for traditional computing workloads but it do
 	- ring 0 for core targets but ring 3 for DX portability
 	- lightweight orchestration to enable local dev and rapid iterations and onboarding cycles with minimal to no cloud
 The core selling point is the emergent properties of having a unified orchestrator across workloads. It must be better than the best orchestrators that specialize in their own domain, not necessarily independently, but across workload fabrics specifically. For instance, a FaaS function that calls into AI Inference should be able to understand that that's going to happen ahead of time, reducing latency by having excellent execution and routing properties independently, but also being able to pre-warm and route based on its knowledge of the shared differences between workloads.
+
+The prototype, its design and its results are in [`docs/`](docs/prototype.md).

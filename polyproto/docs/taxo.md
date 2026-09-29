@@ -1,6 +1,6 @@
 # AI Inference Dynamics
 
-The following workload patterns serve as a representative sample used to isolate properties creating a taxonomy for our control plane.
+Ten workload patterns, chosen as a representative sample of what the control plane has to serve. The four dimensions below are the properties that separate them; [`owned-and-observed.md`](owned-and-observed.md) §4 turns them into scheduler fields.
 
 | Pattern                                | Basic shape                                          | External knowledge / tools                     | State and iteration                         | Typical output                         | Example                                        |
 | -------------------------------------- | ---------------------------------------------------- | ---------------------------------------------- | ------------------------------------------- | -------------------------------------- | ---------------------------------------------- |
@@ -15,7 +15,7 @@ The following workload patterns serve as a representative sample used to isolate
 | Multimodal real-time inference         | Continuous or latency-sensitive inputs               | Sensors, audio/video streams, vision pipelines | Often stateful over a stream                | Live detection, transcription, control | Voice assistant or factory defect detection    |
 | Batch inference                        | Large offline set of independent requests            | Optional retrieval or enrichment               | Little per-item state                       | Enriched records, scores, summaries    | Summarize 10 million support tickets           |
 
-## A Better Taxonomy
+## Four dimensions
 
 Each workload pattern is characterized across four dimensions.
 1. Control flow
