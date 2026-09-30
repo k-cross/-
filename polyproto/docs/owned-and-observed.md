@@ -1595,6 +1595,8 @@ sequence.
 
 ### Phase 6 -- Macro authority: placement, partitions, prefill/decode, tenancy
 
+Implementation plan: [`phase-6.md`](phase-6.md), which states its predictions before the run.
+
 The slow, coarse, orchestrator-owned decisions -- §2.4's provisioning tier, and between them
 everything Phase 3 froze. These are also the decisions the system of record holds (§8).
 
