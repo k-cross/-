@@ -4,7 +4,7 @@ use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::engine::{EngineCache, Placed};
 use crate::flow::FlowHint;
-use crate::stream::{KvEvent, Medium};
+use crate::stream::{KvEvent, Mark, Medium};
 use crate::tier::{Tier, TierSpec};
 
 const FREQ_CAP: u32 = 16;
@@ -175,6 +175,7 @@ struct Entry {
     meta: BlobMeta,
 
     expect: f64,
+    retain_until: u64,
     last_touch: u64,
     freq: u32,
     resident_children: u32,
@@ -235,6 +236,8 @@ pub struct TierPool {
 
     last_price: f64,
 
+    retirements: BinaryHeap<Reverse<(u64, BlobId)>>,
+
     pub coupled: u64,
     pub coupled_decisions: u64,
 }
@@ -263,6 +266,7 @@ impl TierPool {
             regrets: [0; BlobKind::N],
             recovery: None,
             last_price: 0.0,
+            retirements: BinaryHeap::new(),
             coupled: 0,
             coupled_decisions: 0,
         }
@@ -364,6 +368,54 @@ impl TierPool {
             Policy::Clairvoyant => return,
         };
         self.reheap(id);
+    }
+
+    pub fn retain_until(&mut self, id: BlobId, until: u64, enforced: bool) {
+        let Some(e) = self.entries.get_mut(&id) else {
+            return;
+        };
+        if e.expect <= 0.0 {
+            return;
+        }
+        e.retain_until = until;
+        if enforced {
+            self.retirements.push(Reverse((until, id)));
+        }
+    }
+
+    pub fn retire(&mut self, now: u64) {
+        while let Some(&Reverse((until, id))) = self.retirements.peek() {
+            if until > now {
+                break;
+            }
+            self.retirements.pop();
+            let Some(e) = self.entries.get_mut(&id) else {
+                continue;
+            };
+            if e.retain_until != until || e.expect <= 0.0 || self.policy != Policy::Gdsf {
+                continue;
+            }
+            e.priority -= e.expect * e.meta.value_per_byte();
+            e.expect = 0.0;
+            self.reheap(id);
+        }
+    }
+
+    pub fn evict_first(&mut self, id: BlobId) {
+        let inflation = self.inflation;
+        let Some(e) = self.entries.get_mut(&id) else {
+            return;
+        };
+        e.priority = inflation;
+        self.reheap(id);
+    }
+
+    #[must_use]
+    pub fn stale_bumps(&self, now: u64) -> usize {
+        self.entries
+            .values()
+            .filter(|e| e.expect > 0.0 && e.retain_until > 0 && e.retain_until <= now)
+            .count()
     }
 
     #[must_use]
@@ -642,6 +694,7 @@ impl TierPool {
             Entry {
                 meta,
                 expect: 0.0,
+                retain_until: 0,
                 last_touch: self.clock,
                 freq: 1,
                 resident_children: 0,
@@ -766,6 +819,7 @@ fn record(
             id,
             bytes: meta.bytes,
             medium,
+            mark: None,
         });
     }
 }
@@ -803,6 +857,21 @@ impl KvTiers {
         placed.resident
     }
 
+    fn mark(&mut self, id: BlobId, mark: Mark) -> bool {
+        let Some(applied) = self.gpu.mark(id, mark) else {
+            return false;
+        };
+        if let (Some(log), Some(meta)) = (self.events.as_mut(), self.gpu.meta_of(&id)) {
+            log.push(KvEvent::Stored {
+                id,
+                bytes: meta.bytes,
+                medium: Medium::Gpu,
+                mark: Some(applied),
+            });
+        }
+        true
+    }
+
     fn forget_cold(&mut self, id: &BlobId) {
         let removed_offload = self.offload.remove(id).is_some();
         let removed_spill = self.spill.remove(id).is_some();
@@ -830,6 +899,48 @@ impl KvTiers {
             log.push(KvEvent::Cleared);
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Half {
+    #[default]
+    Both,
+    Retain,
+    Prewarm,
+    Off,
+}
+
+impl Half {
+    #[must_use]
+    pub fn retains(self) -> bool {
+        matches!(self, Self::Both | Self::Retain)
+    }
+
+    #[must_use]
+    pub fn prewarms(self) -> bool {
+        matches!(self, Self::Both | Self::Prewarm)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct AnnounceMix {
+    pub kv: Half,
+    pub host: Half,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Ahead {
+    pub prefill: bool,
+    pub hold: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct DirectiveStats {
+    pub applied: u64,
+    pub expired: u64,
+    pub pressure_evictions: u64,
+    pub marked_blocks: u64,
+    pub marked_bytes: u64,
 }
 
 #[must_use]
@@ -860,7 +971,12 @@ pub struct Hierarchy {
     clairvoyant_op: u64,
     policy: Policy,
     kv: Option<KvTiers>,
-    prewarm_kv: bool,
+    announce: AnnounceMix,
+    ahead: Ahead,
+    deadline: bool,
+    now: u64,
+    pub prefilled_blocks: u64,
+    pub held_blocks: u64,
     seq_hits: u64,
 }
 
@@ -965,13 +1081,43 @@ impl Hierarchy {
             clairvoyant_op: 0,
             policy,
             kv,
-            prewarm_kv: true,
+            announce: AnnounceMix::default(),
+            ahead: Ahead::default(),
+            deadline: false,
+            now: 0,
+            prefilled_blocks: 0,
+            held_blocks: 0,
             seq_hits: 0,
         }
     }
 
-    pub fn set_prewarm_kv(&mut self, on: bool) {
-        self.prewarm_kv = on;
+    pub fn set_announce(&mut self, mix: AnnounceMix) {
+        self.announce = mix;
+    }
+
+    pub fn set_ahead(&mut self, ahead: Ahead) {
+        self.ahead = ahead;
+    }
+
+    pub fn set_deadline(&mut self, on: bool) {
+        self.deadline = on;
+    }
+
+    pub fn tick(&mut self, now: u64) {
+        self.now = now;
+        self.expire_marks(now);
+        if self.deadline {
+            for tier in [Tier::Hbm, Tier::Ddr, Tier::Nvme] {
+                self.pool_mut(tier).retire(now);
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn stale_bumps(&self) -> usize {
+        self.hbm.stale_bumps(self.now)
+            + self.ddr.stale_bumps(self.now)
+            + self.nvme.stale_bumps(self.now)
     }
 
     pub fn set_clairvoyant_index(&mut self, index: HashMap<BlobId, VecDeque<u64>>) {
@@ -1379,6 +1525,70 @@ impl Hierarchy {
         if let Some(kv) = self.kv.as_mut() {
             kv.gpu.release(now_ns);
         }
+        self.tick(now_ns);
+    }
+
+    pub fn expire_marks(&mut self, now: u64) {
+        if let Some(kv) = self.kv.as_mut() {
+            kv.gpu.expire(now);
+        }
+    }
+
+    pub fn mark_kv(&mut self, id: BlobId, mark: Mark) -> bool {
+        self.kv.as_mut().is_some_and(|kv| kv.mark(id, mark))
+    }
+
+    #[must_use]
+    pub fn kv_live_marks(&self, now: u64) -> Vec<(BlobId, Mark)> {
+        self.kv
+            .as_ref()
+            .map_or_else(Vec::new, |kv| kv.gpu.live_marks(now))
+    }
+
+    #[must_use]
+    pub fn directive_stats(&self) -> DirectiveStats {
+        self.kv.as_ref().map_or_else(DirectiveStats::default, |kv| {
+            let (marked_blocks, marked_bytes) = kv.gpu.marked();
+            DirectiveStats {
+                applied: kv.gpu.marks_applied,
+                expired: kv.gpu.marks_expired,
+                pressure_evictions: kv.gpu.pressure_evictions,
+                marked_blocks,
+                marked_bytes,
+            }
+        })
+    }
+
+    #[must_use]
+    pub fn kv_tier_of(&self, id: &BlobId) -> Option<Medium> {
+        let kv = self.kv.as_ref()?;
+        if kv.gpu.contains(id) {
+            Some(Medium::Gpu)
+        } else if kv.offload.contains(id) {
+            Some(Medium::Cpu)
+        } else if kv.spill.contains(id) {
+            Some(Medium::Storage)
+        } else {
+            None
+        }
+    }
+
+    pub fn prefill_block(&mut self, id: BlobId, meta: BlobMeta) -> Option<u64> {
+        let ns = self.local_ns(&id, &meta);
+        let kv = self.kv.as_mut()?;
+        if kv.gpu.contains(&id) {
+            return Some(0);
+        }
+        if meta.parent.is_some_and(|p| !kv.gpu.contains(&p)) {
+            return None;
+        }
+        if !kv.place(id, meta) {
+            return None;
+        }
+        kv.forget_cold(&id);
+        self.prefilled_blocks += 1;
+        self.clairvoyant_touch(id, meta.kind);
+        Some(ns)
     }
 
     #[must_use]
@@ -1723,14 +1933,59 @@ impl Hierarchy {
     }
 
     pub fn announce(&mut self, hint: &FlowHint) {
+        let until = self.now + u64::from(hint.lead_ops) + 1;
+        let deadline = self.deadline;
+        let mut prefilling = self.ahead.prefill;
+        let mut prefilled = false;
         for &(id, meta) in &hint.downstream {
-            if self.engine_kv(meta.kind).is_some()
-                || (!self.prewarm_kv && meta.kind == BlobKind::KvBlock)
-            {
+            if self.engine_kv(meta.kind).is_some() {
+                if self.is_hot(&id, meta.kind) {
+                    if self.ahead.hold {
+                        self.held_blocks += u64::from(self.mark_kv(
+                            id,
+                            Mark {
+                                rank: crate::stream::Rank::Retain,
+                                until_ns: until,
+                            },
+                        ));
+                    }
+                } else if prefilling {
+                    match self.prefill_block(id, meta) {
+                        Some(ns) => {
+                            self.prewarm_ns += ns;
+                            self.prewarmed_bytes += meta.bytes;
+                            prefilled = true;
+                            if self.ahead.hold {
+                                self.held_blocks += u64::from(self.mark_kv(
+                                    id,
+                                    Mark {
+                                        rank: crate::stream::Rank::Retain,
+                                        until_ns: until,
+                                    },
+                                ));
+                            }
+                        }
+                        None => prefilling = false,
+                    }
+                }
+                continue;
+            }
+            let half = if meta.kind == BlobKind::KvBlock {
+                self.announce.kv
+            } else {
+                self.announce.host
+            };
+            if half == Half::Off {
                 continue;
             }
             if self.is_hot(&id, meta.kind) {
-                self.anticipate(id, meta.kind, hint.probability);
+                if half.retains() {
+                    self.anticipate(id, meta.kind, hint.probability);
+                    self.home_mut(meta.kind).retain_until(id, until, deadline);
+                }
+                continue;
+            }
+            if !half.prewarms() {
                 continue;
             }
             if meta.bytes > self.home(meta.kind).free_bytes() {
@@ -1743,8 +1998,14 @@ impl Hierarchy {
             self.forget_cold(&id, meta.kind);
 
             self.prewarm_ns += ns;
-            self.anticipate(id, meta.kind, hint.probability);
+            if half.retains() {
+                self.anticipate(id, meta.kind, hint.probability);
+                self.home_mut(meta.kind).retain_until(id, until, deadline);
+            }
             self.prewarmed_bytes += meta.bytes;
+        }
+        if prefilled {
+            self.seal(None);
         }
     }
 
@@ -2315,5 +2576,174 @@ mod tests {
                 assert_eq!(direct, via_hierarchy, "kind={kind:?} split={split}");
             }
         }
+    }
+
+    fn pool_of(blobs: u64) -> TierPool {
+        TierPool::new(
+            TierSpec::dram(blobs * 100),
+            Policy::Gdsf,
+            false,
+            Quota::open(blobs * 100, [0; BlobKind::N]),
+        )
+    }
+
+    fn blob(tag: &str) -> (BlobId, BlobMeta) {
+        (
+            BlobId::leaf(tag.as_bytes()),
+            BlobMeta {
+                kind: BlobKind::Snapshot,
+                bytes: 100,
+                parent: None,
+                recompute_ns: 1_000,
+            },
+        )
+    }
+
+    fn victim_of(enforced: bool) -> BlobId {
+        let mut pool = pool_of(2);
+        let (a, b, c) = (blob("a"), blob("b"), blob("c"));
+        let mut out = Vec::new();
+        pool.admit(a.0, a.1, &mut out);
+        pool.admit(b.0, b.1, &mut out);
+        pool.touch(b.0);
+        pool.anticipate(a.0, 1.0);
+        pool.retain_until(a.0, 10, enforced);
+        pool.retire(10);
+        pool.admit(c.0, c.1, &mut out);
+        out[0].0
+    }
+
+    #[test]
+    fn a_deadline_withdraws_the_bump_and_an_unbounded_one_never_self_corrects() {
+        let (a, b) = (blob("a").0, blob("b").0);
+        assert_eq!(
+            victim_of(true),
+            a,
+            "the withdrawn bump no longer shields it"
+        );
+        assert_eq!(
+            victim_of(false),
+            b,
+            "the unbounded bump outranks a touched blob"
+        );
+    }
+
+    #[test]
+    fn a_bump_past_its_deadline_is_stale_until_withdrawn() {
+        for (enforced, stale) in [(false, 1), (true, 0)] {
+            let mut pool = pool_of(2);
+            let a = blob("a");
+            pool.admit(a.0, a.1, &mut Vec::new());
+            pool.anticipate(a.0, 1.0);
+            pool.retain_until(a.0, 10, enforced);
+            assert_eq!(pool.stale_bumps(9), 0);
+            pool.retire(9);
+            assert_eq!(pool.stale_bumps(10), 1);
+            pool.retire(10);
+            assert_eq!(pool.stale_bumps(10), stale, "enforced {enforced}");
+        }
+    }
+
+    #[test]
+    fn evict_first_puts_a_blob_at_the_front_of_its_class_until_it_is_touched() {
+        let mut pool = pool_of(2);
+        let (a, b, c, d) = (blob("a"), blob("b"), blob("c"), blob("d"));
+        let mut out = Vec::new();
+        pool.admit(a.0, a.1, &mut out);
+        pool.admit(b.0, b.1, &mut out);
+        for _ in 0..3 {
+            pool.touch(a.0);
+        }
+        pool.evict_first(a.0);
+        pool.admit(c.0, c.1, &mut out);
+        assert_eq!(out[0].0, a.0, "the hottest blob goes first once demoted");
+        pool.touch(b.0);
+        pool.evict_first(b.0);
+        pool.touch(b.0);
+        pool.admit(d.0, d.1, &mut out);
+        assert_eq!(out[1].0, c.0, "a touch cancels the demotion");
+    }
+
+    #[test]
+    fn announce_halves_split_retention_from_prewarm() {
+        let downstream: Vec<_> = (0..4).map(|i| blob(&format!("s{i}"))).collect();
+        let hint = FlowHint {
+            task: 1,
+            downstream: downstream.clone(),
+            probability: 1.0,
+            lead_ops: 6,
+            payload_bytes: 0,
+        };
+        for (half, prewarmed) in [
+            (Half::Both, true),
+            (Half::Retain, false),
+            (Half::Prewarm, true),
+            (Half::Off, false),
+        ] {
+            let mut h = hierarchy(true);
+            h.set_announce(AnnounceMix {
+                kv: Half::Both,
+                host: half,
+            });
+            h.announce(&hint);
+            assert_eq!(h.prewarmed_bytes > 0, prewarmed, "{half:?}");
+            assert_eq!(h.is_hot(&downstream[0].0, BlobKind::Snapshot), prewarmed);
+        }
+        for (deadline, stale) in [(false, 4), (true, 0)] {
+            let mut h = hierarchy(true);
+            for &(id, meta) in &downstream {
+                assert!(!h.access(&[(id, meta)]).pending);
+            }
+            h.set_deadline(deadline);
+            h.set_announce(AnnounceMix {
+                kv: Half::Both,
+                host: Half::Retain,
+            });
+            h.announce(&hint);
+            h.tick(100);
+            assert_eq!(h.stale_bumps(), stale, "deadline {deadline}");
+        }
+    }
+
+    #[test]
+    fn a_prefill_places_a_chain_in_order_and_a_mark_is_echoed_on_the_stream() {
+        let mut h = tiers(16 * BLOCK, 0);
+        h.record_kv_events(true);
+        let chain = kv_chain("p", 3);
+        assert_eq!(
+            h.prefill_block(chain[2].0, chain[2].1),
+            None,
+            "no parent yet"
+        );
+        for &(id, meta) in &chain {
+            assert_eq!(h.prefill_block(id, meta), Some(meta.recompute_ns));
+        }
+        h.seal(None);
+        for &(id, meta) in &chain {
+            assert!(h.is_hot(&id, meta.kind));
+            assert_eq!(h.prefill_block(id, meta), Some(0), "already resident");
+        }
+        assert_eq!(h.prefilled_blocks, 3);
+        let mark = Mark {
+            rank: crate::stream::Rank::Retain,
+            until_ns: 50,
+        };
+        let stored = h.take_kv_events().len();
+        assert_eq!(stored, 3);
+        assert!(h.mark_kv(chain[1].0, mark));
+        assert!(!h.mark_kv(BlobId::leaf(b"absent"), mark));
+        assert_eq!(
+            h.take_kv_events(),
+            vec![KvEvent::Stored {
+                id: chain[1].0,
+                bytes: BLOCK,
+                medium: Medium::Gpu,
+                mark: Some(mark),
+            }]
+        );
+        assert_eq!(h.kv_live_marks(49), vec![(chain[1].0, mark)]);
+        h.tick(50);
+        assert!(h.kv_live_marks(50).is_empty());
+        assert_eq!(h.directive_stats().expired, 1);
     }
 }

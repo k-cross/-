@@ -1,10 +1,11 @@
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, VecDeque};
 
 use crate::blob::{BlobId, BlobMeta};
 use crate::engine::STEP_BASE_NS;
 use crate::rng::Rng;
-use crate::stream::{Index, KvEvent, Medium};
+use crate::stream::{Index, KvEvent, Medium, Rank};
 
 pub const BUFFER_STEPS: usize = 10_000;
 pub const SLO_QUANTILE: f64 = 0.9;
@@ -30,6 +31,65 @@ pub enum Scoring {
     Expected,
     Quantile(f64),
     Slo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Marks {
+    Acked,
+    Trusted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cause {
+    NotYetDue,
+    Dropped,
+    Silenced,
+    NeverStored,
+    Stranded,
+    Redispatched,
+}
+
+impl Cause {
+    pub const N: usize = 6;
+    pub const ALL: [Self; Self::N] = [
+        Self::NotYetDue,
+        Self::Dropped,
+        Self::Silenced,
+        Self::NeverStored,
+        Self::Stranded,
+        Self::Redispatched,
+    ];
+
+    #[must_use]
+    pub fn idx(self) -> usize {
+        match self {
+            Self::NotYetDue => 0,
+            Self::Dropped => 1,
+            Self::Silenced => 2,
+            Self::NeverStored => 3,
+            Self::Stranded => 4,
+            Self::Redispatched => 5,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NotYetDue => "not yet due",
+            Self::Dropped => "dropped",
+            Self::Silenced => "silenced",
+            Self::NeverStored => "never stored",
+            Self::Stranded => "stranded",
+            Self::Redispatched => "re-dispatched",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fate {
+    InTransit,
+    Lost,
+    Silenced,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +162,8 @@ struct Publisher {
     open_close: u64,
     buffer: VecDeque<Batch>,
     next_snapshot: u64,
+    stored_seq: HashMap<BlobId, u64>,
+    removed_seq: HashMap<BlobId, u64>,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +172,7 @@ struct Subscriber {
     ahead: BTreeMap<u64, Batch>,
     outstanding_until: u64,
     unapplied: Vec<(u64, u64)>,
+    fates: BTreeMap<u64, Fate>,
     log: BTreeMap<u64, Batch>,
 }
 
@@ -136,6 +199,8 @@ pub struct Belief {
     last_price: f64,
     reported_load: usize,
     sent: BTreeMap<u64, usize>,
+    trusted: HashMap<BlobId, u64>,
+    certain: Cell<Option<(u64, usize)>>,
 }
 
 impl Belief {
@@ -147,6 +212,53 @@ impl Belief {
     #[must_use]
     pub fn believes_held(&self, id: &BlobId) -> bool {
         self.believes_gpu(id) || self.index.contains(Medium::Cpu, id)
+    }
+
+    #[must_use]
+    pub fn optimistic_window(&self, id: &BlobId) -> Option<u64> {
+        self.optimistic.get(id).map(|o| o.window_seq)
+    }
+
+    fn holds_live(&self, id: &BlobId, now: u64) -> bool {
+        self.index
+            .mark(id)
+            .is_some_and(|m| m.rank == Rank::Retain && m.live_at(now))
+            || self.trusted.get(id).is_some_and(|&until| until > now)
+    }
+
+    fn certain_blocks(&self, now: u64) -> usize {
+        if self.trusted.is_empty() && self.index.marks().next().is_none() {
+            return self.pinned.len();
+        }
+        if let Some((at, n)) = self.certain.get()
+            && at == now
+        {
+            return n;
+        }
+        let mut extra = 0;
+        for (id, m) in self.index.marks() {
+            extra += usize::from(
+                m.rank == Rank::Retain && m.live_at(now) && !self.pinned.contains_key(id),
+            );
+        }
+        for (id, &until) in &self.trusted {
+            let acked = self
+                .index
+                .mark(id)
+                .is_some_and(|m| m.rank == Rank::Retain && m.live_at(now));
+            extra += usize::from(until > now && !acked && !self.pinned.contains_key(id));
+        }
+        let n = self.pinned.len() + extra;
+        self.certain.set(Some((now, n)));
+        n
+    }
+
+    fn trust(&mut self, ids: &[BlobId], until: u64) {
+        for id in ids {
+            let held = self.trusted.entry(*id).or_insert(0);
+            *held = (*held).max(until);
+        }
+        self.certain.set(None);
     }
 
     #[must_use]
@@ -187,6 +299,7 @@ impl Belief {
     }
 
     fn apply(&mut self, seq: u64, close_ns: u64, load: usize, events: &[KvEvent]) {
+        self.certain.set(None);
         self.windows_applied += 1;
         self.reported_load = load;
         self.sent = self.sent.split_off(&(seq + 1));
@@ -205,6 +318,7 @@ impl Belief {
                         Medium::Gpu => {
                             self.gpu_removals += 1;
                             self.last_price = self.unit_price;
+                            self.trusted.remove(&id);
                         }
                         Medium::Cpu => self.cpu_removals += 1,
                         Medium::Storage => {}
@@ -214,6 +328,7 @@ impl Belief {
                     }
                 }
                 KvEvent::Cleared => {
+                    self.trusted.clear();
                     self.optimistic.clear();
                     self.optimistic_bytes = 0;
                     self.confirmed.clear();
@@ -239,6 +354,7 @@ impl Belief {
     }
 
     fn restore(&mut self, as_of: u64, at_ns: u64, index: Index, since: &BTreeMap<u64, Batch>) {
+        self.certain.set(None);
         self.index = index;
         self.reconcile(|o| o.window_seq <= as_of);
         for id in self.index.sorted_ids(Medium::Gpu) {
@@ -253,6 +369,7 @@ impl Belief {
     }
 
     fn dispatched(&mut self, blocks: &[(BlobId, BlobMeta)], now: u64, window_seq: u64, price: f64) {
+        self.certain.set(None);
         if price > 0.0 {
             self.unit_price = price;
         }
@@ -273,6 +390,7 @@ impl Belief {
     }
 
     fn pin(&mut self, ids: Vec<BlobId>, until: u64) {
+        self.certain.set(None);
         let seq = self.next_hold;
         self.next_hold += 1;
         for id in &ids {
@@ -287,6 +405,7 @@ impl Belief {
             if end > now {
                 break;
             }
+            self.certain.set(None);
             self.holds.pop();
             for id in self.held.remove(&seq).unwrap_or_default() {
                 if let Some(n) = self.pinned.get_mut(&id) {
@@ -380,7 +499,31 @@ impl Observer {
         if self.dead[d] {
             return;
         }
-        self.pubs[d].open.extend(events);
+        let publisher = &mut self.pubs[d];
+        for event in &events {
+            match *event {
+                KvEvent::Stored {
+                    id,
+                    medium: Medium::Gpu,
+                    mark: None,
+                    ..
+                } => {
+                    publisher.stored_seq.insert(id, publisher.next_seq);
+                }
+                KvEvent::Removed {
+                    id,
+                    medium: Medium::Gpu,
+                } => {
+                    publisher.removed_seq.insert(id, publisher.next_seq);
+                }
+                KvEvent::Cleared => {
+                    publisher.stored_seq.clear();
+                    publisher.removed_seq.clear();
+                }
+                _ => {}
+            }
+        }
+        publisher.open.extend(events);
         if !self.cond.cadence {
             self.seal(d, now, load);
             self.deliver_due(now);
@@ -390,6 +533,57 @@ impl Observer {
     pub fn dispatched(&mut self, d: usize, blocks: &[(BlobId, BlobMeta)], now: u64, price: f64) {
         let window_seq = self.pubs[d].next_seq;
         self.beliefs[d].dispatched(blocks, now, window_seq, price);
+    }
+
+    pub fn directed(&mut self, d: usize, ids: &[BlobId], until: u64) {
+        self.beliefs[d].trust(ids, until);
+    }
+
+    fn undelivered(&self, d: usize, seq: u64) -> Cause {
+        let sub = &self.subs[d];
+        let gap = if sub.ahead.contains_key(&seq) {
+            sub.next_expected
+        } else {
+            seq
+        };
+        match sub.fates.get(&gap) {
+            Some(Fate::Lost) => Cause::Dropped,
+            Some(Fate::Silenced) => Cause::Silenced,
+            _ => Cause::NotYetDue,
+        }
+    }
+
+    #[must_use]
+    pub fn phantom_cause(&self, d: usize, id: &BlobId) -> Cause {
+        let publisher = &self.pubs[d];
+        if let Some(window) = self.beliefs[d].optimistic_window(id) {
+            let stored = publisher
+                .stored_seq
+                .get(id)
+                .copied()
+                .filter(|&s| s >= window);
+            return match stored {
+                None => Cause::NeverStored,
+                Some(seq) => match self.undelivered(d, seq) {
+                    Cause::Dropped | Cause::Silenced if self.cond.recovery == Recovery::None => {
+                        Cause::Stranded
+                    }
+                    cause => cause,
+                },
+            };
+        }
+        publisher
+            .removed_seq
+            .get(id)
+            .map_or(Cause::NotYetDue, |&seq| self.undelivered(d, seq))
+    }
+
+    #[must_use]
+    pub fn miss_cause(&self, d: usize, id: &BlobId) -> Cause {
+        self.pubs[d]
+            .stored_seq
+            .get(id)
+            .map_or(Cause::NotYetDue, |&seq| self.undelivered(d, seq))
     }
 
     pub fn sent(&mut self, d: usize) {
@@ -448,7 +642,7 @@ impl Observer {
         if !b.believes_gpu(id) {
             return 0.0;
         }
-        if b.pinned.contains_key(id) {
+        if b.pinned.contains_key(id) || b.holds_live(id, self.clock) {
             return 1.0;
         }
         let since = b.confirmed.get(id).copied().unwrap_or(0);
@@ -458,7 +652,7 @@ impl Observer {
         }
         let rate = b.gpu_removals as f64 / b.windows_applied as f64;
         let unpinned = (b.index.len(Medium::Gpu) + b.optimistic.len())
-            .saturating_sub(b.pinned.len())
+            .saturating_sub(b.certain_blocks(self.clock))
             .max(1);
         (1.0 - rate * unknown as f64 / unpinned as f64).clamp(0.0, 1.0)
     }
@@ -489,11 +683,15 @@ impl Observer {
             .any(|e| e.node == d && e.from_ns <= at && at < e.until_ns)
     }
 
-    fn lost(&mut self, d: usize, at: u64) -> bool {
+    fn drop_reason(&mut self, d: usize, at: u64) -> Option<Fate> {
         if self.silenced(d, at) {
-            return true;
+            return Some(Fate::Silenced);
         }
-        self.cond.loss > 0.0 && self.rng.chance(self.cond.loss)
+        (self.cond.loss > 0.0 && self.rng.chance(self.cond.loss)).then_some(Fate::Lost)
+    }
+
+    fn lost(&mut self, d: usize, at: u64) -> bool {
+        self.drop_reason(d, at).is_some()
     }
 
     fn send(&mut self, at: u64, d: usize, delivery: Delivery) {
@@ -524,7 +722,11 @@ impl Observer {
             }
         }
         self.subs[d].unapplied.push((seq, close));
-        if !self.lost(d, close) {
+        let dropped = self.drop_reason(d, close);
+        self.subs[d]
+            .fates
+            .insert(seq, dropped.unwrap_or(Fate::InTransit));
+        if dropped.is_none() {
             self.send(close + self.cond.lag_ns, d, Delivery::Batch(batch));
         }
         if self.cond.recovery == Recovery::Periodic && close >= self.pubs[d].next_snapshot {
@@ -598,6 +800,7 @@ impl Observer {
     fn on_snapshot(&mut self, d: usize, as_of: u64, at_ns: u64, index: Index) {
         let sub = &mut self.subs[d];
         sub.unapplied.retain(|&(seq, _)| seq > as_of);
+        sub.fates = sub.fates.split_off(&(as_of + 1));
         let since = std::mem::take(&mut sub.log);
         self.beliefs[d].restore(as_of, at_ns, index, &since);
         self.subs[d].log = since.into_iter().filter(|(seq, _)| *seq > as_of).collect();
@@ -660,6 +863,7 @@ impl Observer {
         {
             sub.unapplied.remove(i);
         }
+        sub.fates.remove(&batch.seq);
         self.beliefs[d].apply(batch.seq, batch.close_ns, batch.load, &batch.events);
         if self.cond.recovery == Recovery::Periodic {
             self.subs[d].log.insert(batch.seq, batch);
@@ -671,6 +875,7 @@ impl Observer {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+    use crate::stream::Mark;
 
     fn block(tag: &str) -> (BlobId, BlobMeta) {
         (
@@ -689,6 +894,7 @@ mod tests {
             id: b.0,
             bytes: b.1.bytes,
             medium,
+            mark: None,
         }
     }
 
@@ -933,5 +1139,170 @@ mod tests {
         }
         assert_eq!(stream.reported_load(0), Some(7));
         assert_eq!(plus.reported_load(0), Some(7));
+    }
+
+    fn conditions(loss: f64, recovery: Recovery, episodes: Vec<Episode>) -> Conditions {
+        Conditions {
+            cadence: true,
+            lag_ns: 5,
+            loss,
+            recovery,
+            period_ns: 1_000,
+            episodes,
+            seed: 1,
+            load: LoadSource::Path,
+        }
+    }
+
+    fn silent(from_ns: u64, until_ns: u64) -> Vec<Episode> {
+        vec![Episode {
+            node: 0,
+            from_ns,
+            until_ns,
+        }]
+    }
+
+    #[test]
+    fn a_removal_is_not_yet_due_dropped_or_silenced_by_its_batchs_fate() {
+        let (a, b) = (block("a"), block("b"));
+        let mut o = Observer::new(1, conditions(0.0, Recovery::None, silent(20, 40)));
+        o.pump(9, &[10], &[0, 0]);
+        o.emit(
+            0,
+            vec![stored(&a, Medium::Gpu), stored(&b, Medium::Gpu)],
+            9,
+            0,
+        );
+        o.pump(16, &[10], &[0, 0]);
+        assert!(o.belief(0).index().contains(Medium::Gpu, &a.0));
+        o.emit(0, vec![removed(&a, Medium::Gpu)], 21, 0);
+        o.pump(31, &[10], &[0, 0]);
+        assert_eq!(o.phantom_cause(0, &a.0), Cause::Silenced);
+        o.emit(0, vec![removed(&b, Medium::Gpu)], 41, 0);
+        o.pump(42, &[10], &[0, 0]);
+        assert_eq!(o.phantom_cause(0, &b.0), Cause::NotYetDue);
+
+        let mut lost = Observer::new(1, conditions(1.0, Recovery::None, Vec::new()));
+        lost.pump(9, &[10], &[0, 0]);
+        lost.emit(0, vec![stored(&a, Medium::Gpu)], 9, 0);
+        lost.emit(0, vec![removed(&a, Medium::Gpu)], 9, 0);
+        lost.pump(19, &[10], &[0, 0]);
+        lost.dispatched(0, &[a], 19, 1.0);
+        assert_eq!(lost.phantom_cause(0, &a.0), Cause::NeverStored);
+    }
+
+    #[test]
+    fn an_optimistic_entry_whose_store_was_lost_is_stranded_only_without_a_repair_path() {
+        let a = block("a");
+        for (recovery, expected) in [
+            (Recovery::None, Cause::Stranded),
+            (Recovery::Replay, Cause::Dropped),
+            (Recovery::Periodic, Cause::Dropped),
+        ] {
+            let mut o = Observer::new(1, conditions(1.0, recovery, Vec::new()));
+            o.pump(9, &[10], &[0, 0]);
+            o.dispatched(0, &[a], 9, 1.0);
+            o.emit(0, vec![stored(&a, Medium::Gpu)], 9, 0);
+            o.emit(0, vec![removed(&a, Medium::Gpu)], 9, 0);
+            o.pump(19, &[10], &[0, 0]);
+            assert!(o.belief(0).believes_gpu(&a.0));
+            assert_eq!(o.phantom_cause(0, &a.0), expected, "{recovery:?}");
+        }
+    }
+
+    #[test]
+    fn a_block_the_engine_holds_and_the_belief_lacks_takes_its_stores_fate() {
+        let a = block("a");
+        let mut o = Observer::new(1, conditions(1.0, Recovery::Replay, Vec::new()));
+        o.pump(9, &[10], &[0, 0]);
+        o.emit(0, vec![stored(&a, Medium::Gpu)], 9, 0);
+        assert_eq!(
+            o.miss_cause(0, &a.0),
+            Cause::NotYetDue,
+            "the window is open"
+        );
+        o.pump(19, &[10], &[0, 0]);
+        assert_eq!(o.miss_cause(0, &a.0), Cause::Dropped);
+    }
+
+    fn marked(b: &(BlobId, BlobMeta), until_ns: u64) -> KvEvent {
+        KvEvent::Stored {
+            id: b.0,
+            bytes: b.1.bytes,
+            medium: Medium::Gpu,
+            mark: Some(Mark {
+                rank: Rank::Retain,
+                until_ns,
+            }),
+        }
+    }
+
+    fn crowded(marked_fillers: usize) -> (Observer, (BlobId, BlobMeta)) {
+        let a = block("a");
+        let fillers: Vec<_> = (0..99).map(|i| block(&format!("v{i}"))).collect();
+        let mut o = Observer::new(1, conditions(0.0, Recovery::Replay, Vec::new()));
+        o.pump(9, &[10], &[0, 0]);
+        let mut events = vec![stored(&a, Medium::Gpu)];
+        events.extend(fillers.iter().map(|v| stored(v, Medium::Gpu)));
+        o.emit(0, events, 9, 0);
+        o.pump(15, &[10], &[0, 0]);
+        let marks: Vec<_> = fillers[10..10 + marked_fillers]
+            .iter()
+            .map(|v| marked(v, 10_000))
+            .collect();
+        let gone: Vec<_> = fillers[..10]
+            .iter()
+            .map(|v| removed(v, Medium::Gpu))
+            .collect();
+        o.emit(0, [marks, gone].concat(), 16, 0);
+        o.pump(25, &[10], &[0, 0]);
+        (o, a)
+    }
+
+    #[test]
+    fn a_live_acknowledged_retain_is_certain_and_leaves_the_turnover_denominator() {
+        let (plain, a) = crowded(0);
+        let (held, _) = crowded(3);
+        let base = plain.survival(0, &a.0);
+        assert!((base - (1.0 - 5.0 / 90.0)).abs() < 1e-12, "{base}");
+        assert!((held.survival(0, &a.0) - (1.0 - 5.0 / 87.0)).abs() < 1e-12);
+        assert_eq!(held.survival(0, &block("v10").0), 1.0);
+        assert!(held.survival(0, &block("v20").0) < 1.0);
+    }
+
+    #[test]
+    fn an_acknowledged_retain_stops_counting_when_its_deadline_passes() {
+        let (mut held, a) = crowded(3);
+        let (mut plain, _) = crowded(0);
+        for o in [&mut held, &mut plain] {
+            o.pump(9_999, &[10], &[0, 0]);
+        }
+        assert_eq!(held.survival(0, &block("v10").0), 1.0);
+        for o in [&mut held, &mut plain] {
+            o.pump(10_000, &[10], &[0, 0]);
+        }
+        let expired = block("v10").0;
+        assert!(held.survival(0, &expired) < 1.0);
+        assert_eq!(held.survival(0, &expired), plain.survival(0, &expired));
+        assert_eq!(held.survival(0, &a.0), plain.survival(0, &a.0));
+        assert!(held.survival(0, &a.0) < 1.0);
+    }
+
+    #[test]
+    fn a_trusted_mark_is_certain_until_the_removal_is_heard() {
+        let (mut o, a) = crowded(0);
+        assert!(o.survival(0, &a.0) < 1.0);
+        o.directed(0, &[a.0], 10_000);
+        assert_eq!(o.survival(0, &a.0), 1.0);
+        assert!((o.survival(0, &block("v20").0) - (1.0 - 5.0 / 89.0)).abs() < 1e-12);
+        o.emit(0, vec![removed(&a, Medium::Gpu)], 26, 0);
+        o.pump(40, &[10], &[0, 0]);
+        assert_eq!(o.survival(0, &a.0), 0.0);
+        o.emit(0, vec![stored(&a, Medium::Gpu)], 41, 0);
+        o.pump(60, &[10], &[0, 0]);
+        assert!(
+            o.survival(0, &a.0) < 1.0,
+            "the trust did not outlive the removal"
+        );
     }
 }

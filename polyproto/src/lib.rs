@@ -6,6 +6,7 @@ pub mod boundary;
 pub mod cache;
 pub mod engine;
 pub mod flow;
+pub mod foresight;
 pub mod instruments;
 pub mod machine;
 pub mod oracle;

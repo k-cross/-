@@ -688,8 +688,8 @@ Two rules the score needs to be a decision rather than a suggestion:
 ## Results
 
 All numbers below are split memory unless marked unified, and run with the ledger allocating KV
-unless marked **engine**: *Engine allocation* and *Belief* give the corrected side. Two rules apply
-to everything here:
+unless marked **engine**: *Engine allocation*, *Belief* and *Influence* give the corrected side. Two
+rules apply to everything here:
 
 - **Service time leads.** Once decode cost depends on the batch a request joins, placement
   moves execution as well as waiting. `stall` excludes execution, so on its own it misreports
@@ -1231,6 +1231,84 @@ silence, on three seeds. Interactive stall p99 drops off its ~45 ms plateau (to 
 `slo`, in one of its two conditions on each seed and in none of the other twelve cells -- a
 direction with no measurable size.
 
+### Influence: what the router can do to memory it does not allocate
+
+`phase-5.md`, implemented. With `--engine-cache` the router can no longer write a KV block or
+reprice one. It can do two things: dispatch work that produces state (`--prefill-ahead`), and attach
+an RFC-0001 directive -- retain until a deadline, or evict first -- to a request the engine may
+honour or ignore (`--directives`, `--ignores`). `polyphonic influence` measures both on seeds 1-3,
+15k ops, no control crossing charged, `scored + fetch` at rack unless stated; every number below is
+a difference from the same run with the mechanism off, one value per seed, or a range.
+
+**`announce` was prewarm, and a directive cannot prewarm.** Splitting `announce`'s KV half on the
+ledger (task-latency margin over `blind`, split memory, seeds 1 / 2 / 3): the bump alone on what is
+resident, 5.4 / 4.5 / 4.9%, is `host-only`'s 5.3 / 4.8 / 4.5%; the prewarm alone, 10.4 / 11.3 /
+10.9%, is the published 10.7 / 10.6 / 10.3%. Unified memory says the same (5.2 / 5.8 / 3.8% against
+`host-only`'s 5.1 / 6.4 / 4.3%; 16.2 / 18.1 / 16.2% against 17.6 / 17.9 / 16.0%), and so does owned
+state: a `Snapshot` bump is worth 0.0 / 0.0 / 0.1%, admitting the cell 5.2 / 4.7 / 4.5%. Phase 3's
+"a directive is the only honest way left to buy it back" is retracted: a directive cannot create a
+block.
+
+**A dispatch can, and buys more than the ledger's prewarm did.** Prefilling the declared
+downstream's missing blocks when its hint arrives, through the engine's own allocator:
+
+| | seeds 1 / 2 / 3 |
+|---|---|
+| one node, split: margin over `blind` | **24.4 / 24.5 / 24.5%** (engine's `announce` with KV skipped: 9.0 / 9.4 / 9.0%) |
+| one node, unified | **28.4 / 28.2 / 28.5%** (3.2 / 3.6 / 3.2%) |
+| one node, net work against `blind` | +0.06 / +0.06 / +0.09% split, -0.01 / -0.22 / -0.06% unified |
+| cluster, defaults: flow downstream's stall | -63.8 / -63.5 / -63.5% |
+| cluster, defaults: total stall, mean service | -4.07 / -4.13 / -3.59%, -0.11 / -0.12 / -0.11% |
+| cluster, half partition, decode held: flow downstream's stall | -46.0 / -38.1 / -52.4% |
+| cluster, first seed: flow downstream's stall at zone / region | -30.6% / -7.4% |
+
+It beats the ledger because the ledger's prewarm admits only into free space and an engine never
+refuses, so a prefill always lands and displaces the LRU tail; the displaced blocks' later rebuilds
+are in the stall column and it still falls. The prefill lands where the downstream is placed 49-50%
+of the time (40-42% if it goes to the deepest believed prefix instead, which saves about five points
+less at rack), and costs 1.5-1.7x what it saves in prefill work, because a miss is a rack fetch and
+past a rack it is waste. Prefill is not a resource in the engine model, so this is exact about when
+the prefill runs and silent about whether an engine has room for it. Holding what is resident
+instead is worth 0.0-0.1pp.
+
+**A directive buys almost nothing.** Retaining a fan-out's parent chain until its declared resume:
+stall +0.00 / -0.05 / +0.08% at the published partition, and worse on every seed at half of it
+(+0.24 / +1.01 / +0.19%, 22k pressure evictions a seed). Evict-first over one-shot scopes: -0.76 /
+-1.67 / -0.87% and +0.94 / -0.01 / -0.01%. The ceilings, against LRU with no directives: a
+clairvoyant block manager -0.66 / -1.85 / -0.69% of stall at the published partition and +1.03 /
+-2.40 / -0.74% at half; an oracle emitter that retains every block until its true next use, at 5 s,
+-1.41 / -1.37 / +0.11% and +0.12 / +1.65 / +0.14%, at 30 s **worse** at the published partition on
+all three seeds (+0.40 / +0.40 / +2.07%, 108k pressure evictions a seed). Service is within 0.07% in
+every cell. The RFC's pressure rule evicts the soonest-expiring hold, which is the block needed
+soonest, and it fires where holding more than the partition's evictable share is already the
+mistake.
+
+**Why: reuse sits past LRU residency, and it does not matter.** Blocks a session reuses come back at
+a median 8.8 s after the node evicted them, against 2.3 s of median residency, so session reuse is
+the shape retention was built for. But those misses, though they touch 35.9% of KV dispatches at
+the published partition and 53.4% at half, cost 0.93 and 1.59 ms per served request -- 0.19% and
+0.32% of service. Routing already sends a turn where its prefix is, fetch pulls it from a peer, and
+the connector's offload catches most GPU evictions at a fifth of a rebuild.
+
+**An ignored directive is invisible to an acknowledged belief.** The gate is identical on four cells
+(declared and 5 s oracle emitters, both regimes, 5% loss). A router that believes its own requests
+fills the top calibration bin four times over and is over-confident only where removals go
+undelivered: 0.975 realised against 1.000 at half the partition with 20% loss and no recovery, 0.999
+with replay, 1.000 at the published partition. Service moves by at most 0.12%.
+
+**Divergence by cause.** Phantom share by cause, published partition / half: under replay every
+phantom is an undelivered removal (0.069-0.132%; 0.198-0.371% with 16-17% never stored); under 5% /
+20% loss with no recovery 15.1% / 36.6% (59.6% at half) are almost all dropped removals, and 0.9% /
+7.8% stranded -- an optimistic entry whose store was lost, which no later removal clears; under 2 s
+of silence 0.777% / 1.667%, of which 0.701% / 1.200% silenced. Misses are zero at every sample.
+
+**A deadline on the ledger's bump.** Withdrawing a bump when its hint's lead has passed leaves no
+stale entries at any rate of hints for flows that never come (against 27-852 under the bump), moves
+net work the same as the bump does (+0.4% to +7.9% at 25-76% false hints), and wins task latency by
+1.0 / 0.8 / 2.0 points even with no false hint, because a hinted prefix's interior otherwise keeps
+an inflated priority indefinitely. With false hints the two differ by -4.4 to +5.3 points in both
+directions.
+
 ## Method
 
 **On the fairness caveat.** Every comparison above between arms this repository wrote is a delta
@@ -1322,8 +1400,8 @@ the decision loop.
 
 [`owned-and-observed.md`](owned-and-observed.md) is the design this ledger is being corrected
 toward: what the orchestrator *owns*, *infers* and only *observes*, the data path, the workload
-taxonomy in [`taxo.md`](taxo.md) as a scheduler input, and the phase plan (§9 there). Phases 0-4
-and 8 are built, and their results are above. Phase 5, retention directives, is next.
+taxonomy in [`taxo.md`](taxo.md) as a scheduler input, and the phase plan (§9 there). Phases 0-5
+and 8 are built, and their results are above. Phase 6, macro authority, is next.
 
 ## Not built
 
@@ -1359,7 +1437,7 @@ computed.
 | memory coupling | regime-bound — **0.0%** at the `distributed` defaults (nothing binds), **54–85%** at 4 GiB DDR/node; locality coupling 0.8–1.7% in both. **With the engine allocating KV, 0–26%** (0–2% on the scored arms): most of it was the ledger allocating the engine's offload |
 | clairvoyant eviction vs GDSF | budget-matched: wins hit rate (+22.8pp), loses on cost (+3.7%) — GDSF gives up the *cheap* hits, so cost-weighting is already doing the work |
 | unified control plane beats RPC-queried | rounding error in aggregate (+0.02 ms/request); 33.7% of a warm `FaaS` invocation against its chosen `exec_ns` |
-| announce / anticipatory prewarm | 11–18% faster tasks, net work slightly worse — **half to three-quarters of it was KV prewarm**, which the engine does not let the orchestrator do; 3–9% with the engine allocating |
+| announce / anticipatory prewarm | 11–18% faster tasks, net work slightly worse — **half to three-quarters of it was KV prewarm**, which the engine does not let the orchestrator write; 3–9% with the engine allocating. **All of the KV margin was prewarm, none retention**, and a prefill of the declared downstream dispatched with the hint buys 24–28% |
 | downstream-aware gate | coupling tier 1 — replicable by a hint API |
 | data path binds below ~1 ms, dissolves an order of magnitude above | holds — crossover 0.84–1.42 ms / 4.35–7.42 ms, measured tax not borrowed |
 | out-of-process hook caps scheduler fleet size | holds — ~20 nodes (`ext_proc`) vs ~1000 (`Wasm`), `d` measured not assumed |
@@ -1373,3 +1451,9 @@ computed.
 | `P(resident)` as `1 - V/B` is calibrated | **no** -- near the diagonal with replay, over-confident (0.96 predicted, 0.70 realised) with unrecovered loss |
 | the gossip result is about engine telemetry | **retracted** -- it was about an informer cache over owned state in one regime; engine KV from the channel moves residency-greedy +21% at the published partition and -30% at half of it |
 | the score can stop reading the exact output length | **yes** -- the observed mean is within 0.13% and better; a quantile of it is not wanted |
+| retention directives buy back what the correction removed | **no** -- holding a declared flow's blocks is worth 0.0-0.1pp; an oracle emitter that knows every next use buys at most 1.4% of stall and 0.1% of service, with the sign changing across seeds; the bump half of `announce` carried -5% to +9% of its KV margin |
+| the engine lets the orchestrator prewarm | **yes, by dispatch** -- prefill-ahead buys 24-28% task latency on one node and cuts a flow downstream's stall by 64% at rack, 31% at zone and 7% at region, for 1.5-1.7x its saving in prefill work; only about half land where the downstream is placed |
+| an ignored directive can make the router's view wrong | **no** -- it changes no event, and an acknowledged belief is byte-identical to no directives; a belief that trusts its own requests is over-confident (0.975 against 1.000 realised) only where removals go undelivered |
+| divergence has separable causes | **yes** -- undelivered removals dominate; 1-8% of the no-recovery column is stranded optimistic entries; misses are zero at every sample |
+| a deadline on the ledger's bump | bounded state (no stale entries against 27-852) and 0.8-2.0 points of task latency with honest hints |
+| session reuse is worth retaining for | **by shape yes, by size no** -- reuse returns 3.8x past median residency, and the misses cost 0.2-0.3% of service |

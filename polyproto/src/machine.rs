@@ -1,16 +1,19 @@
 use crate::admit::{Reservations, Reserve};
-use crate::belief::{Conditions, Observer, SLO_QUANTILE, Scoring};
+use crate::belief::{Cause, Conditions, Marks, Observer, SLO_QUANTILE, Scoring};
 use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::boundary::Cost as Crossing;
 use crate::cache::{Cost, Hierarchy, NodeMemory, Policy};
 use crate::engine::{Engine, MAX_BATCH};
-use crate::instruments::Instruments;
+use crate::flow::FlowHint;
+use crate::foresight::Foresight;
+use crate::instruments::{Instruments, Reuse};
 use crate::oracle;
 use crate::span::Span;
+use crate::stream::{KvEvent, Mark, Rank};
 use crate::tele::Telemetry;
 use crate::tier::TierSpec;
 use crate::topo::Topology;
-use crate::work::{Agent, Gang, Request, RequestView, Slo, ToolCall};
+use crate::work::{Agent, Gang, Origin, Origins, Request, RequestView, Slo, ToolCall};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -42,6 +45,28 @@ impl Control {
             Self::Gossip { period } => format!("gossip (every {period})"),
         }
     }
+}
+
+pub const EVICT_FIRST_LEASE_NS: u64 = 30_000_000_000;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Target {
+    #[default]
+    Argmin,
+    Deepest,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Emit {
+    Declared { retain: bool, evict_first: bool },
+    Oracle { horizon_ns: u64 },
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Directives {
+    pub emit: Emit,
+    pub ignores: bool,
+    pub marks: Marks,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -188,12 +213,21 @@ pub struct Machine {
     observed: [(u64, u64); 2],
     pub instruments: Instruments,
     instrument: bool,
+    directives: Option<Directives>,
+    foresight: Option<Foresight>,
+    position: u64,
+    prefill_ahead: bool,
+    prefill_target: Target,
+    landing: HashMap<u64, usize>,
+    redispatched: Vec<HashSet<BlobId>>,
+    origins: Option<Origins>,
 }
 
 const DIVERGENCE_EVERY: u64 = 16;
 
 impl Machine {
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn new(
         topo: Topology,
         memory: impl Fn(usize) -> NodeMemory,
@@ -298,7 +332,64 @@ impl Machine {
             observed: [(0, 0); 2],
             instruments: Instruments::default(),
             instrument: false,
+            directives: None,
+            foresight: None,
+            position: 0,
+            prefill_ahead: false,
+            prefill_target: Target::Argmin,
+            landing: HashMap::new(),
+            redispatched: vec![HashSet::new(); n_domains],
+            origins: None,
         }
+    }
+
+    pub fn set_directives(&mut self, directives: Option<Directives>) {
+        self.directives = directives;
+    }
+
+    pub fn set_foresight(&mut self, foresight: Option<Foresight>) {
+        self.foresight = foresight;
+    }
+
+    pub fn set_clairvoyant(&mut self, foresight: &Foresight) {
+        for h in &mut self.domains {
+            h.set_clairvoyant_index(foresight.schedule());
+        }
+    }
+
+    pub fn set_position(&mut self, position: u64) {
+        self.position = position;
+        for h in &mut self.domains {
+            h.set_clairvoyant_op(position);
+        }
+    }
+
+    pub fn set_prefill_ahead(&mut self, on: bool) {
+        self.prefill_ahead = on;
+    }
+
+    pub fn set_prefill_target(&mut self, target: Target) {
+        self.prefill_target = target;
+    }
+
+    pub fn set_origins(&mut self, origins: Origins) {
+        self.record_kv_events(true);
+        self.instruments.reuse = Some(Reuse::new(origins.clone(), self.domains.len()));
+        self.origins = Some(origins);
+    }
+
+    #[must_use]
+    pub fn directive_stats(&self) -> crate::cache::DirectiveStats {
+        self.domains.iter().map(Hierarchy::directive_stats).fold(
+            crate::cache::DirectiveStats::default(),
+            |a, b| crate::cache::DirectiveStats {
+                applied: a.applied + b.applied,
+                expired: a.expired + b.expired,
+                pressure_evictions: a.pressure_evictions + b.pressure_evictions,
+                marked_blocks: a.marked_blocks + b.marked_blocks,
+                marked_bytes: a.marked_bytes + b.marked_bytes,
+            },
+        )
     }
 
     pub fn set_admission(&mut self, reserve: Reserve, tokens_per_block: u64) {
@@ -521,14 +612,273 @@ impl Machine {
             .filter(|(_, m)| m.kind == BlobKind::KvBlock)
             .copied()
             .collect();
+        self.observe_blocks(d, &blocks);
+    }
+
+    fn observe_blocks(&mut self, d: usize, blocks: &[(BlobId, BlobMeta)]) {
+        if self.observer.is_none() || !self.domains[d].engine_cache() {
+            return;
+        }
         let Some((_, first)) = blocks.first() else {
             return;
         };
         let price = self.domains[d].kv_unit_price(first);
         let now = self.arrival_ns;
-        if let Some(o) = self.observer.as_mut() {
-            o.dispatched(d, &blocks, now, price);
+        if self.instrument
+            && let Some(o) = self.observer.as_ref()
+        {
+            for (id, _) in blocks {
+                if o.belief(d).believes_gpu(id) && !self.domains[d].is_hot(id, BlobKind::KvBlock) {
+                    self.redispatched[d].insert(*id);
+                }
+            }
         }
+        if let Some(o) = self.observer.as_mut() {
+            o.dispatched(d, blocks, now, price);
+        }
+    }
+
+    fn observe_reuse(&mut self, d: usize, req: &Request) {
+        if self.instruments.reuse.is_none() || !self.domains[d].engine_cache() {
+            return;
+        }
+        let now = self.arrival_ns;
+        let seen: Vec<_> = req
+            .chain
+            .iter()
+            .filter(|(_, m)| m.kind == BlobKind::KvBlock)
+            .map(|(id, meta)| {
+                let tier = self.domains[d].kv_tier_of(id);
+                (*id, tier, self.domains[d].kv_acquire_ns(tier, meta))
+            })
+            .collect();
+        if seen.is_empty() {
+            return;
+        }
+        if let Some(r) = self.instruments.reuse.as_mut() {
+            r.dispatches += 1;
+            let mut evicted = false;
+            for (id, tier, cost) in seen {
+                evicted |= r.classify(d, now, &id, tier, cost);
+            }
+            r.dispatches_with_evicted_miss += u64::from(evicted);
+        }
+    }
+
+    fn observe_touched(&mut self, d: usize, req: &Request) {
+        if self.instruments.reuse.is_none() || !self.domains[d].engine_cache() {
+            return;
+        }
+        let now = self.arrival_ns;
+        let resident: Vec<BlobId> = req
+            .chain
+            .iter()
+            .chain(&req.produces)
+            .filter(|(id, m)| m.kind == BlobKind::KvBlock && self.domains[d].is_hot(id, m.kind))
+            .map(|(id, _)| *id)
+            .collect();
+        if let Some(r) = self.instruments.reuse.as_mut() {
+            for id in resident {
+                r.touched(d, now, id);
+            }
+        }
+    }
+
+    fn declared_marks(&self, req: &Request, scope: (bool, bool)) -> Vec<(BlobId, Mark)> {
+        let kv = |(_, m): &&(BlobId, BlobMeta)| m.kind == BlobKind::KvBlock;
+        let now = self.arrival_ns;
+        let mut marks = Vec::new();
+        if let Some(r) = req.retention.retain.filter(|_| scope.0) {
+            let until_ns = now + (u64::from(r.lead_ops) + 1) * self.interval_ns;
+            marks.extend(req.chain.iter().take(r.upto).filter(kv).map(|(id, _)| {
+                (
+                    *id,
+                    Mark {
+                        rank: Rank::Retain,
+                        until_ns,
+                    },
+                )
+            }));
+        }
+        if let Some(from) = req.retention.evict_first_from.filter(|_| scope.1) {
+            let until_ns = now + EVICT_FIRST_LEASE_NS;
+            marks.extend(
+                req.chain
+                    .iter()
+                    .skip(from)
+                    .chain(&req.produces)
+                    .filter(kv)
+                    .map(|(id, _)| {
+                        (
+                            *id,
+                            Mark {
+                                rank: Rank::EvictFirst,
+                                until_ns,
+                            },
+                        )
+                    }),
+            );
+        }
+        marks
+    }
+
+    fn oracle_marks(&self, req: &Request, horizon_ns: u64) -> Vec<(BlobId, Mark)> {
+        let Some(foresight) = &self.foresight else {
+            return Vec::new();
+        };
+        let (now, step, at) = (self.arrival_ns, self.interval_ns, self.position);
+        req.chain
+            .iter()
+            .chain(&req.produces)
+            .filter(|(_, m)| m.kind == BlobKind::KvBlock)
+            .filter_map(|(id, _)| {
+                let wait = (foresight.next_use(id, at)? - at) * step;
+                (wait <= horizon_ns).then_some((
+                    *id,
+                    Mark {
+                        rank: Rank::Retain,
+                        until_ns: now + wait + step,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    fn emit_directives(&mut self, d: usize, req: &Request, cost: &Cost) {
+        let Some(cfg) = self.directives else {
+            return;
+        };
+        if cost.pending || self.interval_ns == 0 || !self.domains[d].engine_cache() {
+            return;
+        }
+        let marks = match cfg.emit {
+            Emit::Declared {
+                retain,
+                evict_first,
+            } => self.declared_marks(req, (retain, evict_first)),
+            Emit::Oracle { horizon_ns } => self.oracle_marks(req, horizon_ns),
+        };
+        for (id, mark) in marks {
+            self.instruments.directives.emitted += 1;
+            if !cfg.ignores && self.domains[d].mark_kv(id, mark) {
+                self.instruments.directives.honoured += 1;
+            }
+            if cfg.marks == Marks::Trusted
+                && mark.rank == Rank::Retain
+                && let Some(o) = self.observer.as_mut()
+            {
+                o.directed(d, &[id], mark.until_ns);
+            }
+        }
+    }
+
+    fn observe_landing(&mut self, req: &Request, home: usize) {
+        if let Some(target) = req.completes.and_then(|t| self.landing.remove(&t)) {
+            self.instruments.prefill.landings += 1;
+            self.instruments.prefill.landed += u64::from(target == home);
+        }
+    }
+
+    fn after_dispatch(&mut self, req: &Request, home: usize, cost: &Cost) {
+        if cost.pending {
+            return;
+        }
+        if self.prefill_ahead
+            && let Some(hint) = &req.hint
+        {
+            self.prefill_for(hint, home);
+        }
+        let flow_prompt = self.origins.as_ref().is_some_and(|o| {
+            req.chain.first().and_then(|(id, _)| o.of(id)) == Some(Origin::FlowPrompt)
+        });
+        if flow_prompt && req.completes.is_some() {
+            self.instruments.flow.record(cost.total_ns());
+        }
+    }
+
+    fn argmin_target(
+        &self,
+        blocks: &[(BlobId, BlobMeta)],
+        flow: &[(usize, u64)],
+        home: usize,
+    ) -> usize {
+        let tokens = match self.observed[Slo::Interactive.idx()] {
+            (sum, n) if n > 0 => sum / n,
+            _ => 0,
+        };
+        let view = RequestView {
+            chain: blocks,
+            requires: &[],
+            tokens,
+            class: BlobKind::KvBlock.idx(),
+            slo: Slo::Interactive,
+        };
+        self.decode_pool()
+            .into_iter()
+            .map(|d| (d, self.placement_terms(d, &view, flow, View::Belief).full()))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map_or(home, |(d, _)| d)
+    }
+
+    fn deepest_target(&self, blocks: &[(BlobId, BlobMeta)], home: usize) -> usize {
+        let pool = self.decode_pool();
+        let mut best = (
+            if pool.contains(&home) {
+                home
+            } else {
+                pool.first().copied().unwrap_or(home)
+            },
+            0,
+        );
+        for &d in &pool {
+            let depth = blocks
+                .iter()
+                .take_while(|(id, m)| self.believes_resident(d, id, m.kind))
+                .count();
+            if depth > best.1 {
+                best = (d, depth);
+            }
+        }
+        best.0
+    }
+
+    fn prefill_for(&mut self, hint: &FlowHint, home: usize) {
+        let blocks = &hint.downstream;
+        if blocks.is_empty() || blocks.iter().any(|(_, m)| m.kind != BlobKind::KvBlock) {
+            return;
+        }
+        let flow = if self.flow_aware {
+            self.upstream.get(&hint.task).cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let target = match self.prefill_target {
+            Target::Argmin => self.argmin_target(blocks, &flow, home),
+            Target::Deepest => self.deepest_target(blocks, home),
+        };
+        if !self.domains[target].engine_cache() {
+            return;
+        }
+        let mut placed = Vec::new();
+        let mut work = 0;
+        for &(id, meta) in blocks {
+            match self.domains[target].prefill_block(id, meta) {
+                Some(0) => {}
+                Some(ns) => {
+                    work += ns;
+                    placed.push((id, meta));
+                }
+                None => break,
+            }
+        }
+        self.domains[target].seal(None);
+        let stats = &mut self.instruments.prefill;
+        stats.calls += 1;
+        stats.blocks += placed.len() as u64;
+        stats.work_ns += work;
+        self.landing.insert(hint.task, target);
+        self.observe_blocks(target, &placed);
+        self.observe_emit(target);
     }
 
     fn observe_sent(&mut self, d: usize) {
@@ -566,11 +916,14 @@ impl Machine {
     }
 
     fn observe_emit(&mut self, d: usize) {
-        if self.observer.is_none() {
+        if self.observer.is_none() && self.instruments.reuse.is_none() {
             return;
         }
-        let events = self.domains[d].take_kv_events();
+        let events: Vec<KvEvent> = self.domains[d].take_kv_events();
         let now = self.arrival_ns;
+        if let Some(r) = self.instruments.reuse.as_mut() {
+            r.events(d, now, &events);
+        }
         let load = self.engines[d].load(now);
         if let Some(o) = self.observer.as_mut() {
             o.emit(d, events, now, load);
@@ -830,6 +1183,7 @@ impl Machine {
             self.active.push(victim);
             return;
         }
+        self.redispatched[victim].clear();
         let (hot, cold) = self.domains[victim].drain_all(self.drain_spill);
         if let Some(o) = self.observer.as_mut() {
             self.domains[victim].take_kv_events();
@@ -1512,29 +1866,58 @@ impl Machine {
             return;
         };
         let (mut phantom, mut miss, mut nodes) = (0.0, 0.0, 0u32);
+        let mut phantom_cause = [0.0; Cause::N];
+        let mut miss_cause = [0.0; Cause::N];
         for &d in &self.active {
             if !self.domains[d].engine_cache() {
                 continue;
             }
             let belief = o.belief(d);
             let (mut believed, mut wrong) = (0u64, 0u64);
+            let mut by_cause = [0u64; Cause::N];
             for id in belief.gpu_ids() {
                 believed += 1;
-                wrong += u64::from(!self.domains[d].is_hot(id, BlobKind::KvBlock));
+                if !self.domains[d].is_hot(id, BlobKind::KvBlock) {
+                    wrong += 1;
+                    by_cause[o.phantom_cause(d, id).idx()] += 1;
+                }
             }
+            for (c, n) in by_cause.iter().enumerate() {
+                phantom_cause[c] += *n as f64 / believed.max(1) as f64;
+                self.instruments.phantom_blocks[c] += n;
+            }
+            self.redispatched[d].retain(|id| !belief.believes_gpu(id));
             let (mut actual, mut missed) = (0u64, 0u64);
+            let mut missed_by = [0u64; Cause::N];
             for id in self.domains[d].kv_gpu_ids() {
                 actual += 1;
-                missed += u64::from(!belief.believes_gpu(&id));
+                if !belief.believes_gpu(&id) {
+                    missed += 1;
+                    let cause = if self.redispatched[d].contains(&id) {
+                        Cause::Redispatched
+                    } else {
+                        o.miss_cause(d, &id)
+                    };
+                    missed_by[cause.idx()] += 1;
+                }
+            }
+            for (c, n) in missed_by.iter().enumerate() {
+                miss_cause[c] += *n as f64 / actual.max(1) as f64;
+                self.instruments.miss_blocks[c] += n;
             }
             phantom += wrong as f64 / believed.max(1) as f64;
             miss += missed as f64 / actual.max(1) as f64;
             nodes += 1;
         }
         if nodes > 0 {
+            let nodes = f64::from(nodes);
             self.instruments.divergence_samples += 1;
-            self.instruments.phantom_share += phantom / f64::from(nodes);
-            self.instruments.miss_share += miss / f64::from(nodes);
+            self.instruments.phantom_share += phantom / nodes;
+            self.instruments.miss_share += miss / nodes;
+            for c in 0..Cause::N {
+                self.instruments.phantom_cause_share[c] += phantom_cause[c] / nodes;
+                self.instruments.miss_cause_share[c] += miss_cause[c] / nodes;
+            }
         }
     }
 
@@ -1655,9 +2038,11 @@ impl Machine {
         let handoff = self.collect(home, &sources);
         let arrival = self.reach(home, req, decode_needed);
 
+        self.observe_landing(req, home);
         let mut cost = self.run_here(home, req);
         cost.decide_ns = decide_ns;
         cost.transfer_ns += handoff + arrival;
+        self.after_dispatch(req, home, &cost);
         if let Some(pick) = pick {
             let class = BlobKind::ALL[req.kind_idx()];
             self.finish_regret(req, class, home, &candidates, pick, &cost, decided_by);
@@ -1707,6 +2092,7 @@ impl Machine {
         let ran_with = self.truly_resident(home, req);
 
         let plan = self.plan(home, &req.view(req.tokens), View::Belief);
+        self.observe_reuse(home, req);
         self.observe_dispatch(home, req);
         let fetch = self.apply_chain(home, req, &plan);
         let mut cost = self.domains[home].access(&req.chain);
@@ -1772,7 +2158,11 @@ impl Machine {
             self.observe_pin(home, req, end);
         }
         self.domains[home].seal(until);
+        self.emit_directives(home, req, &cost);
         self.observe_emit(home);
+        if !cost.pending {
+            self.observe_touched(home, req);
+        }
         cost
     }
 
@@ -1797,6 +2187,7 @@ impl Machine {
             produces: agent.produces.clone(),
             max_tokens: agent.max_tokens,
             slo: agent.slo,
+            retention: agent.retention,
         }
     }
 
@@ -1813,6 +2204,7 @@ impl Machine {
             produces: Vec::new(),
             max_tokens: 0,
             slo: crate::work::Slo::Interactive,
+            retention: crate::work::Retention::default(),
         }
     }
 
@@ -2889,6 +3281,7 @@ mod tests {
             produces: Vec::new(),
             max_tokens: 0,
             slo: crate::work::Slo::Interactive,
+            retention: crate::work::Retention::default(),
         };
         assert!(mach.domains[d].evict_unrecorded(&victim));
         let believed = mach.plan(d, &req.view(0), View::Belief);
@@ -2969,6 +3362,7 @@ mod tests {
             produces: Vec::new(),
             max_tokens: 900,
             slo: crate::work::Slo::Interactive,
+            retention: crate::work::Retention::default(),
         };
         let mut mach = gate_machine(Control::Unified, false);
         assert_eq!(mach.view_of(&request(50)).tokens, 50);
@@ -2985,5 +3379,266 @@ mod tests {
             mach.view_of(&request(200)).tokens
         );
         assert_ne!(mach.view_of(&request(50)).tokens, 900);
+    }
+
+    fn declared(ignores: bool, marks: Marks) -> Directives {
+        Directives {
+            emit: Emit::Declared {
+                retain: true,
+                evict_first: true,
+            },
+            ignores,
+            marks,
+        }
+    }
+
+    #[test]
+    fn the_event_stream_reproduces_every_live_mark_after_every_request() {
+        use crate::stream::Index;
+        let mut mach = stream_machine(64 << 20, 32 << 20, 48 << 20);
+        mach.record_kv_events(true);
+        mach.set_state_transfer(true);
+        mach.set_flow_aware(true);
+        mach.set_hold_decodes(true);
+        mach.set_arrival_rate(250.0);
+        mach.set_directives(Some(declared(false, Marks::Acked)));
+        let mut replicas = vec![Index::default(); 4];
+        let mut seen = [0usize; 2];
+        for (i, req) in decode_trace(3, 2_500).iter().enumerate() {
+            if i == 1_500 {
+                mach.drain(1);
+            }
+            mach.serve_request(req);
+            let now = mach.arrival_ns;
+            for (d, replica) in replicas.iter_mut().enumerate() {
+                for event in mach.domains[d].take_kv_events() {
+                    replica.apply(&event);
+                }
+                let live = mach.domains[d].kv_live_marks(now);
+                assert_eq!(replica.live_marks(now), live, "request {i} domain {d}");
+                for (_, mark) in live {
+                    seen[mark.rank as usize] += 1;
+                }
+            }
+        }
+        assert!(
+            seen.iter().all(|&n| n > 0),
+            "the fixture must hold both ranks, or the invariant is untested: {seen:?}"
+        );
+        let stats = mach.directive_stats();
+        assert!(stats.applied > 0 && stats.expired > 0);
+        assert_eq!(mach.instruments.directives.honoured, stats.applied);
+    }
+
+    fn lossy(recovery: crate::belief::Recovery, loss: f64, episodes: bool) -> Conditions {
+        use crate::belief::{Episode, LoadSource};
+        Conditions {
+            cadence: true,
+            lag_ns: 30_000,
+            loss,
+            recovery,
+            period_ns: 1_000_000_000,
+            episodes: if episodes {
+                (0..4)
+                    .map(|node| Episode {
+                        node,
+                        from_ns: 2_000_000_000 * (node as u64 + 1),
+                        until_ns: 2_000_000_000 * (node as u64 + 1) + 1_000_000_000,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            seed: 5,
+            load: LoadSource::Path,
+        }
+    }
+
+    fn run_lossy(conditions: Conditions, directives: Option<Directives>) -> (Machine, Vec<String>) {
+        let mut mach = gate_machine(Control::Unified, false);
+        mach.set_belief(conditions);
+        mach.set_scoring(Scoring::Expected);
+        mach.set_instrument(true);
+        mach.set_directives(directives);
+        mach.set_foresight(None);
+        let trace = decode_trace(3, 2_500);
+        let mut costs = Vec::new();
+        for (i, req) in trace.iter().enumerate() {
+            mach.set_position(i as u64);
+            costs.push(format!("{:?}", mach.serve_request(req)));
+        }
+        (mach, costs)
+    }
+
+    #[test]
+    fn ignored_directives_and_an_acknowledged_belief_change_nothing() {
+        use crate::belief::Recovery;
+        for recovery in [Recovery::Replay, Recovery::None] {
+            let conditions = || lossy(recovery, 0.05, false);
+            let (off, a) = run_lossy(conditions(), None);
+            let (ignored, b) = run_lossy(conditions(), Some(declared(true, Marks::Acked)));
+            assert_eq!(a, b, "{recovery:?}");
+            assert!(ignored.instruments.directives.emitted > 0, "{recovery:?}");
+            assert_eq!(ignored.instruments.directives.honoured, 0);
+            assert_eq!(
+                format!("{:?}", off.instruments.phantom_blocks),
+                format!("{:?}", ignored.instruments.phantom_blocks)
+            );
+            assert_eq!(off.directive_stats(), ignored.directive_stats());
+        }
+    }
+
+    #[test]
+    fn honoured_directives_move_the_engine_and_the_belief_hears_them() {
+        let (off, _) = run_lossy(lossy(crate::belief::Recovery::Replay, 0.0, false), None);
+        let (on, _) = run_lossy(
+            lossy(crate::belief::Recovery::Replay, 0.0, false),
+            Some(declared(false, Marks::Acked)),
+        );
+        assert!(on.directive_stats().applied > 0);
+        assert!(on.instruments.directives.honoured > 0);
+        assert_eq!(off.directive_stats().applied, 0);
+        let acked: usize = (0..4)
+            .map(|d| {
+                on.observer()
+                    .map_or(0, |o| o.belief(d).index().marks().count())
+            })
+            .sum();
+        assert!(acked > 0, "an honoured mark is echoed on the stream");
+    }
+
+    #[test]
+    fn every_phantom_and_miss_has_exactly_one_cause_that_its_condition_allows() {
+        use crate::belief::Recovery;
+        let cases = [
+            ("exact", Conditions::exact(), false, false),
+            (
+                "loss, replay",
+                lossy(Recovery::Replay, 0.2, false),
+                true,
+                false,
+            ),
+            ("loss, none", lossy(Recovery::None, 0.2, false), true, false),
+            (
+                "loss, periodic",
+                lossy(Recovery::Periodic, 0.2, false),
+                true,
+                false,
+            ),
+            (
+                "episodes, replay",
+                lossy(Recovery::Replay, 0.0, true),
+                false,
+                true,
+            ),
+        ];
+        for (name, conditions, loss, episodes) in cases {
+            let none = conditions.recovery == Recovery::None && !conditions.is_exact();
+            let (mach, _) = run_lossy(conditions, None);
+            let i = &mach.instruments;
+            let by = |c: Cause| i.phantom_blocks[c.idx()];
+            let share: f64 = i.phantom_cause_share.iter().sum();
+            assert!((share - i.phantom_share).abs() < 1e-9, "{name}");
+            let miss_share: f64 = i.miss_cause_share.iter().sum();
+            assert!((miss_share - i.miss_share).abs() < 1e-9, "{name}");
+            if name == "exact" {
+                assert_eq!(i.phantom_blocks, [0; Cause::N]);
+                assert_eq!(i.miss_blocks, [0; Cause::N]);
+                continue;
+            }
+            assert!(i.phantom_blocks.iter().sum::<u64>() > 0, "{name}");
+            if !episodes {
+                assert_eq!(by(Cause::Silenced), 0, "{name}");
+            }
+            if !loss {
+                assert_eq!(by(Cause::Dropped), 0, "{name}");
+            }
+            if !none {
+                assert_eq!(by(Cause::Stranded), 0, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn prefill_ahead_is_accounted_block_for_block_and_only_helps_flows() {
+        let run = |ahead: bool| {
+            let mut mach = gate_machine(Control::Unified, false);
+            mach.set_prefill_ahead(ahead);
+            let origins = Origins::default();
+            mach.set_origins(origins.clone());
+            let workload = Workload::with_fanout(3, 2_500, 1.0, 0.1)
+                .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+                .with_origins(origins);
+            for (i, req) in workload.enumerate() {
+                mach.set_position(i as u64);
+                mach.serve_request(&req);
+            }
+            mach
+        };
+        let (plain, ahead) = (run(false), run(true));
+        assert_eq!(plain.instruments.prefill.calls, 0);
+        let p = ahead.instruments.prefill;
+        assert!(p.calls > 0 && p.blocks > 0 && p.work_ns > 0);
+        let placed: u64 = ahead.domains.iter().map(|h| h.prefilled_blocks).sum();
+        assert_eq!(p.blocks, placed);
+        assert!(p.landings > 0 && p.landed <= p.landings);
+        let per_flow =
+            |m: &Machine| m.instruments.flow.stall_ns as f64 / m.instruments.flow.n.max(1) as f64;
+        assert!(plain.instruments.flow.n > 0 && ahead.instruments.flow.n > 0);
+        assert!(per_flow(&ahead) < per_flow(&plain));
+    }
+
+    #[test]
+    fn the_reuse_table_classifies_every_session_and_flow_access_exactly_once() {
+        let mut mach = gate_machine(Control::Unified, false);
+        let origins = Origins::default();
+        mach.set_origins(origins.clone());
+        let workload = Workload::with_fanout(3, 2_500, 1.0, 0.1)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_origins(origins);
+        let mut dispatched = 0u64;
+        for (i, req) in workload.enumerate() {
+            mach.set_position(i as u64);
+            if !mach.serve_request(&req).pending && req.gang.is_none() {
+                dispatched += req
+                    .chain
+                    .iter()
+                    .filter(|(_, m)| m.kind == BlobKind::KvBlock)
+                    .count() as u64;
+            }
+        }
+        let reuse = mach.instruments.reuse.as_ref().expect("origins turn it on");
+        let accesses: u64 = reuse.rows.iter().map(|r| r.accesses).sum();
+        assert!(accesses >= dispatched && dispatched > 0);
+        for (i, row) in reuse.rows.iter().enumerate() {
+            let missed = row.evicted_to_offload + row.evicted_to_spill + row.evicted_gone;
+            assert_eq!(row.hit + row.cold + missed, row.accesses, "origin {i}");
+        }
+        let flow = &reuse.rows[Origin::FlowPrompt.idx()];
+        assert!(flow.accesses > 0 && flow.hit < flow.accesses);
+        assert!(reuse.rows[Origin::Tenant.idx()].hit > 0);
+    }
+
+    #[test]
+    fn tracking_origins_and_events_changes_no_cost() {
+        let run = |tracked: bool| {
+            let mut mach = gate_machine(Control::Unified, false);
+            let origins = Origins::default();
+            if tracked {
+                mach.set_origins(origins.clone());
+            }
+            let mut workload = Workload::with_fanout(3, 1_500, 1.0, 0.1)
+                .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK);
+            if tracked {
+                workload = workload.with_origins(origins);
+            }
+            let mut costs = Vec::new();
+            for (i, req) in workload.enumerate() {
+                mach.set_position(i as u64);
+                costs.push(format!("{:?}", mach.serve_request(&req)));
+            }
+            costs
+        };
+        assert_eq!(run(false), run(true));
     }
 }

@@ -1,6 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::belief::Cause;
 use crate::blob::{BlobId, BlobMeta};
+use crate::stream::{KvEvent, Medium};
+use crate::work::{Origin, Origins};
 
 pub const BINS: usize = 12;
 pub const CERTAIN: usize = 11;
@@ -69,6 +72,172 @@ impl Share {
 }
 
 #[derive(Clone, Debug, Default)]
+pub struct ReuseRow {
+    pub accesses: u64,
+    pub hit: u64,
+    pub cold: u64,
+    pub evicted_to_offload: u64,
+    pub evicted_to_spill: u64,
+    pub evicted_gone: u64,
+    pub stores: u64,
+    pub gap_hit: Vec<u64>,
+    pub gap_evicted: Vec<u64>,
+    pub residency: Vec<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Reuse {
+    origins: Origins,
+    last_on: Vec<HashMap<BlobId, u64>>,
+    evicted_on: Vec<HashSet<BlobId>>,
+    uses: HashMap<BlobId, u32>,
+    pub rows: Vec<ReuseRow>,
+    pub dispatches: u64,
+    pub dispatches_with_evicted_miss: u64,
+    pub evicted_miss_ns: u64,
+    pub cold_miss_ns: u64,
+}
+
+impl Reuse {
+    #[must_use]
+    pub fn new(origins: Origins, nodes: usize) -> Self {
+        Self {
+            origins,
+            last_on: vec![HashMap::new(); nodes],
+            evicted_on: vec![HashSet::new(); nodes],
+            uses: HashMap::new(),
+            rows: vec![ReuseRow::default(); Origin::N],
+            dispatches: 0,
+            dispatches_with_evicted_miss: 0,
+            evicted_miss_ns: 0,
+            cold_miss_ns: 0,
+        }
+    }
+
+    fn row(&mut self, id: &BlobId) -> &mut ReuseRow {
+        let origin = self.origins.of(id).unwrap_or(Origin::Session);
+        &mut self.rows[origin.idx()]
+    }
+
+    pub fn classify(
+        &mut self,
+        d: usize,
+        now: u64,
+        id: &BlobId,
+        tier: Option<Medium>,
+        cost_ns: u64,
+    ) -> bool {
+        *self.uses.entry(*id).or_insert(0) += 1;
+        let gap = self.last_on[d].get(id).map(|t| now.saturating_sub(*t));
+        let evicted = self.evicted_on[d].contains(id);
+        let row = self.row(id);
+        row.accesses += 1;
+        if tier == Some(Medium::Gpu) {
+            row.hit += 1;
+            row.gap_hit.extend(gap);
+            return false;
+        }
+        if !evicted {
+            row.cold += 1;
+            self.cold_miss_ns += cost_ns;
+            return false;
+        }
+        match tier {
+            Some(Medium::Cpu) => row.evicted_to_offload += 1,
+            Some(Medium::Storage) => row.evicted_to_spill += 1,
+            _ => row.evicted_gone += 1,
+        }
+        row.gap_evicted.extend(gap);
+        self.evicted_miss_ns += cost_ns;
+        true
+    }
+
+    pub fn touched(&mut self, d: usize, now: u64, id: BlobId) {
+        self.last_on[d].insert(id, now);
+    }
+
+    pub fn events(&mut self, d: usize, now: u64, events: &[KvEvent]) {
+        for event in events {
+            match *event {
+                KvEvent::Stored {
+                    id,
+                    medium: Medium::Gpu,
+                    mark: None,
+                    ..
+                } => {
+                    self.row(&id).stores += 1;
+                    self.last_on[d].entry(id).or_insert(now);
+                    self.uses.entry(id).or_insert(0);
+                }
+                KvEvent::Removed {
+                    id,
+                    medium: Medium::Gpu,
+                } => {
+                    if let Some(t) = self.last_on[d].get(&id).copied() {
+                        self.row(&id).residency.push(now.saturating_sub(t));
+                    }
+                    self.evicted_on[d].insert(id);
+                }
+                KvEvent::Cleared => {
+                    self.last_on[d].clear();
+                    self.evicted_on[d].clear();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn one_shot(&self) -> Vec<(u64, u64)> {
+        let mut out = vec![(0u64, 0u64); Origin::N];
+        for (id, n) in &self.uses {
+            let origin = self.origins.of(id).unwrap_or(Origin::Session);
+            out[origin.idx()].0 += 1;
+            out[origin.idx()].1 += u64::from(*n <= 1);
+        }
+        out
+    }
+}
+
+#[must_use]
+pub fn percentile(values: &mut [u64], q: f64) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let i = ((values.len() as f64 * q) as usize).min(values.len() - 1);
+    Some(values[i])
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlowDownstream {
+    pub n: u64,
+    pub stall_ns: u64,
+}
+
+impl FlowDownstream {
+    pub fn record(&mut self, stall_ns: u64) {
+        self.n += 1;
+        self.stall_ns += stall_ns;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Prefill {
+    pub calls: u64,
+    pub blocks: u64,
+    pub work_ns: u64,
+    pub landings: u64,
+    pub landed: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Emitted {
+    pub emitted: u64,
+    pub honoured: u64,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct Instruments {
     pub decisions: u64,
     pub exposed_any: u64,
@@ -79,6 +248,14 @@ pub struct Instruments {
     pub divergence_samples: u64,
     pub phantom_share: f64,
     pub miss_share: f64,
+    pub phantom_blocks: [u64; Cause::N],
+    pub miss_blocks: [u64; Cause::N],
+    pub phantom_cause_share: [f64; Cause::N],
+    pub miss_cause_share: [f64; Cause::N],
+    pub reuse: Option<Reuse>,
+    pub flow: FlowDownstream,
+    pub prefill: Prefill,
+    pub directives: Emitted,
     pub gap_phantom: u64,
     pub gap_miss: u64,
     pub gap_discount: u64,

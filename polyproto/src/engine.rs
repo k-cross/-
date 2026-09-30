@@ -2,6 +2,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap};
 
 use crate::blob::{BlobId, BlobMeta};
+use crate::stream::{Mark, Rank};
 use crate::tier::TierSpec;
 
 pub const STEP_BASE_NS: u64 = 7_000_000;
@@ -138,6 +139,7 @@ struct Block {
     key: u64,
     children: u32,
     pins: u32,
+    mark: Option<Mark>,
 }
 
 #[derive(Debug)]
@@ -150,6 +152,10 @@ pub struct EngineCache {
     clock: u64,
     blocks: HashMap<BlobId, Block>,
     evictable: BTreeSet<(u64, BlobId)>,
+    demoted: BTreeSet<(u64, BlobId)>,
+    retained: BTreeSet<(u64, BlobId)>,
+    expiries: BinaryHeap<Reverse<(u64, BlobId)>>,
+    now: u64,
     staging: Vec<BlobId>,
     inflight: BinaryHeap<Reverse<(u64, u64)>>,
     held: HashMap<u64, Vec<BlobId>>,
@@ -158,6 +164,9 @@ pub struct EngineCache {
     last_price: f64,
     pub evictions: u64,
     pub preemptions: u64,
+    pub marks_applied: u64,
+    pub marks_expired: u64,
+    pub pressure_evictions: u64,
 }
 
 impl EngineCache {
@@ -172,6 +181,10 @@ impl EngineCache {
             clock: 0,
             blocks: HashMap::new(),
             evictable: BTreeSet::new(),
+            demoted: BTreeSet::new(),
+            retained: BTreeSet::new(),
+            expiries: BinaryHeap::new(),
+            now: 0,
             staging: Vec::new(),
             inflight: BinaryHeap::new(),
             held: HashMap::new(),
@@ -180,6 +193,9 @@ impl EngineCache {
             last_price: 0.0,
             evictions: 0,
             preemptions: 0,
+            marks_applied: 0,
+            marks_expired: 0,
+            pressure_evictions: 0,
         }
     }
 
@@ -232,15 +248,133 @@ impl EngineCache {
             .count()
     }
 
-    fn reslot(&mut self, id: BlobId, f: impl FnOnce(&mut Block)) {
-        let Some(b) = self.blocks.get_mut(&id) else {
+    fn detach(&mut self, id: BlobId) {
+        let Some(b) = self.blocks.get(&id) else {
             return;
         };
         self.evictable.remove(&(b.key, id));
-        f(b);
-        if b.pins == 0 && !(self.leaf_first && b.children > 0) {
-            self.evictable.insert((b.key, id));
+        self.demoted.remove(&(b.key, id));
+        if let Some(m) = b.mark {
+            self.retained.remove(&(m.until_ns, id));
         }
+    }
+
+    fn attach(&mut self, id: BlobId) {
+        let Some(b) = self.blocks.get(&id) else {
+            return;
+        };
+        if b.pins > 0 || (self.leaf_first && b.children > 0) {
+            return;
+        }
+        match b.mark {
+            None => self.evictable.insert((b.key, id)),
+            Some(Mark {
+                rank: Rank::EvictFirst,
+                ..
+            }) => self.demoted.insert((b.key, id)),
+            Some(Mark {
+                rank: Rank::Retain,
+                until_ns,
+            }) => self.retained.insert((until_ns, id)),
+        };
+    }
+
+    fn reslot(&mut self, id: BlobId, f: impl FnOnce(&mut Block)) {
+        if !self.blocks.contains_key(&id) {
+            return;
+        }
+        self.detach(id);
+        if let Some(b) = self.blocks.get_mut(&id) {
+            f(b);
+        }
+        self.attach(id);
+    }
+
+    fn take_victim(&mut self) -> Option<BlobId> {
+        if let Some(&entry) = self.demoted.iter().next() {
+            self.demoted.remove(&entry);
+            return Some(entry.1);
+        }
+        if let Some(&entry) = self.evictable.iter().next() {
+            self.evictable.remove(&entry);
+            return Some(entry.1);
+        }
+        let entry = *self.retained.iter().next()?;
+        self.retained.remove(&entry);
+        self.pressure_evictions += 1;
+        Some(entry.1)
+    }
+
+    fn next_victim(&self) -> Option<BlobId> {
+        self.demoted
+            .iter()
+            .next()
+            .or_else(|| self.evictable.iter().next())
+            .or_else(|| self.retained.iter().next())
+            .map(|&(_, id)| id)
+    }
+
+    pub fn mark(&mut self, id: BlobId, mark: Mark) -> Option<Mark> {
+        if !mark.live_at(self.now) {
+            return None;
+        }
+        let next = match self.blocks.get(&id)?.mark {
+            None => mark,
+            Some(held) if mark.rank > held.rank => mark,
+            Some(held) if mark.rank == held.rank && mark.until_ns > held.until_ns => mark,
+            Some(_) => return None,
+        };
+        self.reslot(id, |b| b.mark = Some(next));
+        self.expiries.push(Reverse((next.until_ns, id)));
+        self.marks_applied += 1;
+        Some(next)
+    }
+
+    pub fn expire(&mut self, now: u64) {
+        self.now = now;
+        while let Some(&Reverse((until, id))) = self.expiries.peek() {
+            if until > now {
+                break;
+            }
+            self.expiries.pop();
+            let current = self
+                .blocks
+                .get(&id)
+                .is_some_and(|b| b.mark.is_some_and(|m| m.until_ns == until));
+            if current {
+                self.reslot(id, |b| b.mark = None);
+                self.marks_expired += 1;
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn meta_of(&self, id: &BlobId) -> Option<BlobMeta> {
+        self.blocks.get(id).map(|b| b.meta)
+    }
+
+    #[must_use]
+    pub fn marked(&self) -> (u64, u64) {
+        self.blocks
+            .values()
+            .filter(|b| b.mark.is_some())
+            .fold((0, 0), |(n, bytes), b| (n + 1, bytes + b.meta.bytes))
+    }
+
+    #[must_use]
+    pub fn live_marks(&self, now: u64) -> Vec<(BlobId, Mark)> {
+        let mut live: Vec<(BlobId, Mark)> = self
+            .blocks
+            .iter()
+            .filter_map(|(id, b)| b.mark.filter(|m| m.live_at(now)).map(|m| (*id, m)))
+            .collect();
+        live.sort_unstable_by_key(|(id, _)| *id);
+        live
+    }
+
+    #[must_use]
+    pub fn mark_of(&self, id: &BlobId) -> Option<Mark> {
+        self.blocks.get(id)?.mark
     }
 
     fn next_key(&mut self) -> u64 {
@@ -305,7 +439,7 @@ impl EngineCache {
             self.reslot(p, |b| b.children += 1);
         }
         while self.used + meta.bytes > self.capacity {
-            let Some(&(key, victim)) = self.evictable.iter().next() else {
+            let Some(victim) = self.take_victim() else {
                 if let Some(p) = parent {
                     self.reslot(p, |b| b.children = b.children.saturating_sub(1));
                 }
@@ -315,7 +449,6 @@ impl EngineCache {
                 placed.resident = false;
                 return placed;
             };
-            self.evictable.remove(&(key, victim));
             let Some(b) = self.blocks.remove(&victim) else {
                 continue;
             };
@@ -335,6 +468,7 @@ impl EngineCache {
                 key,
                 children: 0,
                 pins: 0,
+                mark: None,
             },
         );
         self.used += meta.bytes;
@@ -346,8 +480,8 @@ impl EngineCache {
     }
 
     pub fn remove(&mut self, id: &BlobId) -> Option<BlobMeta> {
+        self.detach(*id);
         let b = self.blocks.remove(id)?;
-        self.evictable.remove(&(b.key, *id));
         self.used -= b.meta.bytes;
         if b.pins > 0 {
             self.pinned -= b.meta.bytes;
@@ -398,6 +532,9 @@ impl EngineCache {
     pub fn drain(&mut self) {
         self.blocks.clear();
         self.evictable.clear();
+        self.demoted.clear();
+        self.retained.clear();
+        self.expiries.clear();
         self.staging.clear();
         self.inflight.clear();
         self.held.clear();
@@ -412,10 +549,8 @@ impl EngineCache {
 
     #[must_use]
     pub fn tail_price(&self) -> f64 {
-        self.evictable
-            .iter()
-            .next()
-            .and_then(|(_, id)| self.blocks.get(id))
+        self.next_victim()
+            .and_then(|id| self.blocks.get(&id))
             .map_or(self.last_price, |b| self.loss_per_byte(&b.meta))
     }
 }
@@ -547,6 +682,173 @@ mod tests {
             second.evicted[0].0, blocks[0].0,
             "then the furthest next use"
         );
+    }
+
+    fn block(tag: &str) -> (BlobId, BlobMeta) {
+        chain(tag, 1)[0]
+    }
+
+    fn retain(until_ns: u64) -> Mark {
+        Mark {
+            rank: Rank::Retain,
+            until_ns,
+        }
+    }
+
+    fn demote(until_ns: u64) -> Mark {
+        Mark {
+            rank: Rank::EvictFirst,
+            until_ns,
+        }
+    }
+
+    fn filled(capacity: usize, tags: &[&str]) -> (EngineCache, Vec<(BlobId, BlobMeta)>) {
+        let mut cache = EngineCache::new(capacity as u64 * BLOCK, false);
+        let blocks: Vec<_> = tags.iter().map(|t| block(t)).collect();
+        for &(id, meta) in &blocks {
+            assert!(cache.admit(id, meta, false).resident);
+        }
+        (cache, blocks)
+    }
+
+    #[test]
+    fn evict_first_goes_before_unmarked_and_retained_goes_after() {
+        let (mut cache, b) = filled(3, &["a", "b", "c"]);
+        assert!(cache.mark(b[2].0, demote(1_000)).is_some());
+        assert!(cache.mark(b[0].0, retain(1_000)).is_some());
+        let mut gone = Vec::new();
+        for tag in ["d", "e", "f"] {
+            let (id, meta) = block(tag);
+            gone.extend(
+                cache
+                    .admit(id, meta, false)
+                    .evicted
+                    .into_iter()
+                    .map(|(v, _)| v),
+            );
+        }
+        assert_eq!(gone, vec![b[2].0, b[1].0, block("d").0]);
+        assert!(
+            cache.contains(&b[0].0),
+            "the retained block outlives all three"
+        );
+        assert_eq!(cache.pressure_evictions, 0);
+    }
+
+    #[test]
+    fn under_pressure_the_soonest_expiring_retained_block_goes_and_is_counted() {
+        let (mut cache, b) = filled(2, &["a", "b"]);
+        cache.mark(b[0].0, retain(500));
+        cache.mark(b[1].0, retain(300));
+        let (id, meta) = block("c");
+        let placed = cache.admit(id, meta, false);
+        assert!(placed.resident, "a mark never causes a preemption");
+        assert_eq!(placed.evicted[0].0, b[1].0);
+        assert_eq!(cache.pressure_evictions, 1);
+        assert_eq!(cache.preemptions, 0);
+        assert!(cache.contains(&b[0].0));
+    }
+
+    #[test]
+    fn an_expired_mark_is_an_unmarked_block_to_every_later_eviction() {
+        let (mut cache, b) = filled(2, &["a", "b"]);
+        cache.mark(b[0].0, retain(100));
+        cache.expire(99);
+        assert!(cache.mark_of(&b[0].0).is_some());
+        cache.expire(100);
+        assert_eq!(cache.mark_of(&b[0].0), None);
+        assert_eq!(cache.marks_expired, 1);
+        let (id, meta) = block("c");
+        let placed = cache.admit(id, meta, false);
+        assert_eq!(placed.evicted[0].0, b[0].0, "the oldest unmarked block");
+        assert_eq!(cache.pressure_evictions, 0);
+    }
+
+    #[test]
+    fn a_touch_without_a_directive_leaves_a_live_mark_alone() {
+        let (mut cache, b) = filled(2, &["a", "b"]);
+        cache.mark(b[0].0, retain(100));
+        cache.touch(b[0].0, false);
+        assert_eq!(cache.mark_of(&b[0].0), Some(retain(100)));
+    }
+
+    #[test]
+    fn marks_combine_by_rank_and_then_by_the_latest_deadline() {
+        let (mut cache, b) = filled(1, &["a"]);
+        let id = b[0].0;
+        assert_eq!(cache.mark(id, demote(50)), Some(demote(50)));
+        assert_eq!(cache.mark(id, demote(40)), None);
+        assert_eq!(cache.mark(id, demote(90)), Some(demote(90)));
+        assert_eq!(
+            cache.mark(id, retain(60)),
+            Some(retain(60)),
+            "retain escalates"
+        );
+        assert_eq!(
+            cache.mark(id, demote(500)),
+            None,
+            "evict-first never demotes a retain"
+        );
+        assert_eq!(cache.mark(id, retain(80)), Some(retain(80)));
+        assert_eq!(cache.mark(id, retain(70)), None);
+        assert_eq!(cache.marks_applied, 4);
+        cache.expire(60);
+        assert_eq!(
+            cache.mark_of(&id),
+            Some(retain(80)),
+            "the stale deadline expires nothing"
+        );
+        assert_eq!(cache.marks_expired, 0);
+    }
+
+    #[test]
+    fn a_mark_whose_deadline_is_past_on_receipt_does_nothing() {
+        let (mut cache, b) = filled(1, &["a"]);
+        cache.expire(50);
+        assert_eq!(cache.mark(b[0].0, retain(50)), None);
+        assert_eq!(cache.mark(b[0].0, demote(10)), None);
+        assert_eq!(cache.marks_applied, 0);
+        assert_eq!(cache.mark_of(&b[0].0), None);
+    }
+
+    #[test]
+    fn a_marked_parent_is_no_candidate_while_it_has_a_resident_child() {
+        let mut cache = EngineCache::new(3 * BLOCK, true);
+        let seq = chain("p", 2);
+        for &(id, meta) in &seq {
+            cache.admit(id, meta, false);
+        }
+        cache.mark(seq[0].0, demote(1_000));
+        let other = block("o");
+        cache.admit(other.0, other.1, false);
+        let extra = block("x");
+        let placed = cache.admit(extra.0, extra.1, false);
+        assert_eq!(placed.evicted[0].0, seq[1].0, "the child leaf goes first");
+        let placed = cache.admit(block("y").0, block("y").1, false);
+        assert_eq!(
+            placed.evicted[0].0, seq[0].0,
+            "then the demoted parent, now a leaf"
+        );
+    }
+
+    #[test]
+    fn an_engine_with_no_marks_evicts_exactly_as_before() {
+        let mut plain = EngineCache::new(4 * BLOCK, true);
+        let mut marked = EngineCache::new(4 * BLOCK, true);
+        marked.expire(10);
+        for tag in ["a", "b", "c", "d", "e", "f", "g"] {
+            let seq = chain(tag, 2);
+            for &(id, meta) in &seq {
+                let l = plain.admit(id, meta, false);
+                let r = marked.admit(id, meta, false);
+                assert_eq!(l.resident, r.resident);
+                assert_eq!(
+                    l.evicted.iter().map(|(v, _)| *v).collect::<Vec<_>>(),
+                    r.evicted.iter().map(|(v, _)| *v).collect::<Vec<_>>()
+                );
+            }
+        }
+        assert_eq!(plain.evictions, marked.evictions);
     }
 
     #[test]

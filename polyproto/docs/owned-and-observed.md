@@ -12,11 +12,11 @@ not about who wrote it; the HTTP itself is a linked library's (§2.6). **Cede th
 path** -- and the second is only defensible because of the first, since routing and cancellation
 are what is left to decide with once allocation is gone.
 
-**Status.** Phases 0-4 and 8 are built and measured; Phases 5-7 and 9-11 are design (§9). Current
+**Status.** Phases 0-5 and 8 are built and measured; Phases 6-7 and 9-11 are design (§9). Current
 results are in [`residency-ledger.md`](residency-ledger.md); each phase's plan, predictions and
 outcomes are in its own `phase-N.md`. The corrected architecture runs behind bits that are off by
-default -- `--engine-cache` (Phase 3) and `--belief` (Phase 4) -- so a published number is the
-ledger's unless it is marked otherwise.
+default -- `--engine-cache` (Phase 3), `--belief` (Phase 4) and `--directives`, `--prefill-ahead`
+and `--retain` (Phase 5) -- so a published number is the ledger's unless it is marked otherwise.
 
 **On the numbers.** Four grades of evidence, kept apart:
 
@@ -143,7 +143,7 @@ tests the failure model above by injecting each crash.
 | quotas: floors, bands, limits | **owned** | record | `Quota`, operator config |
 | admission outcome, refusals | **owned** | soft | `Admission`, `TierPool.refused`; the router's partition check under `--admit` |
 | gang membership, staged reservations | **owned** | soft; logged when `SideEffecting` | `staged_*`, `cancelled` |
-| retention directives it issued | **owned** | soft | `Entry.expect`; needs `retain_until` (§3.3) |
+| retention directives it issued | **owned** | soft | `Entry.retain_until` on the ledger (`--retain`); on the engine a mark on a dispatch, believed once the stream acknowledges it (§3.3) |
 | placement decisions, flow graph | **owned** | soft | `upstream`, `tool_anchor`, `origin` |
 | partition sizes, model placement | **owned** | record | fixed config; a decision in Phase 6 |
 | side-effect intents, suspended sessions, approval pauses | **owned** | logged | **missing** -- §4 |
@@ -308,7 +308,7 @@ result and the same run with `--engine-cache` (ledger *Engine allocation*):
 | tool placement inverts under memory pressure | **holds**: ~10% of tool calls kept home under pressure, 65.7% at region, 57.9% under hard pools |
 | KV ships within a rack and is rebuilt across a zone | **holds**: `scored + fetch` fetches 25.8% of what it acquires at rack (30.5% on the ledger), 0.1% from zone out |
 | boundary ladder, origin round trip, congestion toll | **unaffected** |
-| `announce` buys 11-18% task latency | **shrinks**: KV prewarm carried 50% of the margin on split memory and 71% on unified; with the engine allocating, announce buys 9.0% (split) and 3.2% (unified) from what it can still prewarm |
+| `announce` buys 11-18% task latency | **shrinks**: KV prewarm carried 50% of the margin on split memory and 71% on unified; with the engine allocating, announce buys 9.0% (split) and 3.2% (unified) from what it can still prewarm. **A dispatch buys it back, and more**: prefilling the declared downstream's prompt when its hint arrives buys 24-28% (Phase 5, §3.3) |
 | 54-85% of DDR evictions are cross-class at 4 GiB DDR per node | **mostly gone**: 0-26%, and 0-2% on the scored arms. Most of it was the ledger allocating the engine's offload |
 
 The pattern: results about **costs** survive; results about **per-block authority over inference
@@ -691,9 +691,8 @@ this workload's decision rate, against ~1000 for a warm WASM hook (§5).
 
 Ordered by what makes the rest trustworthy: the boundary first (3.1), then the estimates that
 replace declarations (3.2-3.3), then the apparatus that makes any of it measurable (3.4-3.6), then
-confidence and tenancy (3.7-3.8), and three smaller points (3.9-3.11). Built: 3.1, 3.4, 3.5, 3.7,
-3.11, part of 3.6 and 3.10's term. Open: the flow estimator in 3.2 (Phase 7), 3.3 and the rest of
-3.6 (Phase 5), and 3.8 (Phase 6).
+confidence and tenancy (3.7-3.8), and three smaller points (3.9-3.11). Built: 3.1, 3.3, 3.4, 3.5,
+3.6, 3.7, 3.11 and 3.10's term. Open: the flow estimator in 3.2 (Phase 7) and 3.8 (Phase 6).
 
 ### 3.1 A `Telemetry` boundary
 
@@ -739,18 +738,44 @@ and the inferred workload class. That distribution has to be **calibrated** rath
 accurate, since a quantile drawn from a miscalibrated distribution is a number with a decimal point
 and no meaning -- the same obligation §3.7 puts on `P(resident)`, for the same reason.
 
-### 3.3 Retention directives in the ledger
+### 3.3 Retention directives
 
-Add to `Entry`: `retain_until: u64`, a soft pin with a deadline, and `evict_first: bool`, the
-one-shot / cache-pollution mark.
+**Built** (Phase 5; `--directives`, `--retain`). Two forms, split by who allocates.
 
-This is RFC-0001's `50; ttl=<window>; scope=<session>` and `-1`, and it is strictly better than the
-current unbounded `expect` bump: a priority inflation with no deadline never self-corrects when the
-prediction was wrong, while a TTL does. It is also live in `sched_lm`'s forked simulator, so
-modelling it means modelling something that exists.
+*On the engine* a directive is RFC-0001's, carried on a dispatch: retain until a deadline (`50;
+ttl=<window>`) or evict first (`-1`). It ranks evict-first < unmarked < retained, expires on its
+lease with no message, and is soft under pressure: when every candidate is marked and live the
+soonest-expiring is evicted and counted, so a mark never causes a preemption. A touch without a
+directive leaves a live mark alone. The engine acknowledges an honoured mark on its stream as the
+store event's trailing `priority` and `retain_until`, and the router believes a mark only when it is
+acknowledged (§3.6). A *dispatch* is the other way to act on engine memory: a prefill of a declared
+downstream's prompt, sent when its hint arrives, makes the engine allocate the blocks by its own
+rules.
+
+*On the ledger*, for the classes the orchestrator owns, retention is a decision:
+`Entry.retain_until`, a soft pin with a deadline in place of the unbounded `expect` bump, and
+`evict_first`, which sends a blob to the front of its class. This is RFC-0001's vocabulary applied
+to owned state, and a deadline is strictly better than the bump for the reason it always was: a
+priority inflation with no deadline never self-corrects when the prediction was wrong, while a lease
+does.
+
+Measured, a directive is worth almost nothing on this workload, and a dispatch is worth a great
+deal. None of `announce`'s KV margin was retention: the bump alone on what was resident carried
+between -5% and +9% of it, and the prewarm -- admitting what was not resident -- carried all of
+it, so a retention directive cannot buy back what Phase 3 removed. Holding what a declared flow
+needs costs nothing and buys nothing (0.0-0.1pp of task latency); retaining a fan-out's parent chain
+is within ±0.5% of stall at the published partition and costs 0.2-1.0% at half of it; evict-first on
+one-shot scopes is within ±2%; and an oracle emitter that knows every block's next use, a ceiling
+and never an arm, buys at most 1.4% of stall and 0.1% of service with the sign changing across
+seeds. Prefill-ahead buys 24-28% of task latency on one node against the ledger's 10-18%, and on the
+cluster cuts a flow downstream's stall by 64% at rack, 31% at zone and 7% at region. On the ledger a
+deadline is the better form: bounded state, and one to two points of task latency even with honest
+hints, because a hinted prefix's interior otherwise keeps an inflated priority indefinitely.
 
 The unified angle: a directive priced in the same ns/byte as everything else can be weighed against
-what it displaces. In a siloed stack a retention hint is advisory and unpriced.
+what it displaces, where in a siloed stack a retention hint is advisory and unpriced. On this
+workload the weighing comes out at almost nothing either way, because routing, peer fetch and the
+connector's offload tier already capture what an eviction order could.
 
 ### 3.4 Oracle, regret, coupling
 
@@ -818,8 +843,20 @@ a sequence the engine could not place until that step's batch arrives without th
 `Belief::apply` reconciles them by the absence of the store. Tracking it isolates whether a routing
 mistake came from a bad cost model or from a belief that drifted.
 
-**Partly built** (Phase 4): phantom share `|B \ A| / |B|` and miss share `|A \ B| / |A|` are sampled
-per engine. Divergence *by cause* is not built; Phase 5 needs it and adds it.
+**Built** (Phase 4, Phase 5): phantom share `|B \ A| / |B|` and miss share `|A \ B| / |A|` are
+sampled per engine, and each divergent block is attributed to exactly one cause: a removal not yet
+due, dropped or silenced, by its batch's fate; an optimistic dispatch the engine never stored, or
+one it stored whose store was lost with no repair path to clear it (*stranded*); and, for a miss, a
+block re-dispatched while its eviction was undelivered. Under replay every phantom at the published
+partition is an undelivered removal, under no recovery 1-8% are stranded, and at half the partition
+about 17% are never stored. Misses are zero at every sample.
+
+An ignored directive is not a cause. It changes no event: the engine evicts as its LRU would and
+publishes the removal like any other, so it cannot make the index wrong. It changes confidence,
+which is why the router believes a mark only when the stream acknowledges it -- byte-identical to no
+directives when the engine ignores them -- and why one that believes its own requests is
+over-confident only where removals go undelivered (0.975 realised against 1.000 predicted, at half
+the partition with 20% loss and no recovery).
 
 ### 3.7 Confidence has to reach the argmin
 
@@ -1047,7 +1084,7 @@ an engine input: the scheduler needs a handful of fields it can act on, not a pa
 |---|---|---|
 | Control flow | `flow: None \| Declared \| Predicted(dist) \| Fanout(n)` | 3 of 4 built; **Predicted** is §3.2 |
 | Knowledge grounding | which blob classes, and their sharing shape | KV / snapshot / weights built; **RAG missing** |
-| State and time horizon | `retention: evict_first \| until(deadline) \| durable` | **missing**; §3.3 covers the first two |
+| State and time horizon | `retention: evict_first \| until(deadline) \| durable` | **built** for the first two (Phase 5): `evict_first` declared over one-shot scopes, `until(deadline)` from a hint's lead, both consumed by §3.3; `durable` is missing |
 | Authority to act | `authority: ReadOnly \| DraftOnly \| SideEffecting` + `pause_tolerance` | **missing**; drives speculation, sets which preemption primitive applies (§2.3) and which requests need a durable write (§1) |
 | *no dimension -- see below* | `slo: Interactive \| Throughput` | **declared** (Phase 4, `--throughput`); read by the scoring quantile (§3.7), not yet by admission (§1). `Deadline(t)` waits for something to consume it |
 
@@ -1166,7 +1203,9 @@ whoever fills it.
    stall; it holds on the router's partition check, though its size is sensitive to the control
    crossing (§1).
 5. **One currency for host hints.** A prewarm, a retention directive and an eviction priced in the
-   same host DDR units can be traded against each other. A siloed hint is advisory and unpriced.
+   same host DDR units can be traded against each other. A siloed hint is advisory and unpriced. On
+   the ledger the trade comes out lopsided (Phase 5): a host hint's retention half is worth 0.0-0.7%
+   of task latency and its prewarm half 4.1-6.0%.
 
 **Measured end to end (§2, Phase 8).**
 
@@ -1188,12 +1227,14 @@ whoever fills it.
 
 8. **Learned cross-class retention.** "This agent returns to this tool in ~800 ms, confidence 0.7"
    driving a FaaS warm-cell retention decision priced against what holding it displaces. A silo can
-   receive that as a hint; it cannot weigh it.
+   receive that as a hint; it cannot weigh it. Phase 5 bounds what it could be worth through a
+   directive on this workload: an emitter that knows every next use buys at most 1.4% of stall.
 9. **Authority-driven speculative scheduling.** Pre-executing `ReadOnly` tool calls concurrently
    with decode, and scheduling `DraftOnly` work into burstable capacity with zero-compensation
    preemption -- reclaimed by eviction where the orchestrator still owns the pool and by
    cancellation where the engine does (§4). Both require knowing the authority class, which is a
-   property of the *workload*, not of any one runtime.
+   property of the *workload*, not of any one runtime. Its non-speculative core is built (Phase 5):
+   a declared flow's downstream prefilled when its hint arrives.
 10. **Joint prefill/decode pairing and ratio.** Disaggregation as a two-member gang with a
     direction, plus the fleet ratio behind it (§2.5). A sidecar picks a prefiller from a list.
 11. **Tenant fairness across a tenant-blind engine.** An engine evicts LRU and cannot see tenants,
@@ -1540,7 +1581,7 @@ run, and what was measured; the current numbers are in the ledger.
 | [2](phase-2.md) | oracle, regret, coupling, the wait regime, per-request spans | done | `scored`'s regret is all model gap; coupling is a statement about a regime |
 | [3](phase-3.md) | the engine allocates; the orchestrator sizes the partition (`--engine-cache`) | done | ceding allocation moves mean service by -0.2% where decode dominates; budgets survive and grow, per-block authority does not (§1) |
 | [4](phase-4.md) | belief, not truth: lossy telemetry and `P(resident)` (`--belief`) | done | within 0.16% of the exact view at 20% batch loss with no recovery |
-| 5 | influence: retention directives, divergence by cause | **next** | |
+| [5](phase-5.md) | influence: retention directives, prefill-ahead, divergence by cause (`--directives`, `--prefill-ahead`, `--retain`) | done | an oracle's retention directives buy at most 1.4% of stall; a prefill of a declared downstream buys 24-28% of task latency where `announce` bought 10-18% |
 | 6 | macro authority: weight placement, partitions, disaggregated prefill/decode, tenancy | planned | |
 | 7 | learned flows, speculative authority, sessions that suspend, the taxonomy | planned | |
 | [8](phase-8.md) | the data path as an arm | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
@@ -1551,27 +1592,6 @@ run, and what was measured; the current numbers are in the ledger.
 Built bits are off by default, and every result behind them is an A/B against the run without them.
 Phase numbers are stable once cited, so phases added later take new numbers and *Ordering* sets the
 sequence.
-
-### Phase 5 -- Influence: retention directives
-
-Implementation plan: [`phase-5.md`](phase-5.md), which states its predictions before the run.
-
-Emit RFC-0001-shaped directives on the request path, with two engine arms: honours, and ignores.
-Directives are advisory by construction -- §1 removed any ability to hold a block against the
-engine's will -- so the `ignores` arm is not a pessimistic sweep, it is §3.6's third divergence
-source turned into an experiment.
-
-That needs **divergence by cause** (§3.6), which Phase 4 measured only in total (phantom and miss
-shares): each divergent block attributed to not yet due, dropped, silenced, never stored,
-preempted, or an ignored directive. The simulator knows each event's fate, so the attribution is
-exact.
-
-- **Deliverable:** what a directive is worth, and what routing alone achieves when the serving stack
-  does not cooperate. The second number is the one that matters for planning, and the first
-  coupling-tier-1 result earned by influence rather than assumed by declaration. Phase 3 made this
-  load-bearing: KV prewarm carried half or more of `announce`'s margin, and a directive is the only
-  honest way left to buy it back.
-- **Risk:** low. **Size:** small to medium.
 
 ### Phase 6 -- Macro authority: placement, partitions, prefill/decode, tenancy
 
@@ -1698,8 +1718,8 @@ argmin.
 
 ### Ordering
 
-**The memory chain: 1 -> 2 -> 3 -> 4 -> 5 -> 6**, done through 4. Phase 5 is next. Phase 6 follows
-because it unfreezes what Phase 3 held fixed -- the partition's size and the weights' placement.
+**The memory chain: 1 -> 2 -> 3 -> 4 -> 5 -> 6**, done through 5. Phase 6 is next, because it
+unfreezes what Phase 3 held fixed -- the partition's size and the weights' placement.
 
 **The engine interface: 4 -> 5 -> 9.** Observe, influence, enforce -- the engine interface's three
 channels. Cancellation is the only one that is authoritative rather than advisory (§8), and Phase 7

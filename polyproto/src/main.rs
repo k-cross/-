@@ -1,10 +1,11 @@
 mod belief_cmd;
+mod influence_cmd;
 
 use clap::{Parser, Subcommand};
 use polyphonic::admit::Reserve;
 use polyphonic::arms::{Budget, Correction, EngineArm, Report, Trial, mean_ms, run, run_on, trace};
 use polyphonic::blob::BlobKind;
-use polyphonic::cache::{EngineKv, NodeMemory, Policy, Quota};
+use polyphonic::cache::{Ahead, AnnounceMix, EngineKv, Half, NodeMemory, Policy, Quota};
 use polyphonic::flow::FlowMode;
 use polyphonic::own::{Authority, Question, authority};
 use polyphonic::tier::Tier;
@@ -77,6 +78,8 @@ enum Cmd {
         clairvoyant: bool,
         #[command(flatten)]
         p3: Correct,
+        #[command(flatten)]
+        ahead: AheadArgs,
     },
 
     /// State-blind vs state-aware placement over a synthetic multi-domain machine
@@ -172,6 +175,8 @@ enum Cmd {
         bits: ClusterBits,
         #[command(flatten)]
         belief: BeliefArgs,
+        #[command(flatten)]
+        influence: InfluenceArgs,
     },
 
     /// One model host and one agent-framework host, swept from same-socket to cross-region.
@@ -376,6 +381,39 @@ enum Cmd {
         sections: String,
     },
 
+    /// What the router can do to memory it does not allocate: phase-5.md §4.10's sweeps.
+    /// Charges no control crossing, so every number is reproducible from the seed
+    Influence {
+        #[arg(long, default_value_t = 4)]
+        nodes: usize,
+        #[arg(long, default_value_t = 3)]
+        units_per_node: usize,
+        #[arg(long, default_value = "16GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        #[arg(long, default_value = "32GiB", value_parser = parse_bytes)]
+        dram: u64,
+        #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
+        nvme: u64,
+        #[arg(long, default_value_t = 15_000)]
+        ops: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value_t = 250.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 0.10)]
+        fanout: f64,
+        /// Seeds per directive cell
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..))]
+        seeds: u64,
+        /// Sections to run, comma-separated: gate, causes, flows, prefill, declared, ceilings,
+        /// marks, retain, reuse
+        #[arg(
+            long,
+            default_value = "gate,causes,flows,prefill,declared,ceilings,marks,retain,reuse"
+        )]
+        sections: String,
+    },
+
     /// The price of the engine boundary: phase-3.md §4.11's sweeps, per class and at p99.
     /// Charges no control crossing, so every number is reproducible from the seed
     Price {
@@ -568,6 +606,174 @@ impl BeliefArgs {
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum EmitArg {
+    Declared,
+    Retain,
+    EvictFirst,
+    Oracle,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum MarksArg {
+    Acked,
+    Trusted,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum TargetArg {
+    Argmin,
+    Deepest,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum HalfArg {
+    Both,
+    Retain,
+    Prewarm,
+    Off,
+}
+
+impl HalfArg {
+    fn half(self) -> Half {
+        match self {
+            Self::Both => Half::Both,
+            Self::Retain => Half::Retain,
+            Self::Prewarm => Half::Prewarm,
+            Self::Off => Half::Off,
+        }
+    }
+}
+
+#[derive(clap::Args, Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct InfluenceArgs {
+    /// Attach retention directives to dispatched requests (needs --engine-cache and --rate)
+    #[arg(long)]
+    directives: bool,
+    /// Who decides the marks; oracle reads the trace and is a ceiling, never an arm
+    #[arg(long, value_enum, default_value_t = EmitArg::Declared)]
+    emit: EmitArg,
+    /// The oracle's horizon in seconds
+    #[arg(long, default_value_t = 5.0)]
+    horizon: f64,
+    /// The engine drops every directive
+    #[arg(long)]
+    ignores: bool,
+    /// Whether the router believes only marks the stream acknowledges, or its own
+    #[arg(long, value_enum, default_value_t = MarksArg::Acked)]
+    marks: MarksArg,
+    /// Prefill a declared downstream's prompt when its hint arrives
+    #[arg(long)]
+    prefill_ahead: bool,
+    /// Where the prefill goes: the downstream's scored argmin, or the deepest believed prefix
+    #[arg(long, value_enum, default_value_t = TargetArg::Argmin)]
+    prefill_target: TargetArg,
+    /// Engines evict furthest-next-use: a ceiling, never an arm
+    #[arg(long)]
+    clairvoyant_kv: bool,
+    /// Track reuse by origin; only `influence` reports it
+    #[arg(long)]
+    reuse: bool,
+}
+
+impl InfluenceArgs {
+    const OFF: Self = Self {
+        directives: false,
+        emit: EmitArg::Declared,
+        horizon: 5.0,
+        ignores: false,
+        marks: MarksArg::Acked,
+        prefill_ahead: false,
+        prefill_target: TargetArg::Argmin,
+        clairvoyant_kv: false,
+        reuse: false,
+    };
+
+    fn directives(self) -> Option<polyphonic::machine::Directives> {
+        use polyphonic::belief::Marks;
+        use polyphonic::machine::{Directives, Emit};
+        self.directives.then_some(Directives {
+            emit: match self.emit {
+                EmitArg::Declared => Emit::Declared {
+                    retain: true,
+                    evict_first: true,
+                },
+                EmitArg::Retain => Emit::Declared {
+                    retain: true,
+                    evict_first: false,
+                },
+                EmitArg::EvictFirst => Emit::Declared {
+                    retain: false,
+                    evict_first: true,
+                },
+                EmitArg::Oracle => Emit::Oracle {
+                    horizon_ns: (self.horizon * 1e9) as u64,
+                },
+            },
+            ignores: self.ignores,
+            marks: match self.marks {
+                MarksArg::Acked => Marks::Acked,
+                MarksArg::Trusted => Marks::Trusted,
+            },
+        })
+    }
+
+    fn oracle(self) -> bool {
+        self.directives && matches!(self.emit, EmitArg::Oracle)
+    }
+
+    fn needs_trace(self) -> bool {
+        self.oracle() || self.clairvoyant_kv
+    }
+}
+
+#[derive(clap::Args, Debug, Clone, Copy)]
+struct AheadArgs {
+    /// Engine arm: prefill a declared downstream's missing blocks when its hint arrives
+    #[arg(long)]
+    prefill_ahead: bool,
+    /// Engine arm: hold a declared downstream's resident blocks until it arrives
+    #[arg(long)]
+    hold: bool,
+    /// Which half of announce reaches KV on the ledger
+    #[arg(long, value_enum, default_value_t = HalfArg::Both)]
+    announce_kv: HalfArg,
+    /// Which half of announce reaches host state
+    #[arg(long, value_enum, default_value_t = HalfArg::Both)]
+    announce_host: HalfArg,
+    /// Withdraw a bump when its hint's lead has passed
+    #[arg(long)]
+    retain: bool,
+    /// Chance that a function request also issues a hint for a flow that never comes
+    #[arg(long, default_value_t = 0.0)]
+    false_hints: f64,
+}
+
+impl AheadArgs {
+    fn ledger(self, fix: Correction) -> Correction {
+        Correction {
+            announce: AnnounceMix {
+                kv: self.announce_kv.half(),
+                host: self.announce_host.half(),
+            },
+            deadline: self.retain,
+            false_hints: self.false_hints,
+            ..fix
+        }
+    }
+
+    fn engine(self, fix: Correction) -> Correction {
+        Correction {
+            ahead: Ahead {
+                prefill: self.prefill_ahead,
+                hold: self.hold,
+            },
+            ..self.ledger(fix)
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
 enum AdmitArg {
     Bound,
     Perfect,
@@ -599,7 +805,7 @@ impl Correct {
             decode_kv: self.decode_kv.then_some(self.tokens_per_block),
             reserve: self.reserve(),
             max_token_slack: self.max_token_slack,
-            prewarm_kv: true,
+            ..Correction::default()
         }
     }
 
@@ -1221,6 +1427,7 @@ fn flows_report(
     bands: [u8; BlobKind::N],
     clairvoyant: bool,
     p3: Correct,
+    ahead: AheadArgs,
 ) {
     println!(
         "{} ops={ops} seed={seed} bands={bands:?}\n",
@@ -1236,7 +1443,7 @@ fn flows_report(
         seed,
         ops,
         vol: 1.0,
-        fix: p3.base(),
+        fix: ahead.ledger(p3.base()),
     };
     let (_, split) = best_split(cfg, false, step);
     let budget = Budget::Split { split, hard: false };
@@ -1291,7 +1498,10 @@ fn flows_report(
         Trial {
             flows: FlowMode::Announce,
             fix: Correction {
-                prewarm_kv: false,
+                announce: AnnounceMix {
+                    kv: Half::Off,
+                    host: cfg.fix.announce.host,
+                },
                 ..cfg.fix
             },
             ..cfg
@@ -1309,7 +1519,7 @@ fn flows_report(
             "",
             Trial {
                 flows: mode,
-                fix: p3.engine(false),
+                fix: ahead.engine(p3.engine(false)),
                 ..cfg
             },
             budget,
@@ -1335,6 +1545,14 @@ fn flows_report(
         on[1].refused_by_router.iter().sum::<u64>(),
         on[1].preempted.iter().sum::<u64>(),
     );
+    if ahead.prefill_ahead || ahead.hold {
+        println!(
+            "announce arm: prefilled {} blocks, held {}; {:.2} s of prewarm and prefill work",
+            on[1].prefilled_blocks,
+            on[1].held_blocks,
+            on[1].prewarm_ns as f64 / 1e9,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1850,6 +2068,7 @@ fn main() {
             p3,
             bits,
             belief,
+            influence,
         } => distributed(
             nodes,
             units_per_node,
@@ -1870,6 +2089,7 @@ fn main() {
             p3,
             bits,
             belief,
+            influence,
         ),
         Cmd::CodeReview {
             hbm,
@@ -1981,6 +2201,7 @@ fn main() {
             bands,
             clairvoyant,
             p3,
+            ahead,
         } => {
             flows_report(
                 hbm,
@@ -1992,6 +2213,7 @@ fn main() {
                 bands_of(&bands),
                 clairvoyant,
                 p3,
+                ahead,
             );
         }
         Cmd::Volatility {
@@ -2038,6 +2260,31 @@ fn main() {
             seed,
             rate,
             fanout,
+            sections,
+        }),
+        Cmd::Influence {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            rate,
+            fanout,
+            seeds,
+            sections,
+        } => influence_cmd::run(&influence_cmd::Env {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            rate,
+            fanout,
+            seeds,
             sections,
         }),
         Cmd::Price {
@@ -2588,6 +2835,7 @@ struct Scenario {
     p3: Correct,
     bits: ClusterBits,
     belief: BeliefArgs,
+    influence: InfluenceArgs,
     lag_ns: u64,
 }
 
@@ -2598,6 +2846,14 @@ fn distributed_run(
     sc: Scenario,
 ) -> ArmRun {
     use polyphonic::machine::Machine;
+    let inf = sc.influence;
+    let memory = NodeMemory {
+        kv: memory.kv.map(|kv| EngineKv {
+            clairvoyant: kv.clairvoyant || inf.clairvoyant_kv,
+            ..kv
+        }),
+        ..memory
+    };
     let mut mach = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, a.placement);
     mach.set_flow_aware(a.flow);
     mach.set_control(a.control, sc.cost);
@@ -2614,13 +2870,39 @@ fn distributed_run(
         mach.set_scoring(sc.belief.scoring());
         mach.set_instrument(true);
     }
+    mach.set_directives(inf.directives());
+    mach.set_prefill_ahead(inf.prefill_ahead);
+    mach.set_prefill_target(match inf.prefill_target {
+        TargetArg::Argmin => polyphonic::machine::Target::Argmin,
+        TargetArg::Deepest => polyphonic::machine::Target::Deepest,
+    });
     let workload = polyphonic::work::Workload::with_fanout(sc.seed, sc.ops, 1.0, sc.fanout)
         .with_throughput(sc.belief.throughput);
     let workload = match sc.flow_payload {
         Some(bytes) => workload.with_flow_payload(bytes),
         None => workload,
     };
-    let (t, total, served, offered) = drive(&mut mach, sc.rate, sc.p3.workload(workload));
+    let workload = if inf.reuse {
+        let origins = polyphonic::work::Origins::default();
+        mach.set_origins(origins.clone());
+        workload.with_origins(origins)
+    } else {
+        workload
+    };
+    let workload = sc.p3.workload(workload);
+    let (t, total, served, offered) = if inf.needs_trace() {
+        let trace: Vec<polyphonic::work::Request> = workload.collect();
+        let foresight = polyphonic::foresight::Foresight::of(&trace);
+        if inf.clairvoyant_kv {
+            mach.set_clairvoyant(&foresight);
+        }
+        if inf.oracle() {
+            mach.set_foresight(Some(foresight));
+        }
+        drive(&mut mach, sc.rate, &trace)
+    } else {
+        drive(&mut mach, sc.rate, workload)
+    };
     ArmRun {
         mach,
         t,
@@ -2717,11 +2999,16 @@ fn distributed(
     p3: Correct,
     bits: ClusterBits,
     belief: BeliefArgs,
+    influence: InfluenceArgs,
 ) {
     use polyphonic::topo::{Distance, Topology};
 
     if belief.belief && !(p3.engine_cache && rate > 0.0) {
         println!("--belief needs --engine-cache and a positive --rate");
+        return;
+    }
+    if (influence.directives || influence.clairvoyant_kv) && !(p3.engine_cache && rate > 0.0) {
+        println!("--directives and --clairvoyant-kv need --engine-cache and a positive --rate");
         return;
     }
     let ladder = polyphonic::boundary::measure(repeat);
@@ -2751,6 +3038,7 @@ fn distributed(
         p3,
         bits,
         belief,
+        influence,
         lag_ns: 0,
     };
 
@@ -3012,8 +3300,9 @@ fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
     mach.set_arrival_rate(rate);
     let mut t = ClassTally::default();
     let (mut total, mut served, mut offered) = (0u64, 0u64, 0u64);
-    for req in workload {
+    for (position, req) in workload.into_iter().enumerate() {
         let req = req.borrow();
+        mach.set_position(position as u64);
         let k = req.kind_idx();
         offered += 1;
         let c = mach.serve_request(req);
@@ -3165,12 +3454,7 @@ struct PriceArgs {
 }
 
 fn quantile(v: &[u64], q: f64) -> u64 {
-    if v.is_empty() {
-        return 0;
-    }
-    let mut sorted = v.to_vec();
-    sorted.sort_unstable();
-    sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)]
+    polyphonic::instruments::percentile(&mut v.to_vec(), q).unwrap_or(0)
 }
 
 fn mean_of(v: &[u64]) -> f64 {
@@ -3591,6 +3875,7 @@ fn price(a: &PriceArgs) {
                 no_displacement: false,
             },
             belief: BeliefArgs::OFF,
+            influence: InfluenceArgs::OFF,
             lag_ns: 0,
         };
         let cell = |p3: Correct| -> String {

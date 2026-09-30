@@ -1,8 +1,12 @@
 use crate::admit::{Reservations, Reserve};
 use crate::blob::{BlobId, BlobKind};
-use crate::cache::{Cost, EngineKv, Hierarchy, NodeMemory, Policy, Quota, accelerated};
-use crate::flow::FlowMode;
+use crate::cache::{
+    Ahead, AnnounceMix, Cost, EngineKv, Half, Hierarchy, NodeMemory, Policy, Quota, accelerated,
+};
+use crate::flow::{FlowHint, FlowMode};
 use std::collections::{HashMap, HashSet, VecDeque};
+
+const PHANTOM_SEED: u64 = 0x0BAD_F1A6_5EED;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Trial {
@@ -25,7 +29,10 @@ pub struct Correction {
     pub decode_kv: Option<u64>,
     pub reserve: Reserve,
     pub max_token_slack: f64,
-    pub prewarm_kv: bool,
+    pub announce: AnnounceMix,
+    pub ahead: Ahead,
+    pub deadline: bool,
+    pub false_hints: f64,
 }
 
 impl Default for Correction {
@@ -35,7 +42,16 @@ impl Default for Correction {
             decode_kv: None,
             reserve: Reserve::Prompt,
             max_token_slack: crate::work::MAX_TOKEN_SLACK,
-            prewarm_kv: true,
+            announce: AnnounceMix {
+                kv: Half::Both,
+                host: Half::Both,
+            },
+            ahead: Ahead {
+                prefill: false,
+                hold: false,
+            },
+            deadline: false,
+            false_hints: 0.0,
         }
     }
 }
@@ -80,6 +96,11 @@ pub struct Report {
     pub flow_e2e_ns: u64,
     pub prewarmed_bytes: u64,
     pub prewarm_ns: u64,
+    pub prefilled_blocks: u64,
+    pub held_blocks: u64,
+    pub false_hints: u64,
+    pub kv_hints: u64,
+    pub stale_bumps: usize,
 
     pub engine_ops: crate::cache::EngineOps,
     pub kv_mean: [u64; 3],
@@ -281,7 +302,9 @@ pub fn run_with(
     kv: Option<EngineKv>,
 ) -> Report {
     let mut h = Hierarchy::new(memory_for(t, budget, kv), t.policy);
-    h.set_prewarm_kv(t.fix.prewarm_kv);
+    h.set_announce(t.fix.announce);
+    h.set_ahead(t.fix.ahead);
+    h.set_deadline(t.fix.deadline);
     if t.policy == Policy::Clairvoyant || kv.is_some_and(|k| k.clairvoyant) {
         h.set_clairvoyant_index(clairvoyant_index(trace));
     }
@@ -305,12 +328,17 @@ pub fn run_with(
     let mut flow_attempted = 0u64;
 
     let mut op = 0u64;
+    let mut false_hints = 0u64;
+    let mut kv_hints = 0u64;
+    let mut phantoms = crate::rng::Rng::new(PHANTOM_SEED ^ t.seed);
+    let mut phantom_task = u64::MAX;
     for req in trace {
         if req.gang.is_some() {
             continue;
         }
         h.set_clairvoyant_op(op);
         op += 1;
+        h.tick(op);
         for (sum, bytes) in kv_sum.iter_mut().zip(h.kv_bytes()) {
             *sum += bytes;
         }
@@ -376,10 +404,32 @@ pub fn run_with(
         if let Some(hint) = &req.hint {
             flow_started += 1;
             flow_attempted += 1;
+            kv_hints += u64::from(
+                hint.downstream
+                    .first()
+                    .is_some_and(|(_, m)| m.kind == BlobKind::KvBlock),
+            );
             started.insert(hint.task, c.total_ns());
             if t.flows != FlowMode::Blind {
                 h.announce(hint);
             }
+        }
+        if t.flows != FlowMode::Blind
+            && t.fix.false_hints > 0.0
+            && k == BlobKind::Snapshot.idx()
+            && phantoms.chance(t.fix.false_hints)
+        {
+            let function = phantoms.zipf(crate::work::FLOW_FUNCTIONS, 1.5);
+            let call = crate::work::FLOW_CALLS + phantoms.below(crate::work::FLOW_CALLS);
+            phantom_task -= 1;
+            h.announce(&FlowHint {
+                task: phantom_task,
+                downstream: crate::work::flow_downstream(function, call),
+                probability: 1.0,
+                lead_ops: crate::work::FLOW_LEAD_OPS,
+                payload_bytes: 0,
+            });
+            false_hints += 1;
         }
         served[k] += 1;
         total += c.total_ns();
@@ -411,6 +461,8 @@ pub fn run_with(
             flow_e2e,
         },
     );
+    r.false_hints = false_hints;
+    r.kv_hints = kv_hints;
     r.kv_mean = kv_sum.map(|b| b / samples);
     r.refused_by_router = refused_by_router;
     r.preempted = preempted;
@@ -476,6 +528,11 @@ fn finish(label: &str, h: &Hierarchy, costs: &[u64], t: &Tally) -> Report {
         flow_e2e_ns: t.flow_e2e,
         prewarmed_bytes: h.prewarmed_bytes,
         prewarm_ns: h.prewarm_ns,
+        prefilled_blocks: h.prefilled_blocks,
+        held_blocks: h.held_blocks,
+        false_hints: 0,
+        kv_hints: 0,
+        stale_bumps: h.stale_bumps(),
         engine_ops: h.engine_ops,
         kv_mean: [0; 3],
         refused_by_router: [0; BlobKind::N],
@@ -650,5 +707,74 @@ mod tests {
         assert_eq!(g.partition, mem.hbm_quota.floor_of(BlobKind::KvBlock));
         assert_eq!(g.offload, mem.ddr_quota.floor_of(BlobKind::KvBlock));
         assert_eq!(g.spill, off.kv_mean[2]);
+    }
+
+    fn soft() -> Budget {
+        Budget::Split {
+            split: [0.12, 0.12, 0.38, 0.25],
+            hard: false,
+        }
+    }
+
+    fn ahead(prefill: bool, hold: bool) -> Correction {
+        Correction {
+            engine: Some(EngineArm::default()),
+            ahead: Ahead { prefill, hold },
+            ..Correction::default()
+        }
+    }
+
+    #[test]
+    fn prefill_ahead_is_what_announce_lost_and_a_hold_is_not() {
+        let t = |flows, fix| Trial {
+            flows,
+            fix,
+            ..trial(6_000)
+        };
+        let blind = run("", t(FlowMode::Blind, ahead(false, false)), soft());
+        let skipped = run("", t(FlowMode::Announce, ahead(false, false)), soft());
+        let held = run("", t(FlowMode::Announce, ahead(false, true)), soft());
+        let prefilled = run("", t(FlowMode::Announce, ahead(true, false)), soft());
+        let blind_ahead = run("", t(FlowMode::Blind, ahead(true, true)), soft());
+        assert_eq!(format!("{blind:?}"), format!("{blind_ahead:?}"));
+        let margin = |r: &Report| 1.0 - r.flow_e2e_ms() / blind.flow_e2e_ms();
+        assert!(held.held_blocks > 0);
+        assert!((margin(&held) - margin(&skipped)).abs() < 0.01);
+        assert!(prefilled.prefilled_blocks > 0);
+        assert!(margin(&prefilled) > margin(&skipped) + 0.05);
+        let net = |r: &Report| r.total_ns + r.prewarm_ns;
+        let drift = (net(&prefilled) as f64 - net(&blind) as f64) / net(&blind) as f64;
+        assert!(
+            drift.abs() < 0.01,
+            "moved off the critical path, not added: {drift}"
+        );
+    }
+
+    #[test]
+    fn a_deadline_on_the_bump_removes_the_stale_entries_false_hints_leave_behind() {
+        let run_with = |deadline: bool, false_hints: f64| {
+            run(
+                "",
+                Trial {
+                    fix: Correction {
+                        deadline,
+                        false_hints,
+                        ..Correction::default()
+                    },
+                    ..trial(4_000)
+                },
+                soft(),
+            )
+        };
+        let (kept, bounded) = (run_with(false, 0.5), run_with(true, 0.5));
+        assert!(kept.false_hints > 0 && kept.false_hints == bounded.false_hints);
+        assert!(kept.stale_bumps > 0);
+        assert!(bounded.stale_bumps < kept.stale_bumps);
+        let honest = run_with(false, 0.0);
+        assert_eq!(honest.false_hints, 0);
+        assert!(
+            kept.prewarm_ns > honest.prewarm_ns,
+            "a false hint costs what it prewarms"
+        );
     }
 }

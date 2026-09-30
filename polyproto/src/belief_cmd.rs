@@ -7,8 +7,8 @@ use polyphonic::machine::{Control, Placement};
 use polyphonic::topo::{Distance, Topology};
 
 use super::{
-    AdmitArg, Arm, ArmRun, BeliefArgs, ClusterBits, Correct, LoadArg, RecoveryArg, Scenario,
-    ScoringArg, arm, correct, distributed_run, mean_of, ms, node_memory, quantile,
+    AdmitArg, Arm, ArmRun, BeliefArgs, ClusterBits, Correct, InfluenceArgs, LoadArg, RecoveryArg,
+    Scenario, ScoringArg, arm, correct, distributed_run, mean_of, ms, node_memory, quantile,
 };
 
 pub struct Env {
@@ -25,22 +25,22 @@ pub struct Env {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-enum Regime {
+pub(super) enum Regime {
     Defaults,
     Half,
 }
 
 impl Regime {
-    const ALL: [Self; 2] = [Self::Defaults, Self::Half];
+    pub(super) const ALL: [Self; 2] = [Self::Defaults, Self::Half];
 
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Defaults => "published defaults",
             Self::Half => "half partition, decode output held",
         }
     }
 
-    fn p3(self) -> Correct {
+    pub(super) fn p3(self) -> Correct {
         match self {
             Self::Defaults => correct(false, AdmitArg::None),
             Self::Half => Correct {
@@ -53,13 +53,13 @@ impl Regime {
 
 const TAIL: f64 = 0.99;
 
-struct Lab<'a> {
+pub(super) struct Lab<'a> {
     env: &'a Env,
     memory: NodeMemory,
     grants: HashMap<(u64, Regime), [u64; 3]>,
 }
 
-fn scored_fetch() -> Arm {
+pub(super) fn scored_fetch() -> Arm {
     arm(
         "scored + fetch",
         Placement::Scored,
@@ -89,7 +89,7 @@ fn gossiped_greedy() -> Arm {
     )
 }
 
-fn on() -> BeliefArgs {
+pub(super) fn on() -> BeliefArgs {
     BeliefArgs {
         belief: true,
         ..BeliefArgs::OFF
@@ -104,7 +104,7 @@ fn exact() -> BeliefArgs {
 }
 
 impl<'a> Lab<'a> {
-    fn new(env: &'a Env) -> Self {
+    pub(super) fn new(env: &'a Env) -> Self {
         let n = env.nodes as u64;
         Self {
             env,
@@ -124,7 +124,14 @@ impl<'a> Lab<'a> {
         )
     }
 
-    fn scenario(&self, dist: Distance, p3: Correct, b: BeliefArgs, regret: bool) -> Scenario {
+    fn scenario(
+        &self,
+        dist: Distance,
+        p3: Correct,
+        b: BeliefArgs,
+        influence: InfluenceArgs,
+        regret: bool,
+    ) -> Scenario {
         Scenario {
             cost: Crossing::default(),
             rate: self.env.rate,
@@ -139,16 +146,29 @@ impl<'a> Lab<'a> {
                 no_displacement: false,
             },
             belief: b,
+            influence,
             lag_ns: dist.one_way_ns(),
         }
     }
 
-    fn go(
+    pub(super) fn go(
         &mut self,
         dist: Distance,
         regime: Regime,
         a: &Arm,
         b: BeliefArgs,
+        regret: bool,
+    ) -> ArmRun {
+        self.go_with(dist, regime, a, b, InfluenceArgs::OFF, regret)
+    }
+
+    pub(super) fn go_with(
+        &mut self,
+        dist: Distance,
+        regime: Regime,
+        a: &Arm,
+        b: BeliefArgs,
+        influence: InfluenceArgs,
         regret: bool,
     ) -> ArmRun {
         let topo = self.topo(dist);
@@ -159,12 +179,12 @@ impl<'a> Lab<'a> {
                 engine_cache: false,
                 ..p3
             };
-            let sc = self.scenario(dist, ledger, BeliefArgs::OFF, false);
+            let sc = self.scenario(dist, ledger, BeliefArgs::OFF, InfluenceArgs::OFF, false);
             let run = distributed_run(&scored_fetch(), &topo, self.memory, sc);
             self.grants.insert(key, run.mach.kv_mean());
         }
         let mean = self.grants[&key];
-        let sc = self.scenario(dist, p3, b, regret);
+        let sc = self.scenario(dist, p3, b, influence, regret);
         distributed_run(a, &topo, p3.engine_memory(self.memory, mean), sc)
     }
 }

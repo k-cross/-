@@ -22,12 +22,32 @@ impl Medium {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rank {
+    EvictFirst,
+    Retain,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mark {
+    pub rank: Rank,
+    pub until_ns: u64,
+}
+
+impl Mark {
+    #[must_use]
+    pub fn live_at(self, now_ns: u64) -> bool {
+        self.until_ns > now_ns
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvEvent {
     Stored {
         id: BlobId,
         bytes: u64,
         medium: Medium,
+        mark: Option<Mark>,
     },
     Removed {
         id: BlobId,
@@ -40,22 +60,34 @@ pub enum KvEvent {
 pub struct Index {
     tiers: [HashMap<BlobId, u64>; 3],
     bytes: [u64; 3],
+    marks: HashMap<BlobId, Mark>,
 }
 
 impl Index {
     pub fn apply(&mut self, event: &KvEvent) {
         match *event {
-            KvEvent::Stored { id, bytes, medium } => {
+            KvEvent::Stored {
+                id,
+                bytes,
+                medium,
+                mark,
+            } => {
                 let m = medium.idx();
                 if let Some(old) = self.tiers[m].insert(id, bytes) {
                     self.bytes[m] -= old;
                 }
                 self.bytes[m] += bytes;
+                if let (Some(mark), Medium::Gpu) = (mark, medium) {
+                    self.marks.insert(id, mark);
+                }
             }
             KvEvent::Removed { id, medium } => {
                 let m = medium.idx();
                 if let Some(old) = self.tiers[m].remove(&id) {
                     self.bytes[m] -= old;
+                }
+                if medium == Medium::Gpu {
+                    self.marks.remove(&id);
                 }
             }
             KvEvent::Cleared => {
@@ -63,6 +95,7 @@ impl Index {
                     tier.clear();
                 }
                 self.bytes = [0; 3];
+                self.marks.clear();
             }
         }
     }
@@ -84,6 +117,27 @@ impl Index {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tiers.iter().all(HashMap::is_empty)
+    }
+
+    #[must_use]
+    pub fn mark(&self, id: &BlobId) -> Option<Mark> {
+        self.marks.get(id).copied()
+    }
+
+    pub fn marks(&self) -> impl Iterator<Item = (&BlobId, &Mark)> {
+        self.marks.iter()
+    }
+
+    #[must_use]
+    pub fn live_marks(&self, now_ns: u64) -> Vec<(BlobId, Mark)> {
+        let mut live: Vec<(BlobId, Mark)> = self
+            .marks
+            .iter()
+            .filter(|(_, m)| m.live_at(now_ns))
+            .map(|(id, m)| (*id, *m))
+            .collect();
+        live.sort_unstable_by_key(|(id, _)| *id);
+        live
     }
 
     #[must_use]
@@ -116,11 +170,13 @@ mod tests {
             id: a,
             bytes: 10,
             medium: Medium::Gpu,
+            mark: None,
         });
         index.apply(&KvEvent::Stored {
             id: b,
             bytes: 20,
             medium: Medium::Gpu,
+            mark: None,
         });
         index.apply(&KvEvent::Removed {
             id: a,
@@ -130,11 +186,59 @@ mod tests {
             id: a,
             bytes: 10,
             medium: Medium::Cpu,
+            mark: None,
         });
         assert!(!index.contains(Medium::Gpu, &a));
         assert!(index.contains(Medium::Cpu, &a));
         assert_eq!(index.bytes(Medium::Gpu), 20);
         index.apply(&KvEvent::Cleared);
         assert!(index.is_empty());
+    }
+
+    #[test]
+    fn a_mark_rides_a_gpu_store_until_the_block_leaves_the_gpu() {
+        let a = BlobId::leaf(b"a");
+        let retain = Mark {
+            rank: Rank::Retain,
+            until_ns: 100,
+        };
+        let mut index = Index::default();
+        index.apply(&KvEvent::Stored {
+            id: a,
+            bytes: 10,
+            medium: Medium::Gpu,
+            mark: None,
+        });
+        assert_eq!(index.mark(&a), None);
+        index.apply(&KvEvent::Stored {
+            id: a,
+            bytes: 10,
+            medium: Medium::Gpu,
+            mark: Some(retain),
+        });
+        assert_eq!(index.mark(&a), Some(retain));
+        assert_eq!(index.live_marks(99), vec![(a, retain)]);
+        assert!(index.live_marks(100).is_empty());
+        index.apply(&KvEvent::Stored {
+            id: a,
+            bytes: 10,
+            medium: Medium::Cpu,
+            mark: None,
+        });
+        assert_eq!(
+            index.mark(&a),
+            Some(retain),
+            "a colder copy leaves the mark"
+        );
+        index.apply(&KvEvent::Removed {
+            id: a,
+            medium: Medium::Gpu,
+        });
+        assert_eq!(index.mark(&a), None);
+    }
+
+    #[test]
+    fn evict_first_ranks_below_retain() {
+        assert!(Rank::EvictFirst < Rank::Retain);
     }
 }

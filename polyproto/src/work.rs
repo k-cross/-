@@ -1,7 +1,9 @@
 use crate::blob::{BlobId, BlobKind, BlobMeta, ROOT};
 use crate::flow::FlowHint;
 use crate::rng::Rng;
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
 pub type Chain = Vec<(BlobId, BlobMeta)>;
 
@@ -62,7 +64,7 @@ pub const MAX_TOKEN_SLACK: f64 = 4.0;
 
 const TOOL_FRACTION: f64 = 0.35;
 const FLOW_FRACTION: f64 = 0.45;
-const FLOW_LEAD_OPS: u32 = 6;
+pub const FLOW_LEAD_OPS: u32 = 6;
 const FLOW_PROMPT_BLOCKS: u64 = 24;
 
 pub const FLOW_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
@@ -125,6 +127,86 @@ impl Slo {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retain {
+    pub upto: usize,
+    pub lead_ops: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Retention {
+    pub retain: Option<Retain>,
+    pub evict_first_from: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    Tenant,
+    Session,
+    Agent,
+    AgentOut,
+    Result,
+    FlowPrompt,
+    FlowCall,
+    TaskOut,
+}
+
+impl Origin {
+    pub const N: usize = 8;
+    pub const ALL: [Self; Self::N] = [
+        Self::Tenant,
+        Self::Session,
+        Self::Agent,
+        Self::AgentOut,
+        Self::Result,
+        Self::FlowPrompt,
+        Self::FlowCall,
+        Self::TaskOut,
+    ];
+
+    #[must_use]
+    pub fn idx(self) -> usize {
+        match self {
+            Self::Tenant => 0,
+            Self::Session => 1,
+            Self::Agent => 2,
+            Self::AgentOut => 3,
+            Self::Result => 4,
+            Self::FlowPrompt => 5,
+            Self::FlowCall => 6,
+            Self::TaskOut => 7,
+        }
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Tenant => "tenant",
+            Self::Session => "session",
+            Self::Agent => "agent",
+            Self::AgentOut => "agent out",
+            Self::Result => "result",
+            Self::FlowPrompt => "flow prompt",
+            Self::FlowCall => "flow call",
+            Self::TaskOut => "task out",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Origins(Rc<RefCell<HashMap<BlobId, Origin>>>);
+
+impl Origins {
+    #[must_use]
+    pub fn of(&self, id: &BlobId) -> Option<Origin> {
+        self.0.borrow().get(id).copied()
+    }
+
+    fn register(&self, id: BlobId, origin: Origin) {
+        self.0.borrow_mut().entry(id).or_insert(origin);
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ToolCall {
     pub chain: Chain,
@@ -143,6 +225,7 @@ pub struct Agent {
     pub produces: Chain,
     pub max_tokens: u64,
     pub slo: Slo,
+    pub retention: Retention,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +252,7 @@ pub struct Request {
     pub produces: Chain,
     pub max_tokens: u64,
     pub slo: Slo,
+    pub retention: Retention,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -242,10 +326,14 @@ pub struct Workload {
     tokens_per_block: Option<u64>,
     max_token_slack: f64,
     throughput: f64,
+    origins: Option<Origins>,
 }
 
-fn kv(parent: BlobId, tag: &[u8]) -> (BlobId, BlobMeta) {
+fn kv(origins: Option<&Origins>, parent: BlobId, tag: &[u8], origin: Origin) -> (BlobId, BlobMeta) {
     let id = BlobId::chain(parent, tag);
+    if let Some(o) = origins {
+        o.register(id, origin);
+    }
     let meta = BlobMeta {
         kind: BlobKind::KvBlock,
         bytes: KV_BLOCK_BYTES,
@@ -254,6 +342,48 @@ fn kv(parent: BlobId, tag: &[u8]) -> (BlobId, BlobMeta) {
     };
     (id, meta)
 }
+
+fn flow_prompt(origins: Option<&Origins>, f: u64) -> Chain {
+    let mut prompt = Vec::with_capacity(FLOW_PROMPT_BLOCKS as usize);
+    let mut parent = ROOT;
+    for d in 0..FLOW_PROMPT_BLOCKS {
+        let (id, meta) = kv(
+            origins,
+            parent,
+            format!("fnprompt:{f}:{d}").as_bytes(),
+            Origin::FlowPrompt,
+        );
+        parent = id;
+        prompt.push((id, meta));
+    }
+    prompt
+}
+
+fn flow_call(origins: Option<&Origins>, mut parent: BlobId, f: u64, call: u64) -> Chain {
+    (0..4)
+        .map(|d| {
+            let (id, meta) = kv(
+                origins,
+                parent,
+                format!("fncall:{f}:{call}:{d}").as_bytes(),
+                Origin::FlowCall,
+            );
+            parent = id;
+            (id, meta)
+        })
+        .collect()
+}
+
+#[must_use]
+pub fn flow_downstream(f: u64, call: u64) -> Chain {
+    let mut chain = flow_prompt(None, f);
+    let tail = chain.last().map_or(ROOT, |(id, _)| *id);
+    chain.extend(flow_call(None, tail, f, call));
+    chain
+}
+
+pub const FLOW_FUNCTIONS: u64 = FUNCTIONS;
+pub const FLOW_CALLS: u64 = 64;
 
 impl Workload {
     #[must_use]
@@ -265,7 +395,12 @@ impl Workload {
             let mut chain = Vec::with_capacity(depth as usize);
             let mut parent = ROOT;
             for d in 0..depth {
-                let (id, meta) = kv(parent, format!("tenant:{t}:{d}").as_bytes());
+                let (id, meta) = kv(
+                    None,
+                    parent,
+                    format!("tenant:{t}:{d}").as_bytes(),
+                    Origin::Tenant,
+                );
                 parent = id;
                 chain.push((id, meta));
             }
@@ -289,6 +424,7 @@ impl Workload {
             tokens_per_block: None,
             max_token_slack: MAX_TOKEN_SLACK,
             throughput: 0.0,
+            origins: None,
         };
         for _ in 0..SESSIONS {
             let s = w.fresh_session();
@@ -324,6 +460,17 @@ impl Workload {
     }
 
     #[must_use]
+    pub fn with_origins(mut self, origins: Origins) -> Self {
+        for chain in &self.tenant_prefix {
+            for (id, _) in chain {
+                origins.register(*id, Origin::Tenant);
+            }
+        }
+        self.origins = Some(origins);
+        self
+    }
+
+    #[must_use]
     pub fn with_throughput(mut self, fraction: f64) -> Self {
         self.throughput = fraction;
         self
@@ -352,14 +499,19 @@ impl Workload {
         }
     }
 
-    fn produced(&self, parent: BlobId, tokens: u64, tag: &str) -> Chain {
+    fn produced(&self, parent: BlobId, tokens: u64, tag: &str, origin: Origin) -> Chain {
         let Some(per_block) = self.tokens_per_block else {
             return Vec::new();
         };
         let mut at = parent;
         (0..tokens.div_ceil(per_block))
             .map(|blk| {
-                let (id, meta) = kv(at, format!("{tag}:{blk}").as_bytes());
+                let (id, meta) = kv(
+                    self.origins.as_ref(),
+                    at,
+                    format!("{tag}:{blk}").as_bytes(),
+                    origin,
+                );
                 at = id;
                 (id, meta)
             })
@@ -375,7 +527,12 @@ impl Workload {
             let mut chain = parent.clone();
             let mut at = base;
             for b in 0..SUBAGENT_BLOCKS {
-                let (id, meta) = kv(at, format!("agent:{task}:{a}:{b}").as_bytes());
+                let (id, meta) = kv(
+                    self.origins.as_ref(),
+                    at,
+                    format!("agent:{task}:{a}:{b}").as_bytes(),
+                    Origin::Agent,
+                );
                 at = id;
                 chain.push((id, meta));
             }
@@ -397,16 +554,33 @@ impl Workload {
                 requires: Self::shards_of(model),
                 tokens,
                 tools,
-                produces: self.produced(tail, tokens, &format!("agentout:{task}:{a}")),
+                produces: self.produced(
+                    tail,
+                    tokens,
+                    &format!("agentout:{task}:{a}"),
+                    Origin::AgentOut,
+                ),
                 max_tokens: self.max_tokens(tokens),
                 slo,
+                retention: Retention {
+                    retain: Some(Retain {
+                        upto: parent.len(),
+                        lead_ops: RESUME_LEAD_OPS,
+                    }),
+                    evict_first_from: Some(parent.len()),
+                },
             });
         }
         let mut resume = parent.clone();
         let mut at = base;
         for a in 0..n {
             for b in 0..RESULT_BLOCKS {
-                let (id, meta) = kv(at, format!("result:{task}:{a}:{b}").as_bytes());
+                let (id, meta) = kv(
+                    self.origins.as_ref(),
+                    at,
+                    format!("result:{task}:{a}:{b}").as_bytes(),
+                    Origin::Result,
+                );
                 at = id;
                 resume.push((id, meta));
             }
@@ -521,7 +695,12 @@ impl Workload {
                 4
             };
             for blk in 0..blocks {
-                let (id, meta) = kv(parent, format!("s:{}:{turn}:{blk}", s.id).as_bytes());
+                let (id, meta) = kv(
+                    self.origins.as_ref(),
+                    parent,
+                    format!("s:{}:{turn}:{blk}", s.id).as_bytes(),
+                    Origin::Session,
+                );
                 parent = id;
                 chain.push((id, meta));
             }
@@ -547,25 +726,16 @@ impl Workload {
     }
 
     fn flow_chain(&mut self, f: u64) -> Chain {
-        let prompt = self.prompt_cache.entry(f).or_insert_with(|| {
-            let mut p = Vec::with_capacity(FLOW_PROMPT_BLOCKS as usize);
-            let mut parent = ROOT;
-            for d in 0..FLOW_PROMPT_BLOCKS {
-                let (id, meta) = kv(parent, format!("fnprompt:{f}:{d}").as_bytes());
-                parent = id;
-                p.push((id, meta));
-            }
-            p
-        });
+        let origins = self.origins.clone();
+        let prompt = self
+            .prompt_cache
+            .entry(f)
+            .or_insert_with(|| flow_prompt(origins.as_ref(), f));
         let mut chain = Vec::with_capacity(prompt.len() + 4);
         chain.extend_from_slice(prompt);
-        let mut parent = chain.last().map_or(ROOT, |(id, _)| *id);
+        let tail = chain.last().map_or(ROOT, |(id, _)| *id);
         let call = self.rng.below(64);
-        for d in 0..4 {
-            let (id, meta) = kv(parent, format!("fncall:{f}:{call}:{d}").as_bytes());
-            parent = id;
-            chain.push((id, meta));
-        }
+        chain.extend(flow_call(self.origins.as_ref(), tail, f, call));
         chain
     }
 
@@ -621,13 +791,18 @@ impl Iterator for Workload {
                     produces: Vec::new(),
                     max_tokens: 0,
                     slo: q.slo,
+                    retention: Retention::default(),
                 });
             }
             let tail = q.chain.last().map_or(ROOT, |(id, _)| *id);
             let produces = if q.tokens > 0 {
-                self.produced(tail, q.tokens, &format!("out:{}", q.task))
+                self.produced(tail, q.tokens, &format!("out:{}", q.task), Origin::TaskOut)
             } else {
                 Vec::new()
+            };
+            let retention = Retention {
+                retain: None,
+                evict_first_from: (!produces.is_empty()).then_some(q.chain.len()),
             };
             return Some(Request {
                 phase,
@@ -641,6 +816,7 @@ impl Iterator for Workload {
                 produces,
                 max_tokens: self.max_tokens(q.tokens),
                 slo: q.slo,
+                retention,
             });
         }
         let mix = self.mix();
@@ -664,6 +840,7 @@ impl Iterator for Workload {
             produces: Vec::new(),
             max_tokens: 0,
             slo: Slo::Interactive,
+            retention: Retention::default(),
         })
     }
 }
@@ -733,7 +910,12 @@ impl Workload {
         let slo = self.slo_of(turn.session);
         let tokens = self.tokens();
         let tail = chain.last().map_or(ROOT, |(id, _)| *id);
-        let produces = self.produced(tail, tokens, &format!("s:{}:{}", turn.session, turn.index));
+        let produces = self.produced(
+            tail,
+            tokens,
+            &format!("s:{}:{}", turn.session, turn.index),
+            Origin::Session,
+        );
         self.grow(turn, produces.len() as u64);
         let requires = Self::model_shards(tenant);
         let hint = if self.fanout_fraction > 0.0 && self.rng.chance(self.fanout_fraction) {
@@ -772,6 +954,7 @@ impl Workload {
             produces,
             max_tokens: self.max_tokens(tokens),
             slo,
+            retention: Retention::default(),
         }
     }
 
@@ -805,6 +988,126 @@ impl Workload {
             produces: Vec::new(),
             max_tokens: 0,
             slo: Slo::Interactive,
+            retention: Retention::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn trace(origins: Option<Origins>) -> Vec<Request> {
+        let w = Workload::with_fanout(2, 3_000, 1.0, 0.15).with_decode_kv(TOKENS_PER_KV_BLOCK);
+        match origins {
+            Some(o) => w.with_origins(o).collect(),
+            None => w.collect(),
+        }
+    }
+
+    #[test]
+    fn tracking_origins_changes_no_request() {
+        let plain = format!("{:?}", trace(None));
+        let tracked = format!("{:?}", trace(Some(Origins::default())));
+        assert_eq!(plain, tracked);
+    }
+
+    #[test]
+    fn every_kv_block_a_request_names_has_an_origin_that_fits_its_place() {
+        let origins = Origins::default();
+        let requests = trace(Some(origins.clone()));
+        let mut seen = HashSet::new();
+        for req in &requests {
+            let agents = req.gang.iter().flat_map(|g| g.agents.iter());
+            let chains = std::iter::once((&req.chain, &req.produces))
+                .chain(agents.map(|a| (&a.chain, &a.produces)));
+            for (chain, produces) in chains {
+                for (id, meta) in chain.iter().chain(produces) {
+                    if meta.kind != BlobKind::KvBlock {
+                        continue;
+                    }
+                    let origin = origins.of(id).expect("registered when generated");
+                    seen.insert(origin.idx());
+                }
+            }
+            if let Some((id, _)) = req
+                .chain
+                .first()
+                .filter(|(_, m)| m.kind == BlobKind::KvBlock)
+            {
+                assert!(
+                    matches!(origins.of(id), Some(Origin::Tenant | Origin::FlowPrompt)),
+                    "a chain starts at a tenant prefix or a flow prompt"
+                );
+            }
+            for agent in req.gang.iter().flat_map(|g| &g.agents) {
+                let split = agent.retention.retain.map_or(0, |r| r.upto);
+                assert_eq!(origins.of(&agent.chain[split].0), Some(Origin::Agent));
+                assert_ne!(origins.of(&agent.chain[split - 1].0), Some(Origin::Agent));
+                assert!(
+                    agent
+                        .produces
+                        .iter()
+                        .all(|(id, _)| origins.of(id) == Some(Origin::AgentOut))
+                );
+            }
+        }
+        assert_eq!(seen.len(), Origin::N, "the fixture must reach every origin");
+    }
+
+    #[test]
+    fn a_false_hint_is_built_from_the_same_blocks_a_real_flow_is() {
+        let origins = Origins::default();
+        let requests = trace(Some(origins.clone()));
+        let hinted: Vec<BlobId> = requests
+            .iter()
+            .filter_map(|r| r.hint.as_ref())
+            .filter(|h| {
+                h.downstream
+                    .first()
+                    .is_some_and(|(id, _)| origins.of(id) == Some(Origin::FlowPrompt))
+            })
+            .filter_map(|h| h.downstream.last().map(|(id, _)| *id))
+            .collect();
+        assert!(hinted.len() > 20);
+        let tips: HashSet<BlobId> = (0..FLOW_FUNCTIONS)
+            .flat_map(|f| {
+                (0..FLOW_CALLS)
+                    .filter_map(move |call| flow_downstream(f, call).last().map(|(id, _)| *id))
+            })
+            .collect();
+        assert!(hinted.iter().all(|id| tips.contains(id)));
+        let phantom = flow_downstream(3, FLOW_CALLS + 1);
+        assert_eq!(phantom.len(), FLOW_PROMPT_BLOCKS as usize + 4);
+        assert!(phantom.windows(2).all(|w| w[1].1.parent == Some(w[0].0)));
+    }
+
+    #[test]
+    fn a_fan_out_agent_declares_its_parent_and_its_scratch() {
+        let requests = trace(None);
+        let agents: Vec<&Agent> = requests
+            .iter()
+            .flat_map(|r| r.gang.iter().flat_map(|g| &g.agents))
+            .collect();
+        assert!(!agents.is_empty());
+        for a in agents {
+            let r = a.retention;
+            let upto = r.retain.expect("declared").upto;
+            assert_eq!(r.retain.map(|x| x.lead_ops), Some(RESUME_LEAD_OPS));
+            assert_eq!(r.evict_first_from, Some(upto));
+            assert_eq!(a.chain.len(), upto + SUBAGENT_BLOCKS as usize);
+        }
+        let queued_with_output = requests
+            .iter()
+            .filter(|r| r.completes.is_some() && !r.produces.is_empty())
+            .all(|r| r.retention.evict_first_from == Some(r.chain.len()));
+        assert!(queued_with_output);
+        assert!(
+            requests
+                .iter()
+                .filter(|r| r.completes.is_none())
+                .all(|r| { r.retention == Retention::default() || r.gang.is_some() })
+        );
     }
 }

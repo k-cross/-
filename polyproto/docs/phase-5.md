@@ -10,7 +10,24 @@ ahead of the request that needs it. Owned classes get §3.3's vocabulary as deci
 requests (`Entry.retain_until` and `evict_first` in place of the unbounded `expect` bump). And
 divergence is split by cause (§3.6), which `phase-4.md` §9.3 left unbuilt.
 
-**Status: planned.** Nothing below is built. §2's predictions are stated before the run, per
+**Status: implemented and measured.** The marks are `Mark` and `Rank` in [`stream.rs`](../src/stream.rs)
+(carried on `KvEvent::Stored`, kept by `Index`) and the ranked victims, expiry and pressure rule in
+[`engine.rs`](../src/engine.rs); the directive, expiry and prefill API on `Hierarchy`, `announce`'s
+retain and prewarm halves and the ledger's deadline are [`cache.rs`](../src/cache.rs); causes, batch
+fates and acknowledged and trusted marks are [`belief.rs`](../src/belief.rs); emission, prefill-ahead
+and the two targets are [`machine.rs`](../src/machine.rs); `Retention`, `Origins` and
+`flow_downstream` are [`work.rs`](../src/work.rs); the ceilings' trace index is
+[`foresight.rs`](../src/foresight.rs); the instruments are
+[`instruments.rs`](../src/instruments.rs); `polyphonic influence`
+([`influence_cmd.rs`](../src/influence_cmd.rs)) runs §4.10's sweeps on seeds 1-3 with no control
+crossing charged, so every number below is reproducible from the seed (15,000 ops, the
+`distributed` cluster). §2's eight predictions are annotated with what was measured, and §9 records
+what the build found that the plan did not anticipate. Three things did not get built as planned:
+`code-review` takes none of the new flags (nor Phase 4's), the instruments table's peer-fetch count
+(a prefilled block is never fetched by a peer, so there is nothing to count), and §3 rule 1's second
+clause is checked at the engine and not on the cluster (§9.4).
+
+Before the results, the plan's own text. §2's predictions are stated before the run, per
 `owned-and-observed.md` §7, and like Phase 4's they lean on **pre-measurements**: numbers taken on
 an instrumented copy of `8beb019`, run outside the repository and not committed. They are labelled
 wherever quoted and collected with their configurations in §8. They are reasons to predict, not
@@ -440,6 +457,24 @@ every seed (pre-measured none and 20.6k; -0.05% to +0.08%, and +0.2% to +1.0%).
   of median residency says it cannot, and the probe and the build disagree about the partition -- to
   be reconciled before anything else is published.
 
+**Measured: confirmed.** Section 3 (one node), the engine's hold of the declared downstream's resident
+blocks against `announce` with KV skipped: 9.1 / 9.4 / 9.0% against 9.0 / 9.4 / 9.0% on split memory,
+3.3 / 3.7 / 3.2% against 3.2 / 3.6 / 3.2% on unified -- 0.0-0.1pp, inside the prediction's 0.5pp.
+Section 5 (cluster), retaining each fan-out agent's parent chain until the resume's declared lead,
+by seed:
+
+| | published defaults | half partition, decode output held |
+|---|---|---|
+| stall against off | +0.00 / -0.05 / +0.08% | +0.24 / +1.01 / +0.19% |
+| marks honoured, pressure evictions (all seeds) | 181,737 and 0 | 155,546 and 66,990 |
+| flow downstream's stall | +1.15 / +0.55 / +0.90% | +0.92 / +0.33 / +2.53% |
+
+Inside ±0.5% at the published partition; worse on every seed at half of it, with 22k pressure
+evictions a seed against the predicted "more than 10k". Ignored, the same directives are
+byte-identical to none (§5's gate). The retention half of `announce` is worth nothing on either side
+of the ownership boundary, and §9's "a directive is the only honest way left to buy it back" is
+retracted in `owned-and-observed.md`.
+
 **P2 -- Dispatch recovers more of `announce`'s margin than the ledger's prewarm ever bought.**
 
 One node, `--prefill-ahead`: a task-latency margin of at least 24% on split memory and 28% on
@@ -454,6 +489,28 @@ pre-measured on seed 1).
   than the ledger's free-space rule avoided, and "prewarming never preempts" is a principle rather
   than a restriction.
 
+**Measured: confirmed where it was measured, and two of its edges missed.** `polyphonic influence`
+section 3 (one node) and section 4 (cluster, rack), by seed:
+
+| | seed 1 / 2 / 3 |
+|---|---|
+| one node, split: margin over `blind` with prefill-ahead | 24.4 / 24.5 / 24.5% (`announce` as published: 10.7 / 10.6 / 10.3%) |
+| one node, unified | 28.4 / 28.2 / 28.5% (17.6 / 17.9 / 16.0%) |
+| one node, net work against `blind`, split / unified | +0.06 / +0.06 / +0.09% and -0.01 / -0.22 / -0.06% |
+| cluster, defaults: flow downstream's stall | -63.8 / -63.5 / -63.5% |
+| cluster, defaults: total stall, mean service | -4.07 / -4.13 / -3.59% and -0.11 / -0.12 / -0.11% |
+| cluster, half partition: flow downstream's stall | -46.0 / -38.1 / -52.4% |
+| cluster, half partition: total stall, mean service | -2.95 / -1.48 / -4.94% and -0.13 / -0.04 / -0.16% |
+| prefill work against the stall it saves, pooled over seeds | 39.0 s for 26.1 s (1.49x), 38.4 s for 22.4 s (1.71x) |
+
+The margins, the stall ranges and the service range are inside the prediction. Two edges are not:
+net work on unified memory is 0.22% *below* `blind` on seed 2, outside "within 0.1%" and in the
+favourable direction (the displaced blocks were ones the run would have rebuilt anyway), and the
+work premium is 1.49x at the published partition, a hair under the predicted 1.5-2x. Half-partition
+seed 2's total-stall saving, 1.48%, sits a hair under the predicted 1.5%. The *if right* branch fires:
+the engine lets the orchestrator prewarm, by dispatch, and it buys about 2.3x the ledger's prewarm on
+split memory and 1.6x on unified.
+
 **P3 -- Prefill-ahead's value falls with distance, and landing does not decide it at rack.**
 
 Landing 40-55% at every distance and under either target rule; the flow downstream's stall down
@@ -465,6 +522,25 @@ spread whichever target is used.
 - *If wrong* (the region saving matches rack): the downstream follows its prefill across a region,
   which would mean acquire outweighs load there -- consistent with the scored arm keeping tool calls
   beside the agent at region distance, and worth stating as the same result.
+
+**Measured: half right.** Section 4, prefill-ahead, by target:
+
+| | scored argmin | deepest believed prefix |
+|---|---|---|
+| landed, rack defaults / half / zone / region | 49% / 50% / 45% / 48% | 40% / 42% / 40% / 54% |
+| flow downstream's stall, rack defaults, by seed | -63.8 / -63.5 / -63.5% | -58.8 / -57.1 / -60.1% |
+| ... rack, half partition | -46.0 / -38.1 / -52.4% | -47.7 / -40.7 / -42.2% |
+| ... zone / region (first seed) | -30.6% / -7.4% | -27.8% / -9.4% |
+| total stall, rack defaults | -4.07 / -4.13 / -3.59% | -3.19 / -3.76 / -4.57% |
+
+The landing range holds (40-55% under either rule), and the value falls with distance -- 64% at rack,
+31% at zone, 7% at region -- so prefill-ahead is a rack-local mechanism unless the downstream is bound
+to its warmed node. Two clauses missed. The region saving is 7-9%, under the predicted 10-20%. And the
+saving is *not* within the seeds' spread across targets at rack: the argmin saves about 5 points more
+than the deepest prefix at the published partition, where the seeds differ by 0.3, and the two swap
+places at region and are mixed at half the partition. The target is worth a few points at rack and
+nothing that generalises, which is the size of what a joint placement of the two requests could add
+(§1.4). The zone saving, 28-31%, is at the top of the predicted 25-30%.
 
 **P4 -- No directive emitter buys 2% of stall on the cluster.**
 
@@ -479,6 +555,26 @@ manager within -2% at the published partition and of either sign at half.
 - *If wrong* (the oracle beats the clairvoyant manager by more than the seeds' spread): retention is
   changing placement -- the router follows its holds -- and that co-design is a result worth having.
 
+**Measured: confirmed at the published partition, and half wrong at half of it.** Section 6, by seed:
+
+| against LRU with no directives | stall, defaults | stall, half partition | service, both |
+|---|---|---|---|
+| clairvoyant block manager | -0.66 / -1.85 / -0.69% | +1.03 / -2.40 / -0.74% | within 0.05% |
+| oracle emitter, 2 s | -0.05 / -0.07 / +0.11% | +0.16 / -0.67 / -0.25% | within 0.03% |
+| oracle emitter, 5 s | -1.41 / -1.37 / +0.11% | +0.12 / +1.65 / +0.14% | within 0.07% |
+| oracle emitter, 30 s | +0.40 / +0.40 / +2.07% | +1.01 / -1.86 / -1.45% | within 0.06% |
+| pressure evictions at 2 / 5 / 30 s, defaults, all seeds | 0 / 0 / 323,110 | 126,084 / 215,076 / 334,971 | |
+
+At the published partition every clause holds: the best emitter is -1.41% of stall and -0.04% of
+service, the 30 s horizon is worse on all three seeds, pressure evictions are absent at 2 and 5 s and
+about 108k a seed at 30 s, and the clairvoyant manager is inside -2%. At half the partition "worse
+than no directives" holds only at 5 s (all three seeds); 2 s and 30 s are mixed in sign. The *if
+wrong* branch (the oracle beating the clairvoyant manager beyond the seeds' spread) did not fire.
+What a gap estimator can win through a directive on this workload is bounded at about 1-2% of stall
+and 0.1% of service, and the rate of pressure evictions at half the partition (126k-335k over three
+seeds, at every horizon) is the RFC's soft rule doing what §1.5 said it would: taking the block
+needed soonest.
+
 **P5 -- Evict-first on declared ephemeral scopes is within ±2% of stall.**
 
 One-shot blocks are 13-15% of what the GPU stores (pre-measured), not the scan pollution
@@ -489,6 +585,13 @@ One-shot blocks are 13-15% of what the GPU stores (pre-measured), not the scan p
 - *If wrong* (a gain beyond 2% on every seed): one-shot blocks displace reusable ones enough to
   matter, and demotion is the cheapest directive with a number -- the E4 result, reproduced on a
   workload with routing.
+
+**Measured: confirmed.** Section 5, evict-first over the declared one-shot scopes, by seed: stall
+-0.76 / -1.67 / -0.87% at the published partition and +0.94 / -0.01 / -0.01% at half of it, service
+within 0.05% in both, 30,714 and 56,659 marks honoured over three seeds. Its scope is 7.0% (published)
+and 10.3% (half) of what the GPU stores, from section 9's stores column, which is the size of the
+pollution it could relieve. The `retention` field's first consumer exists and buys nothing a user
+would see.
 
 **P6 -- An ignored directive is invisible to an acknowledged belief and costs a trusting one only
 inside the unknown window.**
@@ -502,6 +605,28 @@ and a nonzero `belief` gap, with service still inside Phase 4's 0.16%.
   event stream is the refusal channel a directive API needs -- nothing has to be added to it.
 - *If wrong* (`trusted` differs under replay): something other than delivery keeps an evicted block
   believed, and §1.9's stranded entries are the first suspect.
+
+**Measured: confirmed for the acknowledged belief, and the trusting one is over-confident only at half
+the partition.** The gate (section 1) is identical on all four cells -- declared and 5 s oracle, both
+regimes, 5% loss with replay -- with 98k-307k marks emitted and none honoured. Section 7 first ran under
+`face-value` scoring, which never reads `P`, so a trusted mark could not move a placement and every
+service column was zero by construction; §9.2 records it, and the section now scores under `expected` and
+`quantile 0.9`. By seed, trusted against acknowledged:
+
+| condition | service | top bin realised, trusted (acked) |
+|---|---|---|
+| defaults, no loss or 5% loss, replay | -0.02 / +0.02 / -0.01% and -0.02 / +0.02 / +0.03% | 1.000 (1.000) |
+| half partition, replay, `expected` | -0.05 / -0.00 / -0.02% | 0.999 (1.000) |
+| defaults, 20% loss, no recovery | +0.00 / +0.02 / +0.04% | 1.000 (1.000) |
+| half partition, 20% loss, no recovery | +0.01 / +0.04 / +0.12% | **0.975 (1.000)** (`quantile 0.9`: 0.974) |
+
+With replay, service is within 0.05%, not the predicted 0.01% (a miss on size, not direction), and the
+top bin is within 0.1pp. With 20% loss and no recovery the top bin's realised residency falls below the
+acknowledged belief's at half the partition and is unchanged at the published one, where evictions are
+too rare for a trusted block to have been evicted. The belief gap is nonzero for both. Service stays
+inside Phase 4's 0.16%. The trusted belief also fills the top bin four times over (4,072 -> 17,800
+predictions at the published partition), which is the over-confidence's whole size. The event stream is
+the refusal channel: nothing has to be added to it.
 
 **P7 -- Divergence by cause follows the condition, and two causes exist at loss zero.**
 
@@ -517,6 +642,27 @@ every cell, all of it re-dispatched while evicted.
   dropped with no loss, stranded under replay): the fate bookkeeping is wrong, and no cause split is
   published until it is not.
 
+**Measured: confirmed at the published partition, and the silence clause is wrong.** Section 2, share of
+believed blocks that are phantoms, by cause (%):
+
+| | phantom | not yet due | dropped | silenced | never stored | stranded |
+|---|---|---|---|---|---|---|
+| defaults, 0% / 5% / 20% loss, replay | 0.069 / 0.082 / 0.132 | 0.069 / 0.073 / 0.069 | 0 / 0.009 / 0.063 | 0 | 0 | 0 |
+| defaults, 5% periodic | 0.801 | 0.061 | 0.740 | 0 | 0 | 0 |
+| defaults, 5% / 20% none | 15.06 / 36.56 | 0.060 / 0.029 | 14.87 / 33.68 | 0 | 0 | 0.137 / 2.853 |
+| defaults, 2 s silence, replay | 0.777 | 0.075 | 0 | 0.701 | 0 | 0 |
+| half, 0% / 5% / 20% loss, replay | 0.198 / 0.233 / 0.371 | 0.166 / 0.166 / 0.162 | 0 / 0.028 / 0.144 | 0 | 0.032 / 0.039 / 0.064 | 0 |
+| half, 5% / 20% none | 31.92 / 59.60 | 0.127 / 0.067 | 27.64 / 47.44 | 0 | 3.84 / 8.19 | 0.319 / 3.903 |
+| half, 2 s silence, replay | 1.667 | 0.187 | 0 | 1.200 | 0.281 | 0 |
+
+Every phantom under replay and periodic recovery at the published partition is an undelivered removal;
+1-8% of the no-recovery column is stranded (0.9% and 7.8%); at half the partition 16-17% of phantoms
+under replay are never stored (inside 15-25%), at every loss rate. **Under 2 s of silence it is 17%, not
+35-45%**: 72% are silenced and 17% never stored. The pre-measurement's 41% counted every optimistic entry,
+including stores that silence swallowed, and the built attribution puts those under *silenced*. The miss
+share is 0.000% in every cell, inside the prediction's 0.01% and leaving "all re-dispatched" without a
+case: the `Redispatched` cause exists in the instrument and never fires at a sample point.
+
 **P8 -- A deadline in place of the unbounded bump changes nothing a user would see.**
 
 The ledger on one node, `--retain` against `expect`, with 0, 18%, 50% and 69% of FaaS->inference
@@ -529,6 +675,28 @@ holding a retention whose flow has passed, zero under `--retain` and growing wit
   say which.
 - *If wrong* (the deadline wins by more than 3% on every seed): wrong hints inflate priority enough
   to displace real work, and §3.3 was right for the reason it gave.
+
+**Measured: the deadline is not latency-neutral even with honest hints, and the prediction's size held.**
+Section 8 (one node, split memory), unbounded bump against deadline, by seed; false share is the share
+of KV-downstream hints that are false:
+
+| hint rate | false share | margin over blind, unbounded | ... deadline | stale entries, unbounded (deadline) |
+|---|---|---|---|---|
+| 0 | 0% | 10.7 / 10.6 / 10.3% | 11.7 / 11.4 / 12.3% | 300 / 270 / 27 (0) |
+| 0.1 | 25% | 11.7 / 6.0 / 8.8% | 11.4 / 11.3 / 10.5% | 244 / 144 / 81 (0) |
+| 0.45 | 59% | 8.5 / 10.9 / 8.2% | 10.5 / 6.5 / 6.0% | 288 / 353 / 248 (0) |
+| 1.0 | 76% | 9.0 / 10.8 / 10.9% | 8.5 / 10.8 / 7.6% | 684 / 852 / 304 (0) |
+
+Net work against `blind` rises with the rate by the same amount under both (+0.3 to +7.7% under the
+bump, +0.4 to +7.9% under the deadline), and the stale-entry count is zero at every rate under a deadline
+and grows with the rate under the bump, as predicted. The latency clause is half wrong: the deadline's
+margin differs from the bump's by -4.4 to +5.3 points, with three of twelve cells outside ±3 and both
+signs present, and at rate zero -- no false hint anywhere -- it wins on every seed, by 1.0 / 0.8 / 2.0
+points, with net work at -0.40 / -0.02 / -1.41% of `blind` against +0.11 / +0.23 / +0.12%. The mechanism is the one §1.11 called a mild frequency prior:
+the ledger touches only a chain's deepest block, so a hinted prefix's interior keeps an inflated
+priority indefinitely, and withdrawing it helps. The *if wrong* branch (a win beyond 3% on every seed)
+did not fire; §3.3's case for `retain_until` is bounded state first and, by one to two points, latency
+second.
 
 ---
 
@@ -789,3 +957,137 @@ ops, the oracle-best soft floors, and a 0.88 GiB partition (1.50 GiB unified).
 | *ephemeral* | evict-first on declared one-shot scopes | after each dispatch, blocks of agent, agent-output and task-output origin moved to the front of the LRU; seeds 1-3 | §1.10's second table, last row |
 | *prefill* | prefill-ahead on the cluster | at each hint with a KV downstream, the downstream's missing blocks acquired on a target before it arrives -- the deepest believed prefix, the downstream's scored argmin, or that argmin executing its acquire plan -- with landing counted; seeds 1-3 at rack, seed 1 at zone and region | §1.3's and §1.4's tables; landing 40-44% (deepest prefix, seed 1) and 47-51% (argmin) |
 | *causes* | the optimistic part of Phase 4's phantoms | at each divergence sample, each phantom split by whether the belief holds it as an optimistic dispatch or as an index entry, over Phase 4's loss and recovery grid and 2 s of silence | §1.9's table; its phantom shares reproduce Phase 4's |
+
+---
+
+## 9. What the build found
+
+Eight things the plan did not anticipate, in the order they were found.
+
+### 9.1 A test caught the plan's own flow filter
+
+The test that a false hint is built from the same blocks as a real flow selected real flows by "first
+block is a KV block and the chain is 28 blocks long". A fan-out's resume chain -- the orchestrator's
+context plus two result blocks per agent -- can be 28 blocks long, and the test failed on it. Flows are now
+selected by origin (`Origin::FlowPrompt`), which is what the instruments do. `flow_downstream(f, call)` is
+one function shared by the generator and the false hints, and `a_false_hint_is_built_from_the_same_blocks_a_real_flow_is`
+pins that they cannot drift.
+
+### 9.2 Section 7 first measured nothing, because the score did not read the thing it changed
+
+The first version scored the acknowledged and trusted beliefs under `face-value`, the default rule, which
+never reads `P(resident)`. A trusted mark changes only `P`, so every service column read +0.00% on every seed
+for a reason that had nothing to do with the mechanism. The section now runs under `expected` and `quantile
+0.9`, the two rules that consume `P`. The lesson is Phase 4's §9.1 again from the other side: check that
+the quantity an experiment changes reaches the thing it measures. It cost one extra pass; the table above is
+the corrected one.
+
+### 9.3 The flow-downstream column was all zeros until origins were switched on
+
+Every "flow stall" cell in the first full run read +0.00% and "0.0 s saved" against 39 s of prefill work,
+because the instrument recognises a flow downstream by its origin and the comparison runs did not track
+origins. They do now. Tracking is inert -- `tracking_origins_and_events_changes_no_cost` runs the same
+trace with and without it and compares every cost -- so the fix moved no other number.
+
+### 9.4 The gate's second clause is an engine property, not a cluster one
+
+§3 rule 1 says honoured directives whose deadlines are past on receipt equal `--ignores`. No emitter produces a
+deadline in the past, so there is no cluster run that could show it. It is checked where it can be: the
+engine refuses a mark that is not live at its own clock (`a_mark_whose_deadline_is_past_on_receipt_does_nothing`)
+and `Hierarchy::tick` advances that clock. The cluster gate is the first clause alone -- ignored, acknowledged,
+byte-identical -- on declared and oracle emitters at both regimes.
+
+### 9.5 The pre-measurement's false-hint shares were against the wrong denominator
+
+§1.11 and P8 said 0.1, 0.45 and 1.0 make 18%, 50% and 69% of FaaS-to-inference hints false. The scratch copy
+divided by every hint the run saw, tool hints included. The build counts against KV-downstream hints, which
+is what "FaaS->inference" means, and the shares are 25%, 59% and 76%. The rates and the behaviour they
+produce are unchanged; only the label was.
+
+### 9.6 A prefill can change which flows complete, on a tight partition
+
+`prefill_ahead_is_accounted_block_for_block_and_only_helps_flows` first asserted that the same number of flow
+downstreams complete with and without prefill. On its fixture -- a 64 MiB partition, a deliberately tiny one
+-- 155 complete without and 143 with, because a 28-block prefill displaces enough to change which later
+requests fit. The test compares stall per completed flow instead, which is the claim. On the cluster at
+Phase 3's partitions the served count is unchanged to the request.
+
+### 9.7 Silence's optimistic entries were counted as never stored, and are not
+
+The pre-measurement split each phantom by whether the belief held it as an optimistic dispatch. Under 2 s of
+silence that put 41% of half-partition phantoms in the optimistic bin. The channel-level attribution asks a
+different question -- did the engine store it -- and files a store swallowed by the silence under *silenced*,
+leaving 17% never stored. P7's silence clause is wrong for that reason, and the table above has both columns.
+The `Redispatched` cause, Phase 4's standing case, never fires: every sample's miss count is zero, so that
+limitation of Phase 4's belief has a size of zero at 15,000 ops on these conditions.
+
+### 9.8 Things that shrank
+
+- **`code-review`** takes none of the new flags, as it takes none of Phase 4's; it has its own run loop and no
+  `Scenario`. `distributed` and `flows` take them.
+- **The engine's hold is a soft mark, not the pre-measurement's hard one.** The pre-measurement held blocks
+  outright; the build marks them with RFC-0001's soft rule. The margins are identical to the digit
+  (9.1 / 9.4 / 9.0%), which says the hold does nothing in either form.
+- **The deepest-prefix target** was a pre-measurement only; it was built as `--prefill-target deepest` because
+  P3's second clause cannot be graded without it.
+- **`Machine::new`** is over clippy's line limit with the new fields and carries the same
+  `allow(clippy::too_many_lines)` the CLI functions do. `serve_request` was split (`observe_landing`,
+  `after_dispatch`) rather than allowed.
+- **Runtime.** The full sweep is about eight minutes as four parallel processes; the one-node sections are
+  the slow part (six `best_split` searches, three seeds of two memory models, and again for section 8).
+
+### 9.9 A review of the build moved one figure
+
+An independent review of the implementation found fourteen issues, and all are fixed. The reproducible set is
+still byte-identical to the commit before this phase, and `polyphonic influence` (every cluster section, seeds
+1-2, 3,000 ops) and `flows --engine-cache --prefill-ahead --hold` differ from the pre-review build in exactly
+two lines each run: the reuse table's denominator and a relabelled summary line.
+
+- **The reuse table's denominator counted every dispatch, not every KV dispatch.** Tool calls, services and
+  `FaaS` invocations on engine nodes were counted, and so were they in the pre-measurement. The share of KV
+  dispatches with a miss on a block the node evicted is **35.9% at the published partition and 53.4% at
+  half**, not the 14.5% and 21.6% §1.10's table quotes. What those misses cost -- 0.93 and 1.59 ms per served
+  request, 0.19% and 0.32% of service -- was always divided by served requests and does not move, so §1.10's
+  conclusion stands with more force: by shape they are common, by size they do not matter.
+- **A prefilled block was never repriced under the clairvoyant engine**, so with `--clairvoyant-kv` and
+  `--prefill-ahead` together it would have been the next victim. No published run combines them.
+  `prefill_block` now takes its cost from `local_ns` and reprices as every other placement does.
+- **`--seeds 0`** printed "seeds 1 .. 0" and measured nothing; the argument now rejects it.
+- **`owned-and-observed.md`.** The reflow that added this phase's status line collapsed the *On the numbers*
+  bullet list into one paragraph and dropped the blank line that keeps §5's item 6 a list item. Both are
+  restored.
+- **Cleanups.** `Entry.evict_first` was written and never read, since the priority does the work;
+  `FlowDownstream` kept two fields nothing read; the CLI's `quantile` duplicated `instruments::percentile`;
+  `influence` recomputed each regime's no-mechanism baseline once per section, and now caches it; the `flows`
+  summary called prewarm work prefill work; and `--reuse`'s help promised a report only `influence` prints.
+
+## 10. Verification, as run
+
+- **Byte-identity with every new bit off**, against the commit before this phase: the 32 outputs of `residency`
+  (split, unified, `--clairvoyant`, `--engine-cache --decode-kv`), `flows` (and `--engine-cache`, split and
+  unified), `placement` (split, unified, `--drain-at`, and with the engine, with and without the drain),
+  `volatility`, `ownership` (and `--engine-cache`) at `--ops 3000` and two seeds, plus `belief` and `price`
+  at 3,000 ops: identical after the engine and cache work, after the belief, generator and machine work, and
+  on the final build. The baseline was run twice against itself first. `belief` being in the set is what says
+  the cause bookkeeping does not touch the channel's random stream.
+- **The gate**: `influence` section 1, identical on all four cells; and
+  `ignored_directives_and_an_acknowledged_belief_change_nothing`, on 5% loss with replay and with no recovery.
+- **The stream reproduces the marks**: `the_event_stream_reproduces_every_live_mark_after_every_request`, on the
+  small-tier fixture with decode output held, fetch, a drain and both ranks live. Mutation-checked: dropping the
+  event a mark change emits fails it at request 7, the first mark.
+- **Causes**: `every_phantom_and_miss_has_exactly_one_cause_that_its_condition_allows` (shares sum to the
+  phantom and miss shares; zero on an exact belief; nothing silenced without episodes, dropped without loss,
+  stranded with a repair path), plus three channel-level tests and two belief tests for acknowledged and trusted
+  marks.
+- **The pressure rule, expiry, combination and the no-op cases** are eight engine tests, including
+  `an_engine_with_no_marks_evicts_exactly_as_before`. Mutation-checked: putting unmarked victims ahead of
+  evict-first fails two; letting `--ignores` reach the engine fails the gate; leaving marked blocks in the
+  turnover denominator fails the belief test.
+- **Prefill-ahead is accounted**: `prefill_ahead_is_accounted_block_for_block_and_only_helps_flows` (the
+  machine's count equals the hierarchies' placed blocks; `blind` is unchanged by the bit is
+  `prefill_ahead_is_what_announce_lost_and_a_hold_is_not`).
+- **The census**: `cargo build --release --features census` emits 13 deprecation warnings; the marks are applied
+  inside `EngineCache` and a prefill is a dispatch. The `KvBlock` row of `EngineOps` is unchanged.
+- `cargo fmt --check`, `cargo clippy --all-targets` and `cargo clippy --all-targets --all-features` clean
+  (the latter's only warnings are the census's 13), and `cargo test` passes with 110 tests, up from 77.
+
