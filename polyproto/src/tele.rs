@@ -1,7 +1,7 @@
 use crate::belief::Belief;
 use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::cache::Hierarchy;
-use crate::engine::Engine;
+use crate::engine::{Engine, Model};
 use crate::tier::Tier;
 
 pub type Need = [u64; BlobKind::N];
@@ -12,6 +12,7 @@ pub struct Telemetry<'a> {
     engine: &'a Engine,
     belief: Option<&'a Belief>,
     load: Option<usize>,
+    model: Option<Model>,
 }
 
 impl<'a> Telemetry<'a> {
@@ -22,7 +23,14 @@ impl<'a> Telemetry<'a> {
             engine,
             belief: None,
             load: None,
+            model: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_model(mut self, model: Option<Model>) -> Self {
+        self.model = model;
+        self
     }
 
     #[must_use]
@@ -143,10 +151,28 @@ impl<'a> Telemetry<'a> {
     }
 
     #[must_use]
+    pub fn in_flight(&self, now_ns: u64, reserved: usize) -> usize {
+        self.load.unwrap_or_else(|| self.engine.load(now_ns)) + reserved
+    }
+
+    #[must_use]
+    pub fn prefill_toll_ns(&self, now_ns: u64, work_ns: u64, reserved: usize) -> f64 {
+        let live = self.in_flight(now_ns, reserved);
+        let step = match self.load {
+            Some(_) => self.engine.step(live + 1),
+            None => self.engine.step_for(now_ns, reserved, self.model),
+        };
+        let excess = self.engine.prefill_excess_ns(now_ns, work_ns, step);
+        live as f64 * excess as f64
+    }
+
+    #[must_use]
     pub fn projected_ns(&self, now_ns: u64, tokens: u64, reserved: usize) -> u64 {
         match self.load {
             Some(live) => self.engine.projected_live(now_ns, tokens, live + reserved),
-            None => self.engine.projected_ns(now_ns, tokens, reserved),
+            None => self
+                .engine
+                .projected_for(now_ns, tokens, reserved, self.model),
         }
     }
 
@@ -154,7 +180,9 @@ impl<'a> Telemetry<'a> {
     pub fn congestion_ns(&self, now_ns: u64, tokens: u64, reserved: usize) -> u64 {
         match self.load {
             Some(live) => self.engine.congestion_live(tokens, live + reserved),
-            None => self.engine.congestion_ns(now_ns, tokens, reserved),
+            None => self
+                .engine
+                .congestion_for(now_ns, tokens, reserved, self.model),
         }
     }
 

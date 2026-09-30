@@ -96,6 +96,7 @@ impl Plugin for SlideshowPlugin {
                 Update,
                 (
                     handle_slide_input,
+                    update_ui_scale_on_fullscreen,
                     hud::update_hud.run_if(resource_changed::<SlideController>),
                     hud::animate_hud,
                     code_view::scroll_code_blocks,
@@ -155,5 +156,36 @@ fn handle_slide_input(
         animation::spawn_screen_slash(&mut commands);
         // Trigger character forward slash/lunge performance
         character::trigger_character_slash(character_roots);
+    }
+}
+
+/// Dynamically scales all UI elements when entering fullscreen mode so that
+/// text and boxes appear proportionally larger on higher-resolution displays.
+/// The design resolution is 1280×720; in fullscreen the UI scales up to
+/// maintain visual prominence across the larger viewport.
+fn update_ui_scale_on_fullscreen(
+    windows: Query<&Window>,
+    mut ui_scale: ResMut<UiScale>,
+) {
+    const BASE_WIDTH: f32 = 1280.0;
+    const BASE_HEIGHT: f32 = 720.0;
+
+    if let Ok(window) = windows.single() {
+        let new_scale = match window.mode {
+            bevy::window::WindowMode::Windowed => 1.0,
+            _ => {
+                // Scale proportionally to the fullscreen resolution,
+                // using the smaller axis ratio to avoid overflow
+                let scale_x = window.resolution.width() / BASE_WIDTH;
+                let scale_y = window.resolution.height() / BASE_HEIGHT;
+                scale_x.min(scale_y).max(1.0)
+            }
+        };
+
+        // Only update the resource when the scale actually changed to avoid
+        // unnecessary change-detection triggers
+        if (ui_scale.0 - new_scale).abs() > 0.001 {
+            ui_scale.0 = new_scale;
+        }
     }
 }

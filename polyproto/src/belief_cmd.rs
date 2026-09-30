@@ -7,8 +7,9 @@ use polyphonic::machine::{Control, Placement};
 use polyphonic::topo::{Distance, Topology};
 
 use super::{
-    AdmitArg, Arm, ArmRun, BeliefArgs, ClusterBits, Correct, InfluenceArgs, LoadArg, RecoveryArg,
-    Scenario, ScoringArg, arm, correct, distributed_run, mean_of, ms, node_memory, quantile,
+    AdmitArg, Arm, ArmRun, BeliefArgs, ClusterBits, Correct, FleetArgs, InfluenceArgs, LoadArg,
+    RecoveryArg, Scenario, ScoringArg, TraceKey, arm, correct, distributed_run, mean_of, ms,
+    node_memory, quantile,
 };
 
 pub struct Env {
@@ -56,7 +57,7 @@ const TAIL: f64 = 0.99;
 pub(super) struct Lab<'a> {
     env: &'a Env,
     memory: NodeMemory,
-    grants: HashMap<(u64, Regime), [u64; 3]>,
+    grants: HashMap<(u64, Regime, TraceKey), [u64; 3]>,
 }
 
 pub(super) fn scored_fetch() -> Arm {
@@ -130,6 +131,7 @@ impl<'a> Lab<'a> {
         p3: Correct,
         b: BeliefArgs,
         influence: InfluenceArgs,
+        fleet: FleetArgs,
         regret: bool,
     ) -> Scenario {
         Scenario {
@@ -147,6 +149,7 @@ impl<'a> Lab<'a> {
             },
             belief: b,
             influence,
+            fleet,
             lag_ns: dist.one_way_ns(),
         }
     }
@@ -171,21 +174,43 @@ impl<'a> Lab<'a> {
         influence: InfluenceArgs,
         regret: bool,
     ) -> ArmRun {
+        self.go_fleet(dist, regime, a, b, influence, FleetArgs::OFF, regret)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn go_fleet(
+        &mut self,
+        dist: Distance,
+        regime: Regime,
+        a: &Arm,
+        b: BeliefArgs,
+        influence: InfluenceArgs,
+        fleet: FleetArgs,
+        regret: bool,
+    ) -> ArmRun {
         let topo = self.topo(dist);
         let p3 = regime.p3();
-        let key = (dist.one_way_ns(), regime);
+        let trace = fleet.trace_only();
+        let key = (dist.one_way_ns(), regime, trace.trace_key());
         if !self.grants.contains_key(&key) {
             let ledger = Correct {
                 engine_cache: false,
                 ..p3
             };
-            let sc = self.scenario(dist, ledger, BeliefArgs::OFF, InfluenceArgs::OFF, false);
-            let run = distributed_run(&scored_fetch(), &topo, self.memory, sc);
-            self.grants.insert(key, run.mach.kv_mean());
+            let sc = self.scenario(
+                dist,
+                ledger,
+                BeliefArgs::OFF,
+                InfluenceArgs::OFF,
+                trace,
+                false,
+            );
+            let run = distributed_run(&scored_fetch(), &topo, self.memory, &sc);
+            self.grants.insert(key.clone(), run.mach.kv_mean());
         }
         let mean = self.grants[&key];
-        let sc = self.scenario(dist, p3, b, influence, regret);
-        distributed_run(a, &topo, p3.engine_memory(self.memory, mean), sc)
+        let sc = self.scenario(dist, p3, b, influence, fleet, regret);
+        distributed_run(a, &topo, p3.engine_memory(self.memory, mean), &sc)
     }
 }
 

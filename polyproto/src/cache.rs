@@ -975,6 +975,8 @@ pub struct Hierarchy {
     ahead: Ahead,
     deadline: bool,
     now: u64,
+    hbm_total: u64,
+    weights: Option<u64>,
     pub prefilled_blocks: u64,
     pub held_blocks: u64,
     seq_hits: u64,
@@ -1085,6 +1087,8 @@ impl Hierarchy {
             ahead: Ahead::default(),
             deadline: false,
             now: 0,
+            hbm_total: mem.hbm,
+            weights: None,
             prefilled_blocks: 0,
             held_blocks: 0,
             seq_hits: 0,
@@ -1233,7 +1237,45 @@ impl Hierarchy {
 
     #[must_use]
     pub fn authority(&self, kind: BlobKind, q: crate::own::Question) -> crate::own::Authority {
-        crate::own::authority(kind, self.tier_of(kind), q)
+        crate::own::authority_in(kind, self.tier_of(kind), q, self.weights.is_some())
+    }
+
+    fn assert_fits(&self, partition: u64, weights_bytes: u64) {
+        assert!(
+            partition + weights_bytes <= self.hbm_total,
+            "a partition of {partition} B and weights of {weights_bytes} B exceed {} B of HBM",
+            self.hbm_total
+        );
+    }
+
+    pub fn bind_weights(&mut self, weights_bytes: u64) {
+        let partition = self.kv.as_ref().map_or(0, |kv| kv.gpu.capacity());
+        self.assert_fits(partition, weights_bytes);
+        self.weights = Some(weights_bytes);
+    }
+
+    pub fn reload(&mut self, weights_bytes: u64, partition: u64) -> u64 {
+        self.assert_fits(partition, weights_bytes);
+        let lost = self
+            .kv
+            .as_ref()
+            .map_or(0, |kv| kv.gpu.used() + kv.offload.used() + kv.spill.used());
+        if let Some(kv) = self.kv.as_mut() {
+            kv.drain();
+            kv.gpu.resize(partition);
+        }
+        self.weights = Some(weights_bytes);
+        lost
+    }
+
+    #[must_use]
+    pub fn weights_bytes(&self) -> Option<u64> {
+        self.weights
+    }
+
+    #[must_use]
+    pub fn hbm_bytes(&self) -> u64 {
+        self.hbm_total
     }
 
     fn engine_kv(&self, kind: BlobKind) -> Option<&KvTiers> {
@@ -1513,6 +1555,23 @@ impl Hierarchy {
     #[must_use]
     pub fn kv_orphans(&self) -> usize {
         self.kv.as_ref().map_or(0, |kv| kv.gpu.orphans())
+    }
+
+    pub fn set_owner(&mut self, owner: Option<u32>) {
+        if let Some(kv) = self.kv.as_mut() {
+            kv.gpu.set_owner(owner);
+        }
+    }
+
+    pub fn set_tenant_floor(&mut self, bytes: u64) {
+        if let Some(kv) = self.kv.as_mut() {
+            kv.gpu.set_tenant_floor(bytes);
+        }
+    }
+
+    #[must_use]
+    pub fn kv_owned_by(&self, owner: u32) -> u64 {
+        self.kv.as_ref().map_or(0, |kv| kv.gpu.owned_by(owner))
     }
 
     pub fn seal(&mut self, until: Option<u64>) {

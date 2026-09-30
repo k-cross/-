@@ -8,15 +8,29 @@ leaves. Prefill and decode become roles a replica holds, paired per request and 
 (§2.5). And tenancy gets the axis `Quota` lacks and the one decision an opaque engine leaves it:
 who shares a replica (§3.8).
 
-**Status: planned.** Nothing below is built. §2's predictions are stated before the run, per
-`owned-and-observed.md` §7, and like Phase 5's they lean on **pre-measurements**: numbers taken on
-an instrumented copy of `a700562`, run outside the repository and not committed. They are labelled
-wherever quoted and collected with their configurations in §8. They are reasons to predict, not
-results: §4.13 rebuilds each instrument in the repository, and a pre-measurement the built
-instrument does not reproduce is reconciled before any prediction resting on it is graded. More of
-them than in Phase 5 are emulations of a mechanism this phase builds -- a placement imposed by a
-filter on the candidates, a load as a node that answers nothing, prefill time as a stretch on the
-decodes admitted after it -- and §8 says where each is cruder than the build.
+**Status: increments 1 to 4 built and measured, and §4.15's publication done.** The engine's two
+corrections and the keyed fan-out (§4.1-§4.3) are in [`engine.rs`](../src/engine.rs),
+[`machine.rs`](../src/machine.rs), [`work.rs`](../src/work.rs) and [`tele.rs`](../src/tele.rs).
+Increment 2 -- the catalogue and replicas, weights out of the ledger, the mix and the clock, the
+planner, and three model sizes (§4.4-§4.8 and §4.12, less its half-width node) -- adds
+[`fleet.rs`](../src/fleet.rs) and the fleet paths of `machine.rs`. `polyphonic fleet`
+([`fleet_cmd.rs`](../src/fleet_cmd.rs)) runs the gate and the `batches`, `routing`, `clock`,
+`placed`, `offload`, `sizes`, `prefill`, `keyed`, `pairing`, `tenants` and `duty` sections on seeds
+1-3. Increment 3 -- roles and the prefill lane, the three pairing rules, and the planner's second
+pass (§4.9 and §4.10) -- adds the pairing paths of `machine.rs` and `Role` to `fleet.rs`. Increment
+4 -- declared tenants, the neighbour and the shared prefix, the tenants instrument, replica sets,
+the router's two meters and the tenant floor (§4.11) -- adds `Tenants` to `instruments.rs`, an owner
+and a floor to `EngineCache`, and the `tenants` section. §9 records what the build and a review of
+it found; P1 to P9 are annotated with what was measured. Everything else below is a plan. §2's
+predictions are stated before the run, per `owned-and-observed.md` §7, and like Phase 5's they lean
+on **pre-measurements**: numbers taken on an instrumented copy of `a700562`, run outside the
+repository and not committed. They are labelled wherever quoted and collected with their
+configurations in §8. They are reasons to predict, not results: §4.13 rebuilds each instrument in
+the repository, and a pre-measurement the built instrument does not reproduce is reconciled before
+any prediction resting on it is graded. More of them than in Phase 5 are emulations of a mechanism
+this phase builds -- a placement imposed by a filter on the candidates, a load as a node that
+answers nothing, prefill time as a stretch on the decodes admitted after it -- and §8 says where
+each is cruder than the build.
 
 Four things make this phase unlike Phase 5.
 
@@ -669,6 +683,23 @@ of lazy weights.
 - *If wrong* (the score pricing the batch lands within 20% of one model per node): per-request
   pricing can find a placement, and the case for a tier above routing rests on load time alone.
 
+**Measured, first half (increment 1): confirmed.** `polyphonic fleet` section 2, the `belief`
+cluster, seeds 1 / 2 / 3. With the score as it is, mean service rises +278.7 / +263.4 / +270.3% at
+the published partition and +278.0 / +267.9 / +270.8% at half with decode output held; pricing the
+batch recovers +250.0 / +241.1 / +248.0% and +251.0 / +242.2 / +252.4%, which is 21-29 points and
+inside the 35 the prediction allowed. Four models are in flight at 79 / 76 / 77% and 80 / 77 / 82%
+of the priced arm's admissions. Every figure equals the pre-measurement to the digit. The other half
+-- one model per node, and placements under one batch per node -- needs §4.5.
+
+**Measured, second half (increment 2): confirmed at the published partition.** Section 5. One
+model per node, the partition the weights leave (3 GiB), against the published engine: +0.22 /
+-0.10 / -0.19% of mean service, and -71.4 / -70.7 / -71.3% against a batch per model with lazy
+weights. At half the grant with decode output held it is -0.27 / -0.61 / -0.70%, faster than the
+published engine by slightly more than the prediction's 0.5%, because the published engine
+preempts 10.5 / 12.4 / 11.1% of requests there and the fleet none. The clause about placements
+under one batch per node is not measured: a node holds one replica (§1.4), so two and three models
+on a node do not exist.
+
 **P2 -- Routing's lead is a count of replicas.**
 
 `scored + fetch` over `hash only` on eight nodes at 500 req/s: 15-32% on the published engine and
@@ -680,6 +711,18 @@ engine.
   model, and the knee is a per-model quantity a planner has to leave room under.
 - *If wrong* (two replicas a model keep the pooled lead): something other than the candidate count
   carries the score's lead, and the first suspect is fetch between a model's two replicas.
+
+**Measured (increment 2): the first clause holds and the second does not, because hash-only is a
+draw.** Section 3, seeds 1 / 2 / 3, 8 nodes, 500 req/s. `scored + fetch` over `hash only`: -16.4 /
+-32.1 / -24.8% on the published engine and -15.3 / -31.4 / -23.8% on eight replicas of one model, a
+point apart. With four models on two replicas each, the lead depends on which nodes the replicas
+sit on -- the same replicas rotated round the eight nodes (`--rotate`) -- from -2.7% to -63.4% over
+eight layouts and three seeds, while the scored arm is the same to 0.1 ms in every layout
+(476.8 / 471.8 / 476.8 ms). Layout 2 reproduces the pre-measurement's -2.8 / -5.0 / -9.6%; the other
+seven do not. A hash router pins each tenant's sessions to one of a model's two replicas, and the
+heaviest tenants are Zipf-skewed, so its result is where they land. At 700 req/s the lead is -25.5%
+to -78.9% and the placed fleet's scored arm is +24.8 / +11.4 / +9.7% slower than the published
+engine (predicted 9-25%), so the second reading of §1.3 holds: the knee is per model.
 
 **P3 -- Following the mix recovers the pooled figure, and lateness is the whole price.**
 
@@ -698,6 +741,44 @@ faster. With sizes of 0.5 / 1 / 1 / 2 GiB at equal token demand the planner's re
   means the accrued loss and the move's cost are not in the same units after all -- the first thing
   to check is the rebuild term.
 
+**Measured (increment 2): the ceiling and the collapse hold, `follow` lands just under the
+prediction's range, and `eager` is the same policy.** Section 4, seeds 1 / 2 / 3, 8 nodes, 500
+req/s, 240 s, the rotating mix, a moved node draining before it loads (§9.14). Mean service, ms:
+
+| | seed 1 | seed 2 | seed 3 |
+|---|---|---|---|
+| published engine | 456.7 | 454.1 | 454.3 |
+| `oracle`, no start time | 459.2 | 456.8 | 456.6 |
+| `oracle`, 2 / 8 / 30 s to start | 463.8 / 492.4 / 835.6 | 462.2 / 487.8 / 807.5 | 461.3 / 488.3 / 827.1 |
+| `oracle`, 10 / 30 s late, 8 s to start | 583.9 / 1072.8 | 570.1 / 1022.5 | 581.9 / 1075.6 |
+| `once` | 6638.3 | 6207.9 | 6459.5 |
+| placed once, first phase / mean mix | 6632.7 / 1923.3 | 6196.8 / 1751.8 | 6449.3 / 1724.6 |
+| `follow`, 5 s interval, 8 s start | 534.1 | 534.5 | 530.0 |
+| `eager`, 5 s interval, 8 s start | 534.1 | 522.2 | 530.0 |
+
+`oracle` with no start time is +0.5 / +0.6 / +0.5% of the published engine (predicted within 1%),
+and `once` collapses to 6.2-6.6 s with 51.5-52.4% of decodes arriving at a full batch (predicted
+above 5 s and 45-55%). Start times of 2, 8 and 30 s cost +1.0 / +1.2 / +1.0%, +7.2 / +6.8 / +6.9%
+and +82.0 / +76.8 / +81.1% of the oracle with none, where the prediction said within 0.5%, +3-8%
+and +75-95%: the 2 s clause misses. `follow` makes 11 moves on every seed (predicted 9-12) and lands
++8.5 / +9.6 / +8.5% over the `oracle` with the same start, under the predicted +10-35% on each seed,
+and -92.0 / -91.4 / -91.8% under `once` (predicted more than 85%). **`eager` makes the same 11
+moves** and is +8.5 / +7.1 / +8.5%, so the prediction that it moves more and is not faster is wrong
+on its first clause: on this mix the rule never waits (§9.8). The interval and start sweeps, seed
+1: `follow` at a 1 / 5 / 15 s interval is +3.6 / +8.5 / +55.6% over its oracle, and at a 2 / 8 / 30
+s start +4.3 / +8.5 / +33.5%.
+
+**Measured, the sizes clause (increment 2): confirmed, and it tests the `eager` clause the rotating
+mix could not.** Section 5's `sizes` rows, models of 0.5 / 1 / 1 / 2 GiB, equal demand, 8 nodes at
+500 req/s for 240 s. Started at two replicas a model, `follow` makes one move and ends at 1 / 2 / 2
+/ 3 on every seed: 522.0 / 517.8 / 520.1 ms, within 0.7% of 519.6 / 514.3 / 517.5 placed there from
+the start, and -30.3 / -23.9 / -36.3% against staying at two a model, where the 2 GiB model's
+replicas meet 24% of their decodes with a full batch. `eager` from the same start makes 19 / 27 / 16
+moves, ends at 1 / 2 / 2 / 3 on two seeds of three, and is +5.2 / +6.9 / +4.5% slower than `follow`:
+at equal demand the best allocation flips with each interval's noise and `eager` follows every flip
+(§9.16), which is the prediction's "more moves and not faster". On the rotating mix with the same
+sizes, `follow` is +6.8 / +11.0 / +11.4% over the oracle and `once` collapses to 10.9-13.1 s.
+
 **P4 -- The partition's size and the offload grant are second-order.**
 
 One model per node at `HBM - weights` against the published grant: within 0.5% of service; at half
@@ -710,6 +791,15 @@ the function warm rate down 20-32 points at 4 GiB and within 3 at 8.
   capacity arbitration has a one-sided answer on this workload.
 - *If wrong* (the partition's size moves service by more than the replica count's neighbours do):
   in-flight KV binds on the placed fleet, and the regimes §1.6 says are gone are still there.
+
+**Measured (increment 2): confirmed.** Section 5, seeds 1 / 2 / 3. One model per node at `HBM -
+weights` against the published grant, published partition: 490.5 / 480.2 / 477.9 ms against 491.1 /
+480.8 / 478.4 ms, within 0.13%; at half the grant with decode output held, the derived partition
+takes preemption from 8.1 / 9.1 / 8.3% of requests to none and service from 492.3 / 482.3 / 479.9
+to 490.2 / 480.0 / 477.6 ms. The offload grant from nothing to 1.6 GiB moves service
+by at most +0.09 / -0.05% at 8 GiB of DDR per node and +0.10 / -0.01% at 4 GiB (predicted 0.2%), and
+the function warm rate by 2 points at 8 GiB and from 63 / 61 / 56% to 40 / 29 / 32% at 4 GiB
+(predicted 20-32 points down at 4 GiB, within 3 at 8).
 
 **P5 -- Prefill, charged, costs the published cluster a sixth of its service time, and the half
 partition two-thirds.**
@@ -726,6 +816,26 @@ service +2-5% and the flow's stall no better.
 - *If wrong* (prefill-ahead still lowers service under the bit): the work it moves lands on engines
   with room, and landing is doing more than its 35-39% suggests.
 
+**Measured (increment 1): confirmed, with a finding about the score.** Section 6, seeds 1 / 2 / 3.
+The pre-measurement is the arm whose score does not price prefill, and the build reproduces it:
++17.5 / +17.1 / +17.4% at the published partition and +67.9 / +81.4 / +72.2% at half, preemption
+10.5 / 12.4 / 11.1% -> 23.2 / 25.9 / 23.8%. With the score pricing prefill (§9.1) the published
+partition costs +13.1 / +13.0 / +13.3%, under the predicted +15-19%, and half +63.4 / +76.3 /
++65.0%, still inside +60-120%. A 1 ms allowance a step leaves +0.55 / +0.30 / +0.42%, inside 1%.
+Prefill-ahead under the bit, priced: +2.9 / +2.6 / +2.7% of mean service at the published
+partition, just over the predicted +2.0-2.5%, with the flow downstream's stall down 56 / 57 / 56%
+(predicted 50-57%) and landing 36 / 35 / 38%; at half, +3.2 / +1.4 / +5.1% of service and the
+flow's stall +4.8 / -9.0 / +1.8%, of no consistent sign.
+
+**Measured, the fleet clause (increment 2): over, and the pre-measurement explains it.** Section 6's
+last rows: 8 nodes, 500 req/s, two replicas a model. Prefill taking engine time costs +17.4 / +17.0
+/ +16.0% with the score blind to it and +16.6 / +16.2 / +15.3% with the score pricing it, against a
+predicted +11-13%. The pre-measurement ran the fleet unkeyed, so an agent on another model than its
+parent's could fetch the parent's KV instead of rebuilding it; run unkeyed, the build's placed fleet
+serves 476.7 / 471.7 / 476.8 ms with prefill free, the pre-measurement's figure to the digit, and
+prefill taking engine time costs it +12.8 / +11.9 / +11.7%, inside the prediction. `--fleet` refuses
+an unkeyed trace (§9.13), so on the fleet P6's keying is part of prefill's price (§9.15).
+
 **P6 -- A fan-out that crosses models pays for it.**
 
 47-50% of fan-out agents run on a model other than their parent's. With `--model-keyed`: prefill
@@ -736,6 +846,14 @@ points above the unkeyed figure under `--prefill-time`.
   have a reason to co-locate that the published co-location rate never priced.
 - *If wrong* (prefill work rises by under 10%): siblings on the same foreign model already share
   the re-encoded context, and the cost is per fan-out rather than per agent.
+
+**Measured (increment 1), re-measured after §9.14's grant fix: confirmed on two clauses, under on
+two.** Section 7. Agents on another model than their parent's: 48.0 / 49.1 / 48.9%. Keyed, prefill
+work is +32.0 / +26.7 / +27.5% at the published partition (+11.7 / +13.4 / +15.1% at half), two
+seeds under the predicted 29-35% and nowhere near the 10% that would make the prediction wrong, and
+mean service moves +0.05 / +0.01 / +0.06% while prefill is free. With prefill taking engine time and
+the score pricing it, keying adds +4.8 / +4.3 / +3.5% to service where the prediction said 6-9
+points: the pricing score routes around some of it, and the blind arm was not run keyed.
 
 **P7 -- The ratio is zero at the published mix and rate, one in eight with headroom, and three in
 eight on fresh prompts.**
@@ -755,6 +873,49 @@ the aggregated fleet's prefill work on the published mix. Coupled % between `joi
   than §1.3 found, and the first thing to check is whether the prefiller's duplicate work
   disappears once it can fetch a prefix.
 
+**Measured (increment 3): the published mix splits one way and the fresh mix another, and the
+prediction is wrong where it matters most.** Section 8, seeds 1 / 2 / 3, eight replicas of one
+model, mean service against eight aggregated, `joint` unless stated. Aggregated: 465.1 / 461.3 /
+466.1 ms with decodes stretched by 5.0 / 5.1 / 5.1% (pre-measured 5.5 / 5.7 / 5.5%) at 300 req/s
+and 526.7 / 524.9 / 529.3 ms, 8.5 / 8.9 / 8.7% (9.3 / 9.7 / 9.3%) at 500.
+
+| | 1 : 7 | 2 : 6 | 3 : 5 | 4 : 4 |
+|---|---|---|---|---|
+| 300 req/s, published mix | -1.7 / -1.7 / -1.6% | +0.2 / +0.2 / +0.2% | +3.6 / +3.7 / +3.7% | +9.5 / +10.3 / +10.2% |
+| 300 req/s, fresh 0.15 | +2.5 / +2.2 / +2.8% | -9.6 / -9.7 / -9.8% | -7.2 / -7.3 / -7.4% | +7.4 / +12.8 / +12.7% |
+| 500 req/s, published mix | -2.3 / -2.6 / -2.3% | +10.4 / +14.2 / +13.8% | +103.8 / +107.1 / +106.7% | +619.5 / +609.7 / +629.4% |
+| 500 req/s, fresh 0.15 | -3.8 / -5.3 / -5.6% | -0.3 / +0.4 / +0.4% | +134.3 / +127.0 / +133.2% | +582.8 / +558.6 / +565.3% |
+
+Against the prediction, clause by clause:
+
+- **At 500 req/s on the published mix, every split slower by at least 2%: wrong at 1 : 7.** `joint`
+  is 2.3-2.6% faster, and `independent` over 10 ms is +1.3 / +1.5 / +1.8%, inside 2%. 2 : 6 and 3 :
+  5 are slower, by 10-14% and 104-107%. This is P7's *if wrong* condition -- a split beating
+  aggregated at the published mix and rate -- and §9.18 runs the check it names: the decode slot a
+  prefiller costs is cheaper than §1.3 found.
+- **At 300 req/s on the published mix, `joint` 1 : 7 faster by 1.5-3% and slower from 3 : 5 on:
+  right**, with 2 : 6 a wash (+0.2%).
+- **With fresh prompts at 300 req/s, `joint` 3 : 5 faster by 15-19%: wrong in size.** It is 7.2-7.4%
+  faster; the best split is 2 : 6 at 9.6-9.8%. The fresh stream as built stretches aggregated
+  decodes by 13.0 / 13.2 / 13.2% against the pre-measurement's 22.0 / 22.2 / 21.8% (and 27.2-27.7%
+  against 31.7-31.9% at 500 req/s), so it is a lighter load than the one the prediction was made on,
+  and the gap to the pre-measurement is not reconciled (§9.21).
+- **`list` at 3 : 5 between -8% and +15%, right (-6.5 / -6.4 / -6.5%); `list` at 1 : 7 and 2 : 6
+  slower by more than 500%: right at 1 : 7 (+3,526 / +3,585 / +3,575%), wrong at 2 : 6** (+62 / +92
+  / +49%). Its prefiller waits 38 s a prefill at 1 : 7 and 0.6-1.1 s at 2 : 6.
+- **A prefiller does at least 1.5 times the aggregated fleet's prefill work on the published mix:
+  right at 1 : 7** (1.94 / 1.91 / 1.97 times what it replaced) **and just under at 2 : 6** (1.47 /
+  1.43 / 1.48), and under 1 from 3 : 5 on, where the prefillers hold enough history to start from.
+  `list` does 2.3-2.7 times, since it scatters a session's turns across prefillers.
+- **Coupled % between `joint` and `independent` above 20% on the published mix: true only where
+  `independent` has a threshold** (§9.19): 83-96% with a 10 ms threshold, 4-20% without.
+- **The planner's second pass gives 0, 1 and 3 prefillers: 3 is right, the other two are not.** At
+  500 req/s on the published mix it ends at 2 / 0 / 3, at 300 req/s on it 2 / 2 / 2, and on fresh
+  prompts at 300 req/s 3 / 3 / 3. With the ratio it chose, service against aggregated is +0.1 / -0.4
+  / -0.2%, -0.8 / -0.9 / -0.8% and -7.0 / -7.5 / -7.2%, against the best static split's -2.3 / -2.6
+  / -2.3%, -1.7 / -1.7 / -1.6% and -9.6 / -9.7 / -9.8%. On fresh prompts at 500 req/s it ends at 0
+  on every seed, -2.1 / -0.7 / +0.2%, where the best static split is 1 : 7 at -3.8 / -5.3 / -5.6%.
+
 **P8 -- A quota at the router is the soft floor, a replica set is the hard partition, and the
 neighbour's damage is engine time.**
 
@@ -773,6 +934,53 @@ time, the quota at the replica's allowance and the replica set cost the others t
   router meters, and the neighbour's decodes -- which the pre-measurement's quota did not meter --
   are the first suspect.
 
+**Measured (increment 4): the diagnosis holds and the sizes do not.** Section 9, seeds 1 / 2 / 3.
+Eight replicas of one model, prefill taking engine time unless stated, the others' mean service
+inside the burst against the shared fleet with no burst; "the others" is every served request but
+the neighbour's. The cache clauses first. No block is touched by two tenants: **0 cross-tenant
+touches of 384,159 / 413,463 / 405,143**, the pre-measurement's counts to the digit, and the tenant
+prefix carries 80 / 82 / 82% of hits (predicted 78-84%). Another owner's request causes **88.6 /
+90.0 / 89.6%** of GPU evictions where 97-98% was predicted; the instrument attributes a victim to
+the tenant that first brought it in, which may not be the pre-measurement's root-block owner
+(§9.23). The neighbour:
+
+| 500 req/s | free, 0.1 | free, 0.2 | priced, 0.1 | priced, 0.2 |
+|---|---|---|---|---|
+| shared, others in the burst | +1.3 / +1.2 / +1.3% | +2.7 / +2.7 / +2.7% | +11.1 / +10.4 / +11.2% | +61.5 / +55.5 / +53.0% |
+| shared, p99 | +1 / +1 / +1% | +3 / +3 / +3% | +12 / +11 / +12% | +112 / +94 / +101% |
+
+Predicted +3-8% free, +32-36% and +79-81% priced, and p99 +40-50% and +73-77%. The free rows are
+under half the prediction's floor, the priced rows under it at both bursts, and the p99 at 0.2 over
+it; the ratio of priced to free is 8.5 and 20, where the claim was ten. At 300 req/s the damage is
++0.8 / +1.6% free and +4.8 / +11.7% priced: it depends on the fleet's headroom as much as on the
+neighbour. What each instrument costs the others, priced, 500 req/s, burst 0.1 and 0.2:
+
+| | in the burst | outside it | the neighbour's own |
+|---|---|---|---|
+| 1 of 8 replicas the neighbour's | +3.0 / +3.0 / +3.2% and +3.0 / +3.0 / +2.9% | -0.2 to -0.9% | 2.1-2.2 s and 2.1-2.4 s |
+| 2 of 8 | +8.0 / +7.7 / +7.9% and +8.1 / +7.8 / +7.9% | +11.6 to +13.8% | 1.0-1.1 s and 2.0-2.1 s |
+| quota 0.25 engine-s a second | +1.9 / +1.8 / +2.1% and +1.4 / +1.5 / +1.5% | -0.6 to -1.4% | refuses 79 / 78 / 80% and 90% |
+| quota 0.5 | +3.5 / +3.3 / +3.8% and +2.9 / +2.9 / +3.0% | -0.5 to -1.3% | refuses 58 / 56 / 59% and 79% |
+| quota 1.0 | +9.0 / +8.5 / +8.7% and +8.3 / +8.2 / +8.2% | -0.3 to -1.2% | refuses 17 / 13 / 18% and 59% |
+
+Clause by clause: **the router quota protects better than sharing at every allowance, and what it
+refuses matches the pre-measurement closely** (79 / 78 / 80%, 58 / 56 / 59% and 17 / 13 / 18% at
+0.25, 0.5 and 1.0 against 80 / 79 / 79%, 60 / 58 / 57% and 20 / 16 / 15%), **so the *if wrong*
+branch is not taken**. The quota's cost to the others is about a third of what was predicted (+1.9%
+against +5.2-5.4% at 0.25, +9.0% against +26-27% at 1.0). **A replica set of one in eight costs the
+others +3.0% in the burst and nothing outside it, not +4.4-4.9% always,** and serves the neighbour
+in 2.1-2.4 s, not 6-8 s; two in eight costs +8% in the burst and +12-14% outside it, against
++12.4-12.8% predicted always. The difference between one and two is the knee: at 500 req/s seven
+replicas carry the others and six do not, and at 300 req/s two in eight costs +1.7% outside. **Over
+a run whose burst is a fifth of it, the quota at the replica's allowance (1.0) costs the others +0.6
+/ +0.1 / +0.5% and a replica set -0.1 / -0.4 / -0.3%** at burst 0.2 (shared +10.2 / +7.9 / +8.5%),
+within the predicted 2 points, **with the replica set ahead, not behind**. The sweep of the burst's
+share of the run (`--neighbour-duty`, §9.27) finds no crossover: the set is ahead of or tied with
+the quota at the replica's allowance at every share from 5% to 100% (at 100%, +3.5 / +4.3 / +4.5%
+against +20.5 / +19.7 / +19.7%), so the prediction that the quota wins below a duty cycle is wrong;
+a tighter quota, 0.25, is ahead of the set at every share, by refusing 80-90% of the neighbour's
+work. The second engine on the node is not built (§9.28).
+
 **P9 -- A tenant-aware block manager is worth under 1% of any tenant's service, and the tiers'
 write rates sit orders apart.**
 
@@ -785,6 +993,21 @@ four nodes and about 600 decisions a second in the soft tier at 500 req/s.
   workload does not justify, and §1's tiers have their first measured ratio.
 - *If wrong* (the floor is worth more than 1% to the quiet half): the quiet tenants' misses are
   longer than the table's mean suggests, and fairness on KV has a number worth an upstream ask.
+
+**Measured (increment 4): the ceiling is under 1% at the published partition and over it at half,
+and the writes are two orders apart from the soft tier and one from the loads.** Section 9. A
+per-tenant floor in the engine's block manager -- each tenant's KV kept from other tenants'
+evictions down to a 24th, 12th or 6th of the partition -- against none, mean service by tenant
+group, three seeds. At the published partition every group is within **0.09%** with prefill free and
+**0.29%** with prefill taking engine time, at every floor, for the busiest tenant, the quietest
+twelve and everyone: under 1% as predicted. The floor works: the quietest twelve's hit rate rises
+from 54.4 / 62.6 / 59.3% to 61.4 / 71.0 / 66.5% at a 24th. At half the partition with decode output
+held and prefill taking engine time the quietest twelve gain 0.2-1.8% of service (and one group
+2.3%), so the prediction's *if wrong* holds there: the quiet tenants' misses are longer where the
+partition is tight. The writes: the planner's 0.046 record writes a second (increment 2) against
+**3.9 / 4.5 / 3.2 lazy weight loads a second** on the `belief` cluster (the pre-measurement's 3.9 /
+4.5 / 3.2) and **306-308 scored decisions a second at 250 req/s**, about 615 at 500 -- 70 to 100
+times the planner's rate for the loads and about 13,000 times for the decisions.
 
 ---
 
@@ -1110,3 +1333,485 @@ to 3 unless stated.
 | *pairing* | roles, rules and ratios | eight replicas of one model, the first `p` of them prefill-only, each a first-come queue; the decoder by the scored argmin, then a pair or not by rule; the prefill run on the prefiller and shipped by the existing peer fetch; `joint` pairing when `queue + work + toll + transfer` at the best prefiller is under `work x (1 + in flight)` at the decoder; the fresh stream injected at the instant of the request before it, 64 blocks and 24-64 output tokens, at 0.15 and 0.30 a request; 300 and 500 req/s | §1.13's tables; at 0.30 a request and 300 req/s, `joint` at 3:5 is -16.5 / -15.0 / -16.5% with its prefillers saturated |
 | *tenants* | sharing and eviction by owner | each chain's owner taken from its root block, a tenant or a function; each block's first toucher recorded; chain reads classified by origin and owner; each GPU eviction attributed to the owner of the request that caused it; both regimes | §1.14's table |
 | *neighbour* | a bursting tenant under three instruments | eight replicas of one model; an injected tenant sending fresh 64-block prompts between 40% and 60% of the run at 0.1 or 0.2 a request; shared, or confined to one or two replicas with the others confined to the rest, or shared under a token bucket on its prefill work that refuses the excess; with and without the 1 s stretch; the others' decodes inside the window | §1.15's and §1.16's tables |
+
+---
+
+## 9. What the build found
+
+Increment 1 -- §4.1 to §4.3 and the first four sections of `polyphonic fleet` -- is §9.1 to §9.6,
+and increment 2 -- §4.4 to §4.8 and §4.12 -- is §9.7 to §9.16, and increment 3 -- §4.9 and §4.10 --
+is §9.17 to §9.21, and increment 4 -- §4.11 -- is §9.22 on, each in the order the findings arrived.
+
+### 9.1 The gate caught a sixth term that fired when nothing was carried
+
+§4.2 specified the score's prefill term as `in flight x rebuild`. Built that way, `--prefill-time`
+with an allowance no step could exceed still changed placement -- rule 1's own case -- because the
+term charged work the engine would have carried for free. The toll is now the *excess* the
+allowance cannot carry: the marginal work beyond `free x window / step` over the trailing window
+(`Engine::prefill_excess_ns`), times the sequences in flight. With no allowance it is the plan's
+`in flight x work`; with one that covers the load it is exactly zero, and the gate reads
+identical. `phase-6.md` §1.10 and §4.2 describe the first form.
+
+### 9.2 Both engine corrections are three-valued, because the pre-measurements had a blind score
+
+`--model-batches` and `--prefill-time` take `off | blind | priced`. The pre-measurements charged
+the engine and left the score unaware of the batch and of the prefill it was placing (§1.1's
+"score as it is"), and §4.2 then built a score that prices both. Without the split the build would
+have measured a different experiment from the one that stated its predictions. The blind arms
+reproduce the pre-measurements to the digit; the priced ones are the built score's. **Pricing
+prefill is worth about four points of service** at the published partition (+13.0-13.3% against
++17.1-17.5%) and 4-7 points at half, which no earlier phase's score could have found: it is a
+`Machine::plan` term, not a placement.
+
+### 9.3 A one-model generator bit was needed for the gate
+
+The gate for a batch per model is "a trace with one model changes nothing", and no bit produced
+one. `--one-model` makes every request name the first model while drawing every random number it
+drew before, so the trace is otherwise identical. It is also what §4.14's one-model-eight-replicas
+rows will run on.
+
+### 9.4 The regret oracle's truth view was blind to the model
+
+`realized_ns` and the truth-view score priced an engine through a `Telemetry` that knew no model,
+so under a batch per model its `execution` and `model` gaps would have measured the score's
+blindness rather than the plan's. The truth view now always carries the request's model; on a
+shared engine the model is ignored, so nothing published moves.
+
+### 9.5 A request's own prefill lengthens its own decode
+
+`run_here` reports a chain's rebuild to the engine before the decode is admitted, so a request's
+own prefill counts in the load its own decode is stretched by, and its own stall counts it a second
+time. The pre-measurements did the same, so the two agree and every figure above carries it. It
+overstates a lone request's cost and is exact in aggregate for the sequences behind it, which is
+what the load is for. Charging the request's decode from the load before it would remove it.
+
+### 9.6 What the sections cost
+
+The four sections take about seven minutes on three seeds as parallel processes. `polyphonic fleet`
+carries no `--regret`: `code-review` and `distributed --regret` take the bits, the fleet command
+does not need them yet.
+
+### 9.7 The catalogue's type is `ModelSpec`, and a replica sets its own step
+
+`Model` was already the engine's batch tag (`engine::Model`, a `u8`), so §4.4's `Model { bytes,
+start_ns, context }` is `ModelSpec`. A replica's step is `STEP_BASE_NS x bytes / 1 GiB / width`
+(`Fleet::step_base_ns`), held by the engine as its own base: the published node is the case the
+constant was chosen for and reads identically, and the belief's per-node step in `observe_arrival`
+now reads each engine's own. The context window is `min(model window, partition / block)` in KV
+blocks and is checked against a request's chain and its `max_tokens` blocks; at the published sizes
+it never binds, and a test forces it.
+
+### 9.8 `follow` and `eager` are the same policy where a collapse is priced by the interval
+
+The loss the planner accrues is `cost(current) - cost(best)` in nanoseconds of token time, and a
+model with no replica or past its knee is priced at one interval per overloaded token (§1.9's "the
+queue it grows"). On the rotating mix every shift puts a model past its knee, so one interval of
+accrued loss exceeds the move's price -- the load's downtime plus the KV it discards -- and `follow`
+moves at the first opportunity, exactly as `eager` does. They differ where the loss is small against
+the move: a stationary mix with a small imbalance, or a very costly move (a test with a 30 s start
+shows `follow` waiting where `eager` does not). The rule was not wrong on this workload; it was
+never tested by it, and §7's rule says the crossover -- how large a shift has to be before waiting
+pays -- is the finding, which needs a mix with modest shifts. §9.16's equal demand on three sizes is
+one: there `eager` makes 16-27 moves to `follow`'s one and is 4.5-6.9% slower. What the sweep does
+show is that lateness is the whole price: `follow` at a 1 s interval loses +3.6% to the oracle and
+at 15 s +55.6%.
+
+### 9.9 The ownership table is a table per regime
+
+§4.5 changes two cells of `own::authority`, but `authority` is one table and `ownership` prints it,
+so changing it would change a reproducible command's output with every bit off. `authority_in(kind,
+tier, question, fleet)` is the fleet's table: `(WeightShard, Ddr | Nvme, Allocation | Capacity)` is
+`Orchestrator`, everything else is the published table, and `Hierarchy::authority` selects it once
+weights are bound. The tier axis now discriminates on the allocation question (a test pins it), and
+nothing in the ledger reads those two cells, since under a fleet no weight reaches the ledger at
+all.
+
+### 9.10 A cold model costs its copy, and the oracle's cheap start is a peer
+
+A load is `start + copy`, the copy being the cheapest of the node's own agent cache (`PCIe`, 43 ms),
+a peer's copy over the topology (344 ms at rack) or a cold pull (2 x `WEIGHT_NS`, 8 s). Every move
+on the rotating mix finds a peer, since a model always keeps a replica, so the oracle with no start
+time pays 344 ms a move and the drain before it (§9.14), and is within 0.6% of the published engine.
+A move that swaps the last replica of a model would pay the cold pull, and `apply_placement`'s test
+pins all three prices.
+
+### 9.11 Fresh requests share their predecessor's instant
+
+`--fresh` adds requests to the trace, and a request that advanced the arrival clock would have
+thinned the base load in proportion. `Request::concurrent` marks a request that arrives at the
+instant of the one before it, so the base trace and its arrival rate are exactly the run without the
+bit (a test filters the fresh requests out and compares the rest), and the fresh stream is offered
+load on top.
+
+### 9.12 The planner sees demand it could not serve
+
+A model with no replica has no admitted tokens, so a planner reading only admissions would never
+place it. `FleetView` counts a decode's tokens when the request arrives, before routing, so the
+tokens of a request no replica could take are in it; a test starts a fleet with no replica of two
+models and watches the planner place both. Two smaller additions: `--fleet-partition` holds the
+partition below what the weights leave, which P4's published-grant arm needs, and `--rotate` moves
+the initial placement round the nodes, which P2's routing finding needed. The prefill-ahead target
+still ignores which node serves the downstream's model, so `--prefill-ahead` under `--fleet` lands
+on the wrong model about as often as it lands anywhere; it is not measured and is not a claim.
+
+### 9.13 What was cut, and what is refused
+
+`--fleet` refuses `--belief` (a reload resets the node's index, and the belief's optimistic entries
+are not reset with it), a ledger-side KV, unified memory, and an unkeyed trace; `--model-batches
+priced` refuses `--belief` too (§9.14). §4.12's half-width node is not built, as §4.12 allows, so
+§1.6's regime in which the partition binds -- a 1 GiB model on a half-width node's 2 GiB -- waits.
+`polyphonic fleet` runs the clock at 120,000 requests, which is 14 minutes on one seed; it is three
+processes, one per seed, for a full run.
+
+### 9.14 What a review of increment 2 found
+
+A review of the build, before this record was written, found fifteen things. These change a figure
+or a claim:
+
+- **A moved node decoded one model while it loaded another.** `apply_placement` flushed the engine
+  and began the load at the decision, while the sequences it flushed kept their completion times. A
+  load now begins when the node's last sequence in flight ends (`Engine::drained_by`), the replica
+  takes nothing new from the decision on, and the planner prices the drain beside the load. P3's
+  figures are the drained ones. Before, the oracle with no start time was +0.1 / 0.0 / +0.1% of the
+  published engine, an 8 s start cost +5.7 / +5.7 / +5.6% of that oracle, and `follow` was +8.7 /
+  +9.4 / +8.2% over its own: the drain adds 0.4-0.6 points to the first, 1.1-1.5 to the second, and
+  nothing consistent to the third, since both arms pay it.
+- **A copy still in flight was a source.** `holders` counted a node whose own copy had not landed,
+  so a second node loading the same unheld model copied from the first over the network before the
+  first had the bytes. A copy now lands at its begin plus its transfer, and a copy that another move
+  interrupts is forgotten. No measured section moves two nodes to an unheld model at once, so no
+  figure changed.
+- **The lab sized each grant from the default trace.** `Lab::go_fleet` cached the engine's grant by
+  distance and regime, so an arm on a keyed, mixed or fresh trace was granted what the ledger's run
+  of the default trace sized, where `distributed` sizes each arm's from its own run. The partition
+  and the offload are quota floors and did not move; the spill tier, the one part of a grant a
+  ledger run sizes, did. The grant is keyed on the trace now, and P6 is re-measured: prefill work
+  keyed was +31.9 / +30.7 / +33.7% and keying's cost under priced prefill time +5.0 / +5.1 / +5.1%.
+  Elsewhere figures move by 0.1 ms, except lazy weights on the rotating mix on seed 1, 1061.8 ms
+  before and 1162.1 ms after.
+- **The shared projection can read a finished sequence.** `Engine::projected_live` takes a full
+  batch's wait from the heap's top, which can be a sequence that has ended and not been retired, so
+  it can predict no wait where the per-model projection, reading only live sequences, predicts one.
+  Reading only live sequences leaves every published command identical at 3,000 requests but moves
+  the `batches` section's blind arm -- the published score on a per-model engine -- by up to 0.2%.
+  That arm is defined as the published score, so the projection stays as published (rule 10) and the
+  difference is recorded here; the one-model gate compares the two readings and is identical on
+  every seed and regime, because a full batch of one model is rare at the published load.
+- **Smaller.** The planner's next tick is computed, not looped to, since an interval of zero hung
+  it, and `distributed` refuses a planner with no interval, `--prefill-time` with no window,
+  `--replicas` beyond `--nodes`, and `--belief` with `--model-batches priced`, where a reported load
+  names no model and the priced score would be blind. A retarget spends empty nodes first. `reload`
+  counts the offload and spill tiers in the KV it loses. The planner's view carries demand tokens
+  only: §1.9 lists prefill work, sequences in flight, unplaced requests and full-batch arrivals, the
+  allocation's cost function reads none of them, and unplaced demand is in the demand, counted at
+  arrival (§9.12). `polyphonic fleet` numbers and runs its sections in §4.14's order, so the
+  increment-1 annotations under P5 and P6 cite sections 6 and 7.
+
+### 9.15 The fleet's prefill includes the keying P6 prices
+
+A replica serves one model, so on the fleet KV has to be keyed by model, and `--fleet` refuses a
+trace that is not. The pre-measurement behind P5's fleet clause predates that and ran the fleet
+unkeyed, which let an agent find its parent's KV on another model's replicas. The fleet section's
+prefill rows carry both: keyed, prefill costs +16-17% of service; unkeyed, +12-13%, the prediction's
+range. The difference is P6's cost, paid where it has to be.
+
+### 9.16 Three sizes: the arithmetic holds, and noise is what separates `follow` from `eager`
+
+`--sizes` gives each model its bytes, and with them its step's base, its partition, its load and its
+place in the planner's cost; nothing in the generator changes (§4.12). At equal token demand the
+cost puts 1 / 2 / 2 / 3 replicas of eight on models of 0.5 / 1 / 1 / 2 GiB at every demand from 500
+to 12,000 tokens a second per model, a test pins it, and a planner started at two a model lands
+there. Past about 16,000 tokens a second per model, more than the fleet can serve, the allocation
+turns toward the small models, since a saturated replica is worth the tokens it takes off the queue
+and a small model's replica takes more; no run reaches that load. At equal demand the best
+allocation still moves from interval to interval with the demand each interval happened to see, and
+`eager` moves with it -- 16-27 loads in four minutes against `follow`'s one -- so the rent-or-buy
+rule earns its keep here and not on the rotating mix (§9.8). The section is three processes of about
+four minutes each.
+
+### 9.17 A pair, as built
+
+`decide_pair` runs after the decoder is chosen, for a request that decodes, has a KV chain, and
+lands on a `Decode` replica; `Both` replicas never pair, so an unpaired fleet is untouched. It
+quotes each prefiller of the request's model read-only: its queue (`prefill_free_at`), the work it
+would do (the plan's `rebuild_ns` there, from the prefiller's own cache), the transfer of the KV
+the decoder lacks (`Topology::fetch_ns`), and a toll of `share x work / 2`, where `share` is the
+prefiller's prefill load over the trailing window: the work a new prefill adds to a queue delays the
+prefills that arrive while it runs, whose expected number times half its length is the load times
+half the work. `joint` pairs with the cheapest quote when it is under `work x (1 + in flight)` at
+the decoder, which is §1.12's rule; `independent` takes the prefiller with the shortest queue and
+work for a prefill over `--pair-over`; `list` takes the prefillers in turn. The prefill then runs
+on the prefiller -- its chain is materialised there, the work is reported to its engine, it is a
+first-come queue that only `recompute_ns` occupies -- and the decoder's ordinary plan fetches what
+it lacks from that prefiller. The request's service gains the prefiller's wait and work, in
+`queue_ns` and `recompute_ns`, beside the transfer. A prefiller whose partition cannot hold the
+chain is counted as `failed` and the decoder does the prefill. Fan-out agents are not paired: the
+gang path places them, and P7's shapes are sessions and fresh prompts.
+
+### 9.18 The duplicate prefiller work is not what makes the published mix lose
+
+P7's *if wrong* names the first thing to check: whether the prefiller's duplicate work disappears
+once it can fetch a prefix. `--prefill-fetch` lets a prefiller fetch the prefix from the decoder
+that holds it, as a decoder can from a peer. Joint at 1 : 7 on the published mix goes from -1.7 /
+-1.7 / -1.6% to -2.2 / -2.2 / -2.2% at 300 req/s and from -2.3 / -2.6 / -2.3% to -4.2 / -4.3 / -4.3%
+at 500, with the prefiller's work falling from 1.94 to 1.10-1.12 and 1.83 to 1.14-1.16 times what it
+replaced. Duplicate work is about two points of the win at 500 req/s and is not the whole of it: a
+win exists before the fix. At 2 : 6 and 3 : 5 the published mix still loses at 500 req/s (+10.2 /
++14.0 / +13.7% and +103.7 / +107.1 / +106.8% with fetching), so what decides the split there is the
+decode slots. The cost of starting over -- a prefiller holding only the sessions it prefilled -- is
+a number a real prefill tier would pay by default, and is what `list` shows at 2.3-2.7 times.
+
+### 9.19 Coupled % is a property of `independent`'s threshold
+
+`joint` and `independent` differ on a decision when one pairs and the other does not, or they pick
+different prefillers. With `independent` pairing every prefill (threshold 0) they differ on 4-20%
+of decisions at the published mix. With a 10 ms threshold
+`independent` pairs 8-11% of published-mix decisions and `joint` 80-100%, so they differ on
+83-96%. The instrument is computed read-only at every decision that has prefill work at the
+decoder, in every pairing run, from the same quotes. Its value is not a property of the rule's
+idea but of how its threshold is set, which is §1.12's point about a list, made of `independent`.
+
+### 9.20 The planner's second pass, and the floor it needed to lose
+
+The pass picks prefillers per model by the cost function of §1.9: decoders decode at the replica
+cost with the prefiller removed, prefill work at the decoders stretches decode by `1 / (1 - share)`,
+and paired work costs its length times the duplication measured on the pairs so far (1 before any),
+plus an M/M/1 wait on the prefillers, or an overload price past saturation. `FleetView` gained the
+prefill work, the prefills, and the paired work and the work it replaced, per model. Moving a role
+costs the drain of the node, which is decoding whatever it is moved from, and the node stops taking
+new requests at once, so no accrual rule has a price to wait on: `follow` and `eager` take the same
+roles, as the rows show, and §9.8's rent-or-buy earns nothing here. The roles flap with the noise in
+a view of one interval: 6-10 moves in 100 s to hold 2 prefillers at 300 req/s on the published mix.
+Building it found a bug in the replica pass the first clock runs could not: the allocation kept one
+replica of every model, even those no request names, so on a one-model trace `eager` moved nodes to
+models that never arrive. The floor now covers the models the planner has seen or placed; the
+`clock` and `sizes` output is unchanged by it.
+
+### 9.21 What is cut, and what is not reconciled
+
+Fan-out agents are not paired (§9.17). `Both` and `Decode` differ only in that `Both` never pairs; a
+prefiller is always `Prefill`. The fresh stream stretches aggregated decodes by 13% at 300 req/s
+where the pre-measurement had 22%, and by 27-28% at 500 where it had 31-32%; the published mix
+reproduces within 0.6 points. The stream is 64 blocks, 24-64 output tokens, 0.15 a request, arriving
+at the instant of the request before it, as §1.7 says, and the pre-measured copy's code is not in
+the repository, so the difference is recorded and not explained. Every fresh-mix row above is a row
+about this lighter load. Section 8 is three processes, one per seed, for a full run.
+
+### 9.22 A queued request forgot its tenant
+
+The first instrument run found 389 cross-tenant touches on a workload that shares nothing. A
+fan-out's resume request reads its session's chain and had been built from the queue without the
+tenant, so it was another owner -- none -- touching the session's blocks. `Queued` and `Fanout` now
+carry it. After the fix the count is 0, which is §1.14's number; a test pins it.
+
+### 9.23 Who evicted whom is a definition
+
+The instrument credits an eviction to the tenant whose request caused it and the victim to the
+tenant that first brought the block in, from the `Stored` event or the first read. That gives
+88.6 / 90.0 / 89.6% of GPU evictions caused by another owner's request, where the pre-measurement
+had 97.1 / 97.7 / 97.5% with an owner taken from each chain's root block. A fan-out agent's blocks
+belong, here, to the session's tenant, and a function's to none, which counts as another owner; the
+pre-measurement's rule is not in the repository. The three other numbers of §1.14's table are
+reproduced to the digit, including 54 / 63 / 59% for the quietest twelve of twenty-four and 40%
+against 70% at half the partition on seed 1.
+
+### 9.24 The shared prefix is worth nothing in service
+
+`--shared-prefix` roots the first 8 blocks of every tenant's prefix at one chain per model: 35,880 /
+42,144 / 39,864 touches of 384,159 / 413,463 / 405,143 (9.3 / 10.2 / 9.8%) are now of a block
+another tenant brought in. The tenant prefix's hit rate goes from 93 / 91 / 92% to 95 / 93 / 94% and
+the quietest twelve's from 54 / 63 / 59% to 56 / 66 / 62%; at half the partition from 40 / 44 / 42%
+to 45 / 50 / 50%. Mean service moves from 489.5 / 480.7 / 478.8 ms by 0.0 / 0.1 / 0.0 ms at the
+published partition and by 0.2 / 0.5 / 0.3 ms at half. The first of §3.8's three prices exists once
+something is shared, and on this workload it is a few points of hit rate and no service.
+
+### 9.25 Damage is load as much as tenant
+
+The neighbour's damage was pre-measured without the fleet's headroom stated. At 500 req/s, the
+published rate per node, the priced burst costs the others +11% at 0.1 and +53-62% at 0.2; at 300
+req/s +5% and +12%. The free rows are +0.8 to +2.7%. The prediction's figures sit above all of
+them. The two readings of the gap are that the pre-measurement's others were a different set of
+requests (the tally here is every served request but the neighbour's, including functions, which
+the burst does not touch) or that its fleet was closer to its knee; the copy that ran it is not in
+the repository, so the gap is recorded and not explained.
+
+### 9.26 A slot meter refuses the others
+
+`--tenant-slots n` caps each tenant's sequences in flight. At 500 req/s with one slot it refuses
+26-27% of the others' requests and 94-98% of the neighbour's; with four, 16-17% and 77-92%. The
+others' service "improves" by 30-33% and 12-14% only because the requests it would have hurt were
+refused: a cap per tenant cannot tell a neighbour from a busy tenant with a dozen sessions. The
+neighbour's decodes -- the *if wrong* suspect -- are metered by it, and the quota, which refuses
+none of the others' work, protects better without it. Every slot row is a row about survivors.
+
+### 9.27 Replica sets cost by the knee, and a quota at the same allowance does not beat one
+
+A replica set's cost to the others is not a constant. One of eight costs nothing outside the burst
+and +3% inside it at 500 req/s; two of eight costs +12-14% outside it, since six replicas are past
+the published load's knee for the others. §1.16 predicted a crossover in how often the neighbour
+bursts, the quota winning below it. `--neighbour-duty` varies the burst's share of the run, centred
+on its middle, and the section `duty` measures the others' mean service over the whole run against
+no burst, priced prefill, eight replicas, seeds 1 / 2 / 3. At 500 req/s and a burst of 0.2 of the
+request rate:
+
+| share of the run | shared | 1 of 8 replicas | quota 1.0 | quota 0.5 | quota 0.25 |
+|---|---|---|---|---|---|
+| 5% | +2.0 / +1.3 / +1.3% | 0.0 / -0.1 / -0.1% | +0.3 / 0.0 / +0.2% | -0.1 / -0.2 / -0.1% | -0.3 / -0.4 / -0.2% |
+| 20% | +10.2 / +7.9 / +8.5% | -0.1 / -0.4 / -0.3% | +0.6 / +0.1 / +0.5% | -0.4 / -0.7 / -0.5% | -0.7 / -1.0 / -0.8% |
+| 60% | +52.7 / +50.5 / +51.5% | +1.3 / +1.4 / +1.4% | +7.0 / +7.6 / +6.7% | +1.6 / +1.5 / +1.5% | +0.2 / 0.0 / +0.2% |
+| 100% | +134.0 / +128.7 / +144.9% | +3.5 / +4.3 / +4.5% | +20.5 / +19.7 / +19.7% | +5.1 / +4.8 / +5.1% | +2.1 / +1.9 / +2.1% |
+
+A burst of 0.1 and 300 req/s say the same at smaller sizes (at 300 req/s and 100% the set is +1.7 /
++1.6 / +1.8% and the quota at 1.0 +6.5%). There is no crossover between the set and the quota at the
+replica's allowance: the set is ahead of or level with it at every share, and the quota's cost
+grows faster with the burst's share because an engine-second a second of prefill work is admitted
+wherever it lands, stretching every node, where a set confines the same work to one. A quota
+ahead of the set needs an allowance a quarter of a replica's, and there it refuses 80-90% of the
+neighbour's prompts, where the set serves the neighbour in 2.1 s. So the choice is not a duty cycle
+but what the neighbour is owed.
+
+### 9.28 The ceiling is an engine change and is measured as one
+
+The floor is `EngineCache`'s: a block's owner is the tenant of the request that admitted it, a
+victim is taken in the order the engine already uses but skipping a block whose owner holds no more
+than the floor, and when every candidate is protected the engine still takes the oldest, since a
+floor is soft. The owner is set around each request's access on its node and on a prefiller's. It
+is off at zero, and the gate shows the instrument, an unreachable quota and slot limit, and a floor
+of nothing each identical to off on both regimes.
+
+### 9.29 What is cut
+
+The host-DDR row of §1.17 -- a tenant axis on `Quota` for `Snapshot` and `ServiceHeap` -- is not
+built; §4.11 names it as the part to leave and no pre-measurement says it binds. A replica set is
+one set, the neighbour's (`--tenant-set n`), not a set per tenant, and the duty cycle is swept at
+one rate of burst at a time, centred. The second engine on a node (§1.16's +91-96%) is not built and
+is not re-measured; it stays a pre-measurement. `--tenant-slots` is one meter for every tenant.
+§4.15's edits are made in `owned-and-observed.md` and `residency-ledger.md`; `--model-batches` and
+`--prefill-time` stay off by default, since they move every published cluster number.
+
+### 9.30 What a review of increments 3 and 4 found
+
+A review of the build, after §9.29 was written, found fifteen things, and all are fixed. These
+change a figure or a claim:
+
+- **A failed pair counted as work avoided.** `decide_pair` added the decoder's prefill to the work
+  the pairs replaced before the prefiller ran, so a prefiller whose partition could not hold the
+  chain still counted it, and the decoder's own prefill after the failure never reached the
+  planner's view. Both now count only what ran. Section 8 re-run on seeds 1-3 reproduces every
+  figure in P7 and §9.18-9.20, the planner's ratios included.
+- **The floor priced a victim it protects.** The score's displacement term read the next victim
+  without the tenant floor that `take_victim` applies, so under `--tenant-floor` it priced a block
+  the engine would not evict. Both read one selection now. P9's ceiling rows reproduce to the
+  digit.
+- **The prefill toll sized its allowance by the shared step.** Under `--model-batches priced` a
+  decode is charged the round, a base step per model in flight, and the toll now sizes the free
+  allowance by the same round. No measured arm combines an allowance with a batch per model.
+- **The late arms had no comparison.** Section 4 recognised an oracle by its name, so the 10 s and
+  30 s late arms were filed as oracles and printed nothing against the oracle with the same start.
+  They print +18.6 / +16.9 / +19.2% and +117.9 / +109.6 / +120.3% over it, the figures
+  `residency-ledger.md` quotes, which puts `follow`'s +8.5 / +9.6 / +8.5% well inside P3's *if
+  wrong* bound.
+- **Smaller.** The planner's allocation gave every node to the first model when it had seen none,
+  and now gives none. The tenants instrument is built under `--tenants` only, not by every run that
+  tracks origins. The lab's grant is keyed on the trace `trace_only` keeps, not on a second list of
+  its fields. The tenant meter and the pairing decision share one plan; the decoder plans again
+  after a paired prefill, since the prefiller then holds the chain. A node's width is gone with
+  the half-width node (§9.13): a replica's step is `STEP_BASE_NS x bytes / 1 GiB`. P8's table
+  quotes both bursts in every column, and §9.19 and §9.26 quote the ranges the sections print.
+
+## 10. Verification, as run
+
+- **Byte-identity with every new bit off**, against `HEAD` before this phase, on the reproducible
+  set at `--ops 3000` and two seeds: `residency` (split, unified, `--engine-cache --decode-kv`),
+  `flows` (and `--engine-cache --prefill-ahead`), `placement` (and `--drain-at`), `volatility`,
+  `ownership` (and `--engine-cache`), `price`, `belief` and `influence`, identical after the engine
+  change and on the final build. `distributed` smoke-run: the same arms and served rates, and only
+  the handoff column differs, as it does between two runs of one binary.
+- **The gate**, section 1 of `polyphonic fleet`, on both regimes: one model with a batch per model,
+  blind and priced, equals one batch per node; prefill time, blind and priced, with an allowance no
+  step exceeds equals off; keying with no fan-outs equals unkeyed.
+- **A round is what §1.1 says**, and one model equals the shared engine, on a fixture that fills the
+  batch (`one_model_per_model_batching_equals_shared`); a full batch queues its own model's arrivals
+  only; the prefill stretch, its window and its allowance, and the excess toll, each have a test in
+  `engine.rs`.
+- **The machine**: `a_batch_per_model_changes_nothing_when_every_request_names_one_model`,
+  `a_batch_per_model_is_dearer_where_four_models_decode` (round-robin placement, since the scored
+  fixture pins a model to a node), `an_allowance_no_step_exceeds_makes_prefill_time_change_nothing`,
+  `prefill_time_lengthens_decodes_by_the_work_the_engine_was_handed`, and
+  `a_priced_prefill_term_reaches_the_score_only_when_the_engine_is_loaded`.
+- **The generator**: `model_of` names every model and nothing else; a one-model trace names the
+  first; keying changes only the parent prefix of agents on another model, siblings on one foreign
+  model share it, and a keyed block carries the origin of the block it was keyed from.
+- **The census**: `cargo build --release --features census` emits 13 warnings; the engine's new
+  counters and the machine's reports are the engine's own.
+- `cargo fmt --check` and `cargo clippy --all-targets` clean, and `cargo test` passes with 128
+  tests, up from 110.
+- **Increment 2, byte-identity**: the same set plus `ownership --hbm 0` and the `fleet` gate and
+  `batches` sections, identical to the build before it.
+- **The gate**, section 1, adds a planner on a stationary mix: `follow` and `eager` both tick 12
+  times and move no replica.
+- **The fleet's types**: a replica serves its model and nothing else; the context window is the
+  smaller of the model and the partition; a load serves nothing until it is ready and leaves the
+  model cached; a step scales with size and width; the partition is what the weights leave
+  (`fleet.rs`). The cost function is convex and saturation costs a queue; the greedy allocation is
+  optimal against every other split of six nodes; a retarget moves only the surplus and spares the
+  nodes with the most KV; the oracle places for the first phase, shifts at each boundary and is
+  delayed by `--late`.
+- **The machine**: `every_decode_lands_on_a_replica_serving_its_model` (per node and model),
+  `weights_never_reach_the_ledger_under_a_fleet` (the census row and every weight counter are zero),
+  `a_model_with_no_replica_is_unplaced_and_counted_apart`, a window the partition cannot hold is not
+  routed to, a reload empties the node, keeps the HBM whole and prices 16 s for a cold model, a
+  request reaching a loading replica waits for the rest of the load, a load is priced from the
+  cheapest copy, weights that do not fit beside the partition are refused, and a concurrent request
+  does not advance the clock. The planner: a stationary mix moves nothing, a shifting one follows
+  the hot model and every move is a write, `follow` waits where `eager` does not, `once` moves once,
+  and demand the fleet could not serve is demand the planner sees.
+- **The generator**: a model mix moves demand phase by phase and maps tenants to models in blocks of
+  six; fresh requests are extra, concurrent, never shared and leave the base trace alone.
+- `cargo fmt --check` and `cargo clippy --all-targets` clean, and `cargo test` passes with 158
+  tests, up from 128.
+- **After the review (§9.14)**, the reproducible set is identical again, and the `fleet` gate and
+  `batches` sections differ from the build before increment 2 only by the header and the planner's
+  gate lines. The sections the fixes touch were re-run on seeds 1-3: `clock` and `keyed` (their
+  figures are the ones above), `placed` and `routing` (0.1 ms), and `prefill`, whose belief-cluster
+  rows are unchanged. The tests add a load that waits for a drain, a copy that another move
+  interrupts, a reload that drains before it loads, two nodes loading an unheld model both paying
+  the cold pull, and an empty node spent first by a retarget; `cargo test` passes with 160.
+- **Sizes (§9.16)**: `--sizes` leaves the `clock` and `placed` output of a reduced run
+  byte-identical and the reproducible set identical. Tests: a sized catalogue scales the step, the
+  partition and the cold pull; at equal demand the larger model gets the replicas, and the unsized
+  catalogue splits evenly; a sized fleet gives each node the partition and the step its model
+  leaves, and a move re-derives both; a planner at equal demand on the sized fleet ends at 1 / 2 / 2
+  / 3. `cargo test` passes with 164.
+- **Increment 3**: the reproducible set and the `fleet` gate and `batches` sections are identical
+  to the build before it, except the planner lines; the `clock` and `sizes` output of a reduced
+  run is byte-identical after the planner's floor changed. Tests: a prefill replica serves no decode
+  and keeps its role through a load; a paired prefill runs on the prefiller, the decoders' engines
+  do a fraction of the prefill work and the stretch falls; a prefiller that holds no history starts
+  over, and with `--prefill-fetch` does exactly the decoder's work; a prefiller is a first-come
+  queue; `joint` declines a saturated prefiller where a list does not; `independent` with an
+  unreachable threshold never pairs and the coupled count is bounded by the decisions; pairing
+  needs a `Decode` replica and a prefiller of the model; a replica that changes model returns as a
+  decoder; the role cost function, the planner giving fresh prompts prefillers and a trace with none
+  at most one, and a model no request names keeping no replica. `cargo test` passes with 177.
+- **Increment 4**: the reproducible set is identical to the build before it, and the `fleet` gate
+  adds three lines per regime -- the tenants instrument, a prefill quota and slot limit nothing
+  reaches, and a floor of nothing, each identical to off. Tests: a neighbour bursts only inside its
+  window, leaves the base trace alone and sends about its rate; sessions, their fan-out agents and
+  a fresh stream declare tenants; a shared prefix is one chain per model under every tenant of
+  that model and leaves depths unchanged; off, it is the published trace; no tenant touches
+  another's block until a prefix is shared (0 cross touches), and hits by origin and by tenant sum
+  to every read; a floor keeps a quiet tenant's blocks from a loud one's evictions, owned bytes
+  follow every removal and a floor that protects everything still admits; a replica set confines
+  the neighbour and everyone else to their replicas; a prefill quota refuses the neighbour's
+  excess and none of the others'; a slot meter refuses a tenant with its slots full. `cargo test`
+  passes with 189.
+- **The duty sweep**: a neighbour duty centres the burst's window and the default is the fifth
+  already measured, the section `tenants` byte-identical before and after; the run's window reaches
+  the tally. `cargo test` passes with 190.
+- **After the review (§9.30)**, `clock`, `pairing` and `tenants` re-run on seeds 1-3 reproduce
+  every figure this record quotes from them, and section 4 adds the late arms' lines against the
+  oracle with the same start. Tests: a priced allowance under a batch per model is sized by the
+  round the decode is charged, the planner's allocation with no model open gives no node, and a run
+  that tracks origins builds no tenants instrument; the width test goes with the width. `cargo test`
+  passes with 190.

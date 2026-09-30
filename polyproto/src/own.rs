@@ -52,6 +52,16 @@ pub fn authority(kind: BlobKind, tier: Tier, q: Question) -> Authority {
     }
 }
 
+#[must_use]
+pub fn authority_in(kind: BlobKind, tier: Tier, q: Question, fleet: bool) -> Authority {
+    match (fleet, kind, tier, q) {
+        (true, BlobKind::WeightShard, Tier::Ddr | Tier::Nvme, Question::Allocation) => {
+            Authority::Orchestrator
+        }
+        _ => authority(kind, tier, q),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +168,44 @@ mod tests {
                     authority(kind, tier, Allocation) == Engine,
                     "{kind:?} at {tier:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn under_a_fleet_weights_outside_hbm_are_a_file_the_orchestrator_holds() {
+        for tier in [Ddr, Nvme] {
+            assert_eq!(
+                authority_in(WeightShard, tier, Allocation, true),
+                Orchestrator
+            );
+            assert_eq!(
+                authority_in(WeightShard, tier, Capacity, true),
+                Orchestrator
+            );
+        }
+        assert_eq!(authority_in(WeightShard, Hbm, Allocation, true), Engine);
+        for kind in BlobKind::ALL {
+            for tier in [Hbm, Ddr, Nvme] {
+                for q in [Capacity, Allocation] {
+                    if (kind, tier, q) == (WeightShard, Ddr, Allocation)
+                        || (kind, tier, q) == (WeightShard, Nvme, Allocation)
+                    {
+                        continue;
+                    }
+                    assert_eq!(authority_in(kind, tier, q, true), authority(kind, tier, q));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn without_a_fleet_the_table_is_the_published_one() {
+        for kind in BlobKind::ALL {
+            for tier in [Hbm, Ddr, Nvme] {
+                for q in [Capacity, Allocation] {
+                    assert_eq!(authority_in(kind, tier, q, false), authority(kind, tier, q));
+                }
             }
         }
     }

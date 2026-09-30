@@ -1,9 +1,11 @@
 use crate::blob::{BlobId, BlobKind, BlobMeta, ROOT};
+use crate::engine::{MODEL_COUNT, Model};
 use crate::flow::FlowHint;
 use crate::rng::Rng;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::sync::OnceLock;
 
 pub type Chain = Vec<(BlobId, BlobMeta)>;
 
@@ -26,10 +28,10 @@ pub fn snapshot_restore_ns(bytes: u64) -> u64 {
 pub const WEIGHT_BYTES: u64 = 512 * 1024 * 1024;
 pub const WEIGHT_NS: u64 = 4_000_000_000;
 
-const TENANTS: u64 = 24;
+pub const TENANTS: u64 = 24;
 const SESSIONS: usize = 512;
 const FUNCTIONS: u64 = 400;
-const MODELS: u64 = 4;
+const MODELS: u64 = MODEL_COUNT as u64;
 const SHARDS_PER_MODEL: u64 = 2;
 const SERVICES: u64 = 3;
 
@@ -67,6 +69,33 @@ const FLOW_FRACTION: f64 = 0.45;
 pub const FLOW_LEAD_OPS: u32 = 6;
 const FLOW_PROMPT_BLOCKS: u64 = 24;
 
+const MIX_SEED: u64 = 0x4D49_585F_5345_4544;
+const FRESH_SEED: u64 = 0x4652_4553_485F_5345;
+const NEIGHBOUR_SEED: u64 = 0x4E45_4947_4842_5352;
+pub const FRESH_TENANT: u32 = 3_000;
+pub const NEIGHBOUR_TENANT: u32 = 2_000;
+pub const SHARED_PREFIX_BLOCKS: u64 = 8;
+const NEIGHBOUR_FROM: f64 = 0.4;
+const NEIGHBOUR_TO: f64 = 0.6;
+pub const FRESH_BLOCKS: u64 = 64;
+const FRESH_TOKENS_MIN: u64 = 24;
+const FRESH_TOKENS_SPAN: u64 = 40;
+
+pub type ModelMix = [[f64; MODEL_COUNT]; PHASES];
+
+#[must_use]
+pub fn rotating_mix(head: [f64; MODEL_COUNT]) -> ModelMix {
+    std::array::from_fn(|phase| {
+        std::array::from_fn(|m| head[(m + MODEL_COUNT - phase % MODEL_COUNT) % MODEL_COUNT])
+    })
+}
+
+#[must_use]
+pub fn neighbour_window(duty: f64) -> (f64, f64) {
+    let duty = duty.clamp(0.0, 1.0);
+    ((1.0 - duty) / 2.0, f64::midpoint(1.0, duty))
+}
+
 pub const FLOW_PAYLOAD_BYTES: u64 = 4 * 1024 * 1024;
 
 pub const TOOL_PAYLOAD_BYTES: u64 = 256 * 1024;
@@ -88,6 +117,7 @@ struct Queued {
     tokens: u64,
     fanout: Option<Fanout>,
     slo: Slo,
+    tenant: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +126,7 @@ struct Fanout {
     resume: Chain,
     resume_requires: Chain,
     resume_tokens: u64,
+    tenant: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -226,6 +257,7 @@ pub struct Agent {
     pub max_tokens: u64,
     pub slo: Slo,
     pub retention: Retention,
+    pub tenant: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -253,15 +285,31 @@ pub struct Request {
     pub max_tokens: u64,
     pub slo: Slo,
     pub retention: Retention,
+    pub concurrent: bool,
+    pub tenant: Option<u32>,
+}
+
+#[must_use]
+pub fn model_of(requires: &[(BlobId, BlobMeta)]) -> Option<Model> {
+    static FIRST_SHARDS: OnceLock<[BlobId; MODEL_COUNT]> = OnceLock::new();
+    let first = requires.first()?.0;
+    let table = FIRST_SHARDS.get_or_init(|| {
+        std::array::from_fn(|m| {
+            BlobId::leaf(format!("shard:{}", m as u64 * SHARDS_PER_MODEL).as_bytes())
+        })
+    });
+    table.iter().position(|id| *id == first).map(|m| m as Model)
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct RequestView<'a> {
     pub chain: &'a [(BlobId, BlobMeta)],
     pub requires: &'a [(BlobId, BlobMeta)],
+    pub model: Option<Model>,
     pub tokens: u64,
     pub class: usize,
     pub slo: Slo,
+    pub tenant: Option<u32>,
 }
 
 impl Request {
@@ -270,9 +318,11 @@ impl Request {
         RequestView {
             chain: &self.chain,
             requires: &self.requires,
+            model: model_of(&self.requires),
             tokens,
             class: self.kind_idx(),
             slo: self.slo,
+            tenant: self.tenant,
         }
     }
 
@@ -327,6 +377,18 @@ pub struct Workload {
     max_token_slack: f64,
     throughput: f64,
     origins: Option<Origins>,
+    model_keyed: bool,
+    one_model: bool,
+    mix: Option<ModelMix>,
+    mix_rng: Rng,
+    fresh_fraction: f64,
+    fresh_rng: Rng,
+    fresh_pending: VecDeque<Request>,
+    fresh_n: u64,
+    neighbour_rate: f64,
+    neighbour_window: (f64, f64),
+    neighbour_rng: Rng,
+    shared_prefix: bool,
 }
 
 fn kv(origins: Option<&Origins>, parent: BlobId, tag: &[u8], origin: Origin) -> (BlobId, BlobMeta) {
@@ -425,6 +487,18 @@ impl Workload {
             max_token_slack: MAX_TOKEN_SLACK,
             throughput: 0.0,
             origins: None,
+            model_keyed: false,
+            one_model: false,
+            mix: None,
+            mix_rng: Rng::new(seed ^ MIX_SEED),
+            fresh_fraction: 0.0,
+            fresh_rng: Rng::new(seed ^ FRESH_SEED),
+            fresh_pending: VecDeque::new(),
+            fresh_n: 0,
+            neighbour_rate: 0.0,
+            neighbour_window: (NEIGHBOUR_FROM, NEIGHBOUR_TO),
+            neighbour_rng: Rng::new(seed ^ NEIGHBOUR_SEED),
+            shared_prefix: false,
         };
         for _ in 0..SESSIONS {
             let s = w.fresh_session();
@@ -467,6 +541,94 @@ impl Workload {
             }
         }
         self.origins = Some(origins);
+        self
+    }
+
+    #[must_use]
+    pub fn with_model_mix(mut self, mix: ModelMix) -> Self {
+        self.mix = Some(mix);
+        for slot in 0..self.sessions.len() {
+            self.sessions[slot] = self.fresh_session_in(slot);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_neighbour(mut self, rate: f64) -> Self {
+        self.neighbour_rate = rate;
+        self
+    }
+
+    #[must_use]
+    pub fn with_neighbour_duty(mut self, duty: f64) -> Self {
+        self.neighbour_window = neighbour_window(duty);
+        self
+    }
+
+    #[must_use]
+    pub fn with_shared_prefix(mut self, on: bool) -> Self {
+        if !on || self.shared_prefix {
+            return self;
+        }
+        self.shared_prefix = true;
+        let mut shared: HashMap<u64, Chain> = HashMap::new();
+        for t in 0..TENANTS as usize {
+            let model = self.home_model(t);
+            let prefix = shared.entry(model).or_insert_with(|| {
+                let mut parent = ROOT;
+                (0..SHARED_PREFIX_BLOCKS)
+                    .map(|d| {
+                        let (id, meta) = kv(
+                            None,
+                            parent,
+                            format!("model-prefix:{model}:{d}").as_bytes(),
+                            Origin::Tenant,
+                        );
+                        parent = id;
+                        (id, meta)
+                    })
+                    .collect()
+            });
+            let own = std::mem::take(&mut self.tenant_prefix[t]);
+            let mut parent = prefix.last().map_or(ROOT, |(id, _)| *id);
+            let mut chain = prefix.clone();
+            for (d, _) in own.iter().enumerate().skip(SHARED_PREFIX_BLOCKS as usize) {
+                let (id, meta) = kv(
+                    None,
+                    parent,
+                    format!("tenant:{t}:{d}").as_bytes(),
+                    Origin::Tenant,
+                );
+                parent = id;
+                chain.push((id, meta));
+            }
+            self.tenant_prefix[t] = chain;
+        }
+        if let Some(o) = &self.origins {
+            for chain in &self.tenant_prefix {
+                for (id, _) in chain {
+                    o.register(*id, Origin::Tenant);
+                }
+            }
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_fresh(mut self, fraction: f64) -> Self {
+        self.fresh_fraction = fraction;
+        self
+    }
+
+    #[must_use]
+    pub fn with_one_model(mut self, on: bool) -> Self {
+        self.one_model = on;
+        self
+    }
+
+    #[must_use]
+    pub fn with_model_keyed(mut self, on: bool) -> Self {
+        self.model_keyed = on;
         self
     }
 
@@ -518,14 +680,42 @@ impl Workload {
             .collect()
     }
 
+    fn keyed_parent(&self, parent: &Chain, model: u64) -> (Chain, BlobId) {
+        let mut keyed = Vec::with_capacity(parent.len());
+        let mut before: Option<BlobId> = None;
+        for &(id, meta) in parent {
+            let salted = BlobId::chain(id, format!("model:{model}").as_bytes());
+            if let Some(o) = &self.origins
+                && let Some(origin) = o.of(&id)
+            {
+                o.register(salted, origin);
+            }
+            keyed.push((
+                salted,
+                BlobMeta {
+                    parent: before,
+                    ..meta
+                },
+            ));
+            before = Some(salted);
+        }
+        let tail = before.unwrap_or(ROOT);
+        (keyed, tail)
+    }
+
     fn fanout(&mut self, parent: &Chain, tenant: usize, task: u64, slo: Slo) -> Fanout {
         let n = AGENTS_MIN + self.rng.below(AGENTS_SPAN);
-        let home_model = tenant as u64 % MODELS;
+        let home_model = self.home_model(tenant);
         let base = parent.last().map_or(ROOT, |(id, _)| *id);
         let mut agents = Vec::with_capacity(n as usize);
         for a in 0..n {
-            let mut chain = parent.clone();
-            let mut at = base;
+            let drawn = (home_model + self.rng.zipf(MODELS, 2.0)) % MODELS;
+            let model = if self.one_model { 0 } else { drawn };
+            let (mut chain, mut at) = if self.model_keyed && model != home_model {
+                self.keyed_parent(parent, model)
+            } else {
+                (parent.clone(), base)
+            };
             for b in 0..SUBAGENT_BLOCKS {
                 let (id, meta) = kv(
                     self.origins.as_ref(),
@@ -536,7 +726,6 @@ impl Workload {
                 at = id;
                 chain.push((id, meta));
             }
-            let model = (home_model + self.rng.zipf(MODELS, 2.0)) % MODELS;
             let tail = at;
             let tools = (0..self.rng.below(TOOLS_MAX + 1))
                 .map(|_| {
@@ -569,6 +758,7 @@ impl Workload {
                     }),
                     evict_first_from: Some(parent.len()),
                 },
+                tenant: Some(tenant as u32),
             });
         }
         let mut resume = parent.clone();
@@ -588,8 +778,46 @@ impl Workload {
         Fanout {
             gang: Gang { agents },
             resume,
-            resume_requires: Self::model_shards(tenant),
+            resume_requires: self.model_shards(tenant),
             resume_tokens: self.tokens(),
+            tenant: Some(tenant as u32),
+        }
+    }
+
+    fn drawn_model(&mut self) -> u64 {
+        let Some(mix) = self.mix else {
+            return 0;
+        };
+        let row = mix[self.phase()];
+        let u = self.mix_rng.unit();
+        let mut share = 0.0;
+        for (m, p) in row.iter().enumerate() {
+            share += p;
+            if u < share {
+                return m as u64;
+            }
+        }
+        MODELS - 1
+    }
+
+    fn fresh_session_in(&mut self, slot: usize) -> Session {
+        let per_model = TENANTS / MODELS;
+        let model = (slot / (SESSIONS / MODEL_COUNT)) as u64;
+        let tenant = (model * per_model + self.rng.zipf(per_model, 1.6)) as usize;
+        self.next_session += 1;
+        Session {
+            tenant,
+            id: self.next_session,
+            turns: 1,
+            grown: vec![4],
+        }
+    }
+
+    fn replacement_session(&mut self, slot: usize) -> Session {
+        if self.mix.is_some() {
+            self.fresh_session_in(slot)
+        } else {
+            self.fresh_session()
         }
     }
 
@@ -662,8 +890,22 @@ impl Workload {
         )]
     }
 
-    fn model_shards(tenant: usize) -> Chain {
-        Self::shards_of(tenant as u64 % MODELS)
+    fn home_model(&self, tenant: usize) -> u64 {
+        if self.one_model {
+            0
+        } else if self.mix.is_some() {
+            tenant as u64 / (TENANTS / MODELS)
+        } else {
+            tenant as u64 % MODELS
+        }
+    }
+
+    fn flow_model(&self, function: u64) -> u64 {
+        if self.one_model { 0 } else { function % MODELS }
+    }
+
+    fn model_shards(&self, tenant: usize) -> Chain {
+        Self::shards_of(self.home_model(tenant))
     }
 
     fn shards_of(model: u64) -> Chain {
@@ -684,7 +926,12 @@ impl Workload {
     }
 
     fn agent_turn(&mut self) -> (Chain, usize, Turn) {
-        let slot = self.rng.zipf(self.sessions.len() as u64, 1.3) as usize;
+        let slot = if self.mix.is_some() {
+            let per_model = (SESSIONS / MODEL_COUNT) as u64;
+            (self.drawn_model() * per_model + self.rng.zipf(per_model, 1.3)) as usize
+        } else {
+            self.rng.zipf(self.sessions.len() as u64, 1.3) as usize
+        };
         let s = self.sessions[slot].clone();
         let mut chain = self.tenant_prefix[s.tenant].clone();
         let mut parent = chain.last().map_or(ROOT, |(id, _)| *id);
@@ -706,7 +953,7 @@ impl Workload {
             }
         }
         if s.turns >= MAX_TURNS || self.rng.chance(0.04) {
-            self.sessions[slot] = self.fresh_session();
+            self.sessions[slot] = self.replacement_session(slot);
         } else {
             self.sessions[slot].turns += 1;
         }
@@ -759,6 +1006,84 @@ impl Iterator for Workload {
     type Item = Request;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if let Some(extra) = self.fresh_pending.pop_front() {
+            return Some(extra);
+        }
+        let req = self.next_base()?;
+        if self.fresh_fraction > 0.0 && self.fresh_rng.chance(self.fresh_fraction) {
+            let fresh = self.fresh_request(req.phase, FRESH_TENANT, false);
+            self.fresh_pending.push_back(fresh);
+        }
+        let lo = (self.neighbour_window.0 * self.ops as f64) as u64;
+        let hi = (self.neighbour_window.1 * self.ops as f64) as u64;
+        if self.neighbour_rate > 0.0
+            && (lo..hi).contains(&self.issued)
+            && self.neighbour_rng.chance(self.neighbour_rate)
+        {
+            let burst = self.fresh_request(req.phase, NEIGHBOUR_TENANT, true);
+            self.fresh_pending.push_back(burst);
+        }
+        Some(req)
+    }
+}
+
+impl Workload {
+    fn fresh_request(&mut self, phase: usize, tenant: u32, neighbour: bool) -> Request {
+        self.fresh_n += 1;
+        let n = self.fresh_n;
+        let rng = if neighbour {
+            &mut self.neighbour_rng
+        } else {
+            &mut self.fresh_rng
+        };
+        let model = if self.one_model { 0 } else { rng.below(MODELS) };
+        let tokens = FRESH_TOKENS_MIN + rng.below(FRESH_TOKENS_SPAN);
+        let mut parent = ROOT;
+        let chain: Chain = (0..FRESH_BLOCKS)
+            .map(|d| {
+                let (id, meta) = kv(
+                    None,
+                    parent,
+                    format!("fresh:{n}:{d}").as_bytes(),
+                    Origin::Session,
+                );
+                parent = id;
+                (id, meta)
+            })
+            .collect();
+        let produces = self.tokens_per_block.map_or_else(Vec::new, |per_block| {
+            (0..tokens.div_ceil(per_block))
+                .map(|d| {
+                    let (id, meta) = kv(
+                        None,
+                        parent,
+                        format!("fresh:{n}:out:{d}").as_bytes(),
+                        Origin::Session,
+                    );
+                    parent = id;
+                    (id, meta)
+                })
+                .collect()
+        });
+        Request {
+            phase,
+            chain,
+            requires: Self::shards_of(model),
+            hint: None,
+            completes: None,
+            exec_ns: tokens * DECODE_NS_PER_TOKEN,
+            tokens,
+            gang: None,
+            produces,
+            max_tokens: self.max_tokens(tokens),
+            slo: Slo::Interactive,
+            retention: Retention::default(),
+            concurrent: true,
+            tenant: Some(tenant),
+        }
+    }
+
+    fn next_base(&mut self) -> Option<Request> {
         let phase = self.phase();
 
         let ready = self.pending.front().is_some_and(|q| q.due <= self.issued);
@@ -778,6 +1103,7 @@ impl Iterator for Workload {
                     payload,
                     None,
                     q.slo,
+                    f.tenant,
                 );
                 return Some(Request {
                     phase,
@@ -792,6 +1118,8 @@ impl Iterator for Workload {
                     max_tokens: 0,
                     slo: q.slo,
                     retention: Retention::default(),
+                    concurrent: false,
+                    tenant: None,
                 });
             }
             let tail = q.chain.last().map_or(ROOT, |(id, _)| *id);
@@ -817,6 +1145,8 @@ impl Iterator for Workload {
                 max_tokens: self.max_tokens(q.tokens),
                 slo: q.slo,
                 retention,
+                concurrent: false,
+                tenant: q.tenant,
             });
         }
         let mix = self.mix();
@@ -841,6 +1171,8 @@ impl Iterator for Workload {
             max_tokens: 0,
             slo: Slo::Interactive,
             retention: Retention::default(),
+            concurrent: false,
+            tenant: None,
         })
     }
 }
@@ -863,6 +1195,7 @@ impl Workload {
             payload,
             None,
             Slo::Interactive,
+            None,
         )
     }
 
@@ -877,6 +1210,7 @@ impl Workload {
         payload: u64,
         fanout: Option<Fanout>,
         slo: Slo,
+        tenant: Option<u32>,
     ) -> FlowHint {
         self.next_task += 1;
         let task = self.next_task;
@@ -894,6 +1228,7 @@ impl Workload {
                 tokens,
                 fanout,
                 slo,
+                tenant,
             },
         );
         FlowHint {
@@ -917,7 +1252,7 @@ impl Workload {
             Origin::Session,
         );
         self.grow(turn, produces.len() as u64);
-        let requires = Self::model_shards(tenant);
+        let requires = self.model_shards(tenant);
         let hint = if self.fanout_fraction > 0.0 && self.rng.chance(self.fanout_fraction) {
             let task = self.next_task + 1;
             let plan = self.fanout(&chain, tenant, task, slo);
@@ -930,6 +1265,7 @@ impl Workload {
                 DISPATCH_PAYLOAD_BYTES * plan.gang.agents.len() as u64,
                 Some(plan),
                 slo,
+                None,
             );
             debug_assert_eq!(hint.task, task);
             Some(hint)
@@ -955,16 +1291,23 @@ impl Workload {
             max_tokens: self.max_tokens(tokens),
             slo,
             retention: Retention::default(),
+            concurrent: false,
+            tenant: Some(tenant as u32),
         }
     }
 
     fn faas_request(&mut self, phase: usize) -> Request {
-        let f = self.rng.zipf(FUNCTIONS, 1.5);
+        let f = if self.mix.is_some() {
+            let model = self.drawn_model();
+            self.rng.zipf(FUNCTIONS / MODELS, 1.5) * MODELS + model
+        } else {
+            self.rng.zipf(FUNCTIONS, 1.5)
+        };
         let chain = self.faas_for(f);
         let exec_ns = self.faas_exec();
         let hint = if self.rng.chance(FLOW_FRACTION) {
             let downstream = self.flow_chain(f);
-            let requires = Self::model_shards(f as usize % TENANTS as usize);
+            let requires = Self::shards_of(self.flow_model(f));
             let tokens = self.tokens();
             Some(self.enqueue(
                 downstream,
@@ -989,6 +1332,8 @@ impl Workload {
             max_tokens: 0,
             slo: Slo::Interactive,
             retention: Retention::default(),
+            concurrent: false,
+            tenant: None,
         }
     }
 }
@@ -1109,5 +1454,337 @@ mod tests {
                 .filter(|r| r.completes.is_none())
                 .all(|r| { r.retention == Retention::default() || r.gang.is_some() })
         );
+    }
+    #[test]
+    fn model_of_names_the_model_a_request_requires() {
+        let requests = trace(None);
+        let mut seen = HashSet::new();
+        for req in &requests {
+            let expected = req.requires.first().map(|(id, _)| *id);
+            match model_of(&req.requires) {
+                Some(m) => {
+                    let first = BlobId::leaf(
+                        format!("shard:{}", u64::from(m) * SHARDS_PER_MODEL).as_bytes(),
+                    );
+                    assert_eq!(expected, Some(first));
+                    seen.insert(m);
+                }
+                None => assert!(req.requires.is_empty()),
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            MODEL_COUNT,
+            "the fixture must reach every model"
+        );
+    }
+
+    #[test]
+    fn a_one_model_trace_names_the_first_model_only() {
+        let workload = Workload::with_fanout(2, 2_000, 1.0, 0.15).with_one_model(true);
+        for req in workload {
+            assert!(model_of(&req.requires).is_none_or(|m| m == 0));
+            for agent in req.gang.iter().flat_map(|g| &g.agents) {
+                assert_eq!(model_of(&agent.requires), Some(0));
+            }
+        }
+    }
+
+    fn ids(chain: &[(BlobId, BlobMeta)]) -> Vec<BlobId> {
+        chain.iter().map(|(id, _)| *id).collect()
+    }
+
+    fn keyed_pair() -> (Vec<Request>, Vec<Request>) {
+        let build = |keyed| {
+            Workload::with_fanout(2, 3_000, 1.0, 0.15)
+                .with_model_keyed(keyed)
+                .collect::<Vec<Request>>()
+        };
+        (build(false), build(true))
+    }
+
+    #[test]
+    fn keying_changes_only_the_parent_prefix_of_agents_on_another_model() {
+        let (plain, keyed) = keyed_pair();
+        assert_eq!(plain.len(), keyed.len());
+        let mut foreign = 0;
+        for (p, k) in plain.iter().zip(&keyed) {
+            assert_eq!(p.chain.len(), k.chain.len());
+            assert_eq!(p.tokens, k.tokens);
+            let (Some(pg), Some(kg)) = (&p.gang, &k.gang) else {
+                assert_eq!(format!("{:?}", p.chain), format!("{:?}", k.chain));
+                continue;
+            };
+            for (pa, ka) in pg.agents.iter().zip(&kg.agents) {
+                assert_eq!(pa.chain.len(), ka.chain.len());
+                assert_eq!(model_of(&pa.requires), model_of(&ka.requires));
+                let upto = pa.retention.retain.map_or(0, |r| r.upto);
+                if ids(&pa.chain[..upto]) == ids(&ka.chain[..upto]) {
+                    continue;
+                }
+                foreign += 1;
+                assert!(ka.chain.windows(2).all(|w| w[1].1.parent == Some(w[0].0)));
+                assert!(
+                    ka.chain[..upto]
+                        .iter()
+                        .zip(&pa.chain[..upto])
+                        .all(|(k, p)| k.0 != p.0)
+                );
+            }
+        }
+        assert!(
+            foreign > 0,
+            "the fixture must reach an agent on another model"
+        );
+    }
+
+    #[test]
+    fn siblings_on_one_foreign_model_share_the_keyed_prefix() {
+        let (_, keyed) = keyed_pair();
+        let mut shared = 0;
+        for gang in keyed.iter().filter_map(|r| r.gang.as_ref()) {
+            let upto = gang.agents[0].retention.retain.map_or(0, |r| r.upto);
+            for (i, a) in gang.agents.iter().enumerate() {
+                for b in &gang.agents[i + 1..] {
+                    if model_of(&a.requires) == model_of(&b.requires)
+                        && ids(&a.chain[..upto]) == ids(&b.chain[..upto])
+                    {
+                        shared += 1;
+                    }
+                    if model_of(&a.requires) != model_of(&b.requires) {
+                        assert_ne!(a.chain[upto - 1].0, b.chain[upto - 1].0);
+                    }
+                }
+            }
+        }
+        assert!(shared > 0);
+    }
+
+    #[test]
+    fn a_keyed_block_carries_the_origin_of_the_block_it_was_keyed_from() {
+        let origins = Origins::default();
+        let requests: Vec<Request> = Workload::with_fanout(2, 3_000, 1.0, 0.15)
+            .with_model_keyed(true)
+            .with_origins(origins.clone())
+            .collect();
+        for req in &requests {
+            for agent in req.gang.iter().flat_map(|g| &g.agents) {
+                let upto = agent.retention.retain.map_or(0, |r| r.upto);
+                for (id, _) in &agent.chain[..upto] {
+                    assert!(matches!(
+                        origins.of(id),
+                        Some(Origin::Tenant | Origin::Session)
+                    ));
+                }
+            }
+        }
+    }
+    #[test]
+    fn a_model_mix_moves_the_demand_between_models_phase_by_phase() {
+        let ops = 20_000;
+        let mix = rotating_mix([0.55, 0.25, 0.12, 0.08]);
+        let trace: Vec<Request> = Workload::with_fanout(2, ops, 0.0, 0.0)
+            .with_model_mix(mix)
+            .collect();
+        let mut demand = [[0u64; MODEL_COUNT]; PHASES];
+        for req in trace
+            .iter()
+            .filter(|r| r.tokens > 0 && r.completes.is_none())
+        {
+            if let Some(m) = model_of(&req.requires) {
+                demand[req.phase][usize::from(m)] += 1;
+            }
+        }
+        for (phase, row) in demand.iter().enumerate() {
+            let total: u64 = row.iter().sum();
+            let hot = row
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, n)| **n)
+                .map(|(m, _)| m);
+            assert_eq!(hot, Some(phase), "phase {phase}: {row:?}");
+            assert!(
+                row[phase] as f64 > 0.45 * total as f64,
+                "phase {phase}: {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_mix_maps_tenants_to_models_in_blocks() {
+        let roots: HashMap<BlobId, usize> = (0..TENANTS)
+            .map(|t| (BlobId::leaf(format!("tenant:{t}:0").as_bytes()), t as usize))
+            .collect();
+        let trace: Vec<Request> = Workload::with_fanout(3, 4_000, 0.0, 0.0)
+            .with_model_mix(rotating_mix([0.4, 0.3, 0.2, 0.1]))
+            .collect();
+        let mut chats = 0;
+        for req in trace
+            .iter()
+            .filter(|r| r.completes.is_none() && r.tokens > 0)
+        {
+            let Some(tenant) = req.chain.first().and_then(|(id, _)| roots.get(id)) else {
+                continue;
+            };
+            chats += 1;
+            assert_eq!(
+                model_of(&req.requires).map(usize::from),
+                Some(tenant / (TENANTS as usize / MODEL_COUNT))
+            );
+        }
+        assert!(chats > 500);
+    }
+
+    fn base_of(trace: Vec<Request>) -> Vec<String> {
+        trace
+            .into_iter()
+            .filter(|r| !r.concurrent)
+            .map(|r| format!("{r:?}"))
+            .collect()
+    }
+
+    #[test]
+    fn fresh_requests_are_extra_concurrent_and_leave_the_base_trace_alone() {
+        let plain: Vec<Request> = Workload::with_fanout(2, 3_000, 1.0, 0.1).collect();
+        let fresh: Vec<Request> = Workload::with_fanout(2, 3_000, 1.0, 0.1)
+            .with_fresh(0.2)
+            .collect();
+        let extra: Vec<&Request> = fresh.iter().filter(|r| r.concurrent).collect();
+        assert!(plain.iter().all(|r| !r.concurrent));
+        assert_eq!(base_of(plain), base_of(fresh.clone()));
+        let share = extra.len() as f64 / (fresh.len() - extra.len()) as f64;
+        assert!((share - 0.2).abs() < 0.03, "{share}");
+        let mut seen = HashSet::new();
+        for r in &extra {
+            assert_eq!(r.chain.len() as u64, FRESH_BLOCKS);
+            assert!((FRESH_TOKENS_MIN..FRESH_TOKENS_MIN + FRESH_TOKENS_SPAN).contains(&r.tokens));
+            assert!(model_of(&r.requires).is_some() && r.gang.is_none() && r.hint.is_none());
+            assert!(
+                r.chain.iter().all(|(id, _)| seen.insert(*id)),
+                "a fresh prompt is never shared"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_prompts_on_a_one_model_trace_name_the_first_model() {
+        let trace: Vec<Request> = Workload::with_fanout(2, 2_000, 1.0, 0.0)
+            .with_one_model(true)
+            .with_fresh(0.3)
+            .collect();
+        let fresh: Vec<&Request> = trace.iter().filter(|r| r.concurrent).collect();
+        assert!(fresh.len() > 100);
+        assert!(fresh.iter().all(|r| model_of(&r.requires) == Some(0)));
+    }
+    #[test]
+    fn a_neighbour_bursts_only_inside_its_window_and_leaves_the_base_trace_alone() {
+        let ops = 10_000;
+        let plain: Vec<Request> = Workload::with_fanout(2, ops, 1.0, 0.05).collect();
+        let loud: Vec<Request> = Workload::with_fanout(2, ops, 1.0, 0.05)
+            .with_neighbour(0.2)
+            .collect();
+        assert_eq!(base_of(plain), base_of(loud.clone()));
+        let mut base_seen = 0u64;
+        let mut burst = Vec::new();
+        for r in &loud {
+            if r.concurrent {
+                burst.push((base_seen, r));
+            } else {
+                base_seen += 1;
+            }
+        }
+        assert!(
+            burst
+                .iter()
+                .all(|(_, r)| r.tenant == Some(NEIGHBOUR_TENANT))
+        );
+        let inside = (burst.first().map(|b| b.0), burst.last().map(|b| b.0));
+        assert!(inside.0 >= Some(ops * 4 / 10 - 50) && inside.1 <= Some(ops * 6 / 10 + 500));
+        let share = burst.len() as f64 / (0.2 * 0.2 * ops as f64);
+        assert!((share - 1.0).abs() < 0.15, "{share}");
+    }
+
+    #[test]
+    fn sessions_declare_their_tenant_and_a_fresh_stream_another_id() {
+        let trace: Vec<Request> = Workload::with_fanout(2, 3_000, 1.0, 0.1)
+            .with_fresh(0.2)
+            .collect();
+        let tenants: HashSet<u32> = trace.iter().filter_map(|r| r.tenant).collect();
+        assert!(tenants.contains(&FRESH_TENANT));
+        assert!(tenants.iter().filter(|&&t| t < 24).count() > 10);
+        assert!(
+            trace
+                .iter()
+                .filter(|r| r.gang.is_some())
+                .flat_map(|r| r.gang.iter().flat_map(|g| &g.agents))
+                .all(|a| a.tenant.is_some_and(|t| t < 24))
+        );
+        assert!(
+            trace
+                .iter()
+                .filter(|r| r.tokens == 0 && r.gang.is_none())
+                .all(|r| r.tenant.is_none())
+        );
+    }
+
+    #[test]
+    fn a_shared_prefix_is_one_chain_per_model_under_every_tenants_of_that_model() {
+        let plain = Workload::new(2, 100, 1.0);
+        let shared = Workload::new(2, 100, 1.0).with_shared_prefix(true);
+        for t in 0..TENANTS as usize {
+            assert_eq!(plain.tenant_prefix[t].len(), shared.tenant_prefix[t].len());
+        }
+        let ids = |w: &Workload, t: usize| -> Vec<BlobId> {
+            w.tenant_prefix[t].iter().map(|(id, _)| *id).collect()
+        };
+        let k = SHARED_PREFIX_BLOCKS as usize;
+        let (a, b, other) = (ids(&shared, 0), ids(&shared, 4), ids(&shared, 1));
+        assert_eq!(a[..k], b[..k]);
+        assert_ne!(a[..k], other[..k]);
+        assert_ne!(a[k..], b[k..]);
+        assert!(
+            plain.tenant_prefix[0]
+                .iter()
+                .zip(&plain.tenant_prefix[4])
+                .all(|(x, y)| x.0 != y.0)
+        );
+        let first_own = shared.tenant_prefix[0][k].1;
+        assert_eq!(first_own.parent, Some(shared.tenant_prefix[0][k - 1].0));
+    }
+
+    #[test]
+    fn a_shared_prefix_off_is_the_published_trace() {
+        let a: Vec<Request> = Workload::with_fanout(2, 2_000, 1.0, 0.1).collect();
+        let b: Vec<Request> = Workload::with_fanout(2, 2_000, 1.0, 0.1)
+            .with_shared_prefix(false)
+            .with_neighbour(0.0)
+            .collect();
+        assert_eq!(base_of(a), base_of(b));
+    }
+
+    #[test]
+    fn a_neighbour_duty_centres_its_window_and_the_default_is_a_fifth() {
+        let ops = 10_000;
+        let span = |w: Workload| -> (u64, u64) {
+            let mut base = 0u64;
+            let mut seen = (u64::MAX, 0u64);
+            for r in w {
+                if r.concurrent {
+                    seen = (seen.0.min(base), seen.1.max(base));
+                } else {
+                    base += 1;
+                }
+            }
+            seen
+        };
+        let (lo, hi) = span(Workload::with_fanout(2, ops, 1.0, 0.0).with_neighbour(1.0));
+        assert!(lo >= 4_000 - 50 && hi <= 6_000 + 50, "{lo} {hi}");
+        let wide = span(
+            Workload::with_fanout(2, ops, 1.0, 0.0)
+                .with_neighbour(1.0)
+                .with_neighbour_duty(0.6),
+        );
+        assert!(wide.0 >= 2_000 - 50 && wide.1 <= 8_000 + 50, "{wide:?}");
+        assert!(wide.1 - wide.0 > 5_500);
     }
 }

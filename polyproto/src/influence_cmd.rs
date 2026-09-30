@@ -80,25 +80,25 @@ fn cell(r: &ArmRun) -> Cell {
 #[derive(Default)]
 struct Baselines(HashMap<(u64, Regime, usize), Cell>);
 
-fn change(base: f64, x: f64) -> f64 {
+pub(super) fn change(base: f64, x: f64) -> f64 {
     100.0 * (x - base) / base.abs().max(f64::MIN_POSITIVE)
 }
 
-fn seeds_of(values: &[f64], unit: &str) -> String {
+pub(super) fn seeds_of(values: &[f64], unit: &str) -> String {
     let joined: Vec<String> = values.iter().map(|v| format!("{v:+.2}")).collect();
     format!("{}{unit}", joined.join(" / "))
 }
 
-fn plain_seeds(values: &[f64], places: usize, unit: &str) -> String {
+pub(super) fn plain_seeds(values: &[f64], places: usize, unit: &str) -> String {
     let joined: Vec<String> = values.iter().map(|v| format!("{v:.places$}")).collect();
     format!("{}{unit}", joined.join(" / "))
 }
 
-fn section(title: &str) {
+pub(super) fn section(title: &str) {
     println!("\n{title}");
 }
 
-fn identical(a: &ArmRun, b: &ArmRun) -> bool {
+pub(super) fn identical(a: &ArmRun, b: &ArmRun) -> bool {
     a.t.samples == b.t.samples
         && a.total == b.total
         && a.served == b.served

@@ -27,7 +27,8 @@ only one is a moat:
 
 This document is about coupling tier 2, specifically the ledger. By default the ledger also
 allocates the engine's KV, which `owned-and-observed.md` §1 disclaims; `--engine-cache` is the
-corrected side, and *Engine allocation* says what it changes.
+corrected side, and *Engine allocation* says what it changes. `--fleet` (Phase 6) takes weights out
+of the ledger too: a model is a placement, and *Fleet* says what that adds.
 
 ## The model
 
@@ -196,6 +197,14 @@ an engine-allocated entry. Phase 3 adds none -- every engine-cache path is reach
 `#[deprecated]` fires once per named item, so a dispatcher's one call to its census-marked sibling
 is one warning no matter how many external callers route through the dispatcher.
 
+**Under `--fleet`, two cells change.** A model's bytes in host DDR or on `NVMe` are a file in a node
+agent's cache that no engine allocates, so `(WeightShard, Ddr | Nvme)` answers `Orchestrator` on
+both questions (`own::authority_in`), and the tier axis discriminates on the allocation question for
+the first time. `(WeightShard, Hbm)` stays `Engine` on allocation: which model a node loads is its
+capacity question, already the orchestrator's. Nothing in the ledger reads those cells, since under
+a fleet no weight reaches it: the `WeightShard` row of the dynamic census is zero, as `KvBlock`'s is
+under `--engine-cache`. `polyphonic ownership` still prints the published table.
+
 **`machine.rs`'s share is 0, and this is a real finding, not an artifact of the counting
 mechanism.** Every ledger read the scheduler makes is a residency or cost *query* --
 `Telemetry::resident`/`held`, `ground_truth_holds` on the execution path, `local_ns`,
@@ -273,6 +282,28 @@ linear term, and it diverges only where placement starts to matter. The cap keep
 saturated node expensive rather than infinite, so a cluster where every node is full still
 has an argmin. This is the same move as pricing displacement, applied to engine slots instead
 of memory: a cost that someone else pays, charged to the request that causes it.
+
+### A batch per model
+
+The engine above batches every sequence on a node together, whichever model it decodes. A step reads
+each resident model's weights once, so a node with `k` models in flight and `n` sequences in all
+pays `k × STEP_BASE_NS + (n - k) × STEP_PER_SEQ_NS` a round: `--model-batches` keeps a batch per
+model, the batches take turns, and saturation is per model. With one model it is the shared engine
+to the digit (the gate); with four it is what the published node was hiding. `blind` leaves the
+score unaware of it and `priced` puts the model in the `engine` and `congestion` terms. A replica
+under `--fleet` sets its own step base, `STEP_BASE_NS × bytes / 1 GiB`, and its partition is
+what its weights leave of the node's HBM, asserted at every load.
+
+### Prefill as engine time
+
+The engine also charged nothing for prefill, so a rebuild cost its request latency and nobody else
+anything. `--prefill-time` reports each KV dispatch's rebuild to the engine it ran on and stretches
+a decode admitted at `t` by `1 / (1 - ρ)`, `ρ` being that engine's prefill work over the trailing
+window (1 s by default) less what a step carries for free (`--prefill-free`, none by default). The
+score's `prefill` term is the sequences in flight times the prefill work the allowance cannot
+carry, so with an allowance that carries every load it is zero and the run is identical to prefill
+off (the gate). The window is modelled; the pre-measured sweep over 250 ms, 1 s and 4 s is in
+`phase-6.md` §1.10.
 
 ## Policy
 
@@ -1309,6 +1340,109 @@ net work the same as the bump does (+0.4% to +7.9% at 25-76% false hints), and w
 an inflated priority indefinitely. With false hints the two differ by -4.4 to +5.3 points in both
 directions.
 
+### Fleet: weights, replicas, pairing and tenants
+
+`phase-6.md`, implemented. `polyphonic fleet` runs every section below on seeds 1-3, with no
+control crossing charged and `scored + fetch` at rack unless stated; every figure is one value per
+seed or a range and carries its rate and its replicas per model. Eight replicas means eight of the
+published node (4 GiB HBM, 8 GiB DDR, 16 GiB `NVMe`) on the four published models, at 500 req/s
+unless stated, which is the published rate per node.
+
+**A batch per model.** On the `belief` cluster (4 nodes, 250 req/s), a batch per model with the
+weights cached per request costs mean service **+278.7 / +263.4 / +270.3%** with the score blind to
+it and **+250.0 / +241.1 / +248.0%** with it priced, at the published partition; four models are in
+flight at 79 / 76 / 77% of the priced arm's admissions. Pricing the batch recovers 21-29 points and
+finds no placement. One model per node -- the partition the weights leave, 3 GiB -- is **+0.22 /
+-0.10 / -0.19%** of the published engine and **-71.4 / -70.7 / -71.3%** of the lazy arm; at half
+the published grant with decode output held it is -0.27 / -0.61 / -0.70%, because the published
+engine preempts 10.5 / 12.4 / 11.1% of requests there and the fleet none. The partition's size and
+the connector's offload grant are second-order on a placed fleet: the derived partition against the
+published grant is within 0.13%, and the grant from nothing to 1.6 GiB moves service by at most 0.1%
+at 8 and at 4 GiB of DDR per node while the function warm rate falls from 63 / 61 / 56% to 40 / 29 /
+32% at 4.
+
+**Routing.** `scored + fetch` over `hash only` on the published engine is -16.4 / -32.1 / -24.8% at
+500 req/s and -58.9 / -65.7 / -62.3% at 700, the same within a point on eight replicas of one
+model. With four models at two replicas each it is a function of where the replicas sit: over eight
+rotations of one placement and three seeds the lead runs from -2.7% to -63.4% at 500 req/s and
+-25.5% to -78.9% at 700, while the scored arm does not move by 0.1 ms. The knee is per model: at 700
+req/s the placed fleet's scored arm is 10-25% slower than the published engine.
+
+**The clock.** Eight nodes, 500 req/s, 240 s, demand by model 55 / 25 / 12 / 8% with the hot model
+rotating one place each phase. Mean service, seeds 1 / 2 / 3: the published engine 456.7 / 454.1 /
+454.3 ms; a placement that is always right, with no start time, +0.5 / +0.6 / +0.5%; with a start
+of 2, 8 and 30 s, +1.0 / +1.2 / +1.0%, +7.2 / +6.8 / +6.9% and +82.0 / +76.8 / +81.1% more; 10 s
+late (8 s start) +18.6 / +16.9 / +19.2% more than on time and 30 s late +117.9 / +109.6 / +120.3%; a
+placement made once 6.6 / 6.2 / 6.5 s with 52% of decodes arriving at a full batch. A load is its
+start time plus the cheapest copy -- 43 ms from the node's own agent cache, 344 ms from a peer at
+rack, 8 s cold -- and the node drains its in-flight sequences first. The rent-or-buy planner
+(`follow`: move when the loss suffered pays for the move) makes 11 moves, lands +8.5 / +9.6 /
++8.5% over the clairvoyant placement with the same start and 92% under a placement made once, and
+writes the record tier 0.046 times a second; `eager` makes the same 11 moves here, because every
+shift of this mix puts a model past its knee. With models of 0.5 / 1 / 1 / 2 GiB at equal demand
+the cost function puts 1 / 2 / 2 / 3 replicas of eight, `follow` gets there in one move and is
+-30.3 / -23.9 / -36.3% against two replicas a model, and `eager` makes 16-27 moves and is 4.5-6.9%
+slower than `follow`. Its lateness is the price: `follow` at a 1, 5 and 15 s interval is +3.6,
++8.5 and +55.6% over the clairvoyant placement.
+
+**Prefill as engine time.** Prefill taking engine time costs the `belief` cluster **+13.1 / +13.0 /
++13.3%** of mean service with the score pricing it (**+17.5 / +17.1 / +17.4%** blind) at the
+published partition and +63.4 / +76.3 / +65.0% (+67.9 / +81.4 / +72.2% blind) at half with decode
+output held, preemption rising from 10.5 / 12.4 / 11.1% to 23-26%; a 1 ms allowance a step leaves
++0.3 to +0.6%. Prefill-ahead under it costs +2.9 / +2.6 / +2.7% of service and keeps the flow
+downstream's stall -56 / -57 / -56%, where it had cost nothing. On eight replicas at two a model it
+is +16.6 / +16.2 / +15.3%, about five points of which are keying (unkeyed and blind to it, +12.8 /
++11.9 / +11.7%, against +17.4 / +17.0 / +16.0% keyed): an agent on another model than its parent's
+(48-49% of them) rebuilds the parent's context, which adds **+32.0 / +26.7 / +27.5%** to prefill
+work and +4.8 / +4.3 / +3.5% to service on the `belief` cluster.
+
+**Prefill and decode.** Eight replicas of one model against eight aggregated, `joint` pairing,
+seeds 1 / 2 / 3. At 300 req/s on the published mix (aggregated decodes stretched 5.0 / 5.1 / 5.1%)
+one prefiller in eight is -1.7 / -1.7 / -1.6%, two +0.2%, three +3.7%, four +10%; at 500 req/s
+(8.5 / 8.9 / 8.7%) -2.3 / -2.6 / -2.3%, then +10-14%, +104-107% and +610-630%. With fresh 64-block
+prompts at 0.15 a request the best split at 300 req/s is two in eight, -9.6 / -9.7 / -9.8%, three
+-7.2 / -7.3 / -7.4%, one +2.5% (it pairs 24% and its prefiller waits 450 ms); at 500 req/s one is
+-3.8 / -5.3 / -5.6% and three +127-134%. A list pairing every prefill is +3,526 / +3,585 / +3,575%
+at one in eight on fresh prompts and -6.5% at three; over 10 ms it pairs a third of the decisions
+on fresh prompts and 7-8% on the published mix. A prefiller does 1.9 times the work it replaces at
+one in eight and a list 2.4-2.7 times; letting it fetch the prefix brings that to 1.1 for about two
+points. A planner's second pass ends at 2 / 2 / 2, 3 / 3 / 3 and 0 / 0 / 0 prefillers in the
+published 300, fresh 300 and fresh 500 cells. The fresh stream stretches aggregated decodes 13.0% at
+300 req/s, lighter than the 22% it was predicted on.
+
+**Tenants.** On the `belief` cluster no block is touched by two tenants (0 of 384,159 / 413,463 /
+405,143 touches); the tenant prefix carries 52 / 57 / 56% of reads at a 93 / 91 / 92% hit rate and
+80 / 82 / 82% of hits; another owner's request causes 88.6 / 90.0 / 89.6% of GPU evictions; the
+busiest tenant's hit rate is 76 / 75 / 79% and the quietest twelve of twenty-four's 54 / 63 / 59%
+(40 / 44 / 42% at half the partition). A prefix per model under every tenant's puts 9.3 / 10.2 /
+9.8% of touches across tenants, raises the quietest twelve's hit rate 2-3 points at the published
+partition and 5-8 at half, and moves mean service by at most 0.5 ms. A tenant sending fresh
+64-block prompts for a fifth of the run, on eight replicas at 500 req/s, costs the others in the
+burst, against the shared fleet with no burst:
+
+| at 0.1 and 0.2 of the request rate | prefill free | prefill takes engine time |
+|---|---|---|
+| shared | +1.3% and +2.7% | +11.1 / +10.4 / +11.2% and +61.5 / +55.5 / +53.0%; p99 +12% and +94-112% |
+| 1 of 8 replicas the neighbour's | +1.1% and +1.9% | +3.0% and +3.0%; nothing outside the burst |
+| 2 of 8 | +1.3% and +2.5% | +8.0% and +8.1%; +12-14% outside the burst |
+| quota 0.25 engine-seconds a second | | +1.9% and +1.4%; refuses 79% and 90% of the neighbour's |
+| quota 0.5 | | +3.5% and +2.9%; refuses 58% and 79% |
+| quota 1.0 | | +9.0% and +8.3%; refuses 17% and 59% |
+
+At 300 req/s the shared burst costs +0.8% and +1.6% free and +4.8% and +11.7% priced, and two of
+eight +1.7% outside the burst. Over the whole run, varying the share of it the neighbour bursts for
+(0.2 of the request rate, priced): a replica set is level with the quota at 1.0 engine-seconds a
+second or ahead of it at every share from 5% to 100% -- +3.5 / +4.3 / +4.5% against +20.5 / +19.7 /
++19.7% at all of it, shared +134 / +129 / +145% -- and a quota a quarter of that is ahead of the set
+by refusing 80-90% of the neighbour's prompts. A cap on sequences in flight per tenant refuses
+16-27% of the others' requests and is a row about survivors. A tenant floor in the engine's block
+manager -- each tenant's KV kept from other tenants' evictions down to a 24th, 12th or 6th of the
+partition -- moves any tenant group's mean service by at most 0.09% with prefill free and 0.29%
+taking engine time at the published partition, raising the quietest twelve's hit rate by 5-10
+points; at half the partition with prefill taking engine time the quiet half gain 0.2-1.8%. Lazy
+weight loads run 3.9 / 4.5 / 3.2 a second on the `belief` cluster and scored decisions 306-308 a
+second at 250 req/s.
+
 ## Method
 
 **On the fairness caveat.** Every comparison above between arms this repository wrote is a delta
@@ -1400,8 +1534,9 @@ the decision loop.
 
 [`owned-and-observed.md`](owned-and-observed.md) is the design this ledger is being corrected
 toward: what the orchestrator *owns*, *infers* and only *observes*, the data path, the workload
-taxonomy in [`taxo.md`](taxo.md) as a scheduler input, and the phase plan (§9 there). Phases 0-5
-and 8 are built, and their results are above. Phase 6, macro authority, is next.
+taxonomy in [`taxo.md`](taxo.md) as a scheduler input, and the phase plan (§9 there). Phases 0-6
+and 8 are built, and their results are above. Phase 7, learned flows and speculative authority,
+follows Phase 9's cancellation.
 
 ## Not built
 
@@ -1411,7 +1546,9 @@ but exercised by `calibrate` only; the residency experiments run on the calibrat
 rather than moving real bytes. `Topology::discover` probes the host but the host is one
 unified memory domain, so every cross-node constant is modelled and the HBM/DDR split exists
 only in the model. There is no accelerator runtime: KV and weights are sized and priced, never
-computed.
+computed. The fleet has no half-width node, no second engine per node, no per-tenant axis on
+`Quota` for host DDR, and no replica set per tenant; fan-out agents are not paired with a prefiller;
+a replica set is one neighbour's.
 
 ## Standing
 
@@ -1419,16 +1556,16 @@ computed.
 |---|---|
 | eviction priced as expected recovery cost per byte | holds — regret-discounted, recovery from the tier below |
 | admission that refuses rather than overcommits | holds |
-| soft floors beat hard partitions | **holds on split memory (32%), carried by weight residency; ties on unified** -- with the engine allocating KV it grows (36% at 20k, 45% at 60k) and wins on unified too (+7%) |
+| soft floors beat hard partitions | **holds on split memory (32%), carried by weight residency (a lazy cache a placed fleet does not have); ties on unified** -- with the engine allocating KV it grows (36% at 20k, 45% at 60k) and wins on unified too (+7%) |
 | open sharing | worst arm in both memory models |
 | warm microVM cells are the cheapest state to rebuild | holds — 0.21–0.39 ns/byte |
 | cells and KV compete for the same bytes | **unified-memory only** — separate pools in the target |
 | greedy prefix affinity | right at low load, collapses past the knee |
-| scored placement | best arm at every load and distance — **4–6% end to end at moderate load, 38% near the knee**; restated as regret — its heuristic and execution gaps are exactly zero, every ns of its regret is model gap |
+| scored placement | best arm at every load and distance on the published engine — **4–6% end to end at moderate load, 38% near the knee**, and on a fleet of several models a lead that depends on layout (*Fleet*); restated as regret — its heuristic and execution gaps are exactly zero, every ns of its regret is model gap |
 | score adapts sibling co-location to load | holds — 63–66% vs 85–86% for filtered specialists |
 | score adapts tool placement to distance | holds — all calls local across regions, where hashing pays 10× |
 | all-or-nothing fan-out admission | holds where it binds, on the ledger's per-block test and on the router's partition check alike; the **+22%** is sensitive to the control crossing (+2% with none charged) |
-| heterogeneous nodes (model host + agent host) | expressible — per-node memory, decode filter, origin round trip |
+| heterogeneous nodes (model host + agent host) | expressible — per-node memory, decode filter, origin round trip; a fleet of replicas per model, each a node with its own model, step and partition, is the same case |
 | separating the orchestrator from the accelerator | free within a zone (0.16–1.7 ms), **61 ms per turn across regions** |
 | placement policy on that topology | worth 0.7% — the round trip and decode dominate, and no policy moves either |
 | KV state transfer | roughly neutral end to end |
@@ -1457,3 +1594,16 @@ computed.
 | divergence has separable causes | **yes** -- undelivered removals dominate; 1-8% of the no-recovery column is stranded optimistic entries; misses are zero at every sample |
 | a deadline on the ledger's bump | bounded state (no stale entries against 27-852) and 0.8-2.0 points of task latency with honest hints |
 | session reuse is worth retaining for | **by shape yes, by size no** -- reuse returns 3.8x past median residency, and the misses cost 0.2-0.3% of service |
+| a step reads every resident model's weights once, so a batch per model is what a node pays | **holds** -- a four-model node is +241-279% of the pooled engine; pricing it in the score recovers 21-29 points and no placement is found by a score |
+| one model per node at the partition its weights leave | **holds** -- within 0.3% of the published engine at 500 req/s and -71% of the lazy cache; partition size and offload grant move service by under 0.15% |
+| routing's lead over hashing is a count of replicas | **partly** -- equal on the published engine and one model of eight replicas (-15 to -32%); with two replicas a model it depends on layout, -2.7% to -63.4% |
+| a placement has to follow the mix | **holds** -- made once, 6.2-6.6 s of mean service; a 30 s start +77-82% and 30 s late +110-120% over on time |
+| a rent-or-buy planner bounds lateness | **holds** -- +8.5-9.6% over a clairvoyant one, 92% under a placement made once; it makes the same moves as a greedy one on the rotating mix and 1 against 16-27 at equal demand |
+| prefill is engine time | **holds** -- +13-17% of service at the published partition, +63-81% at half; a 1 ms allowance leaves under 0.6%; prefill-ahead then costs +2.7% and keeps -56% stall |
+| KV keyed by model prices a cross-model fan-out | **holds** -- +27-32% prefill work, +3.5-5.1% service under prefill time |
+| disaggregated prefill beats aggregated | **only at one prefiller in eight on the published mix (-1.6 to -2.6%) and two in eight on fresh prompts (-9.6%)**; every larger ratio loses, by 100% or more at three in eight at 500 req/s |
+| a sidecar's list of prefillers | **fails** where the prefiller saturates -- +3,500% at one in eight on fresh prompts; `joint` declines 76% of the pairs there |
+| cross-tenant prefix sharing is the highest-value hit | **retracted** -- zero on the published workload (0 of 384,159 touches); with a prefix per model, 9-10% of touches and no measurable service |
+| a noisy neighbour's damage is cache | **no** -- engine time: +1-3% while prefill is free, +11% to +62% once it takes engine time |
+| a router quota on prefill work isolates a neighbour | **yes** -- +1.9-3.5% to the others against +11% shared; a replica set is the hard version, +3% and nothing outside at one of eight, and ahead of a quota at the same allowance at every duty cycle; a cap on sequences per tenant refuses the others |
+| a tenant-aware block manager is worth asking for | **no at the published partition** (under 0.3% of service for every group), up to 1.8% to the quiet half at half of it |

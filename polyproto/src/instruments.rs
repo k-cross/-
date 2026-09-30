@@ -86,6 +86,94 @@ pub struct ReuseRow {
 }
 
 #[derive(Clone, Debug)]
+pub struct Tenants {
+    origins: Origins,
+    first: HashMap<BlobId, Option<u32>>,
+    requester: Option<u32>,
+    pub touches: u64,
+    pub cross_touches: u64,
+    pub by_origin: Vec<(u64, u64)>,
+    pub per_owner: HashMap<Option<u32>, (u64, u64)>,
+    pub evictions: u64,
+    pub evictions_by_other: u64,
+}
+
+impl Tenants {
+    #[must_use]
+    pub fn new(origins: Origins) -> Self {
+        Self {
+            origins,
+            first: HashMap::new(),
+            requester: None,
+            touches: 0,
+            cross_touches: 0,
+            by_origin: vec![(0, 0); Origin::N],
+            per_owner: HashMap::new(),
+            evictions: 0,
+            evictions_by_other: 0,
+        }
+    }
+
+    pub fn set_requester(&mut self, tenant: Option<u32>) {
+        self.requester = tenant;
+    }
+
+    pub fn read(&mut self, id: &BlobId, hit: bool) {
+        let owner = *self.first.entry(*id).or_insert(self.requester);
+        self.touches += 1;
+        self.cross_touches += u64::from(owner != self.requester);
+        let origin = self.origins.of(id).unwrap_or(Origin::Session);
+        let row = &mut self.by_origin[origin.idx()];
+        row.0 += 1;
+        row.1 += u64::from(hit);
+        let per = self.per_owner.entry(self.requester).or_default();
+        per.0 += 1;
+        per.1 += u64::from(hit);
+    }
+
+    pub fn events(&mut self, events: &[KvEvent]) {
+        for event in events {
+            match *event {
+                KvEvent::Stored {
+                    id,
+                    medium: Medium::Gpu,
+                    mark: None,
+                    ..
+                } => {
+                    self.first.entry(id).or_insert(self.requester);
+                }
+                KvEvent::Removed {
+                    id,
+                    medium: Medium::Gpu,
+                } => {
+                    self.evictions += 1;
+                    let owner = self.first.get(&id).copied().flatten();
+                    self.evictions_by_other += u64::from(owner != self.requester);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn hit_rate_of(&self, tenants: impl Iterator<Item = u32>) -> f64 {
+        let (reads, hits) = tenants
+            .filter_map(|t| self.per_owner.get(&Some(t)))
+            .fold((0, 0), |(r, h), &(tr, th)| (r + tr, h + th));
+        hits as f64 / reads.max(1) as f64
+    }
+
+    #[must_use]
+    pub fn by_volume(&self, among: u32) -> Vec<u32> {
+        let mut ranked: Vec<u32> = (0..among).collect();
+        ranked.sort_by_key(|t| {
+            std::cmp::Reverse(self.per_owner.get(&Some(*t)).map_or(0, |&(r, _)| r))
+        });
+        ranked
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Reuse {
     origins: Origins,
     last_on: Vec<HashMap<BlobId, u64>>,
@@ -253,8 +341,10 @@ pub struct Instruments {
     pub phantom_cause_share: [f64; Cause::N],
     pub miss_cause_share: [f64; Cause::N],
     pub reuse: Option<Reuse>,
+    pub tenants: Option<Tenants>,
     pub flow: FlowDownstream,
     pub prefill: Prefill,
+    pub work_by_origin: [Vec<u64>; Origin::N],
     pub directives: Emitted,
     pub gap_phantom: u64,
     pub gap_miss: u64,

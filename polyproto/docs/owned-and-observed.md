@@ -12,11 +12,12 @@ not about who wrote it; the HTTP itself is a linked library's (§2.6). **Cede th
 path** -- and the second is only defensible because of the first, since routing and cancellation
 are what is left to decide with once allocation is gone.
 
-**Status.** Phases 0-5 and 8 are built and measured; Phases 6-7 and 9-11 are design (§9). Current
+**Status.** Phases 0-6 and 8 are built and measured; Phases 7 and 9-11 are design (§9). Current
 results are in [`residency-ledger.md`](residency-ledger.md); each phase's plan, predictions and
 outcomes are in its own `phase-N.md`. The corrected architecture runs behind bits that are off by
-default -- `--engine-cache` (Phase 3), `--belief` (Phase 4) and `--directives`, `--prefill-ahead`
-and `--retain` (Phase 5) -- so a published number is the ledger's unless it is marked otherwise.
+default -- `--engine-cache` (Phase 3), `--belief` (Phase 4), `--directives`, `--prefill-ahead` and
+`--retain` (Phase 5), and `--model-batches`, `--prefill-time`, `--model-keyed` and `--fleet`
+(Phase 6) -- so a published number is the ledger's unless it is marked otherwise.
 
 **On the numbers.** Four grades of evidence, kept apart:
 
@@ -138,16 +139,16 @@ tests the failure model above by injecting each crash.
 |---|---|---|---|
 | per-blob residency, host classes (`Snapshot`, `ServiceHeap`) | **owned** | soft | `TierPool.entries` |
 | per-blob residency, `KvBlock` | **inferred** | soft | `EngineCache` under `--engine-cache`, read through the event-stream belief under `--belief`; by default the ledger still owns it in `TierPool.entries` |
-| per-blob residency, `WeightShard` | **inferred** | soft | `TierPool.entries` until Phase 6 |
+| per-blob residency, `WeightShard` | **inferred** | soft | `TierPool.entries` by default; under `--fleet` a model is a placement, owned (next row), and no weight reaches the ledger |
 | offloaded KV in host DDR | **inferred** | soft | the connector's LRU tiers under `--engine-cache`; `TierPool.entries` by default |
 | quotas: floors, bands, limits | **owned** | record | `Quota`, operator config |
 | admission outcome, refusals | **owned** | soft | `Admission`, `TierPool.refused`; the router's partition check under `--admit` |
 | gang membership, staged reservations | **owned** | soft; logged when `SideEffecting` | `staged_*`, `cancelled` |
 | retention directives it issued | **owned** | soft | `Entry.retain_until` on the ledger (`--retain`); on the engine a mark on a dispatch, believed once the stream acknowledges it (§3.3) |
 | placement decisions, flow graph | **owned** | soft | `upstream`, `tool_anchor`, `origin` |
-| partition sizes, model placement | **owned** | record | fixed config; a decision in Phase 6 |
+| partition sizes, model placement | **owned** | record | `Fleet` under `--fleet`: a replica per node, its role, and the partition its weights leave, changed by the planner about once in 20 s on the rotating mix (§9, Phase 6) |
 | side-effect intents, suspended sessions, approval pauses | **owned** | logged | **missing** -- §4 |
-| tenant identity and per-tenant quota | **owned** | record | **missing** -- §3.8 |
+| tenant identity and per-tenant quota | **owned** | record | identity declared on `Request`, and the router's two per-tenant meters built (§3.8); the per-tenant axis on `Quota` is **missing** |
 | node liveness and membership | **owned** | record | **missing** -- a lease in the record |
 | shadow price per pool | **inferred** | soft | `TierPool::marginal_price` |
 | regret rate per class | **inferred** | soft | `TierPool::regret_rate`, from a ghost list |
@@ -198,9 +199,9 @@ the table below cuts across it twice:
 
 | class / resource | who owns the bytes | what the orchestrator does |
 |---|---|---|
-| **HBM partition** | **the orchestrator** -- it provisions the engine | decide how much HBM a replica gets, scale replicas, partition the hardware |
+| **HBM partition** | **the orchestrator** -- it provisions the engine | decide how much HBM a replica gets, scale replicas, partition the hardware; a replica is one model on one node and its partition is what its weights leave |
 | `KvBlock` | **the engine** (vLLM's block manager) | observe an approximate index; influence by directive; **route** |
-| `WeightShard` | **the engine**, once loaded | decide which models load where, and when to unload -- slow, coarse, genuinely orchestration (Phase 6) |
+| `WeightShard` | **the engine**, once loaded; the placement is **the orchestrator's** | decide which models load where, and when to unload -- slow, coarse, genuinely orchestration. In host DDR or on NVMe a model is a file in a node agent's cache: owned outright |
 | `Snapshot` | **the orchestrator** -- it starts and stops microVMs | own outright: admit, evict, refuse |
 | `ServiceHeap` | **the orchestrator** -- it scales replicas | own outright |
 | offloaded KV in host DDR | the engine's KV connector (`LMCache`, NIXL) | observe; ownership follows the connector, so assume the engine's |
@@ -213,7 +214,8 @@ what that costs.
 The table has an executable form: `own::authority(kind, tier, question)` in `own.rs` (Phase 1),
 total over every `(BlobKind, Tier)` cell and over both questions -- *capacity*, how big the pool
 is, and *allocation*, which bytes occupy it right now -- since a class alone cannot say which side
-answers which.
+answers which. Under a fleet the two host cells of `WeightShard` answer `Orchestrator` on both
+questions, and the tier axis discriminates on allocation for the first time.
 
 This is a **two-tier control system** for memory: macro authority over the hardware (provisioning,
 partition sizing, model loading) stays with the orchestrator; micro, per-request authority (KV
@@ -380,6 +382,17 @@ partitions, pulling 140 GB of weights, initialising contexts takes 5-30+ seconds
 That gap is the point. Near-instant micro-actions (diversion, backpressure, cancellation) buy the
 time that slow macro-actions (provisioning, weight swapping) need, which is what makes the two-tier
 model viable.
+
+**The gap has a number (Phase 6).** A replica that changes model serves nothing for its start time
+and the copy of its weights -- 344 ms from a peer, 43 ms from its own agent's cache, 8 s cold --
+and leaves the node's KV behind. On eight nodes at 500 req/s under a rotating model mix, a placement
+that is always right costs +0.5% over the pooled engine; one whose loads take 2 s costs +1.0% more,
+8 s +7% and 30 s +77-82%; one that is 10 s late costs +17-19% more than one that is on time and 30 s
+late +110-120%. A placement made once collapses: 6.2-6.6 s of mean service and half the decodes
+arriving at a full batch. A planner that moves when the loss suffered pays for the move lands
++8.5-9.6% over the clairvoyant one, and its lateness is the whole of the difference: +3.6% at a 1 s
+interval, +56% at 15 s. So the start time is the number worth asking a serving stack for, and the
+planner is a bound on lateness.
 
 **Freshness matters little, for a structural reason.** Under `--belief`, mean service stays within
 0.16% of the exact view at every point measured -- up to 20% batch loss with no recovery, with the
@@ -589,6 +602,33 @@ loss, and avoidable by construction.
 An orchestrator picks the pair and sets the ratio; a sidecar picks a prefiller from a list. That
 difference is a **coupling-tier-2** joint decision, and coupled % (§3.4) sizes it.
 
+**Measured (Phase 6).** Eight replicas of one model, `--prefill-time` on, against eight aggregated.
+Three things §2.5's statement leaves out:
+
+- **A prefiller needs its prefix.** A session's next turn is four new blocks at the decoder that ran
+  the last one and the whole chain at a prefiller that did not, so the prefill tier duplicates the
+  cache as well as the compute: a prefiller does 1.9 times the work it replaces at one in eight on
+  the published mix, and a list, which scatters a session's turns, 2.4-2.7 times. Letting a
+  prefiller fetch the prefix from the decoder brings it to 1.1 and buys about two points.
+- **Not pairing is an option of the same argmin.** `joint` pairs when the prefiller's queue, its
+  work, its toll and the transfer are under what the prefill costs at the decoder, which includes
+  every sequence in flight there. A list pairs every prefill, and its prefiller is past saturation
+  at every ratio `joint` prefers: +3,500% at one in eight on fresh prompts, where `joint` declines
+  76% of the pairs.
+- **The right ratio moves with the mix and with the load.** On the published mix `joint` at one
+  prefiller in eight is 1.6-1.7% faster at 300 req/s and 2.3-2.6% faster at 500, and every larger
+  ratio loses (+104-107% at three in eight at 500 req/s). With fresh 64-block prompts at 0.15 a
+  request and 300 req/s the best split is two in eight, 9.6-9.8% faster, and three in eight
+  7.2-7.4%; at 500 req/s one in eight is the only split that wins. A planner's second pass ends at
+  2, 3 and 0 prefillers in the cells where one, two and one were best, and lands within 1-6 points
+  of the best static split in each.
+
+Coupled % between `joint` and `independent` is 83-96% when `independent` pairs only prefills over
+10 ms and 4-20% when it pairs them all: the quantity is a property of the threshold a pairing rule
+was handed. The fresh-prompt stream is a lighter load than the one the ratio was first predicted
+on (decodes stretched by 13% where 22% had been measured), so the fresh rows are sizes for that
+stream.
+
 ### 2.6 What this gives up
 
 First, what it does not. **"Integrated" is a claim about the process boundary, not about
@@ -692,7 +732,8 @@ this workload's decision rate, against ~1000 for a warm WASM hook (§5).
 Ordered by what makes the rest trustworthy: the boundary first (3.1), then the estimates that
 replace declarations (3.2-3.3), then the apparatus that makes any of it measurable (3.4-3.6), then
 confidence and tenancy (3.7-3.8), and three smaller points (3.9-3.11). Built: 3.1, 3.3, 3.4, 3.5,
-3.6, 3.7, 3.11 and 3.10's term. Open: the flow estimator in 3.2 (Phase 7) and 3.8 (Phase 6).
+3.6, 3.7, 3.11, 3.10's term, and 3.8's measurements (Phase 6). Open: the flow estimator in 3.2
+(Phase 7) and the per-tenant axis on `Quota` in 3.8.
 
 ### 3.1 A `Telemetry` boundary
 
@@ -972,7 +1013,7 @@ been worth. Calling it impossible would be wrong; assuming it available would be
 
 | | one shared partition | a partition per tenant |
 |---|---|---|
-| cross-tenant prefix sharing | **yes**, the highest-value hit in this workload -- teams share system prompts and company context, which is why `work.rs` gives each tenant a shared prefix | no |
+| cross-tenant prefix sharing | **a price only where something is shared.** `work.rs` roots each tenant's prefix at its own block, so on the published workload no block is touched by two tenants (0 of 384,159 touches) and the price is zero; with a prefix per model under every tenant's, 9-10% of touches cross tenants and the hit rate rises 2-3 points for no measurable service | no |
 | batch occupancy | one wide batch, `step_ns` amortised across tenants | fragmented; each tenant pays the weight-read floor |
 | noisy-neighbour isolation | **none**; LRU is tenant-blind | enforced by construction |
 
@@ -1004,11 +1045,39 @@ per model is a **replica**, which makes tenancy a question of *which tenants sha
 -- a routing and capacity decision, in §2.4's provisioning tier, and the reason Phase 6 settles
 isolation and sizing in one act rather than two.
 
-**The quota axis is missing.** `Quota` is per *class*: `band`, `floor` and `limit` are all
-`[_; BlobKind::N]`. Soft tenancy needs a second axis per tenant, and the two interact the standard
-way -- when a tenant is over quota and an under-floor class wants its bytes, one has to yield. The
-workload already carries tenants; the ledger does not. Same generator-side / scheduler-side split
-§4 describes for the taxonomy, same fix.
+**Measured (Phase 6): "no hint-shaped workaround" holds for the cache and not for compute.** The
+engine's cache is where §3.8 said it would be unfair -- 12-22 points of hit rate separate the
+busiest tenant from the quietest twelve of twenty-four, and another owner's request causes about
+90% of GPU evictions -- and it is not where a neighbour's damage lands. A tenant sending fresh
+64-block prompts for a fifth of the run costs the others +1-3% while prefill is free and +11% to
++62% once prefill takes engine time, at 500 req/s on eight replicas of one model: the damage is the
+steps its prefills lengthen, and every prefill is a dispatch the router makes. So the router is the
+arm for compute:
+
+- **A quota on prefill work at the router** refuses the neighbour's excess -- 79% at 0.25
+  engine-seconds a second, 58% at 0.5, 17% at 1.0 -- and costs the others +1.9%, +3.5% and +9.0%
+  in the burst against +11% shared, and nothing outside it.
+- **A replica set** costs the others a replica's decode slots: one of eight +3% in the burst and
+  nothing outside it, two of eight +8% and +12-14%, since six replicas are past the published
+  load's knee. At the same allowance the set is ahead of the quota or level with it at every share
+  of the run the neighbour bursts for, from 5% to 100% (+3.5-4.5% against +20% at all of it): a
+  quota admits its engine-seconds wherever they land, and a set confines them to one replica.
+- **A cap on sequences in flight per tenant** cannot tell a neighbour from a busy tenant: it refuses
+  16-27% of the others' requests.
+- **A second engine on the node** remains the worst instrument, on the pre-measurement's +91-96%.
+
+The tenant-aware block manager §3.8 anticipates as promotion tier 2 was built as a ceiling, a
+per-tenant floor in the engine's eviction: at the published partition it moves any tenant group's
+mean service by at most 0.3% while raising the quietest twelve's hit rate by 5-10 points; at half
+the partition with prefill taking engine time the quiet half gain 0.2-1.8%. That is the regret
+number to ask with, and it is small where the partition is not tight.
+
+**The quota axis is missing on the ledger and built at the router.** `Quota` is per *class*:
+`band`, `floor` and `limit` are all `[_; BlobKind::N]`. Soft tenancy needs a second axis per tenant,
+and the two interact the standard way -- when a tenant is over quota and an under-floor class wants
+its bytes, one has to yield. A request now declares its tenant, as it declares its `slo`, and the
+router meters prefill work and sequences in flight per tenant; host DDR's `Snapshot` and
+`ServiceHeap` still have no tenant axis, and no measurement says it binds.
 
 One reframing falls out. The soft-floors-beat-hard-partitions result **is** this argument in
 miniature: a soft floor lets a class borrow idle capacity where a hard partition strands it, which
@@ -1237,18 +1306,29 @@ whoever fills it.
    a declared flow's downstream prefilled when its hint arrives.
 10. **Joint prefill/decode pairing and ratio.** Disaggregation as a two-member gang with a
     direction, plus the fleet ratio behind it (§2.5). A sidecar picks a prefiller from a list.
+    Measured (Phase 6), it is worth 1.6-2.6% at one prefiller in eight on the published mix and
+    9.6-9.8% at two in eight on fresh prompts, and the same split costs +104-107% at three in eight
+    at 500 req/s: the property is that the ratio is a function of mix and load, and that declining
+    to pair is the decision a list cannot make.
 11. **Tenant fairness across a tenant-blind engine.** An engine evicts LRU and cannot see tenants,
     and a partition is physically an engine -- so isolation is paid in a duplicated copy of the
     weights as well as in lost prefix sharing and batch width (§3.8). That makes it a *capacity*
     decision, not a policy toggle, and only a component that both sizes partitions and routes into
     them can make the trade deliberately: shared where prefixes overlap and load shapes are
     compatible, separated where one tenant is bursty enough to evict the others and the HBM exists
-    to pay for it. A siloed router can only pick one side in advance.
+    to pay for it. A siloed router can only pick one side in advance. Measured (Phase 6), the damage
+    is engine time and not cache, so the cheaper arm is the router's quota on prefill work
+    (+1.9-3.5% to the others where sharing costs +11%), with a replica set the hard version of it,
+    and the engine-side floor a ceiling worth under 1% at the published partition.
 12. **Two-dimensional coupling as a published quantity.** Not an advantage but the measure of one.
 
 Plainly: the largest defensible effects are **topological dataflow co-placement**,
 **macro-orchestration of weights, partitions and gangs**, and **targeted host DDR multiplexing** --
-not cross-hardware arbitration of HBM bytes. Once the orchestrator stops pretending it allocates KV
+not cross-hardware arbitration of HBM bytes. Macro-orchestration of weights has a size and a
+condition (Phase 6): one model per node at the partition its weights leave is within 0.3% of the
+pooled engine and 71% ahead of weights cached per request with a batch per model, and it holds only
+while the placement follows the mix -- a placement that is late by 30 s costs 110-120% more than
+one that is on time. Once the orchestrator stops pretending it allocates KV
 blocks, what remains is a system solving three problems existing stacks fail at: joint dataflow
 placement across network boundaries, macro capacity and gang coordination, and authority-aware
 speculative execution. Phase 3 showed the first two survive the correction; Phase 7 tests the third.
@@ -1375,11 +1455,12 @@ Worst first.
    - **Goodput as an outcome.** Refusals for inference move to the router, so the numbers change
      shape even where they do not change size: router refusals and engine preemptions are counted
      apart and never summed.
-2. **Tenant fairness on KV goes with it** (§3.8). LRU is tenant-blind, so a noisy neighbour on a
-   shared partition is unpreventable, and isolation costs a partition -- which is an engine, which
-   is a second copy of the weights. The only cheaper answer is an upstream one: per-tenant eviction
-   floors are bookkeeping over block hashes, not model internals, so they are askable at promotion
-   tier 2 once there is a regret number to ask with.
+2. **Tenant fairness on KV goes with it** (§3.8). LRU is tenant-blind, so a noisy tenant's eviction
+   of another's blocks is unpreventable inside the engine, and a partition is an engine, a second
+   copy of the weights. Measured, it matters less than it reads: the damage a neighbour does is
+   engine time, which the router can meter, and per-tenant eviction floors -- bookkeeping over
+   block hashes, askable at promotion tier 2 -- are worth under 0.3% of service at the published
+   partition and up to 1.8% to the quiet half where the partition is tight.
 3. **Displacement becomes an externality, not a decision.** Routing still *causes* the engine to
    evict; the orchestrator does not choose what. The term stays in the score as an estimate from
    observed eviction pressure -- noisier and lagged. §3.7 covers that only partly: the turnover
@@ -1408,9 +1489,11 @@ Worst first.
   or refusal. Modelling vLLM means modelling *less* policy, not more.
 - **Model agnosticism becomes checkable.** Once the orchestrator cannot see inside the engine, the
   interface it consumes is small enough to write down: capacity, hit/miss/eviction counts, queue
-  depth, load and unload cost per model, declared context window, a directive channel, and
-  **request cancellation**. Anything beyond that list is a model-specific dependency, and the
-  compiler enforces the list.
+  depth, load and unload cost per model, declared context window, a directive channel, and **request
+  cancellation**. As built, the catalogue states a model's size, its start time and its context
+  window; a load costs the start time plus the cheapest copy, and a replica's window is the smaller
+  of the model's and what its partition holds. Anything beyond that list is a model-specific
+  dependency, and the compiler enforces the list.
 
   Cancellation is listed apart from the directive channel because it is the one entry that is not
   advisory. A retention directive the engine ignores costs a worse placement, and §3.6 counts it;
@@ -1419,13 +1502,13 @@ Worst first.
   asked to stop is one this design cannot schedule priorities on.
 
   Context window earns its place because it is *declared metadata*, like size and load time, and
-  Phase 6's heterogeneous fleet needs it: dispatching a 200k-token prompt to a 32k model produces a
+    Phase 6's fleet uses it: dispatching a 200k-token prompt to a 32k model produces a
   failure and a retry costing more than the placement saved. It also marks where the list stops.
   Routing by **model accuracy** needs per-model, per-workload evaluation, which is model-specific by
   definition and is what §1 gave up KV ownership to avoid. A capability *gate* is in scope; a
   quality *ranking* is not, and the test is whether the engine can state the fact about itself.
 - **Weights become orchestration rather than caching** (Phase 6) -- more realistic, and a
-  capability no arm has today.
+  capability no arm has today; the ledger never sees a weight again under `--fleet`.
 
 ### The system of record
 
@@ -1582,7 +1665,7 @@ run, and what was measured; the current numbers are in the ledger.
 | [3](phase-3.md) | the engine allocates; the orchestrator sizes the partition (`--engine-cache`) | done | ceding allocation moves mean service by -0.2% where decode dominates; budgets survive and grow, per-block authority does not (§1) |
 | [4](phase-4.md) | belief, not truth: lossy telemetry and `P(resident)` (`--belief`) | done | within 0.16% of the exact view at 20% batch loss with no recovery |
 | [5](phase-5.md) | influence: retention directives, prefill-ahead, divergence by cause (`--directives`, `--prefill-ahead`, `--retain`) | done | an oracle's retention directives buy at most 1.4% of stall; a prefill of a declared downstream buys 24-28% of task latency where `announce` bought 10-18% |
-| 6 | macro authority: weight placement, partitions, disaggregated prefill/decode, tenancy | planned | |
+| [6](phase-6.md) | macro authority: weight placement, partitions, disaggregated prefill/decode, tenancy (`--model-batches`, `--prefill-time`, `--model-keyed`, `--fleet`, `--planner`, `--pairing`, `--neighbour`) | done | one model per node is within 0.3% of the pooled engine and a late placement is the whole price (30 s start +77-82%); a pair wins 1.6-2.6% at one prefiller in eight and loses past it; a router quota beats sharing against a neighbour |
 | 7 | learned flows, speculative authority, sessions that suspend, the taxonomy | planned | |
 | [8](phase-8.md) | the data path as an arm | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
 | 9 | enforcement: cancellation on the path, and two-tier admission | planned | |
@@ -1595,41 +1678,48 @@ sequence.
 
 ### Phase 6 -- Macro authority: placement, partitions, prefill/decode, tenancy
 
-Implementation plan: [`phase-6.md`](phase-6.md), which states its predictions before the run.
+Plan, predictions and outcomes: [`phase-6.md`](phase-6.md). **Status:** built and measured, behind
+`--model-batches`, `--prefill-time`, `--model-keyed` and `--fleet` with their planner, pairing and
+tenancy bits; current numbers are in the ledger's *Fleet* section. The slow, coarse,
+orchestrator-owned decisions -- §2.4's provisioning tier, and between them everything Phase 3
+froze -- are also the decisions the system of record holds (§8).
 
-The slow, coarse, orchestrator-owned decisions -- §2.4's provisioning tier, and between them
-everything Phase 3 froze. These are also the decisions the system of record holds (§8).
+The phase is two corrections to the engine and three decisions.
 
-Weight shards stop being per-request cache entries: the orchestrator decides which models load
-where on a slow timescale, with load and unload costs, through a model-agnostic interface (size,
-load time, context window, no internals). **HBM partition sizing stops being a fixed input**, since
-a node's partition budget and its resident model set are one allocation made twice.
+**The engine's two corrections.** The published engine decoded four models in one batch and
+charged prefill nothing, so neither placement nor pairing had anything to act on.
 
-**Prefill and decode become separate engines** (§2.5). The simulator runs both on one engine today,
-so neither half of disaggregation has anything to act on. With them split, **per-request pairing**
-is a two-member gang with a direction -- one placement over a pair, all-or-nothing, the transfer
-priced by `Topology` -- and the **P:D replica ratio** is the fleet decision behind it, bound by
-different resources at each end, so the ratio serving a long-prompt mix starves an agent mix.
+- **A batch per model.** A step reads each resident model's weights once, so a node decoding four
+  models pays four reads a round: a four-model node is +241-279% of the pooled figure, and pricing
+  the batch in the score recovers 21-29 points of it. No score finds the placement that avoids it.
+- **Prefill takes engine time.** A prefill stretches the decodes it overlaps, by 13-17% of mean
+  service at the published partition and 63-81% at half of it. Prefill-ahead keeps its stall
+  saving (-56%) and costs +2.7% of service. KV keyed by model adds 27-32% to prefill work where a
+  fan-out crosses models, which is 48-49% of its agents.
 
-**Tenancy constrains all of it** (§3.8). Because engine eviction is tenant-blind, how many
-partitions exist and who shares one *is* the fairness policy -- and because a partition is
-physically an engine, each extra one spends HBM on another copy of the weights. That is why
-isolation and capacity are decided in one act here rather than as separate knobs. It also adds the
-missing per-tenant axis to `Quota`, which is per-class only.
+**Three decisions.**
 
-These decisions are the record tier's writers, so Phase 6 extends Phase 10's count with them:
-partition resizes, placement changes, tenancy and quota edits.
+- **Placement.** Weights leave the ledger: a replica is one model on one node, the KV partition is
+  what the weights leave, and a model's load costs its start time and a copy. One model per node is
+  within 0.3% of the published engine and 71% ahead of the lazy cache. The clock is the result
+  (§1's *Two control loops, two clocks*): a planner that moves by rent-or-buy lands +8.5-9.6% over
+  a clairvoyant one, and three model sizes move the allocation to 1 / 2 / 2 / 3 replicas of eight
+  with a saving of 24-36% against an even split.
+- **Pairing and ratio** (§2.5). `joint` pairing with an unpaired option beats a list everywhere it
+  is unsafe, and the ratio is one or two in eight depending on mix and rate.
+- **Tenancy** (§3.8). Cross-tenant prefix sharing is zero on the published workload; a neighbour's
+  damage is engine time; the router's quota on prefill work is the arm and a replica set the hard
+  version of it; a tenant-aware block manager is worth under 0.3% at the published partition.
 
-- **Deliverable:** a result no arm can produce today -- a heterogeneous fleet serving several model
-  types under a shifting request mix -- plus two arms: joint P/D pairing and ratio against a
-  sidecar-style pick of a prefiller from a list (coupled %, §3.4, sizes the difference), and shared
-  partitions against per-tenant partitions under a bursty neighbour, reporting isolation's cost on
-  all three prices §3.8 names -- cross-tenant prefix hits, batch width, and the HBM spent
-  duplicating the weights. The third is what makes this a capacity result rather than a policy
-  toggle.
-- **Risk:** needs a workload with a realistic model mix, which `taxo.md` supplies, and a
-  prompt/output-length mix with some shape, since the ratio only moves when the mix does.
-  **Size:** large, separable into increments -- weights and partitions, disaggregation, tenancy.
+The decisions are the record tier's writers, and the planner's are counted: 0.046 a second on the
+rotating mix.
+
+- **Not built:** the per-tenant axis on `Quota` for host DDR, a second engine per node (still
+  §3.8's +91-96% pre-measurement), a replica set per tenant, and a half-width node, so the regime
+  in which a partition binds on a placed fleet is not reached.
+- **Open:** whether `--model-batches` and `--prefill-time` become the default. They move every
+  published cluster number, which the other bits did not, so they stay off and the published
+  results stay the ledger's, read as a fleet of one model.
 
 ### Phase 7 -- Learned flows, speculative authority, and the taxonomy
 
@@ -1681,8 +1771,10 @@ mean, and throughput work the designated victim, cancelled to make room.
 magnitude apart, and soft state can be rebuilt rather than stored.
 
 - **The per-tier count.** Owned-state changes per tier per simulated second, from counters the
-  runs mostly already keep. Today only the soft tier has writers; Phase 6 adds the record tier's
-  and Phase 7 the logged tier's, and each extends the count.
+  runs mostly already keep. Phase 6 measured the record tier's first writer, the planner, at 0.046
+  writes a simulated second on the rotating mix, against 3-5 weight loads a second from the lazy
+  cache and about 600 scored decisions a second at 500 req/s in the soft tier; Phase 7 adds the
+  logged tier's, and each extends the count.
 - **Failure injection.** A scheduler restart -- soft state gone, rebuilt from node agents and
   engines, with node agents' backpressure the only bound on what the rebuilding scheduler
   over-admits; an engine crash -- its KV gone, every belief about it at `P(resident) = 0`, its
@@ -1720,8 +1812,8 @@ argmin.
 
 ### Ordering
 
-**The memory chain: 1 -> 2 -> 3 -> 4 -> 5 -> 6**, done through 5. Phase 6 is next, because it
-unfreezes what Phase 3 held fixed -- the partition's size and the weights' placement.
+**The memory chain: 1 -> 2 -> 3 -> 4 -> 5 -> 6**, done. Phase 6 unfroze what Phase 3 held fixed --
+the partition's size and the weights' placement.
 
 **The engine interface: 4 -> 5 -> 9.** Observe, influence, enforce -- the engine interface's three
 channels. Cancellation is the only one that is authoritative rather than advisory (§8), and Phase 7
@@ -1729,10 +1821,9 @@ depends on it, so Phase 9 precedes 7.
 
 **The path chain: 0 -> 8**, done.
 
-**Phase 7** follows Phase 9 and can run alongside 6. **Phase 10** is independent and can run now;
-its count grows as 6 and 7 add writers. **Phase 11** follows 6, whose budgets and partitions it
-moves across regions.
+**Phase 7** follows Phase 9. **Phase 10** is independent and can run now; its count grows as 7 adds
+writers. **Phase 11** follows 6, whose budgets and partitions it moves across regions.
 
-**The system of record** (§8) is built after Phase 6, once its contents are real decisions, and
-sized by Phase 10's count. It is infrastructure rather than a phase, since the simulator models no
-store.
+**The system of record** (§8) is built after Phase 6, whose decisions are now real and whose first
+writer is counted, and sized by Phase 10's count. It is infrastructure rather than a phase, since
+the simulator models no store.

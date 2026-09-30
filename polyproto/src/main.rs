@@ -1,4 +1,5 @@
 mod belief_cmd;
+mod fleet_cmd;
 mod influence_cmd;
 
 use clap::{Parser, Subcommand};
@@ -18,6 +19,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Cmd {
     /// Unified vs siloed residency ledger under a phase-shifting workload
     Residency {
@@ -177,6 +179,8 @@ enum Cmd {
         belief: BeliefArgs,
         #[command(flatten)]
         influence: InfluenceArgs,
+        #[command(flatten)]
+        fleet: FleetArgs,
     },
 
     /// One model host and one agent-framework host, swept from same-socket to cross-region.
@@ -410,6 +414,39 @@ enum Cmd {
         #[arg(
             long,
             default_value = "gate,causes,flows,prefill,declared,ceilings,marks,retain,reuse"
+        )]
+        sections: String,
+    },
+
+    /// The engine's corrections and the fleet's decisions: phase-6.md §4.14's sweeps.
+    /// Charges no control crossing, so every number is reproducible from the seed
+    Fleet {
+        #[arg(long, default_value_t = 4)]
+        nodes: usize,
+        #[arg(long, default_value_t = 3)]
+        units_per_node: usize,
+        #[arg(long, default_value = "16GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        #[arg(long, default_value = "32GiB", value_parser = parse_bytes)]
+        dram: u64,
+        #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
+        nvme: u64,
+        #[arg(long, default_value_t = 15_000)]
+        ops: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value_t = 250.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 0.10)]
+        fanout: f64,
+        /// Seeds per cell
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..))]
+        seeds: u64,
+        /// Sections to run, comma-separated, printed in phase-6.md §4.14's order: gate,
+        /// batches, routing, clock, placed, offload, sizes, prefill, keyed, pairing, tenants, duty
+        #[arg(
+            long,
+            default_value = "gate,batches,routing,clock,placed,offload,sizes,prefill,keyed,pairing,tenants,duty"
         )]
         sections: String,
     },
@@ -727,6 +764,360 @@ impl InfluenceArgs {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelBatchesArg {
+    Off,
+    Blind,
+    Priced,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefillArg {
+    Off,
+    Blind,
+    Priced,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum PlannerArg {
+    None,
+    Once,
+    Follow,
+    Eager,
+    Oracle,
+}
+
+type TraceKey = String;
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum PairingArg {
+    Off,
+    List,
+    Independent,
+    Joint,
+}
+
+#[derive(clap::Args, Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct FleetArgs {
+    /// Each model on a node decodes in a batch of its own and the batches take turns; blind leaves
+    /// the score unaware of it (needs --rate)
+    #[arg(long, value_enum, default_value_t = ModelBatchesArg::Off)]
+    model_batches: ModelBatchesArg,
+    /// Prefill work takes engine time: it stretches the decodes admitted while it is inside the
+    /// window; blind leaves the score unaware of it (needs --rate)
+    #[arg(long, value_enum, default_value_t = PrefillArg::Off)]
+    prefill_time: PrefillArg,
+    /// The trailing window prefill load is measured over, in seconds
+    #[arg(long, default_value_t = 1.0)]
+    prefill_window: f64,
+    /// Prefill each decode step carries for free, in milliseconds
+    #[arg(long, default_value_t = 0.0)]
+    prefill_free: f64,
+    /// A fan-out agent on another model than its parent's keys its copy of the parent's context
+    /// by its own model
+    #[arg(long)]
+    model_keyed: bool,
+    /// Every request names the first model: the published engine's exact case
+    #[arg(long)]
+    one_model: bool,
+    /// Weights leave the ledger: a replica is one model on one node, requests are routed to the
+    /// replicas that serve their model, and the KV partition is what the weights leave (needs
+    /// --engine-cache, --model-keyed, split memory and a positive --rate)
+    #[arg(long)]
+    fleet: bool,
+    /// Replicas per model under --fleet, as four comma-separated counts; default an even split
+    #[arg(long, value_parser = parse_counts)]
+    replicas: Option<[u8; 4]>,
+    /// Rotate the initial placement by this many nodes: the same replicas on other nodes, which a
+    /// hash router sees as a different draw
+    #[arg(long, default_value_t = 0)]
+    rotate: usize,
+    /// Each model's weights under --fleet in GiB, four comma-separated; only the step's base scales
+    /// with them, and the partition is what they leave
+    #[arg(long, value_parser = parse_sizes)]
+    sizes: Option<[f64; 4]>,
+    /// Hold the KV partition under --fleet at this size instead of what the weights leave
+    #[arg(long, value_parser = parse_bytes)]
+    fleet_partition: Option<u64>,
+    /// The busiest model's share of session and flow demand, then the rest, as four comma-separated
+    /// shares; the hot model rotates one place each phase and the class mix is held flat
+    #[arg(long, value_parser = parse_shares)]
+    model_mix: Option<[f64; 4]>,
+    /// Extra requests per request with a long prompt nothing holds and a short output, arriving at
+    /// the instant of the request before them
+    #[arg(long, default_value_t = 0.0)]
+    fresh: f64,
+    /// Who moves replicas under --fleet: nobody, one move after the first interval, a move once
+    /// the loss suffered pays for it, a move whenever the best allocation changes, or the
+    /// generator's own phases as a ceiling that reads the trace
+    #[arg(long, value_enum, default_value_t = PlannerArg::None)]
+    planner: PlannerArg,
+    /// The planner's interval, in seconds
+    #[arg(long, default_value_t = 5.0)]
+    interval: f64,
+    /// Seconds the oracle's moves are delayed by
+    #[arg(long, default_value_t = 0.0)]
+    late: f64,
+    /// The first n replicas under --fleet only prefill, each a first-come queue, and the rest only
+    /// decode
+    #[arg(long, default_value_t = 0)]
+    prefillers: usize,
+    /// How a request's prefill is paired with a prefiller: a list takes every prefill over
+    /// --pair-over in turn, independent picks the prefiller with the shortest queue for those over
+    /// it, joint weighs the pair against prefilling at the decoder (needs --prefillers and
+    /// --prefill-time priced)
+    #[arg(long, value_enum, default_value_t = PairingArg::Off)]
+    pairing: PairingArg,
+    /// A prefiller may fetch the prefix of a prompt from the decoder that holds it instead of
+    /// starting over
+    #[arg(long)]
+    prefill_fetch: bool,
+    /// The prefill work, in milliseconds, at or under which a list or independent pairing leaves a
+    /// request at its decoder
+    #[arg(long, default_value_t = 0.0)]
+    pair_over: f64,
+    /// One tenant sends fresh 64-block prompts between 40% and 60% of the run, this many extra
+    /// requests per request
+    #[arg(long, default_value_t = 0.0)]
+    neighbour: f64,
+    /// The share of the run the neighbour bursts for, centred on its middle
+    #[arg(long, default_value_t = 0.2)]
+    neighbour_duty: f64,
+    /// A prefix per model under every tenant's own
+    #[arg(long)]
+    shared_prefix: bool,
+    /// Record which tenant first touched each KV block, cross-tenant reads, hits by origin and
+    /// tenant, and evictions by owner
+    #[arg(long)]
+    tenants: bool,
+    /// Replicas only the neighbour may use, the rest serving everyone else
+    #[arg(long, default_value_t = 0)]
+    tenant_set: usize,
+    /// The router admits each tenant this many engine-seconds of prefill work a second and
+    /// refuses the excess (needs --prefill-time priced)
+    #[arg(long, default_value_t = 0.0)]
+    tenant_prefill: f64,
+    /// The router admits each tenant this many sequences in flight and refuses the rest
+    #[arg(long, default_value_t = 0)]
+    tenant_slots: usize,
+    /// A ceiling, not an arm: the engine keeps this many bytes of each tenant's KV from other
+    /// tenants' evictions
+    #[arg(long, value_parser = parse_bytes)]
+    tenant_floor: Option<u64>,
+    /// How long a model takes to start once its bytes are on the node, in seconds
+    #[arg(long, default_value_t = 8.0)]
+    start: f64,
+    /// The connector's host-DDR offload grant per node, overriding the ledger-sized one
+    #[arg(long, value_parser = parse_bytes)]
+    kv_offload: Option<u64>,
+}
+
+impl FleetArgs {
+    const OFF: Self = Self {
+        model_batches: ModelBatchesArg::Off,
+        prefill_time: PrefillArg::Off,
+        prefill_window: 1.0,
+        prefill_free: 0.0,
+        model_keyed: false,
+        one_model: false,
+        fleet: false,
+        replicas: None,
+        rotate: 0,
+        sizes: None,
+        fleet_partition: None,
+        model_mix: None,
+        fresh: 0.0,
+        planner: PlannerArg::None,
+        interval: 5.0,
+        late: 0.0,
+        prefillers: 0,
+        pairing: PairingArg::Off,
+        pair_over: 0.0,
+        prefill_fetch: false,
+        neighbour: 0.0,
+        neighbour_duty: 0.2,
+        shared_prefix: false,
+        tenants: false,
+        tenant_set: 0,
+        tenant_prefill: 0.0,
+        tenant_slots: 0,
+        tenant_floor: None,
+        start: 8.0,
+        kv_offload: None,
+    };
+
+    fn batching(self) -> (polyphonic::engine::Batching, bool) {
+        use polyphonic::engine::Batching;
+        match self.model_batches {
+            ModelBatchesArg::Off => (Batching::Shared, false),
+            ModelBatchesArg::Blind => (Batching::PerModel, false),
+            ModelBatchesArg::Priced => (Batching::PerModel, true),
+        }
+    }
+
+    fn prefill_load(self) -> Option<polyphonic::engine::PrefillLoad> {
+        (self.prefill_time != PrefillArg::Off).then_some(polyphonic::engine::PrefillLoad {
+            window_ns: (self.prefill_window * 1e9) as u64,
+            free_ns: (self.prefill_free * 1e6) as u64,
+        })
+    }
+
+    fn needs_engine(self) -> bool {
+        self.model_batches != ModelBatchesArg::Off
+            || self.prefill_time != PrefillArg::Off
+            || self.fleet
+    }
+
+    fn mix_rows(self) -> Option<polyphonic::work::ModelMix> {
+        self.model_mix.map(polyphonic::work::rotating_mix)
+    }
+
+    fn workload(self, w: polyphonic::work::Workload) -> polyphonic::work::Workload {
+        let w = w
+            .with_model_keyed(self.model_keyed)
+            .with_one_model(self.one_model)
+            .with_fresh(self.fresh)
+            .with_neighbour(self.neighbour)
+            .with_neighbour_duty(self.neighbour_duty);
+        let w = match self.mix_rows() {
+            Some(rows) => w.with_model_mix(rows),
+            None => w,
+        };
+        w.with_shared_prefix(self.shared_prefix)
+    }
+
+    fn neighbour_window(self) -> (f64, f64) {
+        polyphonic::work::neighbour_window(self.neighbour_duty)
+    }
+
+    fn tenant_refusal(self, nodes: usize, engine_cache: bool) -> Option<&'static str> {
+        if self.tenant_prefill > 0.0 && self.prefill_time != PrefillArg::Priced {
+            return Some("--tenant-prefill needs --prefill-time priced");
+        }
+        if self.neighbour_duty <= 0.0 || self.neighbour_duty > 1.0 {
+            return Some("--neighbour-duty is a share of the run, above 0 and at most 1");
+        }
+        if self.tenant_set >= nodes {
+            return Some("--tenant-set must leave a replica for everyone else");
+        }
+        if self.tenant_floor.is_some() && !engine_cache {
+            return Some("--tenant-floor needs --engine-cache");
+        }
+        None
+    }
+
+    fn trace_only(self) -> Self {
+        Self {
+            model_keyed: self.model_keyed,
+            one_model: self.one_model,
+            model_mix: self.model_mix,
+            fresh: self.fresh,
+            neighbour: self.neighbour,
+            neighbour_duty: self.neighbour_duty,
+            shared_prefix: self.shared_prefix,
+            ..Self::OFF
+        }
+    }
+
+    fn trace_key(self) -> TraceKey {
+        format!("{:?}", self.trace_only())
+    }
+
+    fn volatility(self) -> f64 {
+        if self.model_mix.is_some() { 0.0 } else { 1.0 }
+    }
+
+    fn placement(self, nodes: usize) -> Vec<Option<u8>> {
+        let counts = self.replicas.unwrap_or_else(|| {
+            if self.one_model {
+                [u8::try_from(nodes).unwrap_or(u8::MAX), 0, 0, 0]
+            } else {
+                std::array::from_fn(|m| {
+                    u8::try_from(nodes / 4 + usize::from(m < nodes % 4)).unwrap_or(u8::MAX)
+                })
+            }
+        });
+        let mut placement = polyphonic::fleet::layout(&counts.map(usize::from), nodes);
+        if nodes > 0 {
+            placement.rotate_left(self.rotate % nodes);
+        }
+        placement
+    }
+
+    fn fleet_of(
+        self,
+        nodes: usize,
+        initial: Option<&[Option<u8>]>,
+    ) -> Option<polyphonic::fleet::Fleet> {
+        self.fleet.then(|| {
+            let mut fleet = polyphonic::fleet::Fleet::new(
+                self.catalogue(),
+                &initial.map_or_else(|| self.placement(nodes), <[Option<u8>]>::to_vec),
+            );
+            if self.pairing != PairingArg::Off {
+                let held: Vec<usize> = (0..nodes)
+                    .filter(|&d| fleet.model_on(d).is_some())
+                    .collect();
+                for (i, &d) in held.iter().enumerate() {
+                    let role = if i < self.prefillers {
+                        polyphonic::fleet::Role::Prefill
+                    } else {
+                        polyphonic::fleet::Role::Decode
+                    };
+                    fleet.set_role(d, role);
+                }
+            }
+            fleet
+        })
+    }
+
+    fn pairing_rule(self) -> polyphonic::machine::Pairing {
+        use polyphonic::machine::Pairing;
+        match self.pairing {
+            PairingArg::Off => Pairing::Off,
+            PairingArg::List => Pairing::List,
+            PairingArg::Independent => Pairing::Independent,
+            PairingArg::Joint => Pairing::Joint,
+        }
+    }
+
+    fn catalogue(self) -> polyphonic::fleet::Catalogue {
+        let published = polyphonic::fleet::Catalogue::published((self.start * 1e9) as u64);
+        match self.sizes {
+            Some(gib) => {
+                published.with_sizes(gib.map(|g| (g * polyphonic::fleet::GIB as f64) as u64))
+            }
+            None => published,
+        }
+    }
+
+    fn planning(self, mach: &mut polyphonic::machine::Machine) {
+        use polyphonic::fleet::PlannerKind;
+        let interval_ns = (self.interval * 1e9) as u64;
+        match self.planner {
+            PlannerArg::Once => mach.set_planner(PlannerKind::Once, interval_ns),
+            PlannerArg::Follow => mach.set_planner(PlannerKind::Follow, interval_ns),
+            PlannerArg::Eager => mach.set_planner(PlannerKind::Eager, interval_ns),
+            PlannerArg::None | PlannerArg::Oracle => {}
+        }
+    }
+
+    fn apply(self, mach: &mut polyphonic::machine::Machine) {
+        let (batching, priced) = self.batching();
+        mach.set_model_batches(batching, priced);
+        mach.set_prefill_time(self.prefill_load(), self.prefill_time == PrefillArg::Priced);
+        mach.set_tenant_set(self.tenant_set);
+        mach.set_tenant_quota(self.tenant_prefill * 1e9, self.tenant_slots);
+        mach.set_tenant_floor(self.tenant_floor.unwrap_or(0));
+        mach.set_pairing(
+            self.pairing_rule(),
+            (self.pair_over * 1e6) as u64,
+            self.prefill_fetch,
+        );
+    }
+}
+
 #[derive(clap::Args, Debug, Clone, Copy)]
 struct AheadArgs {
     /// Engine arm: prefill a declared downstream's missing blocks when its hint arrives
@@ -886,6 +1277,46 @@ fn grant_label(g: Option<EngineKv>) -> String {
             )
         },
     )
+}
+
+fn parse_four<T>(s: &str, what: &str) -> Result<[T; 4], String>
+where
+    T: std::str::FromStr + Copy + Default,
+    T::Err: std::fmt::Display,
+{
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 4 {
+        return Err(format!(
+            "expected 4 comma-separated {what}, got {}",
+            parts.len()
+        ));
+    }
+    let mut out = [T::default(); 4];
+    for (slot, p) in out.iter_mut().zip(parts) {
+        *slot = p.trim().parse::<T>().map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+fn parse_shares(s: &str) -> Result<[f64; 4], String> {
+    let out: [f64; 4] = parse_four(s, "shares")?;
+    let sum: f64 = out.iter().sum();
+    if (sum - 1.0).abs() > 1e-6 {
+        return Err(format!("shares sum to {sum}, not 1"));
+    }
+    Ok(out)
+}
+
+fn parse_sizes(s: &str) -> Result<[f64; 4], String> {
+    let out: [f64; 4] = parse_four(s, "sizes")?;
+    if out.iter().any(|&g| g.is_nan() || g <= 0.0) {
+        return Err("every size must be positive".to_string());
+    }
+    Ok(out)
+}
+
+fn parse_counts(s: &str) -> Result<[u8; 4], String> {
+    parse_four(s, "counts")
 }
 
 fn parse_bands(s: &str) -> Result<String, String> {
@@ -2069,6 +2500,7 @@ fn main() {
             bits,
             belief,
             influence,
+            fleet,
         } => distributed(
             nodes,
             units_per_node,
@@ -2090,6 +2522,7 @@ fn main() {
             bits,
             belief,
             influence,
+            fleet,
         ),
         Cmd::CodeReview {
             hbm,
@@ -2260,6 +2693,31 @@ fn main() {
             seed,
             rate,
             fanout,
+            sections,
+        }),
+        Cmd::Fleet {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            rate,
+            fanout,
+            seeds,
+            sections,
+        } => fleet_cmd::run(&fleet_cmd::Env {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            rate,
+            fanout,
+            seeds,
             sections,
         }),
         Cmd::Influence {
@@ -2525,6 +2983,10 @@ struct ClassTally {
     produced: [u64; 2],
     slo_service: [Vec<u64>; 2],
     slo_stall: [Vec<u64>; 2],
+    phase: [(u64, u64); polyphonic::work::PHASES],
+    tenant_samples: Vec<(u64, u32, u64)>,
+    base: u64,
+    window: (f64, f64),
 }
 
 type ClassRow<'a> = (&'a str, ClassTally);
@@ -2676,10 +3138,15 @@ fn state_terms(mach: &polyphonic::machine::Machine, served: u64) {
 }
 
 fn term_spread(mach: &polyphonic::machine::Machine) {
-    use polyphonic::machine::TERM_LABELS;
+    use polyphonic::machine::{TERM_COUNT, TERM_LABELS};
     let n = mach.scored_decisions.max(1) as f64;
     print!("{:<22} term spread (mean, ms):", "");
-    for (label, total) in TERM_LABELS.iter().zip(mach.term_spread) {
+    let shown = if mach.prices_prefill() {
+        TERM_COUNT
+    } else {
+        TERM_COUNT - 1
+    };
+    for (label, total) in TERM_LABELS.iter().zip(mach.term_spread).take(shown) {
         print!(" {label} {:.2}", total / n / 1e6);
     }
     println!();
@@ -2836,25 +3303,84 @@ struct Scenario {
     bits: ClusterBits,
     belief: BeliefArgs,
     influence: InfluenceArgs,
+    fleet: FleetArgs,
     lag_ns: u64,
 }
 
+fn oracle_of(sc: &Scenario, nodes: usize) -> Option<polyphonic::fleet::OraclePlan> {
+    (sc.fleet.fleet && sc.fleet.planner == PlannerArg::Oracle).then(|| {
+        let trace: Vec<polyphonic::work::Request> = sc
+            .p3
+            .workload(
+                sc.fleet.workload(
+                    polyphonic::work::Workload::with_fanout(
+                        sc.seed,
+                        sc.ops,
+                        sc.fleet.volatility(),
+                        sc.fanout,
+                    )
+                    .with_throughput(sc.belief.throughput),
+                ),
+            )
+            .collect();
+        polyphonic::fleet::oracle_plan(
+            &polyphonic::fleet::Costs::of(&sc.fleet.catalogue(), (sc.fleet.interval * 1e9) as u64),
+            &trace,
+            nodes,
+            (1e9 / sc.rate.max(f64::MIN_POSITIVE)) as u64,
+            (sc.fleet.late * 1e9) as u64,
+        )
+    })
+}
+
+#[allow(clippy::too_many_lines)]
 fn distributed_run(
     a: &Arm,
     topo: &polyphonic::topo::Topology,
     memory: NodeMemory,
-    sc: Scenario,
+    sc: &Scenario,
 ) -> ArmRun {
     use polyphonic::machine::Machine;
     let inf = sc.influence;
     let memory = NodeMemory {
         kv: memory.kv.map(|kv| EngineKv {
             clairvoyant: kv.clairvoyant || inf.clairvoyant_kv,
+            offload: match sc.fleet.kv_offload {
+                Some(bytes) if memory.hbm > 0 => bytes.min(memory.ddr),
+                _ => kv.offload,
+            },
             ..kv
         }),
         ..memory
     };
-    let mut mach = Machine::new(topo.clone(), |_| memory, Policy::Gdsf, a.placement);
+    let nodes = topo.domains.len();
+    let oracle = oracle_of(sc, nodes);
+    let fleet = sc
+        .fleet
+        .fleet_of(nodes, oracle.as_ref().map(|p| p.initial.as_slice()));
+    let node_memory = |d: usize| {
+        let Some(model) = fleet.as_ref().and_then(|f| f.model_on(d)) else {
+            return memory;
+        };
+        let derived = fleet
+            .as_ref()
+            .map_or(0, |f| f.partition_bytes(model, memory.hbm));
+        NodeMemory {
+            kv: memory.kv.map(|kv| EngineKv {
+                partition: sc.fleet.fleet_partition.map_or(derived, |p| p.min(derived)),
+                ..kv
+            }),
+            ..memory
+        }
+    };
+    let mut mach = Machine::new(topo.clone(), node_memory, Policy::Gdsf, a.placement);
+    if let Some(fleet) = fleet {
+        mach.set_fleet(fleet, sc.fleet.fleet_partition);
+        sc.fleet.planning(&mut mach);
+        for (at, placement) in oracle.iter().flat_map(|p| p.shifts.clone()) {
+            mach.schedule_placement(at, placement);
+        }
+    }
     mach.set_flow_aware(a.flow);
     mach.set_control(a.control, sc.cost);
     mach.set_state_transfer(a.transfer);
@@ -2870,27 +3396,33 @@ fn distributed_run(
         mach.set_scoring(sc.belief.scoring());
         mach.set_instrument(true);
     }
+    sc.fleet.apply(&mut mach);
     mach.set_directives(inf.directives());
     mach.set_prefill_ahead(inf.prefill_ahead);
     mach.set_prefill_target(match inf.prefill_target {
         TargetArg::Argmin => polyphonic::machine::Target::Argmin,
         TargetArg::Deepest => polyphonic::machine::Target::Deepest,
     });
-    let workload = polyphonic::work::Workload::with_fanout(sc.seed, sc.ops, 1.0, sc.fanout)
-        .with_throughput(sc.belief.throughput);
+    let workload = sc.fleet.workload(
+        polyphonic::work::Workload::with_fanout(sc.seed, sc.ops, sc.fleet.volatility(), sc.fanout)
+            .with_throughput(sc.belief.throughput),
+    );
     let workload = match sc.flow_payload {
         Some(bytes) => workload.with_flow_payload(bytes),
         None => workload,
     };
-    let workload = if inf.reuse {
+    let workload = if inf.reuse || sc.fleet.tenants {
         let origins = polyphonic::work::Origins::default();
         mach.set_origins(origins.clone());
+        if sc.fleet.tenants {
+            mach.track_tenants();
+        }
         workload.with_origins(origins)
     } else {
         workload
     };
     let workload = sc.p3.workload(workload);
-    let (t, total, served, offered) = if inf.needs_trace() {
+    let (mut t, total, served, offered) = if inf.needs_trace() {
         let trace: Vec<polyphonic::work::Request> = workload.collect();
         let foresight = polyphonic::foresight::Foresight::of(&trace);
         if inf.clairvoyant_kv {
@@ -2903,6 +3435,7 @@ fn distributed_run(
     } else {
         drive(&mut mach, sc.rate, workload)
     };
+    t.window = sc.fleet.neighbour_window();
     ArmRun {
         mach,
         t,
@@ -3000,9 +3533,81 @@ fn distributed(
     bits: ClusterBits,
     belief: BeliefArgs,
     influence: InfluenceArgs,
+    fleet: FleetArgs,
 ) {
     use polyphonic::topo::{Distance, Topology};
 
+    if fleet.needs_engine() && rate <= 0.0 {
+        println!("--model-batches, --prefill-time and --fleet need a positive --rate");
+        return;
+    }
+    if (fleet.planner != PlannerArg::None || fleet.sizes.is_some()) && !fleet.fleet {
+        println!("--planner and --sizes need --fleet");
+        return;
+    }
+    if fleet.sizes.is_some_and(|gib| {
+        gib.iter()
+            .any(|&g| (g * polyphonic::fleet::GIB as f64) as u64 >= hbm / nodes as u64)
+    }) {
+        println!("--sizes leaves no partition: every model must be smaller than a node's HBM");
+        return;
+    }
+    if fleet.fleet && !(p3.engine_cache && fleet.model_keyed && hbm > 0 && !belief.belief) {
+        println!("--fleet needs --engine-cache, --model-keyed, split memory and no --belief");
+        return;
+    }
+    let plans_roles = matches!(
+        fleet.planner,
+        PlannerArg::Once | PlannerArg::Follow | PlannerArg::Eager
+    );
+    if (fleet.pairing != PairingArg::Off || fleet.prefillers > 0)
+        && !(fleet.fleet
+            && fleet.pairing != PairingArg::Off
+            && (fleet.prefillers > 0 || plans_roles)
+            && fleet.prefill_time == PrefillArg::Priced)
+    {
+        println!(
+            "--pairing needs --fleet, --prefill-time priced and --prefillers or a --planner that \
+             moves replicas"
+        );
+        return;
+    }
+    if let Some(why) = fleet.tenant_refusal(nodes, p3.engine_cache) {
+        println!("{why}");
+        return;
+    }
+    if fleet.prefillers > 0 && fleet.planner != PlannerArg::None {
+        println!("--prefillers fixes the roles and takes no --planner");
+        return;
+    }
+    if fleet.fleet_of(nodes, None).is_some_and(|f| {
+        f.counts()
+            .iter()
+            .zip(f.decode_counts())
+            .any(|(&all, dec)| all > 0 && dec == 0)
+    }) {
+        println!("--prefillers leaves a model with no replica that decodes");
+        return;
+    }
+    if fleet.planner != PlannerArg::None && (fleet.interval * 1e9) as u64 == 0 {
+        println!("--planner needs a positive --interval");
+        return;
+    }
+    if fleet.prefill_load().is_some_and(|l| l.window_ns == 0) {
+        println!("--prefill-time needs a positive --prefill-window");
+        return;
+    }
+    if fleet
+        .replicas
+        .is_some_and(|r| r.iter().map(|&n| usize::from(n)).sum::<usize>() > nodes)
+    {
+        println!("--replicas places more replicas than there are --nodes");
+        return;
+    }
+    if belief.belief && fleet.model_batches == ModelBatchesArg::Priced {
+        println!("--model-batches priced needs no --belief: a reported load names no model");
+        return;
+    }
     if belief.belief && !(p3.engine_cache && rate > 0.0) {
         println!("--belief needs --engine-cache and a positive --rate");
         return;
@@ -3039,6 +3644,7 @@ fn distributed(
         bits,
         belief,
         influence,
+        fleet,
         lag_ns: 0,
     };
 
@@ -3065,7 +3671,7 @@ fn distributed(
         let mut per_class: Vec<ClassRow<'_>> = Vec::new();
         let mut means = Vec::with_capacity(arms.len());
         for a in &arms {
-            let r = distributed_run(a, &topo, memory, sc);
+            let r = distributed_run(a, &topo, memory, &sc);
             distributed_row(a, &r, regret);
             if p3.engine_cache {
                 correction_terms(&r.mach, &r, bits);
@@ -3079,28 +3685,32 @@ fn distributed(
         }
 
         class_table(&per_class);
-        fanout_admission(&topo, memory, sc);
+        fanout_admission(&topo, memory, &sc);
         if !p3.engine_cache {
             continue;
         }
         let g = p3.grant(&memory, [0; 3]);
+        let partition = if fleet.fleet {
+            "what each node's model leaves".to_string()
+        } else {
+            format!("{:.2} GiB", gib(g.map_or(0, |g| g.partition)))
+        };
         println!(
-            "\n-- engine allocates KV (phase-3.md): partition {:.2} GiB, offload {:.2} GiB per \
+            "\n-- engine allocates KV (phase-3.md): partition {partition}, offload {:.2} GiB per \
              node, spill from each arm's own run above; {} --",
-            gib(g.map_or(0, |g| g.partition)),
             gib(g.map_or(0, |g| g.offload)),
             p3.describe(),
         );
         distributed_header();
         let mut per_class_on: Vec<ClassRow<'_>> = Vec::new();
         for (a, off) in arms.iter().zip(&means) {
-            let r = distributed_run(a, &topo, p3.engine_memory(memory, *off), sc);
+            let r = distributed_run(a, &topo, p3.engine_memory(memory, *off), &sc);
             distributed_row(a, &r, regret);
             correction_terms(&r.mach, &r, bits);
             per_class_on.push((a.label, r.t));
         }
         class_table(&per_class_on);
-        engine_fanout_admission(&topo, memory, sc);
+        engine_fanout_admission(&topo, memory, &sc);
     }
     crossover(&ladder, cost, &warm_seen);
 }
@@ -3305,16 +3915,22 @@ fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
         mach.set_position(position as u64);
         let k = req.kind_idx();
         offered += 1;
+        let base_at = t.base;
+        t.base += u64::from(!req.concurrent);
         let c = mach.serve_request(req);
         if c.pending {
             continue;
         }
+        t.tenant_samples
+            .push((base_at, req.tenant.unwrap_or(u32::MAX), c.service_ns()));
         total += c.total_ns();
         t.stall[k] += c.total_ns();
         t.service[k] += c.service_ns();
         t.decide[k] += c.decide_ns;
         t.ops[k] += 1;
         t.samples[k].push(c.service_ns());
+        t.phase[req.phase].0 += c.service_ns();
+        t.phase[req.phase].1 += 1;
         if k == BlobKind::KvBlock.idx() && req.tokens > 0 {
             t.slo_service[req.slo.idx()].push(c.service_ns());
             t.slo_stall[req.slo.idx()].push(c.total_ns());
@@ -3340,7 +3956,7 @@ fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
     (t, total, served, offered)
 }
 
-fn fanout_admission(topo: &polyphonic::topo::Topology, memory: NodeMemory, sc: Scenario) {
+fn fanout_admission(topo: &polyphonic::topo::Topology, memory: NodeMemory, sc: &Scenario) {
     if sc.fanout <= 0.0 {
         return;
     }
@@ -3362,7 +3978,7 @@ fn fanout_header() {
 fn fanout_run(
     topo: &polyphonic::topo::Topology,
     memory: NodeMemory,
-    sc: Scenario,
+    sc: &Scenario,
     atomic: bool,
 ) -> ArmRun {
     use polyphonic::machine::{Machine, Placement};
@@ -3406,7 +4022,7 @@ fn fanout_row(atomic: bool, r: &ArmRun) {
     );
 }
 
-fn engine_fanout_admission(topo: &polyphonic::topo::Topology, memory: NodeMemory, sc: Scenario) {
+fn engine_fanout_admission(topo: &polyphonic::topo::Topology, memory: NodeMemory, sc: &Scenario) {
     if sc.fanout <= 0.0 {
         return;
     }
@@ -3876,6 +4492,7 @@ fn price(a: &PriceArgs) {
             },
             belief: BeliefArgs::OFF,
             influence: InfluenceArgs::OFF,
+            fleet: FleetArgs::OFF,
             lag_ns: 0,
         };
         let cell = |p3: Correct| -> String {
@@ -3884,7 +4501,7 @@ fn price(a: &PriceArgs) {
                 let off = fanout_run(
                     &topo,
                     mem,
-                    sc(Correct {
+                    &sc(Correct {
                         engine_cache: false,
                         ..p3
                     }),
@@ -3894,7 +4511,7 @@ fn price(a: &PriceArgs) {
                     fanout_run(
                         &topo,
                         p3.engine_memory(mem, off.mach.kv_mean()),
-                        sc(p3),
+                        &sc(p3),
                         atomic,
                     )
                 } else {

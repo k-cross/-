@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
 
 use crate::blob::{BlobId, BlobMeta};
 use crate::stream::{Mark, Rank};
@@ -9,7 +9,11 @@ pub const STEP_BASE_NS: u64 = 7_000_000;
 pub const STEP_PER_SEQ_NS: u64 = 40_000;
 pub const MAX_BATCH: usize = 64;
 
+pub type Model = u8;
+pub const MODEL_COUNT: usize = 4;
+
 const UTILISATION_CAP: f64 = 0.95;
+const PREFILL_SHARE_CAP: f64 = 0.9;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Decode {
@@ -18,15 +22,37 @@ pub struct Decode {
     pub batch: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Batching {
+    #[default]
+    Shared,
+    PerModel,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PrefillLoad {
+    pub window_ns: u64,
+    pub free_ns: u64,
+}
+
 #[derive(Debug)]
 pub struct Engine {
     max_batch: usize,
+    base_ns: u64,
+    batching: Batching,
+    prefill_load: Option<PrefillLoad>,
+    prefills: VecDeque<(u64, u64)>,
 
-    inflight: BinaryHeap<Reverse<u64>>,
+    inflight: BinaryHeap<Reverse<(u64, Option<Model>)>>,
     pub queue_ns: u64,
     pub batch_sum: u64,
     pub admitted: u64,
     pub saturated: u64,
+    pub prefill_work_ns: u64,
+    pub stretch_ns: u64,
+    pub decode_ns: u64,
+    pub decode_share_ns: u64,
+    pub models_in_flight: [u64; MODEL_COUNT + 1],
 }
 
 impl Engine {
@@ -34,12 +60,56 @@ impl Engine {
     pub fn new(max_batch: usize) -> Self {
         Self {
             max_batch: max_batch.max(1),
+            base_ns: STEP_BASE_NS,
+            batching: Batching::Shared,
+            prefill_load: None,
+            prefills: VecDeque::new(),
             inflight: BinaryHeap::new(),
             queue_ns: 0,
             batch_sum: 0,
             admitted: 0,
             saturated: 0,
+            prefill_work_ns: 0,
+            stretch_ns: 0,
+            decode_ns: 0,
+            decode_share_ns: 0,
+            models_in_flight: [0; MODEL_COUNT + 1],
         }
+    }
+
+    pub fn set_step_base(&mut self, base_ns: u64) {
+        self.base_ns = base_ns.max(1);
+    }
+
+    #[must_use]
+    pub fn step_base_ns(&self) -> u64 {
+        self.base_ns
+    }
+
+    #[must_use]
+    pub fn step(&self, batch: usize) -> u64 {
+        self.base_ns + (batch.saturating_sub(1)) as u64 * STEP_PER_SEQ_NS
+    }
+
+    pub fn flush(&mut self) {
+        self.inflight.clear();
+        self.prefills.clear();
+    }
+
+    #[must_use]
+    pub fn drained_by(&self, now_ns: u64) -> u64 {
+        self.inflight
+            .iter()
+            .map(|Reverse((end, _))| *end)
+            .fold(now_ns, u64::max)
+    }
+
+    pub fn set_batching(&mut self, batching: Batching) {
+        self.batching = batching;
+    }
+
+    pub fn set_prefill_load(&mut self, load: Option<PrefillLoad>) {
+        self.prefill_load = load;
     }
 
     #[must_use]
@@ -48,7 +118,7 @@ impl Engine {
     }
 
     fn retire(&mut self, now_ns: u64) {
-        while let Some(&Reverse(end)) = self.inflight.peek() {
+        while let Some(&Reverse((end, _))) = self.inflight.peek() {
             if end > now_ns {
                 break;
             }
@@ -60,13 +130,143 @@ impl Engine {
     pub fn load(&self, now_ns: u64) -> usize {
         self.inflight
             .iter()
-            .filter(|Reverse(e)| *e > now_ns)
+            .filter(|Reverse((e, _))| *e > now_ns)
             .count()
     }
 
     #[must_use]
+    pub fn live_by_model(&self, now_ns: u64) -> [usize; MODEL_COUNT] {
+        let mut live = [0usize; MODEL_COUNT];
+        for Reverse((end, model)) in &self.inflight {
+            if let (true, Some(m)) = (*end > now_ns, model) {
+                live[usize::from(*m) % MODEL_COUNT] += 1;
+            }
+        }
+        live
+    }
+
+    fn slice_of(&self, model: Option<Model>) -> Option<usize> {
+        match (self.batching, model) {
+            (Batching::PerModel, Some(m)) => Some(usize::from(m) % MODEL_COUNT),
+            _ => None,
+        }
+    }
+
+    fn round_ns(&self, live: &[usize; MODEL_COUNT], joining: usize, extra: usize) -> u64 {
+        let mut joined = *live;
+        joined[joining] = (joined[joining] + extra).min(self.max_batch - 1) + 1;
+        let models = joined.iter().filter(|&&n| n > 0).count() as u64;
+        let sequences: u64 = joined.iter().map(|&n| n as u64).sum();
+        models * self.base_ns + (sequences - models) * STEP_PER_SEQ_NS
+    }
+
+    fn earliest_end(&self, slice: Option<usize>, now_ns: u64) -> Option<u64> {
+        match slice {
+            None => self.inflight.peek().map(|&Reverse((end, _))| end),
+            Some(m) => self
+                .inflight
+                .iter()
+                .filter(|Reverse((end, model))| {
+                    *end > now_ns && model.is_some_and(|t| usize::from(t) % MODEL_COUNT == m)
+                })
+                .map(|Reverse((end, _))| *end)
+                .min(),
+        }
+    }
+
+    pub fn prefill(&mut self, now_ns: u64, work_ns: u64) {
+        self.prefill_work_ns += work_ns;
+        let Some(load) = self.prefill_load else {
+            return;
+        };
+        if work_ns == 0 {
+            return;
+        }
+        let from = now_ns.saturating_sub(load.window_ns);
+        while self.prefills.front().is_some_and(|&(at, _)| at <= from) {
+            self.prefills.pop_front();
+        }
+        self.prefills.push_back((now_ns, work_ns));
+    }
+
+    #[must_use]
+    pub fn prefill_share(&self, now_ns: u64) -> f64 {
+        self.prefill_load.map_or(0.0, |load| {
+            (self.window_work_ns(now_ns, load) as f64 / load.window_ns.max(1) as f64).min(1.0)
+        })
+    }
+
+    fn window_work_ns(&self, now_ns: u64, load: PrefillLoad) -> u64 {
+        let from = now_ns.saturating_sub(load.window_ns);
+        self.prefills
+            .iter()
+            .rev()
+            .take_while(|&&(at, _)| at > from)
+            .map(|&(_, w)| w)
+            .sum()
+    }
+
+    #[must_use]
+    pub fn step_for(&self, now_ns: u64, reserved: usize, model: Option<Model>) -> u64 {
+        match self.slice_of(model) {
+            Some(m) => self.round_ns(&self.live_by_model(now_ns), m, reserved),
+            None => self.step(self.load(now_ns) + reserved + 1),
+        }
+    }
+
+    #[must_use]
+    pub fn prefill_excess_ns(&self, now_ns: u64, work_ns: u64, step_ns: u64) -> u64 {
+        let Some(load) = self.prefill_load else {
+            return 0;
+        };
+        let carried = load.free_ns as f64 / step_ns as f64 * load.window_ns as f64;
+        let held = self.window_work_ns(now_ns, load) as f64;
+        let over = |work: f64| (work - carried).max(0.0);
+        (over(held + work_ns as f64) - over(held)) as u64
+    }
+
+    fn stretch(&self, now_ns: u64, step_ns: u64) -> f64 {
+        let Some(load) = self.prefill_load else {
+            return 1.0;
+        };
+        let work = self.window_work_ns(now_ns, load);
+        let share = work as f64 / load.window_ns.max(1) as f64;
+        let free = load.free_ns as f64 / step_ns as f64;
+        1.0 / (1.0 - (share - free).clamp(0.0, PREFILL_SHARE_CAP))
+    }
+
+    fn stretched(&self, now_ns: u64, plain_ns: u64, step_ns: u64) -> u64 {
+        if self.prefill_load.is_none() {
+            return plain_ns;
+        }
+        (plain_ns as f64 * self.stretch(now_ns, step_ns)) as u64
+    }
+
+    #[must_use]
     pub fn projected_ns(&self, now_ns: u64, tokens: u64, reserved: usize) -> u64 {
-        self.projected_live(now_ns, tokens, self.load(now_ns) + reserved)
+        self.projected_for(now_ns, tokens, reserved, None)
+    }
+
+    #[must_use]
+    pub fn projected_for(
+        &self,
+        now_ns: u64,
+        tokens: u64,
+        reserved: usize,
+        model: Option<Model>,
+    ) -> u64 {
+        let Some(m) = self.slice_of(model) else {
+            return self.projected_live(now_ns, tokens, self.load(now_ns) + reserved);
+        };
+        let live = self.live_by_model(now_ns);
+        let wait = if live[m] + reserved < self.max_batch {
+            0
+        } else {
+            self.earliest_end(Some(m), now_ns)
+                .map_or(0, |end| end.saturating_sub(now_ns))
+        };
+        let step = self.round_ns(&live, m, reserved);
+        wait + self.stretched(now_ns, tokens * step, step)
     }
 
     #[must_use]
@@ -76,14 +276,38 @@ impl Engine {
         } else {
             self.inflight
                 .peek()
-                .map_or(0, |&Reverse(e)| e.saturating_sub(now_ns))
+                .map_or(0, |&Reverse((end, _))| end.saturating_sub(now_ns))
         };
-        wait + tokens * Self::step_ns(live.min(self.max_batch - 1) + 1)
+        let step = self.step(live.min(self.max_batch - 1) + 1);
+        wait + self.stretched(now_ns, tokens * step, step)
     }
 
     #[must_use]
     pub fn congestion_ns(&self, now_ns: u64, tokens: u64, reserved: usize) -> u64 {
-        self.congestion_live(tokens, self.load(now_ns) + reserved)
+        self.congestion_for(now_ns, tokens, reserved, None)
+    }
+
+    #[must_use]
+    pub fn congestion_for(
+        &self,
+        now_ns: u64,
+        tokens: u64,
+        reserved: usize,
+        model: Option<Model>,
+    ) -> u64 {
+        let Some(m) = self.slice_of(model) else {
+            return self.congestion_live(tokens, self.load(now_ns) + reserved);
+        };
+        let live = self.live_by_model(now_ns);
+        let others: u64 = live.iter().map(|&n| n as u64).sum::<u64>() + reserved as u64;
+        let own = live[m] + reserved;
+        let u = (own as f64 / self.max_batch as f64).min(UTILISATION_CAP);
+        let round = if own > 0 {
+            STEP_PER_SEQ_NS
+        } else {
+            self.base_ns
+        };
+        ((others * round * tokens) as f64 / (1.0 - u)) as u64
     }
 
     #[must_use]
@@ -94,18 +318,41 @@ impl Engine {
     }
 
     pub fn decode(&mut self, arrival_ns: u64, tokens: u64) -> Decode {
+        self.decode_for(arrival_ns, tokens, None)
+    }
+
+    pub fn decode_for(&mut self, arrival_ns: u64, tokens: u64, model: Option<Model>) -> Decode {
         self.retire(arrival_ns);
+        let slice = self.slice_of(model);
         let mut start = arrival_ns;
-        if self.inflight.len() >= self.max_batch {
+        let full = match slice {
+            Some(m) => self.live_by_model(start)[m] >= self.max_batch,
+            None => self.inflight.len() >= self.max_batch,
+        };
+        if full {
             self.saturated += 1;
-            if let Some(&Reverse(end)) = self.inflight.peek() {
+            if let Some(end) = self.earliest_end(slice, start) {
                 start = start.max(end);
             }
             self.retire(start);
         }
         let batch = self.inflight.len() + 1;
-        let exec_ns = tokens * Self::step_ns(batch);
-        self.inflight.push(Reverse(start + exec_ns));
+        let live = self.live_by_model(start);
+        let step = match slice {
+            Some(m) => self.round_ns(&live, m, 0),
+            None => self.step(batch),
+        };
+        let mut present = live;
+        if let Some(m) = model {
+            present[usize::from(m) % MODEL_COUNT] += 1;
+        }
+        self.models_in_flight[present.iter().filter(|&&n| n > 0).count()] += 1;
+        let plain_ns = tokens * step;
+        let exec_ns = self.stretched(start, plain_ns, step);
+        self.stretch_ns += exec_ns - plain_ns;
+        self.decode_ns += exec_ns;
+        self.decode_share_ns += exec_ns / batch as u64;
+        self.inflight.push(Reverse((start + exec_ns, model)));
         let queue_ns = start - arrival_ns;
         self.queue_ns += queue_ns;
         self.batch_sum += batch as u64;
@@ -140,6 +387,14 @@ struct Block {
     children: u32,
     pins: u32,
     mark: Option<Mark>,
+    owner: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VictimSet {
+    Demoted,
+    Evictable,
+    Retained,
 }
 
 #[derive(Debug)]
@@ -149,6 +404,9 @@ pub struct EngineCache {
     pinned: u64,
     leaf_first: bool,
     clairvoyant: bool,
+    owner: Option<u32>,
+    floor: u64,
+    owned: HashMap<u32, u64>,
     clock: u64,
     blocks: HashMap<BlobId, Block>,
     evictable: BTreeSet<(u64, BlobId)>,
@@ -178,6 +436,9 @@ impl EngineCache {
             pinned: 0,
             leaf_first,
             clairvoyant: false,
+            owner: None,
+            floor: 0,
+            owned: HashMap::new(),
             clock: 0,
             blocks: HashMap::new(),
             evictable: BTreeSet::new(),
@@ -211,9 +472,48 @@ impl EngineCache {
         self
     }
 
+    pub fn set_owner(&mut self, owner: Option<u32>) {
+        self.owner = owner;
+    }
+
+    pub fn set_tenant_floor(&mut self, bytes: u64) {
+        self.floor = bytes;
+    }
+
+    #[must_use]
+    pub fn owned_by(&self, owner: u32) -> u64 {
+        self.owned.get(&owner).copied().unwrap_or(0)
+    }
+
+    fn account_out(&mut self, b: &Block) {
+        if let Some(o) = b.owner
+            && let Some(bytes) = self.owned.get_mut(&o)
+        {
+            *bytes = bytes.saturating_sub(b.meta.bytes);
+        }
+    }
+
+    fn allowed(&self, id: &BlobId) -> bool {
+        let Some(b) = self.blocks.get(id) else {
+            return true;
+        };
+        match b.owner {
+            Some(o) if self.floor > 0 && Some(o) != self.owner => self.owned_by(o) > self.floor,
+            _ => true,
+        }
+    }
+
     #[must_use]
     pub fn capacity(&self) -> u64 {
         self.capacity
+    }
+
+    pub fn resize(&mut self, capacity: u64) {
+        assert!(
+            self.blocks.is_empty(),
+            "a partition is resized only when empty"
+        );
+        self.capacity = capacity;
     }
 
     #[must_use]
@@ -290,28 +590,41 @@ impl EngineCache {
         self.attach(id);
     }
 
+    fn first_victim(
+        &self,
+        admissible: impl Fn(&BlobId) -> bool,
+    ) -> Option<(VictimSet, (u64, BlobId))> {
+        let first =
+            |set: &BTreeSet<(u64, BlobId)>| set.iter().find(|(_, id)| admissible(id)).copied();
+        first(&self.demoted)
+            .map(|e| (VictimSet::Demoted, e))
+            .or_else(|| first(&self.evictable).map(|e| (VictimSet::Evictable, e)))
+            .or_else(|| first(&self.retained).map(|e| (VictimSet::Retained, e)))
+    }
+
+    fn pick_victim(&self) -> Option<(VictimSet, (u64, BlobId))> {
+        if self.floor == 0 {
+            return self.first_victim(|_| true);
+        }
+        self.first_victim(|id| self.allowed(id))
+            .or_else(|| self.first_victim(|_| true))
+    }
+
     fn take_victim(&mut self) -> Option<BlobId> {
-        if let Some(&entry) = self.demoted.iter().next() {
-            self.demoted.remove(&entry);
-            return Some(entry.1);
-        }
-        if let Some(&entry) = self.evictable.iter().next() {
-            self.evictable.remove(&entry);
-            return Some(entry.1);
-        }
-        let entry = *self.retained.iter().next()?;
-        self.retained.remove(&entry);
-        self.pressure_evictions += 1;
+        let (set, entry) = self.pick_victim()?;
+        match set {
+            VictimSet::Demoted => self.demoted.remove(&entry),
+            VictimSet::Evictable => self.evictable.remove(&entry),
+            VictimSet::Retained => {
+                self.pressure_evictions += 1;
+                self.retained.remove(&entry)
+            }
+        };
         Some(entry.1)
     }
 
     fn next_victim(&self) -> Option<BlobId> {
-        self.demoted
-            .iter()
-            .next()
-            .or_else(|| self.evictable.iter().next())
-            .or_else(|| self.retained.iter().next())
-            .map(|&(_, id)| id)
+        self.pick_victim().map(|(_, (_, id))| id)
     }
 
     pub fn mark(&mut self, id: BlobId, mark: Mark) -> Option<Mark> {
@@ -452,6 +765,7 @@ impl EngineCache {
             let Some(b) = self.blocks.remove(&victim) else {
                 continue;
             };
+            self.account_out(&b);
             self.used -= b.meta.bytes;
             self.evictions += 1;
             self.last_price = self.loss_per_byte(&b.meta);
@@ -469,8 +783,12 @@ impl EngineCache {
                 children: 0,
                 pins: 0,
                 mark: None,
+                owner: self.owner,
             },
         );
+        if let Some(o) = self.owner {
+            *self.owned.entry(o).or_insert(0) += meta.bytes;
+        }
         self.used += meta.bytes;
         self.evictable.insert((key, id));
         if pin {
@@ -482,6 +800,7 @@ impl EngineCache {
     pub fn remove(&mut self, id: &BlobId) -> Option<BlobMeta> {
         self.detach(*id);
         let b = self.blocks.remove(id)?;
+        self.account_out(&b);
         self.used -= b.meta.bytes;
         if b.pins > 0 {
             self.pinned -= b.meta.bytes;
@@ -530,6 +849,7 @@ impl EngineCache {
     }
 
     pub fn drain(&mut self) {
+        self.owned.clear();
         self.blocks.clear();
         self.evictable.clear();
         self.demoted.clear();
@@ -851,6 +1171,156 @@ mod tests {
         assert_eq!(plain.evictions, marked.evictions);
     }
 
+    fn per_model_engine(max_batch: usize) -> Engine {
+        let mut engine = Engine::new(max_batch);
+        engine.set_batching(Batching::PerModel);
+        engine
+    }
+
+    #[test]
+    fn a_round_costs_a_base_step_per_model_with_a_sequence_in_flight() {
+        let mut engine = per_model_engine(MAX_BATCH);
+        let first = engine.decode_for(0, 10, Some(0));
+        assert_eq!(first.exec_ns, 10 * Engine::step_ns(1));
+        let second = engine.decode_for(1, 10, Some(1));
+        assert_eq!(second.exec_ns, 10 * 2 * STEP_BASE_NS);
+        let third = engine.decode_for(2, 10, Some(1));
+        assert_eq!(third.exec_ns, 10 * (2 * STEP_BASE_NS + STEP_PER_SEQ_NS));
+        assert_eq!(engine.models_in_flight[1..3], [1, 2]);
+    }
+
+    #[test]
+    fn one_model_per_model_batching_equals_shared() {
+        let mut shared = Engine::new(4);
+        let mut sliced = per_model_engine(4);
+        for i in 0..40u64 {
+            let at = i * 3_000_000;
+            let tokens = 20 + i % 7 * 9;
+            let a = shared.decode(at, tokens);
+            let b = sliced.decode_for(at, tokens, Some(2));
+            assert_eq!(
+                (a.queue_ns, a.exec_ns, a.batch),
+                (b.queue_ns, b.exec_ns, b.batch)
+            );
+            assert_eq!(
+                shared.projected_ns(at, 50, 1),
+                sliced.projected_for(at, 50, 1, Some(2))
+            );
+            assert_eq!(
+                shared.congestion_ns(at, 50, 1),
+                sliced.congestion_for(at, 50, 1, Some(2))
+            );
+        }
+        assert_eq!(shared.saturated, sliced.saturated);
+        assert!(shared.saturated > 0, "the fixture must fill the batch");
+    }
+
+    #[test]
+    fn a_full_batch_queues_only_the_arrivals_of_its_own_model() {
+        let mut engine = per_model_engine(2);
+        engine.decode_for(0, 10, Some(0));
+        engine.decode_for(0, 10, Some(0));
+        let other = engine.decode_for(0, 10, Some(1));
+        assert_eq!(other.queue_ns, 0);
+        let own = engine.decode_for(0, 10, Some(0));
+        assert!(own.queue_ns > 0);
+        assert_eq!(engine.saturated, 1);
+    }
+
+    #[test]
+    fn a_model_blind_read_of_a_per_model_engine_is_the_shared_read() {
+        let mut engine = per_model_engine(MAX_BATCH);
+        engine.decode_for(0, 30, Some(0));
+        engine.decode_for(0, 30, Some(1));
+        let shared = Engine::step_ns(3);
+        assert_eq!(engine.projected_for(1, 10, 0, None), 10 * shared);
+        assert_ne!(
+            engine.projected_for(1, 10, 0, Some(0)),
+            engine.projected_for(1, 10, 0, Some(2))
+        );
+    }
+
+    fn loaded(free_ns: u64) -> Engine {
+        let mut engine = Engine::new(MAX_BATCH);
+        engine.set_prefill_load(Some(PrefillLoad {
+            window_ns: 1_000_000_000,
+            free_ns,
+        }));
+        engine
+    }
+
+    #[test]
+    fn prefill_stretches_decodes_admitted_inside_its_window_and_the_window_expires() {
+        let mut engine = loaded(0);
+        engine.prefill(10, 250_000_000);
+        let plain = 10 * Engine::step_ns(1);
+        let inside = engine.decode(100, 10);
+        assert_eq!(inside.exec_ns, (plain as f64 * (1.0 / (1.0 - 0.25))) as u64);
+        assert_eq!(engine.stretch_ns, inside.exec_ns - plain);
+        let after = engine.decode(2_000_000_000, 10);
+        assert_eq!(after.exec_ns, plain);
+    }
+
+    #[test]
+    fn a_prefill_the_allowance_carries_stretches_nothing() {
+        let mut engine = loaded(Engine::step_ns(1));
+        engine.prefill(1, 900_000_000);
+        let decode = engine.decode(2, 10);
+        assert_eq!(decode.exec_ns, 10 * Engine::step_ns(1));
+        assert_eq!(
+            engine.prefill_excess_ns(2, 100_000_000, Engine::step_ns(1)),
+            0
+        );
+        assert_eq!(engine.stretch_ns, 0);
+    }
+
+    #[test]
+    fn excess_prefill_is_the_marginal_work_the_allowance_cannot_carry() {
+        let mut engine = loaded(Engine::step_ns(1) / 2);
+        assert_eq!(
+            engine.prefill_excess_ns(1, 200_000_000, Engine::step_ns(1)),
+            0
+        );
+        engine.prefill(2, 400_000_000);
+        assert_eq!(
+            engine.prefill_excess_ns(3, 200_000_000, Engine::step_ns(1)),
+            100_000_000
+        );
+        engine.prefill(4, 400_000_000);
+        assert_eq!(
+            engine.prefill_excess_ns(5, 200_000_000, Engine::step_ns(1)),
+            200_000_000
+        );
+    }
+
+    #[test]
+    fn an_engine_with_no_prefill_load_records_work_and_stretches_nothing() {
+        let mut engine = Engine::new(MAX_BATCH);
+        engine.prefill(0, 900_000_000);
+        assert_eq!(engine.prefill_work_ns, 900_000_000);
+        assert_eq!(
+            engine.prefill_excess_ns(1, 900_000_000, Engine::step_ns(1)),
+            0
+        );
+        let decode = engine.decode(1, 10);
+        assert_eq!(decode.exec_ns, 10 * Engine::step_ns(1));
+    }
+
+    #[test]
+    fn per_model_batching_sizes_the_allowance_by_the_round_the_decode_is_charged() {
+        let mut engine = loaded(STEP_BASE_NS);
+        engine.set_batching(Batching::PerModel);
+        engine.decode_for(0, 1_000, Some(1));
+        engine.prefill(1, 700_000_000);
+        let round = engine.step_for(2, 0, Some(0));
+        assert_eq!(round, 2 * STEP_BASE_NS);
+        assert_eq!(engine.prefill_excess_ns(2, 100_000_000, round), 100_000_000);
+        let shared = engine.step_for(2, 0, None);
+        assert_eq!(engine.prefill_excess_ns(2, 100_000_000, shared), 0);
+        let decode = engine.decode_for(2, 10, Some(0));
+        assert!(decode.exec_ns > 10 * round);
+    }
+
     #[test]
     fn tail_price_is_the_next_victims_loss_and_recovery_caps_it() {
         let seq = chain("price", 1);
@@ -864,5 +1334,58 @@ mod tests {
         });
         offloadable.admit(seq[0].0, seq[0].1, false);
         assert!((offloadable.tail_price() - 1.0).abs() < 1e-9);
+    }
+    fn owned_chain(cache: &mut EngineCache, owner: u32, tag: &str, len: usize) {
+        cache.set_owner(Some(owner));
+        for (id, meta) in chain(tag, len) {
+            cache.admit(id, meta, false);
+        }
+        cache.set_owner(None);
+    }
+
+    #[test]
+    fn a_tenant_floor_keeps_a_quiet_tenants_blocks_from_a_loud_neighbours_evictions() {
+        let survivors = |floor: u64| {
+            let mut cache = EngineCache::new(6 * BLOCK, false);
+            cache.set_tenant_floor(floor);
+            owned_chain(&mut cache, 1, "quiet", 2);
+            for round in 0..20 {
+                owned_chain(&mut cache, 2, &format!("loud:{round}"), 4);
+            }
+            chain("quiet", 2)
+                .iter()
+                .filter(|(id, _)| cache.contains(id))
+                .count()
+        };
+        assert_eq!(survivors(0), 0);
+        assert_eq!(survivors(2 * BLOCK), 2);
+    }
+
+    #[test]
+    fn a_tenant_above_its_floor_gives_up_the_excess_and_owned_bytes_follow_every_removal() {
+        let mut cache = EngineCache::new(6 * BLOCK, false);
+        cache.set_tenant_floor(2 * BLOCK);
+        owned_chain(&mut cache, 1, "big", 4);
+        owned_chain(&mut cache, 2, "next", 4);
+        assert_eq!(cache.owned_by(1) + cache.owned_by(2), cache.used());
+        assert!(cache.owned_by(1) >= 2 * BLOCK);
+        let ids: Vec<BlobId> = chain("next", 4).iter().map(|(id, _)| *id).collect();
+        for id in &ids {
+            cache.remove(id);
+        }
+        assert_eq!(cache.owned_by(2), 0);
+        assert_eq!(cache.owned_by(1), cache.used());
+        cache.drain();
+        assert_eq!(cache.owned_by(1), 0);
+    }
+
+    #[test]
+    fn a_floor_that_protects_everything_still_admits_by_evicting_someone() {
+        let mut cache = EngineCache::new(2 * BLOCK, false);
+        cache.set_tenant_floor(10 * BLOCK);
+        owned_chain(&mut cache, 1, "a", 2);
+        owned_chain(&mut cache, 2, "b", 2);
+        assert_eq!(cache.used(), 2 * BLOCK);
+        assert!(cache.contains(&chain("b", 2)[1].0));
     }
 }

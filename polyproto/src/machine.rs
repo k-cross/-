@@ -3,18 +3,23 @@ use crate::belief::{Cause, Conditions, Marks, Observer, SLO_QUANTILE, Scoring};
 use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::boundary::Cost as Crossing;
 use crate::cache::{Cost, Hierarchy, NodeMemory, Policy};
-use crate::engine::{Engine, MAX_BATCH};
+use crate::engine::{Batching, Engine, MAX_BATCH, MODEL_COUNT, Model, PrefillLoad};
+use crate::fleet::{Costs, Fleet, FleetView, PlannerKind, Role, moves_between, retarget};
 use crate::flow::FlowHint;
 use crate::foresight::Foresight;
 use crate::instruments::{Instruments, Reuse};
 use crate::oracle;
 use crate::span::Span;
-use crate::stream::{KvEvent, Mark, Rank};
+use crate::stream::{KvEvent, Mark, Medium, Rank};
 use crate::tele::Telemetry;
 use crate::tier::TierSpec;
 use crate::topo::Topology;
-use crate::work::{Agent, Gang, Origin, Origins, Request, RequestView, Slo, ToolCall};
-use std::collections::{HashMap, HashSet};
+use crate::work::{
+    Agent, Gang, Origin, Origins, Request, RequestView, Slo, ToolCall, WEIGHT_BYTES, WEIGHT_NS,
+    model_of,
+};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Placement {
@@ -221,6 +226,72 @@ pub struct Machine {
     landing: HashMap<u64, usize>,
     redispatched: Vec<HashSet<BlobId>>,
     origins: Option<Origins>,
+    priced_models: bool,
+    priced_prefill: bool,
+    fleet: Option<Fleet>,
+    partition_override: Option<u64>,
+    placements: Vec<(u64, Vec<Option<Model>>)>,
+    planner: Option<PlannerState>,
+    fleet_view: FleetView,
+    pairing: Pairing,
+    prefill_fetch: bool,
+    pair_over_ns: u64,
+    prefill_free_at: Vec<u64>,
+    list_cursor: usize,
+    pub pair_stats: PairStats,
+    tenant_set: usize,
+    tenant_prefill_ns_per_s: f64,
+    tenant_slots: usize,
+    buckets: HashMap<u32, (f64, u64)>,
+    tenant_flight: HashMap<u32, BinaryHeap<Reverse<u64>>>,
+    pub tenant_refused: HashMap<u32, u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Pairing {
+    #[default]
+    Off,
+    List,
+    Independent,
+    Joint,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PairStats {
+    pub decisions: u64,
+    pub paired: u64,
+    pub coupled: u64,
+    pub failed: u64,
+    pub wait_ns: u64,
+    pub work_ns: u64,
+    pub avoided_ns: u64,
+    pub transfer_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Quote {
+    node: usize,
+    wait_ns: u64,
+    work_ns: u64,
+    transfer_ns: u64,
+    toll_ns: f64,
+}
+
+impl Quote {
+    fn total_ns(&self) -> f64 {
+        (self.wait_ns + self.work_ns + self.transfer_ns) as f64 + self.toll_ns
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlannerState {
+    kind: PlannerKind,
+    interval_ns: u64,
+    next_at: u64,
+    accrued_ns: f64,
+    costs: Costs,
+    ticks: u64,
+    seen: [bool; MODEL_COUNT],
 }
 
 const DIVERGENCE_EVERY: u64 = 16;
@@ -340,6 +411,601 @@ impl Machine {
             landing: HashMap::new(),
             redispatched: vec![HashSet::new(); n_domains],
             origins: None,
+            priced_models: false,
+            priced_prefill: false,
+            fleet: None,
+            partition_override: None,
+            placements: Vec::new(),
+            planner: None,
+            fleet_view: FleetView::default(),
+            pairing: Pairing::Off,
+            prefill_fetch: false,
+            pair_over_ns: 0,
+            prefill_free_at: vec![0; n_domains],
+            list_cursor: 0,
+            pair_stats: PairStats::default(),
+            tenant_set: 0,
+            tenant_prefill_ns_per_s: 0.0,
+            tenant_slots: 0,
+            buckets: HashMap::new(),
+            tenant_flight: HashMap::new(),
+            tenant_refused: HashMap::new(),
+        }
+    }
+
+    pub fn set_planner(&mut self, kind: PlannerKind, interval_ns: u64) {
+        let interval_ns = interval_ns.max(1);
+        let costs = self.fleet.as_ref().map_or_else(
+            || Costs::published(interval_ns),
+            |f| Costs::of(f.catalogue(), interval_ns),
+        );
+        self.planner = Some(PlannerState {
+            kind,
+            interval_ns,
+            next_at: interval_ns,
+            accrued_ns: 0.0,
+            costs,
+            ticks: 0,
+            seen: [false; MODEL_COUNT],
+        });
+    }
+
+    pub fn set_tenant_set(&mut self, replicas: usize) {
+        self.tenant_set = replicas;
+    }
+
+    pub fn set_tenant_quota(&mut self, prefill_ns_per_s: f64, slots: usize) {
+        self.tenant_prefill_ns_per_s = prefill_ns_per_s;
+        self.tenant_slots = slots;
+    }
+
+    pub fn set_tenant_floor(&mut self, bytes: u64) {
+        for h in &mut self.domains {
+            h.set_tenant_floor(bytes);
+        }
+    }
+
+    fn home_plan<'p>(&self, home: usize, req: &Request, planned: &'p mut Option<Plan>) -> &'p Plan {
+        planned.get_or_insert_with(|| self.plan(home, &req.view(req.tokens), View::Belief))
+    }
+
+    fn meters_admit(&mut self, home: usize, req: &Request, planned: &mut Option<Plan>) -> bool {
+        let Some(tenant) = req.tenant else {
+            return true;
+        };
+        if req.tokens == 0 {
+            return true;
+        }
+        let now = self.arrival_ns;
+        if self.tenant_slots > 0 {
+            let flight = self.tenant_flight.entry(tenant).or_default();
+            while flight.peek().is_some_and(|&Reverse(end)| end <= now) {
+                flight.pop();
+            }
+            if flight.len() >= self.tenant_slots {
+                return false;
+            }
+        }
+        if self.tenant_prefill_ns_per_s > 0.0 && self.priced_prefill {
+            let work = self.home_plan(home, req, planned).rebuild_ns as f64;
+            let rate = self.tenant_prefill_ns_per_s;
+            let (tokens, last) = self.buckets.entry(tenant).or_insert((rate, now));
+            let cap = rate.max(work);
+            *tokens = (*tokens + rate * now.saturating_sub(*last) as f64 / 1e9).min(cap);
+            *last = now;
+            if *tokens < work {
+                return false;
+            }
+            *tokens -= work;
+        }
+        true
+    }
+
+    pub fn set_pairing(&mut self, rule: Pairing, over_ns: u64, prefill_fetch: bool) {
+        self.pairing = rule;
+        self.pair_over_ns = over_ns;
+        self.prefill_fetch = prefill_fetch;
+    }
+
+    fn quotes(&self, home: usize, req: &Request, plan_d: &Plan) -> Vec<Quote> {
+        let (Some(fleet), Some(model)) = (&self.fleet, model_of(&req.requires)) else {
+            return Vec::new();
+        };
+        let now = self.arrival_ns;
+        let view = req.view(req.tokens);
+        let unit = self.unit_in(home);
+        let need = plan_d.need[BlobKind::KvBlock.idx()];
+        fleet
+            .prefillers(model, now)
+            .into_iter()
+            .map(|p| {
+                let work_ns = self
+                    .plan_with(p, &view, View::Belief, self.prefill_fetch)
+                    .rebuild_ns;
+                Quote {
+                    node: p,
+                    wait_ns: self.prefill_free_at[p].saturating_sub(now),
+                    work_ns,
+                    transfer_ns: self.topo.fetch_ns(unit, p, need),
+                    toll_ns: self.engines[p].prefill_share(now) * work_ns as f64 / 2.0,
+                }
+            })
+            .collect()
+    }
+
+    fn joint_pick(quotes: &[Quote], unpaired_ns: f64) -> Option<usize> {
+        quotes
+            .iter()
+            .min_by(|a, b| {
+                a.total_ns()
+                    .total_cmp(&b.total_ns())
+                    .then(a.node.cmp(&b.node))
+            })
+            .filter(|q| q.total_ns() < unpaired_ns)
+            .map(|q| q.node)
+    }
+
+    fn independent_pick(&self, quotes: &[Quote], w_d: u64) -> Option<usize> {
+        if w_d <= self.pair_over_ns {
+            return None;
+        }
+        quotes
+            .iter()
+            .min_by_key(|q| (q.wait_ns + q.work_ns, q.node))
+            .map(|q| q.node)
+    }
+
+    fn list_pick(&mut self, quotes: &[Quote], w_d: u64) -> Option<usize> {
+        if w_d <= self.pair_over_ns || quotes.is_empty() {
+            return None;
+        }
+        let node = quotes[self.list_cursor % quotes.len()].node;
+        self.list_cursor += 1;
+        Some(node)
+    }
+
+    fn decide_pair(
+        &mut self,
+        home: usize,
+        req: &Request,
+        planned: &mut Option<Plan>,
+    ) -> Option<(usize, u64)> {
+        let in_pool = self
+            .fleet
+            .as_ref()
+            .is_some_and(|f| f.role_of(home) == Role::Decode);
+        let kv = req
+            .chain
+            .first()
+            .is_some_and(|(_, m)| m.kind == BlobKind::KvBlock);
+        if self.pairing == Pairing::Off || !in_pool || !kv || req.tokens == 0 {
+            return None;
+        }
+        let plan_d = self.home_plan(home, req, planned);
+        let w_d = plan_d.rebuild_ns;
+        if w_d == 0 {
+            return None;
+        }
+        let quotes = self.quotes(home, req, plan_d);
+        if quotes.is_empty() {
+            return None;
+        }
+        let in_flight = self.engines[home].load(self.arrival_ns) + self.staged_seqs[home];
+        let unpaired_ns = w_d as f64 * (1 + in_flight) as f64;
+        let joint = Self::joint_pick(&quotes, unpaired_ns);
+        let independent = self.independent_pick(&quotes, w_d);
+        self.pair_stats.decisions += 1;
+        if joint != independent {
+            self.pair_stats.coupled += 1;
+        }
+        let pick = match self.pairing {
+            Pairing::Off => None,
+            Pairing::Joint => joint,
+            Pairing::Independent => independent,
+            Pairing::List => self.list_pick(&quotes, w_d),
+        };
+        pick.map(|p| (p, w_d))
+    }
+
+    fn prefill_on(&mut self, p: usize, req: &Request, avoided_ns: u64) -> Option<(u64, u64, u64)> {
+        let now = self.arrival_ns;
+        let wait = self.prefill_free_at[p].saturating_sub(now);
+        self.domains[p].set_owner(req.tenant);
+        let plan = self.plan_with(p, &req.view(req.tokens), View::Belief, self.prefill_fetch);
+        let fetch = self.apply_chain(p, req, &plan);
+        let cost = self.domains[p].access(&req.chain);
+        if cost.pending {
+            self.domains[p].set_owner(None);
+            self.pair_stats.failed += 1;
+            return None;
+        }
+        self.report_prefill(p, req, cost.recompute_ns);
+        self.domains[p].seal(None);
+        self.domains[p].set_owner(None);
+        self.prefill_free_at[p] = now + wait + cost.recompute_ns;
+        self.pair_stats.paired += 1;
+        self.pair_stats.avoided_ns += avoided_ns;
+        self.pair_stats.wait_ns += wait;
+        self.pair_stats.work_ns += cost.recompute_ns;
+        let transfer = fetch.transfer_ns + cost.transfer_ns;
+        self.pair_stats.transfer_ns += transfer;
+        if let (Some(m), true) = (model_of(&req.requires), self.planner.is_some()) {
+            let m = usize::from(m) % MODEL_COUNT;
+            self.fleet_view.paired_work_ns[m] += cost.recompute_ns;
+            self.fleet_view.paired_avoided_ns[m] += avoided_ns;
+            self.fleet_view.prefill_work_ns[m] += avoided_ns;
+            self.fleet_view.prefills[m] += 1;
+        }
+        Some((wait, cost.recompute_ns, transfer))
+    }
+
+    #[must_use]
+    pub fn planner_ticks(&self) -> u64 {
+        self.planner.map_or(0, |p| p.ticks)
+    }
+
+    fn record_prefill(&mut self, req: &Request, work_ns: u64) {
+        let decodes = req.tokens > 0
+            && req
+                .chain
+                .first()
+                .is_some_and(|(_, m)| m.kind == BlobKind::KvBlock);
+        if let (Some(m), true, true) = (model_of(&req.requires), self.planner.is_some(), decodes)
+            && work_ns > 0
+        {
+            let m = usize::from(m) % MODEL_COUNT;
+            self.fleet_view.prefill_work_ns[m] += work_ns;
+            self.fleet_view.prefills[m] += 1;
+        }
+    }
+
+    fn record_demand(&mut self, model: Option<Model>, tokens: u64) {
+        if let (Some(m), true) = (model, self.planner.is_some()) {
+            self.fleet_view.demand_tokens[usize::from(m) % MODEL_COUNT] += tokens;
+        }
+    }
+
+    fn keep_cost_ns(&self, d: usize) -> f64 {
+        let k = BlobKind::KvBlock.idx();
+        let h = &self.domains[d];
+        let reads = h.hits[k] + h.misses[k] + h.offload_hits[k] + h.nvme_hits[k];
+        let hit_share = if reads == 0 {
+            0.0
+        } else {
+            h.hits[k] as f64 / reads as f64
+        };
+        let blocks = h.resident_bytes(BlobKind::KvBlock) / crate::work::KV_BLOCK_BYTES;
+        blocks as f64 * crate::work::KV_BLOCK_NS as f64 * hit_share
+    }
+
+    fn move_cost_ns(
+        &self,
+        current: &[Option<Model>],
+        next: &[Option<Model>],
+        demand: &[f64; MODEL_COUNT],
+        costs: &Costs,
+        keep: &[f64],
+    ) -> f64 {
+        let Some(fleet) = &self.fleet else {
+            return f64::MAX;
+        };
+        let counts = fleet.counts();
+        let mut interim = counts;
+        let (mut load_ns, mut rebuild) = (0u64, 0.0);
+        for (d, (from, to)) in current.iter().zip(next).enumerate() {
+            let (Some(to), true) = (*to, from != to) else {
+                continue;
+            };
+            if let Some(from) = from {
+                interim[usize::from(*from) % MODEL_COUNT] -= 1;
+            }
+            let drain = self.engines[d].drained_by(self.arrival_ns) - self.arrival_ns;
+            load_ns = load_ns.max(drain + self.load_ns(d, to));
+            rebuild += keep[d];
+        }
+        let extra = costs.total_rate(demand, &interim) - costs.total_rate(demand, &counts);
+        extra.max(0.0) * load_ns as f64 / 1e9 + rebuild
+    }
+
+    fn plan_fleet(&mut self) {
+        let Some(mut state) = self.planner.take() else {
+            return;
+        };
+        let now = self.arrival_ns;
+        if now >= state.next_at
+            && let Some(fleet) = &self.fleet
+        {
+            state.next_at = (now / state.interval_ns + 1) * state.interval_ns;
+            state.ticks += 1;
+            let seconds = state.interval_ns as f64 / 1e9;
+            let view = std::mem::take(&mut self.fleet_view);
+            let demand = view.demand_tokens.map(|t| t as f64 / seconds);
+            let current = fleet.placement();
+            let counts = fleet.counts();
+            for ((seen, &tokens), &held) in
+                state.seen.iter_mut().zip(&view.demand_tokens).zip(&counts)
+            {
+                *seen |= tokens > 0 || held > 0;
+            }
+            let best = state
+                .costs
+                .best_counts_among(&demand, current.len(), state.seen);
+            let keep: Vec<f64> = (0..current.len()).map(|d| self.keep_cost_ns(d)).collect();
+            let next = retarget(&current, &best, &keep);
+            let go = if best == counts {
+                state.accrued_ns = 0.0;
+                false
+            } else {
+                match state.kind {
+                    PlannerKind::Once => state.ticks == 1,
+                    PlannerKind::Eager => true,
+                    PlannerKind::Follow => {
+                        let loss = state.costs.total_rate(&demand, &counts)
+                            - state.costs.total_rate(&demand, &best);
+                        state.accrued_ns += loss.max(0.0) * seconds;
+                        state.accrued_ns
+                            >= self.move_cost_ns(&current, &next, &demand, &state.costs, &keep)
+                    }
+                }
+            };
+            if go && moves_between(&current, &next) > 0 {
+                self.apply_placement(&next);
+                state.accrued_ns = 0.0;
+            }
+            self.plan_roles(&state, &view, seconds);
+        }
+        self.planner = Some(state);
+    }
+
+    fn plan_roles(&mut self, state: &PlannerState, view: &FleetView, seconds: f64) {
+        if self.pairing == Pairing::Off || (state.kind == PlannerKind::Once && state.ticks != 1) {
+            return;
+        }
+        let now = self.arrival_ns;
+        let Some(fleet) = &self.fleet else {
+            return;
+        };
+        let (counts, current) = (fleet.counts(), fleet.prefiller_counts());
+        let mut wanted = [0usize; MODEL_COUNT];
+        for m in 0..MODEL_COUNT {
+            if counts[m] > 0 {
+                let demand = view.demand_tokens[m] as f64 / seconds;
+                wanted[m] =
+                    state
+                        .costs
+                        .best_prefillers(m, demand, counts[m], view.prefills_of(m, seconds));
+            }
+        }
+        let mut flips: Vec<(usize, Role)> = Vec::new();
+        for m in 0..MODEL_COUNT {
+            let model = m as Model;
+            if wanted[m] > current[m] {
+                let mut idle: Vec<usize> = (0..fleet.nodes())
+                    .filter(|&d| {
+                        fleet.model_on(d) == Some(model) && fleet.role_of(d) == Role::Decode
+                    })
+                    .collect();
+                idle.sort_by_key(|&d| (self.engines[d].drained_by(now), d));
+                flips.extend(
+                    idle.into_iter()
+                        .take(wanted[m] - current[m])
+                        .map(|d| (d, Role::Prefill)),
+                );
+            } else if wanted[m] < current[m] {
+                let mut held: Vec<usize> = (0..fleet.nodes())
+                    .filter(|&d| {
+                        fleet.model_on(d) == Some(model) && fleet.role_of(d) == Role::Prefill
+                    })
+                    .collect();
+                held.sort_by(|a, b| b.cmp(a));
+                flips.extend(
+                    held.into_iter()
+                        .take(current[m] - wanted[m])
+                        .map(|d| (d, Role::Decode)),
+                );
+            }
+        }
+        if let Some(fleet) = self.fleet.as_mut() {
+            for (d, role) in flips {
+                fleet.move_role(d, role);
+            }
+        }
+    }
+
+    pub fn set_fleet(&mut self, mut fleet: Fleet, partition_override: Option<u64>) {
+        for d in 0..self.domains.len() {
+            let Some(model) = fleet.model_on(d) else {
+                continue;
+            };
+            let bytes = fleet.catalogue().get(model).bytes;
+            self.domains[d].bind_weights(bytes);
+            self.engines[d].set_step_base(fleet.step_base_ns(model));
+            if let Some((capacity, _)) = self.domains[d].kv_partition() {
+                fleet.bind_partition(d, capacity);
+            }
+        }
+        self.partition_override = partition_override;
+        self.fleet = Some(fleet);
+    }
+
+    #[must_use]
+    pub fn fleet(&self) -> Option<&Fleet> {
+        self.fleet.as_ref()
+    }
+
+    pub fn schedule_placement(&mut self, at_ns: u64, placement: Vec<Option<Model>>) {
+        let at = self.placements.partition_point(|(due, _)| *due <= at_ns);
+        self.placements.insert(at, (at_ns, placement));
+    }
+
+    fn load_ns(&self, d: usize, model: Model) -> u64 {
+        let Some(fleet) = &self.fleet else {
+            return 0;
+        };
+        let spec = fleet.catalogue().get(model);
+        let transfer = if fleet.cached(d, model) {
+            TierSpec::pcie().fetch_ns(spec.bytes)
+        } else {
+            let unit = self.unit_in(d);
+            fleet
+                .holders(model, self.arrival_ns)
+                .into_iter()
+                .filter(|&p| p != d)
+                .map(|p| self.topo.fetch_ns(unit, p, spec.bytes))
+                .min()
+                .unwrap_or(WEIGHT_NS * spec.bytes.div_ceil(WEIGHT_BYTES))
+        };
+        spec.start_ns + transfer
+    }
+
+    pub fn apply_placement(&mut self, placement: &[Option<Model>]) -> usize {
+        let now = self.arrival_ns;
+        let mut moved = 0;
+        for (d, target) in placement.iter().enumerate() {
+            let Some(model) = *target else {
+                continue;
+            };
+            let Some(fleet) = &self.fleet else {
+                return moved;
+            };
+            if fleet.model_on(d) == Some(model) {
+                continue;
+            }
+            let load = self.load_ns(d, model);
+            let bytes = fleet.catalogue().get(model).bytes;
+            let hbm = self.domains[d].hbm_bytes();
+            let partition = self
+                .partition_override
+                .unwrap_or_else(|| hbm.saturating_sub(bytes))
+                .min(hbm.saturating_sub(bytes));
+            let base = fleet.step_base_ns(model);
+            let begin = self.engines[d].drained_by(now);
+            let lost = self.domains[d].reload(bytes, partition);
+            self.engines[d].flush();
+            self.engines[d].set_step_base(base);
+            self.reserved[d] = Reservations::default();
+            if let Some(fleet) = self.fleet.as_mut() {
+                fleet.assign(now, begin, d, model, load);
+                if self.pairing != Pairing::Off {
+                    fleet.set_role(d, Role::Decode);
+                }
+                fleet.bind_partition(d, partition);
+                fleet.stats.kv_lost_bytes += lost;
+            }
+            self.observe_emit(d);
+            moved += 1;
+        }
+        moved
+    }
+
+    fn apply_due_placements(&mut self) {
+        while self
+            .placements
+            .first()
+            .is_some_and(|(due, _)| *due <= self.arrival_ns)
+        {
+            let (_, placement) = self.placements.remove(0);
+            self.apply_placement(&placement);
+        }
+    }
+
+    fn eligible(&self, mut pool: Vec<usize>, req: &Request) -> Vec<usize> {
+        if self.tenant_set > 0
+            && let Some(tenant) = req.tenant
+        {
+            let burst = tenant == crate::work::NEIGHBOUR_TENANT;
+            pool.retain(|&d| (d < self.tenant_set) == burst);
+        }
+        let (Some(fleet), Some(model)) = (&self.fleet, model_of(&req.requires)) else {
+            return pool;
+        };
+        let blocks = req.chain.len() as u64 + req.max_tokens.div_ceil(self.tokens_per_block.max(1));
+        pool.retain(|&d| fleet.serves(d, model, blocks));
+        pool
+    }
+
+    fn loading_wait_ns(&self, d: usize) -> u64 {
+        self.fleet
+            .as_ref()
+            .map_or(0, |f| f.wait_ns(d, self.arrival_ns))
+    }
+
+    pub fn set_model_batches(&mut self, batching: Batching, priced: bool) {
+        for e in &mut self.engines {
+            e.set_batching(batching);
+        }
+        self.priced_models = priced;
+    }
+
+    pub fn set_prefill_time(&mut self, load: Option<PrefillLoad>, priced: bool) {
+        for e in &mut self.engines {
+            e.set_prefill_load(load);
+        }
+        self.priced_prefill = load.is_some() && priced;
+    }
+
+    #[must_use]
+    pub fn prices_prefill(&self) -> bool {
+        self.priced_prefill
+    }
+
+    #[must_use]
+    pub fn models_in_flight(&self) -> [u64; MODEL_COUNT + 1] {
+        let mut total = [0; MODEL_COUNT + 1];
+        for e in &self.engines {
+            for (sum, n) in total.iter_mut().zip(e.models_in_flight) {
+                *sum += n;
+            }
+        }
+        total
+    }
+
+    #[must_use]
+    pub fn prefill_work_ns(&self) -> u64 {
+        self.engines.iter().map(|e| e.prefill_work_ns).sum()
+    }
+
+    #[must_use]
+    pub fn stretch_ns(&self) -> u64 {
+        self.engines.iter().map(|e| e.stretch_ns).sum()
+    }
+
+    #[must_use]
+    pub fn decode_ns(&self) -> u64 {
+        self.engines.iter().map(|e| e.decode_ns).sum()
+    }
+
+    #[must_use]
+    pub fn decode_share_ns(&self) -> u64 {
+        self.engines.iter().map(|e| e.decode_share_ns).sum()
+    }
+
+    #[must_use]
+    pub fn kv_partition_bytes(&self) -> u64 {
+        self.domains
+            .first()
+            .and_then(Hierarchy::kv_partition)
+            .map_or(0, |(capacity, _)| capacity)
+    }
+
+    #[must_use]
+    pub fn nodes(&self) -> usize {
+        self.domains.len()
+    }
+
+    fn report_prefill(&mut self, d: usize, req: &Request, work_ns: u64) {
+        if !req
+            .chain
+            .first()
+            .is_some_and(|(_, m)| m.kind == BlobKind::KvBlock)
+        {
+            return;
+        }
+        self.engines[d].prefill(self.arrival_ns, work_ns);
+        if let Some(o) = &self.origins
+            && let Some(origin) = req.chain.last().and_then(|(id, _)| o.of(id))
+        {
+            self.instruments.work_by_origin[origin.idx()].push(work_ns);
         }
     }
 
@@ -376,6 +1042,11 @@ impl Machine {
         self.record_kv_events(true);
         self.instruments.reuse = Some(Reuse::new(origins.clone(), self.domains.len()));
         self.origins = Some(origins);
+    }
+
+    pub fn track_tenants(&mut self) {
+        let origins = self.origins.clone().expect("tenants are read by origin");
+        self.instruments.tenants = Some(crate::instruments::Tenants::new(origins));
     }
 
     #[must_use]
@@ -655,6 +1326,11 @@ impl Machine {
         if seen.is_empty() {
             return;
         }
+        if let Some(t) = self.instruments.tenants.as_mut() {
+            for (id, tier, _) in &seen {
+                t.read(id, *tier == Some(Medium::Gpu));
+            }
+        }
         if let Some(r) = self.instruments.reuse.as_mut() {
             r.dispatches += 1;
             let mut evicted = false;
@@ -783,6 +1459,13 @@ impl Machine {
         if cost.pending {
             return;
         }
+        if self.tenant_slots > 0
+            && let Some(t) = req.tenant
+            && req.tokens > 0
+        {
+            let end = self.arrival_ns + cost.queue_ns + cost.exec_ns;
+            self.tenant_flight.entry(t).or_default().push(Reverse(end));
+        }
         if self.prefill_ahead
             && let Some(hint) = &req.hint
         {
@@ -809,9 +1492,11 @@ impl Machine {
         let view = RequestView {
             chain: blocks,
             requires: &[],
+            model: None,
             tokens,
             class: BlobKind::KvBlock.idx(),
             slo: Slo::Interactive,
+            tenant: None,
         };
         self.decode_pool()
             .into_iter()
@@ -872,6 +1557,7 @@ impl Machine {
             }
         }
         self.domains[target].seal(None);
+        self.engines[target].prefill(self.arrival_ns, work);
         let stats = &mut self.instruments.prefill;
         stats.calls += 1;
         stats.blocks += placed.len() as u64;
@@ -908,7 +1594,11 @@ impl Machine {
             return;
         }
         let loads: Vec<usize> = self.engines.iter().map(|e| e.load(now)).collect();
-        let steps: Vec<u64> = loads.iter().map(|&l| Engine::step_ns(l + 1)).collect();
+        let steps: Vec<u64> = loads
+            .iter()
+            .zip(&self.engines)
+            .map(|(&l, e)| e.step(l + 1))
+            .collect();
         if let Some(o) = self.observer.as_mut() {
             o.release(now);
             o.pump(now, &steps, &loads);
@@ -923,6 +1613,9 @@ impl Machine {
         let now = self.arrival_ns;
         if let Some(r) = self.instruments.reuse.as_mut() {
             r.events(d, now, &events);
+        }
+        if let Some(t) = self.instruments.tenants.as_mut() {
+            t.events(&events);
         }
         let load = self.engines[d].load(now);
         if let Some(o) = self.observer.as_mut() {
@@ -1285,6 +1978,10 @@ impl Machine {
     }
 
     fn plan(&self, d: usize, req: &RequestView<'_>, view: View) -> Plan {
+        self.plan_with(d, req, view, self.state_transfer)
+    }
+
+    fn plan_with(&self, d: usize, req: &RequestView<'_>, view: View, peers: bool) -> Plan {
         let rule = self.rule(req.slo);
         let resident = |dom: usize, id: &BlobId, kind: BlobKind| match view {
             View::Belief => {
@@ -1311,6 +2008,7 @@ impl Machine {
             chain_bytes: 0,
             deps: Vec::new(),
             need,
+            rebuild_ns: 0,
         };
         if let Some(pool) = &self.shared {
             let far = depth
@@ -1332,7 +2030,7 @@ impl Machine {
                 }
             }
         }
-        if self.state_transfer && depth < req.chain.len() {
+        if peers && depth < req.chain.len() {
             let unit = self.unit_in(d);
             for &p in &self.active {
                 if p == d {
@@ -1356,7 +2054,18 @@ impl Machine {
         if view == View::Belief {
             plan.ns = self.expected_chain_ns(d, req, &plan, rule);
         }
-        self.plan_dependencies(d, req, &mut plan, view, &resident, &held);
+        if self.priced_prefill {
+            plan.rebuild_ns = req.chain[plan.chain_cut..]
+                .iter()
+                .filter(|(id, m)| {
+                    m.kind == BlobKind::KvBlock && self.local_ns(d, id, m, view) == m.recompute_ns
+                })
+                .map(|(_, m)| m.recompute_ns)
+                .sum();
+        }
+        if self.fleet.is_none() {
+            self.plan_dependencies(d, req, &mut plan, view, &resident, &held);
+        }
         plan
     }
 
@@ -1483,6 +2192,11 @@ impl Machine {
                 .with_load(self.observed_by(d).and_then(|o| o.reported_load(d))),
             View::Truth => self.telemetry_in(d, view),
         };
+        let tele = tele.with_model(if self.priced_models || view == View::Truth {
+            req.model
+        } else {
+            None
+        });
         let displaced = if self.displacement {
             tele.displacement(&plan.need, &self.staged_bytes[d])
         } else {
@@ -1497,12 +2211,18 @@ impl Machine {
         let decoding = req.tokens > 0 && self.interval_ns > 0;
         let reserved = self.staged_seqs[d];
         let engine = if decoding {
-            tele.projected_ns(self.arrival_ns, req.tokens, reserved) as f64
+            (tele.projected_ns(self.arrival_ns, req.tokens, reserved) + self.loading_wait_ns(d))
+                as f64
         } else {
             0.0
         };
         let congestion = if decoding {
             tele.congestion_ns(self.arrival_ns, req.tokens, reserved) as f64
+        } else {
+            0.0
+        };
+        let prefill = if self.priced_prefill {
+            tele.prefill_toll_ns(self.arrival_ns, plan.rebuild_ns, reserved)
         } else {
             0.0
         };
@@ -1514,6 +2234,7 @@ impl Machine {
             handoff,
             engine,
             congestion,
+            prefill,
             need: plan.need,
         }
     }
@@ -1638,11 +2359,11 @@ impl Machine {
         ns += self.reach_ns(d, req, decode_needed);
         let decoding = req.tokens > 0 && self.interval_ns > 0;
         ns += if decoding {
-            self.telemetry_in(d, View::Truth).projected_ns(
-                self.arrival_ns,
-                req.tokens,
-                self.staged_seqs[d],
-            )
+            self.loading_wait_ns(d)
+                + self
+                    .telemetry_in(d, View::Truth)
+                    .with_model(model_of(&req.requires))
+                    .projected_ns(self.arrival_ns, req.tokens, self.staged_seqs[d])
         } else {
             req.exec_ns
         };
@@ -1945,13 +2666,20 @@ impl Machine {
         chain_bytes + dep_bytes
     }
 
-    pub fn serve_request(&mut self, req: &Request) -> Cost {
-        self.arrival_ns += self.interval_ns;
+    fn arrive(&mut self, concurrent: bool) {
+        if !concurrent {
+            self.arrival_ns += self.interval_ns;
+        }
         let now = self.arrival_ns;
         for (h, r) in self.domains.iter_mut().zip(&mut self.reserved) {
             h.release(now);
             r.release(now);
         }
+        if let Some(fleet) = self.fleet.as_mut() {
+            fleet.settle(now);
+        }
+        self.apply_due_placements();
+        self.plan_fleet();
         self.observe_arrival(now);
         let engines: Vec<usize> = self
             .active
@@ -1966,6 +2694,17 @@ impl Machine {
             }
         }
         self.kv_samples += 1;
+    }
+
+    fn unplaced() -> Cost {
+        Cost {
+            pending: true,
+            ..Cost::default()
+        }
+    }
+
+    pub fn serve_request(&mut self, req: &Request) -> Cost {
+        self.arrive(req.concurrent);
         if let Some(task) = req.completes
             && self.cancelled.remove(&task)
         {
@@ -1978,11 +2717,18 @@ impl Machine {
             return self.serve_gang(req, gang);
         }
         let decode_needed = Self::needs_decode(req);
+        self.record_demand(model_of(&req.requires), req.tokens);
         let candidates = if decode_needed {
-            self.decode_pool()
+            self.eligible(self.decode_pool(), req)
         } else {
             self.active.clone()
         };
+        if candidates.is_empty() {
+            if let Some(fleet) = self.fleet.as_mut() {
+                fleet.stats.unplaced += 1;
+            }
+            return Self::unplaced();
+        }
         let decide_ns = self.decide(req.chain.len(), candidates.len());
         self.decide_ns += decide_ns;
         if self.placement != Placement::Blind {
@@ -2012,6 +2758,14 @@ impl Machine {
         };
         let home = self.topo.units[self.unit_in(target)].home as usize;
 
+        let mut planned = None;
+        if !self.meters_admit(home, req, &mut planned) {
+            if let Some(t) = req.tenant {
+                *self.tenant_refused.entry(t).or_insert(0) += 1;
+            }
+            return Self::unplaced();
+        }
+
         if self.placement == Placement::Aware
             && self.resident_value(target, req) > 0
             && self.truly_resident(target, req) == 0
@@ -2039,7 +2793,8 @@ impl Machine {
         let arrival = self.reach(home, req, decode_needed);
 
         self.observe_landing(req, home);
-        let mut cost = self.run_here(home, req);
+        let pair = self.decide_pair(home, req, &mut planned);
+        let mut cost = self.run_paired(home, req, pair);
         cost.decide_ns = decide_ns;
         cost.transfer_ns += handoff + arrival;
         self.after_dispatch(req, home, &cost);
@@ -2080,6 +2835,10 @@ impl Machine {
     }
 
     fn run_here(&mut self, home: usize, req: &Request) -> Cost {
+        self.run_paired(home, req, None)
+    }
+
+    fn run_paired(&mut self, home: usize, req: &Request, pair: Option<(usize, u64)>) -> Cost {
         let class = req.kind_idx();
         if !self.router_admits(home, req, false) {
             self.refused_by_router[class] += 1;
@@ -2088,6 +2847,11 @@ impl Machine {
                 ..Cost::default()
             };
         }
+        if let Some(t) = self.instruments.tenants.as_mut() {
+            t.set_requester(req.tenant);
+        }
+        self.domains[home].set_owner(req.tenant);
+        let prefilled = pair.and_then(|(p, avoided)| self.prefill_on(p, req, avoided));
         let shared_before = self.shared_reads;
         let ran_with = self.truly_resident(home, req);
 
@@ -2098,8 +2862,17 @@ impl Machine {
         let mut cost = self.domains[home].access(&req.chain);
         let chain_recompute = cost.recompute_ns;
         cost.transfer_ns += fetch.transfer_ns;
+        if let Some((wait, work, transfer)) = prefilled {
+            cost.queue_ns += wait;
+            cost.recompute_ns += work;
+            cost.transfer_ns += transfer;
+        }
 
         if !cost.pending {
+            self.report_prefill(home, req, chain_recompute);
+            if prefilled.is_none() {
+                self.record_prefill(req, chain_recompute);
+            }
             if fetch.transfer_ns > 0 {
                 self.remote += 1;
             } else if ran_with == 0 {
@@ -2109,7 +2882,7 @@ impl Machine {
             }
         }
 
-        if !cost.pending && !req.requires.is_empty() {
+        if !cost.pending && !req.requires.is_empty() && self.fleet.is_none() {
             let shipped = self.apply_deps(home, req, &plan);
             let dep = self.domains[home].access_set(&req.requires);
             cost.transfer_ns += shipped.transfer_ns + dep.transfer_ns;
@@ -2129,7 +2902,7 @@ impl Machine {
                 seen.1 += 1;
             }
             cost.exec_ns = exec;
-            cost.queue_ns = queue;
+            cost.queue_ns += queue;
             self.domains[home].decode_output(&req.chain, &req.produces, chain_recompute, &mut cost);
             self.preempted[class] += u64::from(cost.preempted);
             let decoding = req.tokens > 0 && self.interval_ns > 0;
@@ -2160,6 +2933,7 @@ impl Machine {
         self.domains[home].seal(until);
         self.emit_directives(home, req, &cost);
         self.observe_emit(home);
+        self.domains[home].set_owner(None);
         if !cost.pending {
             self.observe_touched(home, req);
         }
@@ -2170,8 +2944,13 @@ impl Machine {
         if req.tokens == 0 || self.interval_ns == 0 {
             return (req.exec_ns, 0);
         }
-        let step = self.engines[d].decode(self.arrival_ns, req.tokens);
-        (step.exec_ns, step.queue_ns)
+        let model = model_of(&req.requires);
+        let wait = self.loading_wait_ns(d);
+        let step = self.engines[d].decode_for(self.arrival_ns + wait, req.tokens, model);
+        if let (Some(fleet), Some(m)) = (self.fleet.as_mut(), model) {
+            fleet.record_served(d, m);
+        }
+        (step.exec_ns, step.queue_ns + wait)
     }
 
     fn agent_request(agent: &Agent) -> Request {
@@ -2188,6 +2967,8 @@ impl Machine {
             max_tokens: agent.max_tokens,
             slo: agent.slo,
             retention: agent.retention,
+            concurrent: false,
+            tenant: agent.tenant,
         }
     }
 
@@ -2205,11 +2986,16 @@ impl Machine {
             max_tokens: 0,
             slo: crate::work::Slo::Interactive,
             retention: crate::work::Retention::default(),
+            concurrent: false,
+            tenant: None,
         }
     }
 
     fn serve_gang(&mut self, req: &Request, gang: &Gang) -> Cost {
         let n = gang.agents.len().max(1);
+        for a in &gang.agents {
+            self.record_demand(model_of(&a.requires), a.tokens);
+        }
         let blobs: usize = gang.agents.iter().map(|a| a.chain.len()).sum();
 
         let decide_ns = self.decide(blobs, self.decode_pool_len());
@@ -2357,8 +3143,13 @@ impl Machine {
 
     fn place_agent(&mut self, probe: &Request, flow: &[(usize, u64)]) -> Option<(usize, Need)> {
         let seen = self.view_of(probe);
-        let feasible: Vec<(usize, Need)> = self
-            .decode_pool()
+        let eligible = self.eligible(self.decode_pool(), probe);
+        if eligible.is_empty()
+            && let Some(fleet) = self.fleet.as_mut()
+        {
+            fleet.stats.unplaced += 1;
+        }
+        let feasible: Vec<(usize, Need)> = eligible
             .iter()
             .filter_map(|&d| {
                 let need = self.plan(d, &seen, View::Belief).need;
@@ -2521,13 +3312,20 @@ struct Terms {
     handoff: f64,
     engine: f64,
     congestion: f64,
+    prefill: f64,
 
     need: Need,
 }
 
-pub const TERM_COUNT: usize = 5;
-pub const TERM_LABELS: [&str; TERM_COUNT] =
-    ["acquire", "displaced", "handoff", "engine", "congestion"];
+pub const TERM_COUNT: usize = 6;
+pub const TERM_LABELS: [&str; TERM_COUNT] = [
+    "acquire",
+    "displaced",
+    "handoff",
+    "engine",
+    "congestion",
+    "prefill",
+];
 
 impl Terms {
     const EACH: [fn(&Terms) -> f64; TERM_COUNT] = [
@@ -2536,6 +3334,7 @@ impl Terms {
         |t| t.handoff,
         |t| t.engine,
         |t| t.congestion,
+        |t| t.prefill,
     ];
 
     fn acquire_only(&self) -> f64 {
@@ -2551,7 +3350,7 @@ impl Terms {
         self.placed() + self.engine
     }
     fn full(&self) -> f64 {
-        self.loaded() + self.congestion
+        self.loaded() + self.congestion + self.prefill
     }
 }
 
@@ -2583,6 +3382,7 @@ struct Plan {
     deps: Vec<(usize, Source)>,
 
     need: Need,
+    rebuild_ns: u64,
 }
 
 use crate::tele::Need;
@@ -2863,6 +3663,10 @@ mod tests {
     }
 
     fn engine_machine(hbm: u64, partition: u64, control: Control) -> Machine {
+        placed_machine(hbm, partition, control, Placement::Scored)
+    }
+
+    fn placed_machine(hbm: u64, partition: u64, control: Control, placement: Placement) -> Machine {
         let bands = [0u8; BlobKind::N];
         let mem = NodeMemory {
             hbm,
@@ -2879,7 +3683,7 @@ mod tests {
             }),
         };
         let topo = Topology::cluster(4, 1, mem.ddr, Distance::Rack, Crossing::default());
-        let mut mach = Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored);
+        let mut mach = Machine::new(topo, |_| mem, Policy::Gdsf, placement);
         mach.set_control(control, Crossing::default());
         mach
     }
@@ -3282,6 +4086,8 @@ mod tests {
             max_tokens: 0,
             slo: crate::work::Slo::Interactive,
             retention: crate::work::Retention::default(),
+            concurrent: false,
+            tenant: None,
         };
         assert!(mach.domains[d].evict_unrecorded(&victim));
         let believed = mach.plan(d, &req.view(0), View::Belief);
@@ -3363,6 +4169,8 @@ mod tests {
             max_tokens: 900,
             slo: crate::work::Slo::Interactive,
             retention: crate::work::Retention::default(),
+            concurrent: false,
+            tenant: None,
         };
         let mut mach = gate_machine(Control::Unified, false);
         assert_eq!(mach.view_of(&request(50)).tokens, 50);
@@ -3608,6 +4416,7 @@ mod tests {
             }
         }
         let reuse = mach.instruments.reuse.as_ref().expect("origins turn it on");
+        assert!(mach.instruments.tenants.is_none());
         let accesses: u64 = reuse.rows.iter().map(|r| r.accesses).sum();
         assert!(accesses >= dispatched && dispatched > 0);
         for (i, row) in reuse.rows.iter().enumerate() {
@@ -3640,5 +4449,790 @@ mod tests {
             costs
         };
         assert_eq!(run(false), run(true));
+    }
+    fn served_costs(mach: &mut Machine, trace: &[Request]) -> Vec<String> {
+        mach.set_arrival_rate(250.0);
+        trace
+            .iter()
+            .map(|r| format!("{:?}", mach.serve_request(r)))
+            .collect()
+    }
+
+    fn one_model_trace(seed: u64, ops: u64) -> Vec<Request> {
+        Workload::with_fanout(seed, ops, 1.0, 0.1)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_one_model(true)
+            .collect()
+    }
+
+    fn decode_ns(costs: &[String]) -> u64 {
+        costs
+            .iter()
+            .filter_map(|c| {
+                let tail = c.split("exec_ns: ").nth(1)?;
+                tail.split(',').next()?.parse::<u64>().ok()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_batch_per_model_changes_nothing_when_every_request_names_one_model() {
+        let trace = one_model_trace(2, 1_500);
+        let mut shared = engine_machine(4 << 30, 1 << 30, Control::Unified);
+        let base = served_costs(&mut shared, &trace);
+        for priced in [false, true] {
+            let mut mach = engine_machine(4 << 30, 1 << 30, Control::Unified);
+            mach.set_model_batches(Batching::PerModel, priced);
+            assert_eq!(base, served_costs(&mut mach, &trace), "priced={priced}");
+        }
+        assert!(decode_ns(&base) > 0);
+    }
+
+    #[test]
+    fn a_batch_per_model_is_dearer_where_four_models_decode() {
+        let trace = decode_trace(2, 1_500);
+        let spread = || placed_machine(4 << 30, 1 << 30, Control::Unified, Placement::Blind);
+        let mut shared = spread();
+        let base = decode_ns(&served_costs(&mut shared, &trace));
+        let mut mach = spread();
+        mach.set_model_batches(Batching::PerModel, true);
+        let sliced = decode_ns(&served_costs(&mut mach, &trace));
+        assert!(sliced > 2 * base, "{sliced} against {base}");
+        let in_flight = mach.models_in_flight();
+        assert!(in_flight[3] + in_flight[4] > in_flight[1] + in_flight[2]);
+    }
+
+    #[test]
+    fn an_allowance_no_step_exceeds_makes_prefill_time_change_nothing() {
+        let trace = decode_trace(3, 1_500);
+        let mut off = engine_machine(4 << 30, 1 << 30, Control::Unified);
+        let base = served_costs(&mut off, &trace);
+        for priced in [false, true] {
+            let mut mach = engine_machine(4 << 30, 1 << 30, Control::Unified);
+            mach.set_prefill_time(
+                Some(PrefillLoad {
+                    window_ns: 1_000_000_000,
+                    free_ns: 1_000_000_000,
+                }),
+                priced,
+            );
+            assert_eq!(base, served_costs(&mut mach, &trace), "priced={priced}");
+            assert_eq!(mach.stretch_ns(), 0);
+        }
+    }
+
+    #[test]
+    fn prefill_time_lengthens_decodes_by_the_work_the_engine_was_handed() {
+        let trace = decode_trace(3, 1_500);
+        let mut off = engine_machine(4 << 30, 1 << 30, Control::Unified);
+        let base = served_costs(&mut off, &trace);
+        assert!(off.prefill_work_ns() > 0, "every rebuild reaches an engine");
+        assert_eq!(off.stretch_ns(), 0);
+        let mut mach = engine_machine(4 << 30, 1 << 30, Control::Unified);
+        mach.set_prefill_time(
+            Some(PrefillLoad {
+                window_ns: 1_000_000_000,
+                free_ns: 0,
+            }),
+            false,
+        );
+        let stretched = served_costs(&mut mach, &trace);
+        assert!(mach.stretch_ns() > 0);
+        assert!(decode_ns(&stretched) > decode_ns(&base));
+        assert!(!mach.prices_prefill());
+    }
+
+    #[test]
+    fn a_priced_prefill_term_reaches_the_score_only_when_the_engine_is_loaded() {
+        let trace = decode_trace(3, 1_500);
+        let load = Some(PrefillLoad {
+            window_ns: 1_000_000_000,
+            free_ns: 0,
+        });
+        let mut blind = engine_machine(4 << 30, 1 << 30, Control::Unified);
+        blind.set_prefill_time(load, false);
+        served_costs(&mut blind, &trace);
+        let mut priced = engine_machine(4 << 30, 1 << 30, Control::Unified);
+        priced.set_prefill_time(load, true);
+        served_costs(&mut priced, &trace);
+        assert!(blind.term_spread[5].abs() < f64::EPSILON);
+        assert!(priced.term_spread[5] > 0.0);
+        assert!(priced.prices_prefill());
+    }
+    fn fleet_machine(placement: &[Option<Model>], window: Option<u64>) -> Machine {
+        let catalogue = crate::fleet::Catalogue::published(8_000_000_000);
+        let catalogue = window.map_or(catalogue.clone(), |w| catalogue.with_context(w));
+        catalogued_machine(placement, &catalogue, |_| 3 << 30)
+    }
+
+    fn catalogued_machine(
+        placement: &[Option<Model>],
+        catalogue: &crate::fleet::Catalogue,
+        partition: impl Fn(usize) -> u64,
+    ) -> Machine {
+        let bands = [0u8; BlobKind::N];
+        let node = |d: usize| NodeMemory {
+            hbm: 4 << 30,
+            ddr: 8 << 30,
+            nvme: 64 << 30,
+            hbm_quota: Quota::open(4 << 30, bands),
+            ddr_quota: Quota::open(8 << 30, bands),
+            can_decode: true,
+            kv: Some(crate::cache::EngineKv {
+                partition: partition(d),
+                offload: 1 << 30,
+                spill: 8 << 30,
+                clairvoyant: false,
+            }),
+        };
+        let topo = Topology::cluster(
+            placement.len(),
+            1,
+            8 << 30,
+            Distance::Rack,
+            Crossing::default(),
+        );
+        let mut mach = Machine::new(topo, node, Policy::Gdsf, Placement::Scored);
+        mach.set_flow_aware(true);
+        mach.set_state_transfer(true);
+        mach.set_model_batches(Batching::PerModel, true);
+        mach.set_fleet(crate::fleet::Fleet::new(catalogue.clone(), placement), None);
+        mach
+    }
+
+    const SIZED: [u64; 4] = [1 << 29, 1 << 30, 1 << 30, 2 << 30];
+
+    fn sized_machine(placement: &[Option<Model>]) -> Machine {
+        let catalogue = crate::fleet::Catalogue::published(8_000_000_000).with_sizes(SIZED);
+        let held = placement.to_vec();
+        catalogued_machine(placement, &catalogue, move |d| {
+            (4u64 << 30) - held[d].map_or(0, |m| SIZED[usize::from(m)])
+        })
+    }
+
+    fn keyed_trace(seed: u64, ops: u64) -> Vec<Request> {
+        Workload::with_fanout(seed, ops, 1.0, 0.1)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_model_keyed(true)
+            .collect()
+    }
+
+    #[test]
+    fn every_decode_lands_on_a_replica_serving_its_model() {
+        let placement = [Some(0), Some(1), Some(2), Some(3)];
+        let mut mach = fleet_machine(&placement, None);
+        served_costs(&mut mach, &keyed_trace(2, 1_500));
+        let fleet = mach.fleet().expect("a fleet");
+        let mut served = 0;
+        for (d, row) in fleet.stats.served.iter().enumerate() {
+            for (m, n) in row.iter().enumerate() {
+                if Some(m as Model) != placement[d] {
+                    assert_eq!(*n, 0, "node {d} decoded model {m}");
+                }
+                served += n;
+            }
+        }
+        assert!(served > 100);
+        assert_eq!(fleet.stats.unplaced, 0);
+    }
+
+    #[test]
+    fn weights_never_reach_the_ledger_under_a_fleet() {
+        let mut mach = fleet_machine(&[Some(0), Some(1), Some(2), Some(3)], None);
+        served_costs(&mut mach, &keyed_trace(2, 1_500));
+        let w = BlobKind::WeightShard.idx();
+        let ops = mach.engine_ops();
+        assert_eq!(
+            ops.admit[w] + ops.touch[w] + ops.demote[w] + ops.spill[w],
+            0
+        );
+        for d in 0..mach.nodes() {
+            let h = &mach.domains[d];
+            assert_eq!(
+                h.hits[w] + h.misses[w] + h.offload_hits[w] + h.nvme_hits[w],
+                0
+            );
+            assert_eq!(h.weights_bytes(), Some(1 << 30));
+        }
+    }
+
+    #[test]
+    fn a_model_with_no_replica_is_unplaced_and_counted_apart() {
+        let mut mach = fleet_machine(&[Some(0), Some(0), Some(1), Some(1)], None);
+        let trace = keyed_trace(2, 1_500);
+        let costs = served_costs(&mut mach, &trace);
+        let unplaced = mach.fleet().map_or(0, |f| f.stats.unplaced);
+        assert!(unplaced > 100, "{unplaced}");
+        assert!(costs.iter().any(|c| c.contains("pending: true")));
+        assert_eq!(mach.refused_by_router.iter().sum::<u64>(), 0);
+        assert!(decode_ns(&costs) > 0);
+    }
+
+    #[test]
+    fn a_context_window_the_partition_cannot_hold_is_not_routed_to() {
+        let mut mach = fleet_machine(&[Some(0), Some(1), Some(2), Some(3)], Some(4));
+        served_costs(&mut mach, &keyed_trace(2, 600));
+        let fleet = mach.fleet().expect("a fleet");
+        let served: u64 = fleet.stats.served.iter().flatten().sum();
+        assert_eq!(served, 0);
+        assert!(fleet.stats.unplaced > 100);
+    }
+
+    #[test]
+    fn a_reload_empties_the_node_keeps_hbm_whole_and_makes_the_replica_wait() {
+        let mut mach = fleet_machine(&[Some(0), Some(0), Some(1), Some(1)], None);
+        let trace = keyed_trace(2, 1_500);
+        served_costs(&mut mach, &trace[..600]);
+        assert!(
+            mach.domains[0]
+                .kv_partition()
+                .is_some_and(|(_, _)| mach.domains[0].resident_bytes(BlobKind::KvBlock) > 0)
+        );
+        let drain = mach.engines[0].drained_by(mach.arrival_ns) - mach.arrival_ns;
+        assert!(drain > 0, "node 0 is decoding when it is told to move");
+        let moved = mach.apply_placement(&[Some(2), Some(0), Some(1), Some(1)]);
+        assert_eq!(moved, 1);
+        let fleet = mach.fleet().expect("a fleet");
+        assert_eq!(fleet.model_on(0), Some(2));
+        assert_eq!(fleet.stats.loads, 1);
+        assert!(fleet.stats.kv_lost_bytes > 0);
+        assert_eq!(
+            fleet.wait_ns(0, mach.arrival_ns),
+            drain + 16_000_000_000,
+            "what it is decoding finishes, then the cold load"
+        );
+        assert_eq!(mach.domains[0].resident_bytes(BlobKind::KvBlock), 0);
+        let (capacity, _) = mach.domains[0].kv_partition().expect("a partition");
+        assert_eq!(
+            capacity + mach.domains[0].weights_bytes().expect("weights"),
+            mach.domains[0].hbm_bytes()
+        );
+        mach.arrival_ns += drain + 16_000_000_000;
+        mach.fleet
+            .as_mut()
+            .expect("a fleet")
+            .settle(mach.arrival_ns);
+        assert_eq!(mach.fleet().map(|f| f.wait_ns(0, mach.arrival_ns)), Some(0));
+    }
+
+    #[test]
+    fn a_request_reaching_a_loading_replica_waits_for_the_rest_of_the_load() {
+        let mut mach = fleet_machine(&[Some(0), Some(0), Some(1), Some(1)], None);
+        let trace = keyed_trace(2, 2_500);
+        mach.set_arrival_rate(250.0);
+        for req in &trace[..400] {
+            mach.serve_request(req);
+        }
+        mach.apply_placement(&[Some(2), Some(0), Some(1), Some(1)]);
+        let ready = mach.arrival_ns + mach.fleet().map_or(0, |f| f.wait_ns(0, mach.arrival_ns));
+        let mut waited = None;
+        for req in &trace[400..] {
+            if model_of(&req.requires) != Some(2) || req.gang.is_some() {
+                mach.serve_request(req);
+                continue;
+            }
+            let now = mach.arrival_ns + mach.interval_ns;
+            let cost = mach.serve_request(req);
+            waited = Some((cost.queue_ns, ready.saturating_sub(now)));
+            break;
+        }
+        let (queue_ns, remaining) = waited.expect("a request for the loading model");
+        assert!(
+            remaining > 0 && queue_ns >= remaining,
+            "{queue_ns} against {remaining}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exceed")]
+    fn weights_that_do_not_fit_beside_the_partition_are_refused() {
+        let mut mach = fleet_machine(&[Some(0), Some(1), Some(2), Some(3)], None);
+        mach.domains[0].reload(2 << 30, 3 << 30);
+    }
+
+    #[test]
+    fn a_load_is_priced_from_the_cheapest_copy_of_the_model() {
+        let mut mach = fleet_machine(&[Some(0), Some(0), Some(1), Some(1)], None);
+        let start = 8_000_000_000;
+        let bytes = 2 * WEIGHT_BYTES;
+        let peer = mach.topo.fetch_ns(mach.unit_in(0), 2, bytes);
+        assert_eq!(mach.load_ns(0, 1), start + peer);
+        assert_eq!(mach.load_ns(0, 2), start + 2 * WEIGHT_NS);
+        assert_eq!(mach.load_ns(0, 0), start + TierSpec::pcie().fetch_ns(bytes));
+        mach.apply_placement(&[Some(1), Some(0), Some(1), Some(1)]);
+        assert_eq!(mach.load_ns(0, 0), start + TierSpec::pcie().fetch_ns(bytes));
+        assert!(
+            mach.fleet()
+                .is_some_and(|f| f.cached(0, 0) && f.cached(0, 1))
+        );
+        mach.apply_placement(&[Some(1), Some(0), Some(3), Some(3)]);
+        let cold = start + 2 * WEIGHT_NS;
+        let now = mach.arrival_ns;
+        assert_eq!(
+            mach.fleet().map(|f| (f.wait_ns(2, now), f.wait_ns(3, now))),
+            Some((cold, cold)),
+            "a copy still in flight is no source"
+        );
+    }
+    #[test]
+    fn a_concurrent_request_arrives_at_the_instant_of_the_one_before_it() {
+        let trace: Vec<Request> = Workload::with_fanout(2, 800, 1.0, 0.0)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_fresh(0.3)
+            .collect();
+        let mut mach = engine_machine(4 << 30, 1 << 30, Control::Unified);
+        mach.set_arrival_rate(250.0);
+        let (mut base, mut extra, mut last) = (0u64, 0u64, 0u64);
+        for req in &trace {
+            mach.serve_request(req);
+            if req.concurrent {
+                assert_eq!(mach.arrival_ns, last);
+                extra += 1;
+            } else {
+                assert_eq!(mach.arrival_ns, last + mach.interval_ns);
+                base += 1;
+            }
+            last = mach.arrival_ns;
+        }
+        assert!(extra > 50 && base > 500);
+    }
+    fn mix_trace(seed: u64, ops: u64, head: [f64; MODEL_COUNT]) -> Vec<Request> {
+        Workload::with_fanout(seed, ops, 0.0, 0.05)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_model_keyed(true)
+            .with_model_mix(crate::work::rotating_mix(head))
+            .collect()
+    }
+
+    fn planned(placement: &[Option<Model>], kind: PlannerKind, start_ns: u64) -> Machine {
+        let mut mach = fleet_machine(placement, None);
+        let catalogue = crate::fleet::Catalogue::published(start_ns);
+        mach.set_fleet(crate::fleet::Fleet::new(catalogue, placement), None);
+        mach.set_planner(kind, 5_000_000_000);
+        mach
+    }
+
+    const EVEN: [Option<Model>; 8] = [
+        Some(0),
+        Some(0),
+        Some(1),
+        Some(1),
+        Some(2),
+        Some(2),
+        Some(3),
+        Some(3),
+    ];
+
+    #[test]
+    fn a_stationary_mix_makes_every_planner_stop_where_it_started() {
+        let trace = mix_trace(2, 8_000, [0.25; 4]);
+        for kind in [PlannerKind::Follow, PlannerKind::Eager] {
+            let mut mach = planned(&EVEN, kind, 8_000_000_000);
+            served_costs(&mut mach, &trace);
+            assert!(mach.planner_ticks() >= 5);
+            assert_eq!(mach.fleet().map(|f| f.stats.loads), Some(0), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_shifting_mix_moves_replicas_toward_the_model_that_became_hot_and_every_move_is_a_write() {
+        let trace = mix_trace(2, 8_000, [0.7, 0.1, 0.1, 0.1]);
+        let mut mach = planned(&EVEN, PlannerKind::Eager, 8_000_000_000);
+        served_costs(&mut mach, &trace);
+        let fleet = mach.fleet().expect("a fleet");
+        assert!(fleet.counts()[3] >= 4, "{:?}", fleet.counts());
+        assert!(fleet.counts().iter().all(|&n| n >= 1));
+        assert_eq!(fleet.stats.moves.len() as u64, fleet.stats.loads);
+        assert_eq!(
+            fleet
+                .stats
+                .moves
+                .iter()
+                .map(|m| m.ready_ns - m.at_ns)
+                .sum::<u64>(),
+            fleet.stats.downtime_ns
+        );
+        assert!(fleet.stats.loads >= 2);
+    }
+
+    #[test]
+    fn follow_waits_for_the_loss_to_pay_for_a_costly_move_and_eager_does_not() {
+        let trace = mix_trace(2, 8_000, [0.7, 0.1, 0.1, 0.1]);
+        let first_move = |kind| {
+            let mut mach = planned(&EVEN, kind, 30_000_000_000);
+            served_costs(&mut mach, &trace);
+            mach.fleet()
+                .and_then(|f| f.stats.moves.first().map(|m| m.at_ns))
+        };
+        let (eager, follow) = (
+            first_move(PlannerKind::Eager),
+            first_move(PlannerKind::Follow),
+        );
+        assert!(eager.is_some());
+        assert!(follow.is_none_or(|f| f >= eager.unwrap_or(0)));
+    }
+
+    #[test]
+    fn once_moves_after_the_first_interval_and_never_again() {
+        let trace = mix_trace(2, 8_000, [0.7, 0.1, 0.1, 0.1]);
+        let mut mach = planned(&EVEN, PlannerKind::Once, 8_000_000_000);
+        served_costs(&mut mach, &trace);
+        let fleet = mach.fleet().expect("a fleet");
+        assert!(fleet.stats.loads > 0);
+        let times: std::collections::HashSet<u64> =
+            fleet.stats.moves.iter().map(|m| m.at_ns).collect();
+        assert_eq!(times.len(), 1);
+        assert!(times.iter().all(|&t| t < 6_000_000_000));
+    }
+
+    #[test]
+    fn demand_the_fleet_could_not_serve_is_demand_the_planner_sees() {
+        let trace = mix_trace(2, 6_000, [0.25; 4]);
+        let placement = [
+            Some(0),
+            Some(0),
+            Some(1),
+            Some(1),
+            Some(0),
+            Some(0),
+            Some(1),
+            Some(1),
+        ];
+        let mut mach = planned(&placement, PlannerKind::Eager, 8_000_000_000);
+        served_costs(&mut mach, &trace);
+        let fleet = mach.fleet().expect("a fleet");
+        assert!(
+            fleet.counts()[2] >= 1 && fleet.counts()[3] >= 1,
+            "{:?}",
+            fleet.counts()
+        );
+        assert!(fleet.stats.unplaced > 0);
+    }
+
+    #[test]
+    fn a_sized_fleet_gives_each_node_the_partition_and_the_step_its_model_leaves() {
+        let mut mach = sized_machine(&[Some(0), Some(1), Some(2), Some(3)]);
+        let partition = |mach: &Machine, d: usize| mach.domains[d].kv_partition().map(|(c, _)| c);
+        for (d, bytes) in SIZED.iter().enumerate() {
+            assert_eq!(partition(&mach, d), Some((4 << 30) - bytes));
+            assert_eq!(
+                mach.engines[d].step_base_ns(),
+                crate::engine::STEP_BASE_NS * bytes / (1 << 30)
+            );
+        }
+        served_costs(&mut mach, &keyed_trace(2, 1_500));
+        mach.apply_placement(&[Some(3), Some(1), Some(2), Some(3)]);
+        assert_eq!(partition(&mach, 0), Some(2 << 30));
+        assert_eq!(
+            mach.engines[0].step_base_ns(),
+            2 * crate::engine::STEP_BASE_NS
+        );
+        assert_eq!(mach.domains[0].weights_bytes(), Some(2 << 30));
+    }
+
+    #[test]
+    fn at_equal_demand_a_planner_gives_the_larger_model_more_replicas() {
+        let even: [Option<Model>; 8] = [
+            Some(0),
+            Some(0),
+            Some(1),
+            Some(1),
+            Some(2),
+            Some(2),
+            Some(3),
+            Some(3),
+        ];
+        let mut mach = sized_machine(&even);
+        mach.set_planner(PlannerKind::Eager, 5_000_000_000);
+        served_costs(&mut mach, &mix_trace(2, 8_000, [0.25; 4]));
+        let counts = mach.fleet().map(Fleet::counts).expect("a fleet");
+        assert_eq!(counts, [1, 2, 2, 3]);
+    }
+    fn pair_machine(prefillers: usize, rule: Pairing, over_ns: u64, fetch: bool) -> Machine {
+        let mut mach = fleet_machine(&[Some(0); 8], None);
+        for d in 0..8 {
+            let lane = if d < prefillers {
+                Role::Prefill
+            } else {
+                Role::Decode
+            };
+            mach.fleet.as_mut().expect("a fleet").set_role(d, lane);
+        }
+        mach.set_prefill_time(
+            Some(crate::engine::PrefillLoad {
+                window_ns: 1_000_000_000,
+                free_ns: 0,
+            }),
+            true,
+        );
+        mach.set_pairing(rule, over_ns, fetch);
+        mach.set_arrival_rate(400.0);
+        mach
+    }
+
+    fn fresh_trace(seed: u64, ops: u64, fresh: f64) -> Vec<Request> {
+        Workload::with_fanout(seed, ops, 1.0, 0.0)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_model_keyed(true)
+            .with_one_model(true)
+            .with_fresh(fresh)
+            .collect()
+    }
+
+    #[test]
+    fn a_paired_prefill_runs_on_the_prefiller_and_the_decoder_never_does_it() {
+        let trace = fresh_trace(2, 3_000, 0.3);
+        let mut aggregated = pair_machine(0, Pairing::Off, 0, false);
+        served_costs(&mut aggregated, &trace);
+        let mut paired = pair_machine(2, Pairing::List, 0, false);
+        served_costs(&mut paired, &trace);
+        let stats = paired.pair_stats;
+        assert!(stats.paired > 500 && stats.paired == stats.decisions - stats.failed);
+        let fleet = paired.fleet().expect("a fleet");
+        assert!(fleet.stats.served[..2].iter().flatten().all(|&n| n == 0));
+        assert!(fleet.stats.served[2..].iter().flatten().sum::<u64>() > 500);
+        let work_at = |m: &Machine, nodes: std::ops::Range<usize>| -> u64 {
+            nodes.map(|d| m.engines[d].prefill_work_ns).sum()
+        };
+        assert!(work_at(&paired, 0..2) > 0);
+        assert!(work_at(&paired, 2..8) < work_at(&aggregated, 2..8) / 2);
+        assert!(paired.stretch_ns() < aggregated.stretch_ns());
+    }
+
+    #[test]
+    fn a_prefiller_that_holds_no_history_starts_over_unless_it_may_fetch_the_prefix() {
+        let trace = fresh_trace(2, 3_000, 0.0);
+        let ratio = |fetch: bool| {
+            let mut mach = pair_machine(2, Pairing::List, 0, fetch);
+            served_costs(&mut mach, &trace);
+            let s = mach.pair_stats;
+            s.work_ns as f64 / s.avoided_ns as f64
+        };
+        assert!(ratio(false) > 1.05, "{}", ratio(false));
+        assert!((ratio(true) - 1.0).abs() < 1e-9, "{}", ratio(true));
+    }
+
+    #[test]
+    fn a_prefiller_is_a_first_come_queue() {
+        let trace = fresh_trace(2, 1_500, 1.0);
+        let mut mach = pair_machine(1, Pairing::List, 0, false);
+        served_costs(&mut mach, &trace);
+        let s = mach.pair_stats;
+        assert!(s.paired > 1_000 && s.wait_ns > 0);
+        assert!(s.wait_ns / s.paired > 1_000_000, "{s:?}");
+    }
+
+    #[test]
+    fn a_joint_rule_declines_a_saturated_prefiller_where_a_list_does_not() {
+        let trace = fresh_trace(2, 3_000, 0.3);
+        let share = |rule| {
+            let mut mach = pair_machine(1, rule, 0, false);
+            served_costs(&mut mach, &trace);
+            let s = mach.pair_stats;
+            (
+                s.paired as f64 / s.decisions as f64,
+                s.wait_ns as f64 / s.paired.max(1) as f64,
+            )
+        };
+        let (joint, joint_wait) = share(Pairing::Joint);
+        let (list, list_wait) = share(Pairing::List);
+        assert!(list > 0.99);
+        assert!(joint < 0.6, "{joint}");
+        assert!(
+            joint_wait < list_wait / 2.0,
+            "{joint_wait} against {list_wait}"
+        );
+    }
+
+    #[test]
+    fn an_independent_rule_leaves_short_prefills_at_the_decoder_and_coupling_counts_the_difference()
+    {
+        let trace = fresh_trace(2, 3_000, 0.0);
+        let mut never = pair_machine(2, Pairing::Independent, u64::MAX, false);
+        served_costs(&mut never, &trace);
+        assert_eq!(never.pair_stats.paired, 0);
+        let mut joint = pair_machine(2, Pairing::Joint, 0, false);
+        served_costs(&mut joint, &trace);
+        let s = joint.pair_stats;
+        assert!(s.decisions > 500 && s.coupled <= s.decisions);
+        assert!(
+            s.coupled > 0,
+            "joint and independent agree on every decision"
+        );
+    }
+
+    #[test]
+    fn pairing_needs_a_decode_replica_and_a_prefiller_of_its_model() {
+        let trace = fresh_trace(2, 1_000, 0.3);
+        let mut mach = pair_machine(0, Pairing::Joint, 0, false);
+        served_costs(&mut mach, &trace);
+        assert_eq!(mach.pair_stats.decisions, 0);
+        let mut both = pair_machine(2, Pairing::Joint, 0, false);
+        for d in 0..8 {
+            both.fleet
+                .as_mut()
+                .expect("a fleet")
+                .set_role(d, Role::Both);
+        }
+        served_costs(&mut both, &trace);
+        assert_eq!(both.pair_stats.decisions, 0);
+    }
+    #[test]
+    fn a_planner_gives_fresh_prompts_prefillers_and_takes_none_where_there_is_no_prefill() {
+        let prefillers = |fresh: f64| {
+            let mut mach = pair_machine(0, Pairing::Joint, 0, false);
+            mach.set_planner(PlannerKind::Eager, 2_000_000_000);
+            served_costs(&mut mach, &fresh_trace(2, 8_000, fresh));
+            let fleet = mach.fleet().expect("a fleet");
+            (fleet.prefiller_counts()[0], fleet.stats.role_moves)
+        };
+        let (heavy, moves) = prefillers(0.6);
+        assert!(heavy >= 2 && moves >= heavy as u64, "{heavy} {moves}");
+        assert!(prefillers(0.0).0 <= 1);
+    }
+
+    #[test]
+    fn a_replica_that_changes_model_comes_back_as_a_decoder() {
+        let mut mach = pair_machine(2, Pairing::Joint, 0, false);
+        let mut placement = vec![Some(0); 8];
+        placement[0] = Some(1);
+        mach.apply_placement(&placement);
+        let fleet = mach.fleet().expect("a fleet");
+        assert_eq!(fleet.role_of(0), Role::Decode);
+        assert_eq!(fleet.role_of(1), Role::Prefill);
+    }
+    fn tenant_run(shared_prefix: bool) -> Machine {
+        let mut mach = gate_machine(Control::Unified, false);
+        let origins = Origins::default();
+        mach.set_origins(origins.clone());
+        mach.track_tenants();
+        let workload = Workload::with_fanout(3, 4_000, 1.0, 0.05)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_shared_prefix(shared_prefix)
+            .with_origins(origins);
+        for (i, req) in workload.enumerate() {
+            mach.set_position(i as u64);
+            mach.serve_request(&req);
+        }
+        mach
+    }
+
+    #[test]
+    fn no_tenant_touches_a_block_another_tenant_brought_in_until_a_prefix_is_shared() {
+        let own = tenant_run(false);
+        let t = own.instruments.tenants.as_ref().expect("tracked");
+        assert!(t.touches > 1_000);
+        assert_eq!(t.cross_touches, 0, "nothing is shared across owners");
+        assert!(
+            t.evictions > 100
+                && t.evictions_by_other * 2 > t.evictions
+                && t.evictions_by_other < t.evictions,
+            "{} {}",
+            t.evictions,
+            t.evictions_by_other
+        );
+        let shared = tenant_run(true);
+        let s = shared.instruments.tenants.as_ref().expect("tracked");
+        assert!(
+            s.cross_touches > t.cross_touches + 500,
+            "{} {}",
+            s.cross_touches,
+            t.cross_touches
+        );
+    }
+
+    #[test]
+    fn hits_by_origin_and_by_tenant_account_for_every_read() {
+        let mach = tenant_run(false);
+        let t = mach.instruments.tenants.as_ref().expect("tracked");
+        let by_origin: (u64, u64) = t
+            .by_origin
+            .iter()
+            .fold((0, 0), |a, r| (a.0 + r.0, a.1 + r.1));
+        let by_owner: (u64, u64) = t
+            .per_owner
+            .values()
+            .fold((0, 0), |a, r| (a.0 + r.0, a.1 + r.1));
+        assert_eq!(by_origin, by_owner);
+        assert_eq!(by_origin.0, t.touches);
+        let tenant_row = t.by_origin[Origin::Tenant.idx()];
+        assert!(tenant_row.1 as f64 > 0.5 * tenant_row.0 as f64);
+        let ranked = t.by_volume(24);
+        assert_eq!(ranked.len(), 24);
+        assert!(t.hit_rate_of(ranked[..1].iter().copied()) > 0.0);
+    }
+    fn neighbour_trace(seed: u64, ops: u64, rate: f64) -> Vec<Request> {
+        Workload::with_fanout(seed, ops, 1.0, 0.0)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_model_keyed(true)
+            .with_one_model(true)
+            .with_neighbour(rate)
+            .collect()
+    }
+
+    #[test]
+    fn a_replica_set_confines_the_neighbour_to_its_replicas_and_the_others_to_the_rest() {
+        let trace = neighbour_trace(2, 6_000, 0.3);
+        let mut mach = pair_machine(0, Pairing::Off, 0, false);
+        mach.set_tenant_set(2);
+        let mut on = [0u64; 2];
+        for req in &trace {
+            let served_before: Vec<u64> = (0..8)
+                .map(|d| mach.fleet().map_or(0, |f| f.stats.served[d].iter().sum()))
+                .collect();
+            let cost = mach.serve_request(req);
+            if cost.pending || req.tokens == 0 || req.tenant.is_none() {
+                continue;
+            }
+            let node = (0..8)
+                .find(|&d| {
+                    mach.fleet()
+                        .map_or(0, |f| f.stats.served[d].iter().sum::<u64>())
+                        > served_before[d]
+                })
+                .expect("a decode lands somewhere");
+            let burst = req.tenant == Some(crate::work::NEIGHBOUR_TENANT);
+            assert_eq!(node < 2, burst, "node {node} for tenant {:?}", req.tenant);
+            on[usize::from(burst)] += 1;
+        }
+        assert!(on[0] > 1_000 && on[1] > 200, "{on:?}");
+    }
+
+    #[test]
+    fn a_prefill_quota_refuses_the_neighbours_excess_and_leaves_the_others_alone() {
+        let trace = neighbour_trace(2, 6_000, 0.3);
+        let refused = |rate_ns: f64| {
+            let mut mach = pair_machine(0, Pairing::Off, 0, false);
+            mach.set_tenant_quota(rate_ns, 0);
+            served_costs(&mut mach, &trace);
+            let neighbour = mach
+                .tenant_refused
+                .get(&crate::work::NEIGHBOUR_TENANT)
+                .copied()
+                .unwrap_or(0);
+            let others: u64 = mach
+                .tenant_refused
+                .iter()
+                .filter(|(t, _)| **t != crate::work::NEIGHBOUR_TENANT)
+                .map(|(_, n)| n)
+                .sum();
+            (neighbour, others)
+        };
+        assert_eq!(refused(0.0), (0, 0));
+        let (tight, tight_others) = refused(0.25e9);
+        let (loose, _) = refused(1.0e9);
+        assert!(tight > 300 && tight_others == 0, "{tight} {tight_others}");
+        assert!(loose < tight, "{loose} {tight}");
+    }
+
+    #[test]
+    fn a_slot_meter_refuses_a_tenant_with_its_slots_full() {
+        let trace = neighbour_trace(2, 6_000, 0.5);
+        let mut mach = pair_machine(0, Pairing::Off, 0, false);
+        mach.set_tenant_quota(0.0, 1);
+        let costs = served_costs(&mut mach, &trace);
+        let refused: u64 = mach.tenant_refused.values().sum();
+        assert!(refused > 50, "{refused}");
+        assert!(costs.iter().any(|c| !c.contains("pending: true")));
     }
 }
