@@ -1668,7 +1668,7 @@ run, and what was measured; the current numbers are in the ledger.
 | [6](phase-6.md) | macro authority: weight placement, partitions, disaggregated prefill/decode, tenancy (`--model-batches`, `--prefill-time`, `--model-keyed`, `--fleet`, `--planner`, `--pairing`, `--neighbour`) | done | one model per node is within 0.3% of the pooled engine and a late placement is the whole price (30 s start +77-82%); a pair wins 1.6-2.6% at one prefiller in eight and loses past it; a router quota beats sharing against a neighbour |
 | 7 | learned flows, speculative authority, sessions that suspend, the taxonomy | planned | |
 | [8](phase-8.md) | the data path as an arm | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
-| 9 | enforcement: cancellation on the path, and two-tier admission | planned | |
+| [9](phase-9.md) | enforcement: cancellation on the path, and two-tier admission | planned | |
 | 10 | durability: what each tier writes, and what a crash costs | planned | |
 | 11 | regions: a scheduler per region under global budgets | planned | |
 
@@ -1741,6 +1741,8 @@ suspended-session records and approval pauses, so Phase 7 extends Phase 10's cou
   **Size:** large, separable into increments.
 
 ### Phase 9 -- Enforcement: cancellation on the path, and two-tier admission
+
+Implementation plan: [`phase-9.md`](phase-9.md), which states its predictions before the run.
 
 §1 ceded the choice of victim, so every priority policy in this document -- two-tier admission
 (§1), `DraftOnly` preemption (§4), the tenancy trade (§3.8) -- has one enforcement arm: **cancel
