@@ -93,6 +93,7 @@ pub fn spawn_callout_card(
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_slide_scaffold(
     commands: &mut Commands,
     font_assets: &FontAssets,
@@ -459,7 +460,7 @@ pub fn spawn_size_focus_slide(mut commands: Commands, font_assets: Res<FontAsset
             ("        self.size.", TokenKind::Plain),
             ("fetch_sub", TokenKind::Function),
             ("(1, Ordering::AcqRel); ", TokenKind::Plain),
-            ("// ⚠️ Race condition!", TokenKind::Comment),
+            ("// ⚠️ Race condition!", TokenKind::Alert),
         ],
         vec![
             ("        rr = unsafe { r.", TokenKind::Plain),
@@ -479,7 +480,7 @@ pub fn spawn_size_focus_slide(mut commands: Commands, font_assets: Res<FontAsset
         vec![("// strong=6, weak=0, capacity=16384", TokenKind::Comment)],
         vec![(
             "// size = { v = { value = 18446744073687878303 } } // usize::MAX underflow!",
-            TokenKind::Comment,
+            TokenKind::Alert,
         )],
         vec![("// read_idx = 13667, write_idx = 0", TokenKind::Comment)],
     ];
@@ -1176,7 +1177,7 @@ pub fn spawn_automate_recovery_slide(mut commands: Commands, font_assets: Res<Fo
                 TokenKind::Plain,
             ),
             ("fix", TokenKind::Function),
-            ("(id), // DANGER!", TokenKind::Comment),
+            ("(id), // DANGER!", TokenKind::Alert),
         ],
         vec![(
             "            (cnt, id) if id == idx => retry.0 += 1,",

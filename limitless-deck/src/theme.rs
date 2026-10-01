@@ -447,16 +447,12 @@ pub mod typography {
     pub const FONT_LABEL: f32 = 11.5;
     /// HUD sub-labels, palace security text (px)
     pub const FONT_LABEL_SM: f32 = 11.0;
-    /// Classification tags, tiny badges, weather tags (px)
-    pub const FONT_TAG: f32 = 10.5;
     /// Smallest tag / stamp annotations (px)
     pub const FONT_TAG_SM: f32 = 10.0;
 
     // --- Specialized sizes ---
     /// Code block monospace text (px)
     pub const FONT_CODE: f32 = 13.0;
-    /// HUD calendar date stamp (px)
-    pub const FONT_HUD_DATE: f32 = 17.0;
     /// HUD slide counter text (px)
     pub const FONT_HUD_COUNTER: f32 = 15.0;
     /// HUD key prompt text (px)

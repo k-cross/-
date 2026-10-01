@@ -16,11 +16,6 @@ pub struct RotatingStar {
     pub speed: f32,
 }
 
-#[derive(Component)]
-pub struct PulsingAlarm {
-    pub speed: f32,
-}
-
 pub fn setup_hud(
     mut commands: Commands,
     controller: Res<SlideController>,
@@ -50,7 +45,7 @@ pub fn setup_hud(
                 Node {
                     width: Val::Percent(100.0),
                     flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::SpaceBetween,
+                    justify_content: JustifyContent::FlexEnd,
                     align_items: AlignItems::FlexStart,
                     ..default()
                 },
@@ -59,97 +54,6 @@ pub fn setup_hud(
                 InheritedVisibility::default(),
             ))
             .with_children(|top_bar| {
-                // Top Left: Iconic Persona 5 Calendar & Prison Infiltration HUD
-                top_bar
-                    .spawn((
-                        Node {
-                            flex_direction: FlexDirection::Column,
-                            row_gap: Val::Px(5.0),
-                            padding: UiRect::axes(Val::Px(16.0), Val::Px(8.0)),
-                            border: UiRect {
-                                left: Val::Px(5.0),
-                                top: Val::Px(2.0),
-                                right: Val::Px(2.0),
-                                bottom: Val::Px(2.0),
-                            },
-                            ..default()
-                        },
-                        BackgroundColor(P5_BLACK),
-                        BorderColor {
-                            left: P5_RED,
-                            top: P5_WHITE,
-                            right: P5_WHITE,
-                            bottom: P5_WHITE,
-                        },
-                        rot_subtle(),
-                    ))
-                    .with_children(|cal| {
-                        // Top row: Date & Infiltration Time
-                        cal.spawn(Node {
-                            flex_direction: FlexDirection::Row,
-                            align_items: AlignItems::Center,
-                            column_gap: Val::Px(8.0),
-                            ..default()
-                        })
-                        .with_children(|row| {
-                            // Date Stamp
-                            row.spawn((
-                                Text::new("09 / 23"),
-                                TextFont::from_font_size(FONT_HUD_DATE)
-                                    .with_font(font_assets.display.clone()),
-                                TextColor(P5_WHITE),
-                            ));
-                            // Weather / Time Tag
-                            row.spawn((
-                                Node {
-                                    padding: UiRect::axes(Val::Px(6.0), Val::Px(2.0)),
-                                    border: UiRect::all(Val::Px(1.0)),
-                                    ..default()
-                                },
-                                BackgroundColor(P5_CHARCOAL),
-                                BorderColor::all(P5_BORDER),
-                            ))
-                            .with_children(|w| {
-                                w.spawn((
-                                    Text::new("AFTER SCHOOL"),
-                                    TextFont::from_font_size(FONT_TAG)
-                                        .with_font(font_assets.sans_heavy.clone()),
-                                    TextColor(P5_LIGHT_GREY),
-                                ));
-                            });
-                        });
-
-                        // Palace & Pulsing Security Alert Gauge
-                        cal.spawn(Node {
-                            flex_direction: FlexDirection::Row,
-                            align_items: AlignItems::Center,
-                            column_gap: Val::Px(6.0),
-                            ..default()
-                        })
-                        .with_children(|sub| {
-                            sub.spawn((
-                                Text::new("PALACE: KERNEL // ALERT:"),
-                                TextFont::from_font_size(FONT_LABEL_SM)
-                                    .with_font(font_assets.display.clone()),
-                                TextColor(P5_MUTED),
-                            ));
-                            // Segmented Alarm Meter
-                            sub.spawn((
-                                Text::new("[▮▮▮▮▮▮▮▮▮▯ 99%]"),
-                                TextFont::from_font_size(FONT_LABEL_SM)
-                                    .with_font(font_assets.symbols.clone()),
-                                TextColor(P5_RED),
-                                PulsingAlarm { speed: 8.0 },
-                            ));
-                            sub.spawn((
-                                Text::new("[! TRESPASSER !]"),
-                                TextFont::from_font_size(FONT_TAG_SM)
-                                    .with_font(font_assets.sans_heavy.clone()),
-                                TextColor(P5_WHITE),
-                            ));
-                        });
-                    });
-
                 // Top Right: Persona 5 Target Intel Badge
                 top_bar
                     .spawn((
@@ -400,21 +304,10 @@ pub fn update_hud(
     }
 }
 
-pub fn animate_hud(
-    time: Res<Time>,
-    mut star_query: Query<(&mut Transform, &RotatingStar)>,
-    mut alarm_query: Query<(&mut TextColor, &PulsingAlarm)>,
-) {
+pub fn animate_hud(time: Res<Time>, mut star_query: Query<(&mut Transform, &RotatingStar)>) {
     let dt = time.delta_secs();
-    let elapsed = time.elapsed_secs();
 
     for (mut transform, star) in &mut star_query {
         transform.rotate_z(star.speed * dt);
-    }
-
-    for (mut color, alarm) in &mut alarm_query {
-        let pulse = (elapsed * alarm.speed).sin().abs();
-        let r = 0.8 + 0.2 * pulse;
-        color.0 = Color::srgb(r, 0.0, 0.05);
     }
 }

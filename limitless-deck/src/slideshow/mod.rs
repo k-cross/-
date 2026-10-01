@@ -100,6 +100,7 @@ impl Plugin for SlideshowPlugin {
                     hud::update_hud.run_if(resource_changed::<SlideController>),
                     hud::animate_hud,
                     code_view::scroll_code_blocks,
+                    code_view::blink_alert_lines,
                 ),
             );
     }
@@ -116,38 +117,36 @@ fn handle_slide_input(
     let mut changed = false;
 
     // Next slide actions
-    if keys.just_pressed(KeyCode::ArrowRight)
+    if (keys.just_pressed(KeyCode::ArrowRight)
         || keys.just_pressed(KeyCode::Space)
         || keys.just_pressed(KeyCode::Enter)
-        || keys.just_pressed(KeyCode::PageDown)
+        || keys.just_pressed(KeyCode::PageDown))
+        && controller.current_index + 1 < controller.total_slides
     {
-        if controller.current_index + 1 < controller.total_slides {
-            controller.current_index += 1;
-            changed = true;
-        }
+        controller.current_index += 1;
+        changed = true;
     }
 
     // Previous slide actions
-    if keys.just_pressed(KeyCode::ArrowLeft)
+    if (keys.just_pressed(KeyCode::ArrowLeft)
         || keys.just_pressed(KeyCode::Backspace)
-        || keys.just_pressed(KeyCode::PageUp)
+        || keys.just_pressed(KeyCode::PageUp))
+        && controller.current_index > 0
     {
-        if controller.current_index > 0 {
-            controller.current_index -= 1;
-            changed = true;
-        }
+        controller.current_index -= 1;
+        changed = true;
     }
 
     // Fullscreen toggle
-    if keys.just_pressed(KeyCode::KeyF) || keys.just_pressed(KeyCode::F11) {
-        if let Ok(mut window) = windows.single_mut() {
-            window.mode = match window.mode {
-                bevy::window::WindowMode::Windowed => {
-                    bevy::window::WindowMode::BorderlessFullscreen(MonitorSelection::Current)
-                }
-                _ => bevy::window::WindowMode::Windowed,
-            };
-        }
+    if (keys.just_pressed(KeyCode::KeyF) || keys.just_pressed(KeyCode::F11))
+        && let Ok(mut window) = windows.single_mut()
+    {
+        window.mode = match window.mode {
+            bevy::window::WindowMode::Windowed => {
+                bevy::window::WindowMode::BorderlessFullscreen(MonitorSelection::Current)
+            }
+            _ => bevy::window::WindowMode::Windowed,
+        };
     }
 
     if changed {
@@ -163,10 +162,7 @@ fn handle_slide_input(
 /// text and boxes appear proportionally larger on higher-resolution displays.
 /// The design resolution is 1280×720; in fullscreen the UI scales up to
 /// maintain visual prominence across the larger viewport.
-fn update_ui_scale_on_fullscreen(
-    windows: Query<&Window>,
-    mut ui_scale: ResMut<UiScale>,
-) {
+fn update_ui_scale_on_fullscreen(windows: Query<&Window>, mut ui_scale: ResMut<UiScale>) {
     const BASE_WIDTH: f32 = 1280.0;
     const BASE_HEIGHT: f32 = 720.0;
 

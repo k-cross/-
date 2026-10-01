@@ -174,7 +174,7 @@ fn animate_punk_jitter(
             jitter.twitch_timer =
                 JITTER_TWITCH_MIN + (jitter.phase.sin().abs() * JITTER_TWITCH_RANGE);
             // Aggressive punk twitch
-            jitter.current_twitch = (jitter.phase * 3.14).sin() * 0.045;
+            jitter.current_twitch = (jitter.phase * std::f32::consts::PI).sin() * 0.045;
         } else {
             // Decay twitch back towards zero
             jitter.current_twitch *= (1.0 - dt * JITTER_TWITCH_DECAY).max(0.0);

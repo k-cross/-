@@ -273,14 +273,13 @@ fn setup_character(mut commands: Commands) {
         });
 }
 
+type GlintFilter = (Without<PhantomThiefRoot>, Without<CoatTail>);
+
 fn animate_character(
     time: Res<Time>,
     mut roots: Query<(&mut Transform, &mut PhantomThiefRoot)>,
     mut tails: Query<(&mut Transform, &CoatTail), Without<PhantomThiefRoot>>,
-    mut glints: Query<
-        (&mut Transform, &DaggerGlint),
-        (Without<PhantomThiefRoot>, Without<CoatTail>),
-    >,
+    mut glints: Query<(&mut Transform, &DaggerGlint), GlintFilter>,
 ) {
     let dt = time.delta_secs();
 

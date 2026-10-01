@@ -8,6 +8,23 @@ use bevy::ui::ScrollPosition;
 #[derive(Component)]
 pub struct CodeBlockScroll;
 
+#[derive(Component)]
+pub struct BlinkingLine;
+
+const BLINK_HZ: f32 = 1.5;
+const BLINK_PEAK_ALPHA: f32 = 0.75;
+
+pub fn blink_alert_lines(
+    time: Res<Time>,
+    mut lines: Query<&mut BackgroundColor, With<BlinkingLine>>,
+) {
+    let wave = (time.elapsed_secs() * BLINK_HZ * std::f32::consts::TAU).sin();
+    let intensity = ((wave * 3.0).clamp(-1.0, 1.0) * 0.5 + 0.5) * BLINK_PEAK_ALPHA;
+    for mut background in &mut lines {
+        background.0 = P5_RED.with_alpha(intensity);
+    }
+}
+
 pub fn scroll_code_blocks(
     mouse_scroll: Res<AccumulatedMouseScroll>,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -38,6 +55,7 @@ pub enum TokenKind {
     Comment,
     Number,
     Plain,
+    Alert,
 }
 
 impl TokenKind {
@@ -50,6 +68,7 @@ impl TokenKind {
             TokenKind::Comment => CODE_COMMENT,
             TokenKind::Number => CODE_NUMBER,
             TokenKind::Plain => CODE_TEXT,
+            TokenKind::Alert => P5_WHITE,
         }
     }
 }
@@ -161,54 +180,59 @@ pub fn spawn_styled_code_block(
             ))
             .with_children(|code_body| {
                 for (line_idx, tokens) in lines.into_iter().enumerate() {
-                    code_body
-                        .spawn((Node {
-                            flex_direction: FlexDirection::Row,
-                            align_items: AlignItems::Center,
-                            column_gap: Val::Px(16.0),
+                    let is_alert = tokens
+                        .iter()
+                        .any(|(_, kind)| matches!(kind, TokenKind::Alert));
+                    let mut row_entity = code_body.spawn((Node {
+                        flex_direction: FlexDirection::Row,
+                        align_items: AlignItems::Center,
+                        column_gap: Val::Px(16.0),
+                        ..default()
+                    },));
+                    if is_alert {
+                        row_entity.insert((BackgroundColor(P5_RED.with_alpha(0.0)), BlinkingLine));
+                    }
+                    row_entity.with_children(|row| {
+                        // Line number gutter with subtle pointer
+                        row.spawn((Node {
+                            width: Val::Px(32.0),
+                            justify_content: JustifyContent::FlexEnd,
                             ..default()
                         },))
-                        .with_children(|row| {
-                            // Line number gutter with subtle pointer
-                            row.spawn((Node {
-                                width: Val::Px(32.0),
-                                justify_content: JustifyContent::FlexEnd,
+                            .with_children(|gutter| {
+                                gutter.spawn((
+                                    Text::new(format!("{:02}", line_idx + 1)),
+                                    font_gutter.clone(),
+                                    TextColor(P5_MUTED),
+                                ));
+                            });
+
+                        // Separator bar
+                        row.spawn((
+                            Node {
+                                width: Val::Px(1.5),
+                                height: Val::Px(14.0),
                                 ..default()
-                            },))
-                                .with_children(|gutter| {
-                                    gutter.spawn((
-                                        Text::new(format!("{:02}", line_idx + 1)),
-                                        font_gutter.clone(),
-                                        TextColor(P5_MUTED),
+                            },
+                            BackgroundColor(P5_BORDER),
+                        ));
+
+                        // Token spans
+                        row.spawn((Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(0.0),
+                            ..default()
+                        },))
+                            .with_children(|token_row| {
+                                for (text, kind) in tokens {
+                                    token_row.spawn((
+                                        Text::new(text),
+                                        font_token.clone(),
+                                        TextColor(kind.color()),
                                     ));
-                                });
-
-                            // Separator bar
-                            row.spawn((
-                                Node {
-                                    width: Val::Px(1.5),
-                                    height: Val::Px(14.0),
-                                    ..default()
-                                },
-                                BackgroundColor(P5_BORDER),
-                            ));
-
-                            // Token spans
-                            row.spawn((Node {
-                                flex_direction: FlexDirection::Row,
-                                column_gap: Val::Px(0.0),
-                                ..default()
-                            },))
-                                .with_children(|token_row| {
-                                    for (text, kind) in tokens {
-                                        token_row.spawn((
-                                            Text::new(text),
-                                            font_token.clone(),
-                                            TextColor(kind.color()),
-                                        ));
-                                    }
-                                });
-                        });
+                                }
+                            });
+                    });
                 }
             });
         });

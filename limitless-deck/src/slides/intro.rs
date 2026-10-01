@@ -654,7 +654,7 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         card.spawn((
                             Text::new(sub),
                             TextFont::from_font_size(10.5).with_font(font_assets.sans_heavy.clone()),
-                            TextColor(if active { P5_DARK_RED } else if is_climax { P5_DARK_RED } else { P5_MUTED }),
+                            TextColor(if active || is_climax { P5_DARK_RED } else { P5_MUTED }),
                         ));
                     });
                 }
