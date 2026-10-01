@@ -7,6 +7,7 @@ const ARIAL_BLACK_BYTES: &[u8] = include_bytes!("../../assets/fonts/arial_black.
 const GEORGIA_BOLD_BYTES: &[u8] = include_bytes!("../../assets/fonts/georgia_bold.ttf");
 const COURIER_BOLD_BYTES: &[u8] = include_bytes!("../../assets/fonts/courier_bold.ttf");
 const SYMBOLS_BYTES: &[u8] = include_bytes!("../../assets/fonts/symbols.ttf");
+const STIX_MATH_BYTES: &[u8] = include_bytes!("../../assets/fonts/stix_two_math.otf");
 
 /// Centralized typographic font assets for the entire deck.
 /// Provides authentic Persona 5 graphic typography and full symbol coverage.
@@ -24,6 +25,8 @@ pub struct FontAssets {
     pub monospace: Handle<Font>,
     /// Comprehensive vector symbol font for stars (★), arrows (▶), bullets (•), and meter blocks (▮, ▯)
     pub symbols: Handle<Font>,
+    /// STIX Two Math for mathematical formula rendering (⌊⌋, ≥, ÷, ×, −, superscripts)
+    pub math: Handle<Font>,
 }
 
 impl FontAssets {
@@ -50,6 +53,7 @@ impl FromWorld for FontAssets {
         let serif = fonts.add(Font::from_bytes(GEORGIA_BOLD_BYTES.to_vec()));
         let monospace = fonts.add(Font::from_bytes(COURIER_BOLD_BYTES.to_vec()));
         let symbols = fonts.add(Font::from_bytes(SYMBOLS_BYTES.to_vec()));
+        let math = fonts.add(Font::from_bytes(STIX_MATH_BYTES.to_vec()));
 
         // Also upgrade the engine's default font (AssetId::default()) from FiraMono-subset
         // to Arial Bold so any unadorned TextFont automatically inherits clean, bold sans-serif.
@@ -65,6 +69,7 @@ impl FromWorld for FontAssets {
             serif,
             monospace,
             symbols,
+            math,
         }
     }
 }

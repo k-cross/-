@@ -509,7 +509,7 @@ pub fn spawn_size_focus_slide(mut commands: Commands, font_assets: Res<FontAsset
         |side, fonts| {
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// ATOMIC COUNTER UNDERFLOW ///",
                 &[
                     ("size = 0 ", P5_WHITE),
@@ -519,12 +519,12 @@ pub fn spawn_size_focus_slide(mut commands: Commands, font_assets: Res<FontAsset
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// 64-BIT INTEGER CEILING ///",
                 &[
                     ("usize::MAX ", P5_WHITE),
                     ("= ", P5_MUTED),
-                    ("2^64 - 1 (Wraparound!)", P5_GOLD),
+                    ("2⁶⁴ − 1 (Wraparound!)", P5_GOLD),
                 ],
             );
             spawn_callout_card(
@@ -610,31 +610,31 @@ pub fn spawn_state_ambiguity_slide(mut commands: Commands, font_assets: Res<Font
         |side, fonts| {
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// EMPTY STATE: HEAD == TAIL ///",
                 &[
-                    ("write_idx.load() ", P5_WHITE),
-                    ("== ", P5_RED),
-                    ("read_idx.load()", P5_WHITE),
-                ],
-            );
-            spawn_math_formula(
-                side,
-                fonts.monospace.clone(),
-                "/// FULL STATE: WASTE-A-SLOT ///",
-                &[
-                    ("(write_idx + 1) % capacity ", P5_WHITE),
-                    ("== ", P5_RED),
+                    ("write_idx ", P5_WHITE),
+                    ("= ", P5_RED),
                     ("read_idx", P5_WHITE),
                 ],
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
+                "/// FULL STATE: WASTE-A-SLOT ///",
+                &[
+                    ("(write_idx + 1) mod cap ", P5_WHITE),
+                    ("= ", P5_RED),
+                    ("read_idx", P5_WHITE),
+                ],
+            );
+            spawn_math_formula(
+                side,
+                fonts,
                 "/// ALTERNATIVE: 2X INDEX LAPS ///",
                 &[
-                    ("(tail - head) ", P5_MUTED),
-                    (">= ", P5_MUTED),
+                    ("(tail − head) ", P5_MUTED),
+                    ("≥ ", P5_MUTED),
                     ("capacity (Doubled Array)", P5_LIGHT_GREY),
                 ],
             );
@@ -723,7 +723,7 @@ pub fn spawn_bool_rep_slide(mut commands: Commands, font_assets: Res<FontAssets>
         |side, fonts| {
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// 2-STATE LAPPING INVERSION ///",
                 &[
                     ("false ", P5_MUTED),
@@ -819,17 +819,17 @@ pub fn spawn_mem_init_slide(mut commands: Commands, font_assets: Res<FontAssets>
         |side, fonts| {
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// METADATA LOCALITY CALCULATION ///",
                 &[
                     ("bitmap_words ", P5_WHITE),
                     ("= ", P5_MUTED),
-                    ("capacity / 64", P5_CYAN),
+                    ("capacity ÷ 64", P5_CYAN),
                 ],
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// EMBEDDED GENERATION STAMP ///",
                 &[
                     ("Slot<T> { data, stamp } ", P5_WHITE),
@@ -963,12 +963,12 @@ pub fn spawn_aba_problem_slide(mut commands: Commands, font_assets: Res<FontAsse
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// TURN-STAMP INVARIANT ///",
                 &[
                     ("diff ", P5_WHITE),
                     ("= ", P5_MUTED),
-                    ("stamp - head", P5_CYAN),
+                    ("stamp − head", P5_CYAN),
                     (" (0=write, 1=read)", P5_MUTED),
                 ],
             );
@@ -1041,7 +1041,7 @@ pub fn spawn_thread_safety_slide(mut commands: Commands, font_assets: Res<FontAs
         |side, fonts| {
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// LOOM PERMUTATION METRICS ///",
                 &[
                     ("Schedules Explored: ", P5_MUTED),
@@ -1050,7 +1050,7 @@ pub fn spawn_thread_safety_slide(mut commands: Commands, font_assets: Res<FontAs
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// FORMAL MODEL CHECK RESULT ///",
                 &[
                     ("Data Races Detected: ", P5_MUTED),
@@ -1214,17 +1214,17 @@ pub fn spawn_automate_recovery_slide(mut commands: Commands, font_assets: Res<Fo
         |side, fonts| {
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// LAP DISTANCE CALCULATION ///",
                 &[
-                    ("|floor(read/cap) - floor(stamp/cap)| ", P5_WHITE),
-                    (">= ", P5_RED),
+                    ("|⌊read ÷ cap⌋ − ⌊stamp ÷ cap⌋| ", P5_WHITE),
+                    ("≥ ", P5_RED),
                     ("2 (Lapped)", P5_WHITE),
                 ],
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// ADJACENT STAMP HEURISTIC ///",
                 &[
                     ("post_init ", P5_WHITE),
@@ -1320,11 +1320,11 @@ pub fn spawn_cache_contention_slide(mut commands: Commands, font_assets: Res<Fon
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// L1 MISS RATE FORMULA ///",
                 &[
                     ("239M Misses ", P5_RED),
-                    ("/ ", P5_MUTED),
+                    ("÷ ", P5_MUTED),
                     ("471M Loads ", P5_WHITE),
                     ("= ", P5_MUTED),
                     ("50.74%", P5_BRIGHT_RED),
@@ -1332,14 +1332,14 @@ pub fn spawn_cache_contention_slide(mut commands: Commands, font_assets: Res<Fon
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// CAS FAILURE RATE FORMULA ///",
                 &[
                     ("50M Fails ", P5_RED),
-                    ("/ ", P5_MUTED),
+                    ("÷ ", P5_MUTED),
                     ("74M Total ", P5_WHITE),
                     ("= ", P5_MUTED),
-                    ("67.17% (2/3 Wasted!)", P5_BRIGHT_RED),
+                    ("67.17% (⅔ Wasted!)", P5_BRIGHT_RED),
                 ],
             );
         },
@@ -1411,7 +1411,7 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
         |side, fonts| {
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// CACHE LINE CONTENTION (64 BYTES) ///",
                 &[
                     ("read_idx [0x00] ", P5_WHITE),
@@ -1422,7 +1422,7 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// PADDED HARDWARE ISOLATION ///",
                 &[
                     ("#[repr(align(64))] ", P5_CYAN),
@@ -1497,17 +1497,17 @@ pub fn spawn_branchless_index_slide(mut commands: Commands, font_assets: Res<Fon
         |side, fonts| {
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// MODULO DIVISION (10-30 CYCLES) ///",
                 &[
                     ("next_idx ", P5_MUTED),
                     ("= ", P5_MUTED),
-                    ("(idx + 1) % capacity (DIV/IDIV)", P5_RED),
+                    ("(idx + 1) mod capacity (DIV/IDIV)", P5_RED),
                 ],
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// BITWISE MASKING (1 CLOCK CYCLE) ///",
                 &[
                     ("slot_idx ", P5_CYAN),
@@ -1517,7 +1517,7 @@ pub fn spawn_branchless_index_slide(mut commands: Commands, font_assets: Res<Fon
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// GENERATIONAL LAP EXTRACTION ///",
                 &[
                     ("lap_gen  ", P5_GOLD),
@@ -1591,7 +1591,7 @@ pub fn spawn_tail_latency_slide(mut commands: Commands, font_assets: Res<FontAss
         |side, fonts| {
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// USDT COMPILER OVERHEAD ///",
                 &[
                     ("Production Disabled: ", P5_MUTED),
@@ -1600,7 +1600,7 @@ pub fn spawn_tail_latency_slide(mut commands: Commands, font_assets: Res<FontAss
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// DTRACE PROBE ATTACH ///",
                 &[
                     ("Dynamic Instrumentation: ", P5_MUTED),
@@ -1715,22 +1715,22 @@ pub fn spawn_unbounded_latency_slide(mut commands: Commands, font_assets: Res<Fo
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// READ TAIL LATENCY SPIKE ///",
                 &[
-                    ("16,384 ns / 256 ns ", P5_WHITE),
+                    ("16,384 ns ÷ 256 ns ", P5_WHITE),
                     ("= ", P5_MUTED),
-                    ("64x degradation!", P5_BRIGHT_RED),
+                    ("64× degradation!", P5_BRIGHT_RED),
                 ],
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// WRITE TAIL LATENCY SPIKE ///",
                 &[
-                    ("131,072 ns / 512 ns ", P5_WHITE),
+                    ("131,072 ns ÷ 512 ns ", P5_WHITE),
                     ("= ", P5_MUTED),
-                    ("256x degradation!", P5_BRIGHT_RED),
+                    ("256× degradation!", P5_BRIGHT_RED),
                 ],
             );
         },
@@ -1801,16 +1801,16 @@ pub fn spawn_backoffs_slide(mut commands: Commands, font_assets: Res<FontAssets>
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// UNCONTROLLED TAIL SPIKE ///",
                 &[
                     ("Tight CAS Spin: ", P5_MUTED),
-                    ("131,072 ns (256x)", P5_RED),
+                    ("131,072 ns (256×)", P5_RED),
                 ],
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// STABILIZED TAIL LATENCY ///",
                 &[
                     ("With Exponential Backoff: ", P5_MUTED),
@@ -1985,7 +1985,7 @@ pub fn spawn_simplification_slide(mut commands: Commands, font_assets: Res<FontA
         |side, fonts| {
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// SPSC SYNCHRONIZATION OVERHEAD ///",
                 &[
                     ("Atomic CAS Instructions: ", P5_MUTED),
@@ -1994,7 +1994,7 @@ pub fn spawn_simplification_slide(mut commands: Commands, font_assets: Res<FontA
             );
             spawn_math_formula(
                 side,
-                fonts.monospace.clone(),
+                fonts,
                 "/// MEMORY ORDERING REQUIREMENT ///",
                 &[
                     ("Stores: ", P5_MUTED),

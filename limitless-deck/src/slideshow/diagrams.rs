@@ -92,7 +92,7 @@ pub fn spawn_flow_diagram(
 /// Spawns a styled mathematical expression panel with color-coded variables and operands.
 pub fn spawn_math_formula(
     parent: &mut ChildSpawnerCommands,
-    font: Handle<Font>,
+    font_assets: &super::FontAssets,
     title: &str,
     segments: &[(&str, Color)],
 ) {
@@ -122,7 +122,8 @@ pub fn spawn_math_formula(
             if !title.is_empty() {
                 card.spawn((
                     Text::new(title),
-                    TextFont::from_font_size(FONT_LABEL_SM).with_font(font.clone()),
+                    TextFont::from_font_size(FONT_LABEL_SM)
+                        .with_font(font_assets.monospace.clone()),
                     TextColor(P5_RED),
                 ));
             }
@@ -138,7 +139,7 @@ pub fn spawn_math_formula(
                 for (text, color) in segments {
                     row.spawn((
                         Text::new(*text),
-                        TextFont::from_font_size(FONT_BODY_SM).with_font(font.clone()),
+                        TextFont::from_font_size(FONT_BODY_SM).with_font(font_assets.math.clone()),
                         TextColor(*color),
                     ));
                 }
