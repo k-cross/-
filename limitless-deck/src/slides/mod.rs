@@ -1,4 +1,5 @@
 pub mod auto_slides;
+pub mod figure_slides;
 pub mod intro;
 
 use crate::slideshow::SlideState;
@@ -24,6 +25,14 @@ impl Plugin for SlidesPlugin {
             .add_systems(
                 OnEnter(SlideState::BoolRep),
                 auto_slides::spawn_bool_rep_slide,
+            )
+            .add_systems(
+                OnEnter(SlideState::ThreadLanes),
+                figure_slides::spawn_thread_lanes_slide,
+            )
+            .add_systems(
+                OnEnter(SlideState::AbaScenario),
+                figure_slides::spawn_aba_scenario_slide,
             )
             .add_systems(
                 OnEnter(SlideState::MemInit),
@@ -54,8 +63,16 @@ impl Plugin for SlidesPlugin {
                 auto_slides::spawn_disassembled_code_slide,
             )
             .add_systems(
+                OnEnter(SlideState::BitWalk),
+                figure_slides::spawn_bit_walk_slide,
+            )
+            .add_systems(
                 OnEnter(SlideState::BranchlessIndex),
                 auto_slides::spawn_branchless_index_slide,
+            )
+            .add_systems(
+                OnEnter(SlideState::PipelineFlush),
+                figure_slides::spawn_pipeline_flush_slide,
             )
             .add_systems(
                 OnEnter(SlideState::TailLatency),
@@ -68,6 +85,10 @@ impl Plugin for SlidesPlugin {
             .add_systems(
                 OnEnter(SlideState::Backoffs),
                 auto_slides::spawn_backoffs_slide,
+            )
+            .add_systems(
+                OnEnter(SlideState::CoreTopology),
+                figure_slides::spawn_core_topology_slide,
             )
             .add_systems(
                 OnEnter(SlideState::Scaling),

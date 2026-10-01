@@ -12,20 +12,19 @@ There are no tests, and `cargo run` opens a 1280x720 window you cannot see. Veri
 - `cargo clippy --all-targets`
 - `cargo fmt --check`
 
-All three must be clean. The baseline currently fails: clippy has a deny-level `approx_constant` in `src/slideshow/animation.rs` and `cargo fmt --check` has a diff in `src/slideshow/mod.rs`. Those predate your edits.
+All three must be clean.
 
 Use `cargo fmt`, not bare `rustfmt <file>` (it defaults to edition 2015 and there is no `rustfmt.toml`); the hook in the repo-root `.claude/settings.json` passes `--edition 2024` for edited `.rs` files.
 
 ## Adding or reordering slides
 
-A slide is wired up in four places, and nothing fails to compile if one is missed:
+A slide is wired up in three places, and nothing fails to compile if one is missed:
 
 - a `SlideState` variant in `src/slideshow/mod.rs`
-- the matching arm in `SlideState::from_index`
-- `SlideState::TOTAL_COUNT`
+- its position in `SlideState::ORDER` (this defines slide order and `TOTAL_COUNT`)
 - an `OnEnter` registration in `SlidesPlugin::build` in `src/slides/mod.rs`
 
-Every entity a slide spawns needs `DespawnOnExit(SlideState::X)`, otherwise it persists onto the next slide. `src/slides/auto_slides.rs` takes the state as a parameter in its shared helper; `intro.rs` inserts it per entity.
+Every entity a slide spawns needs `DespawnOnExit(SlideState::X)`, otherwise it persists onto the next slide. `spawn_slide_frame` in `src/slides/auto_slides.rs` does this for you and draws the header; `spawn_slide_scaffold` adds the code block and right column on top, and `src/slides/figure_slides.rs` uses the frame for full-width diagram slides built from `src/slideshow/figures.rs`. `intro.rs` inserts it per entity.
 
 `README.md` has the slide list, palette and font roles (`src/theme.rs`, `src/slideshow/fonts.rs`). Its file tree and slide count lag the code.
 

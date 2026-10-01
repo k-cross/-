@@ -93,17 +93,13 @@ pub fn spawn_callout_card(
         });
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_slide_scaffold(
+pub fn spawn_slide_frame(
     commands: &mut Commands,
     font_assets: &FontAssets,
     state: SlideState,
     tag: &'static str,
     title: &'static str,
-    code_filename: &'static str,
-    code_badge: &'static str,
-    code_lines: Vec<Vec<(&'static str, TokenKind)>>,
-    build_right: impl FnOnce(&mut ChildSpawnerCommands, &FontAssets),
+    build_body: impl FnOnce(&mut ChildSpawnerCommands, &FontAssets),
 ) {
     commands
         .spawn((
@@ -197,57 +193,7 @@ pub fn spawn_slide_scaffold(
                         });
                 });
 
-            // --- Main Comparison Section ---
-            slide
-                .spawn((
-                    Node {
-                        width: Val::Percent(100.0),
-                        flex_direction: FlexDirection::Row,
-                        justify_content: JustifyContent::SpaceBetween,
-                        align_items: AlignItems::Center,
-                        column_gap: Val::Px(24.0),
-                        ..default()
-                    },
-                    Transform::default(),
-                    Visibility::default(),
-                    InheritedVisibility::default(),
-                ))
-                .with_children(|row| {
-                    // Left: Code or Terminal container wrapper (Scrollable!)
-                    row.spawn((
-                        Node {
-                            flex_direction: FlexDirection::Column,
-                            flex_grow: 1.0,
-                            max_width: Val::Px(760.0),
-                            ..default()
-                        },
-                        SlamEntrance::new(Vec2::new(-300.0, 40.0), -0.15, 0.08),
-                    ))
-                    .with_children(|code_wrapper| {
-                        spawn_styled_code_block(
-                            code_wrapper,
-                            code_filename,
-                            code_badge,
-                            code_lines,
-                            Some(font_assets.monospace.clone()),
-                        );
-                    });
-
-                    // Right: Tactical Persona 5 Callout Cards & Visual Diagrams
-                    row.spawn((
-                        Node {
-                            flex_direction: FlexDirection::Column,
-                            row_gap: Val::Px(10.0),
-                            width: Val::Px(380.0),
-                            ..default()
-                        },
-                        rot_counter(),
-                        SlamEntrance::new(Vec2::new(320.0, 60.0), 0.2, 0.14),
-                    ))
-                    .with_children(|side| {
-                        build_right(side, font_assets);
-                    });
-                });
+            build_body(slide, font_assets);
 
             // Bottom spacer to ensure room for HUD
             slide.spawn(Node {
@@ -255,6 +201,72 @@ pub fn spawn_slide_scaffold(
                 ..default()
             });
         });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_slide_scaffold(
+    commands: &mut Commands,
+    font_assets: &FontAssets,
+    state: SlideState,
+    tag: &'static str,
+    title: &'static str,
+    code_filename: &'static str,
+    code_badge: &'static str,
+    code_lines: Vec<Vec<(&'static str, TokenKind)>>,
+    build_right: impl FnOnce(&mut ChildSpawnerCommands, &FontAssets),
+) {
+    spawn_slide_frame(commands, font_assets, state, tag, title, |slide, fonts| {
+        slide
+            .spawn((
+                Node {
+                    width: Val::Percent(100.0),
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(24.0),
+                    ..default()
+                },
+                Transform::default(),
+                Visibility::default(),
+                InheritedVisibility::default(),
+            ))
+            .with_children(|row| {
+                // Left: Code or Terminal container wrapper (Scrollable!)
+                row.spawn((
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        flex_grow: 1.0,
+                        max_width: Val::Px(760.0),
+                        ..default()
+                    },
+                    SlamEntrance::new(Vec2::new(-300.0, 40.0), -0.15, 0.08),
+                ))
+                .with_children(|code_wrapper| {
+                    spawn_styled_code_block(
+                        code_wrapper,
+                        code_filename,
+                        code_badge,
+                        code_lines,
+                        Some(fonts.monospace.clone()),
+                    );
+                });
+
+                // Right: Tactical Persona 5 Callout Cards & Visual Diagrams
+                row.spawn((
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(10.0),
+                        width: Val::Px(380.0),
+                        ..default()
+                    },
+                    rot_counter(),
+                    SlamEntrance::new(Vec2::new(320.0, 60.0), 0.2, 0.14),
+                ))
+                .with_children(|side| {
+                    build_right(side, fonts);
+                });
+            });
+    });
 }
 
 // =========================================================================

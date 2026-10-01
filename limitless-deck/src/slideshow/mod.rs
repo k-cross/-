@@ -3,6 +3,7 @@ pub mod background;
 pub mod character;
 pub mod code_view;
 pub mod diagrams;
+pub mod figures;
 pub mod fonts;
 pub mod hud;
 pub mod splatter;
@@ -20,6 +21,8 @@ pub enum SlideState {
     SizeFocus,
     StateAmbiguity,
     BoolRep,
+    ThreadLanes,
+    AbaScenario,
     MemInit,
     AbaProblem,
     ThreadSafety,
@@ -27,39 +30,48 @@ pub enum SlideState {
     AutomateRecovery,
     CacheContention,
     DisassembledCode,
+    BitWalk,
     BranchlessIndex,
+    PipelineFlush,
     TailLatency,
     UnboundedLatency,
     Backoffs,
+    CoreTopology,
     Scaling,
     Simplification,
 }
 
 impl SlideState {
-    pub const TOTAL_COUNT: usize = 18;
+    pub const ORDER: &'static [SlideState] = &[
+        SlideState::Intro,
+        SlideState::MutexBottleneck,
+        SlideState::SizeFocus,
+        SlideState::StateAmbiguity,
+        SlideState::BoolRep,
+        SlideState::ThreadLanes,
+        SlideState::AbaScenario,
+        SlideState::MemInit,
+        SlideState::AbaProblem,
+        SlideState::ThreadSafety,
+        SlideState::Recovery,
+        SlideState::AutomateRecovery,
+        SlideState::CacheContention,
+        SlideState::DisassembledCode,
+        SlideState::BitWalk,
+        SlideState::BranchlessIndex,
+        SlideState::PipelineFlush,
+        SlideState::TailLatency,
+        SlideState::UnboundedLatency,
+        SlideState::Backoffs,
+        SlideState::CoreTopology,
+        SlideState::Scaling,
+        SlideState::Simplification,
+    ];
+
+    pub const TOTAL_COUNT: usize = Self::ORDER.len();
 
     pub fn from_index(index: usize) -> Self {
-        match index {
-            0 => SlideState::Intro,
-            1 => SlideState::MutexBottleneck,
-            2 => SlideState::SizeFocus,
-            3 => SlideState::StateAmbiguity,
-            4 => SlideState::BoolRep,
-            5 => SlideState::MemInit,
-            6 => SlideState::AbaProblem,
-            7 => SlideState::ThreadSafety,
-            8 => SlideState::Recovery,
-            9 => SlideState::AutomateRecovery,
-            10 => SlideState::CacheContention,
-            11 => SlideState::DisassembledCode,
-            12 => SlideState::BranchlessIndex,
-            13 => SlideState::TailLatency,
-            14 => SlideState::UnboundedLatency,
-            15 => SlideState::Backoffs,
-            16 => SlideState::Scaling,
-            17 => SlideState::Simplification,
-            _ => SlideState::Intro,
-        }
+        Self::ORDER.get(index).copied().unwrap_or_default()
     }
 }
 
