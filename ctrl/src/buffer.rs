@@ -1,3 +1,11 @@
+pub struct StepRecord {
+    pub t: f64,
+    pub r: f64,
+    pub e: f64,
+    pub u: f64,
+    pub y: f64,
+}
+
 pub struct Buffer {
     queued: i64,
     wip: i64,
@@ -56,26 +64,43 @@ impl Controller {
     }
 }
 
-pub fn open_loop(process: &mut Buffer, tm: i64) {
+pub fn open_loop(process: &mut Buffer, tm: i64) -> Vec<StepRecord> {
     // might become a function one day?
     const TARGET: f64 = 5.0;
+    let mut records = Vec::with_capacity(tm as usize);
 
-    for _ in 0..tm {
+    for t in 0..tm {
         let u = TARGET;
         let y = process.work(u);
-        println!("{TARGET} {u} 0 {u} {y}");
+        records.push(StepRecord {
+            t: t as f64,
+            r: TARGET,
+            e: 0.0,
+            u,
+            y: y as f64,
+        });
     }
+    records
 }
 
-pub fn closed_loop(controller: &mut Controller, process: &mut Buffer, tm: i64) {
+pub fn closed_loop(controller: &mut Controller, process: &mut Buffer, tm: i64) -> Vec<StepRecord> {
     let mut y = 0;
+    let mut records = Vec::with_capacity(tm as usize);
+
     for t in 0..tm {
         let r = setpoint(t);
         let e = r - y;
         let u = controller.work(e as f64);
         y = process.work(u);
-        println!("{t} {r} {e} {u} {y}");
+        records.push(StepRecord {
+            t: t as f64,
+            r: r as f64,
+            e: e as f64,
+            u,
+            y: y as f64,
+        });
     }
+    records
 }
 
 fn setpoint(t: i64) -> i64 {
