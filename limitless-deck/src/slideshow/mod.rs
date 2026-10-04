@@ -133,9 +133,9 @@ fn handle_slide_input(
         || keys.just_pressed(KeyCode::Space)
         || keys.just_pressed(KeyCode::Enter)
         || keys.just_pressed(KeyCode::PageDown))
-        && controller.current_index + 1 < controller.total_slides
+        && controller.total_slides > 0
     {
-        controller.current_index += 1;
+        controller.current_index = (controller.current_index + 1) % controller.total_slides;
         changed = true;
     }
 
@@ -143,9 +143,10 @@ fn handle_slide_input(
     if (keys.just_pressed(KeyCode::ArrowLeft)
         || keys.just_pressed(KeyCode::Backspace)
         || keys.just_pressed(KeyCode::PageUp))
-        && controller.current_index > 0
+        && controller.total_slides > 0
     {
-        controller.current_index -= 1;
+        controller.current_index =
+            (controller.current_index + controller.total_slides - 1) % controller.total_slides;
         changed = true;
     }
 
