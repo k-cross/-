@@ -1,4 +1,4 @@
-use crate::admit::{Reservations, Reserve};
+use crate::admit::{Lengths, Reservations, Reserve};
 use crate::belief::{Cause, Conditions, Marks, Observer, SLO_QUANTILE, Scoring};
 use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::boundary::Cost as Crossing;
@@ -245,7 +245,201 @@ pub struct Machine {
     buckets: HashMap<u32, (f64, u64)>,
     tenant_flight: HashMap<u32, BinaryHeap<Reverse<u64>>>,
     pub tenant_refused: HashMap<u32, u64>,
+    engine_wait: EngineWait,
+    probe_engine: bool,
+    engine_queues: Vec<Vec<Waiting>>,
+    next_request: usize,
+    closed: Vec<(usize, Cost)>,
+    pub engine_waits: EngineWaitStats,
+    queue: Queue,
+    router_queue: Vec<Waiting>,
+    pub queue_waits: QueueStats,
+    claims: Claim,
+    lengths: [Lengths; 2],
+    attained: HashMap<u64, u64>,
+    completions: BinaryHeap<Reverse<(u64, u64, u64)>>,
+    cancel: CancelMode,
+    victim: Victim,
+    flights: Vec<Flight>,
+    handles: Option<Handles>,
+    pub cancel_stats: CancelStats,
+    aborted_requests: HashSet<usize>,
+    finishing: bool,
+    triggers: Triggers,
+    departures: Option<Departures>,
+    departed: Vec<usize>,
+    pub departure_stats: DepartureStats,
+    track_stream: bool,
+    pub stream: StreamStats,
+    submitted: u64,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum EngineWait {
+    #[default]
+    Off,
+    Fifo,
+    FirstFit,
+    Priority,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Queue {
+    #[default]
+    Off,
+    Fifo,
+    Slo,
+    Plas,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Claim {
+    #[default]
+    Static,
+    Quantile {
+        q: f64,
+        pooled: bool,
+    },
+    Tiered {
+        q: f64,
+    },
+    Gate(f64),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Arrival {
+    id: Option<usize>,
+    seq: u64,
+    at_ns: u64,
+    abort_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Departures {
+    pub share: f64,
+    pub leak: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Triggers {
+    #[default]
+    Both,
+    Router,
+}
+
+pub const STREAM_BYTES_PER_TOKEN: u64 = 200;
+
+const DEPARTURE_POINT_KEY: u64 = 0x5555_5555;
+
+#[derive(Clone, Debug, Default)]
+pub struct DepartureStats {
+    pub leaving: u64,
+    pub aborted: u64,
+    pub leaked_ns: u64,
+    pub freed_ns: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StreamStats {
+    pub samples: u64,
+    pub peak_tokens: Vec<u64>,
+    pub sum_tokens: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CancelMode {
+    #[default]
+    Off,
+    Continue,
+    Drop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Victim {
+    #[default]
+    Recent,
+    Remaining,
+    Attained,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Handles {
+    cache_seq: Option<u64>,
+    resv_seq: Option<u64>,
+    start_ns: u64,
+    end_ns: u64,
+}
+
+impl Handles {
+    fn progress(self, now: u64) -> f64 {
+        if now <= self.start_ns {
+            return 0.0;
+        }
+        ((now - self.start_ns) as f64 / (self.end_ns - self.start_ns).max(1) as f64).min(1.0)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Flight {
+    id: usize,
+    seq: u64,
+    leaves_at: Option<u64>,
+    leaving: bool,
+    node: usize,
+    handles: Handles,
+    dispatched_ns: u64,
+    arrival_ns: u64,
+    req: Request,
+    cost: Cost,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CancelStats {
+    pub cancels: u64,
+    pub engine_cancels: u64,
+    pub freed_bytes: u64,
+    pub wasted_decode_ns: u64,
+    pub reprefill_ns: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct QueueStats {
+    pub queued: u64,
+    pub max_depth: usize,
+    pub waited: [u64; 2],
+    pub waited_ns: [u64; 2],
+}
+
+#[derive(Clone, Debug)]
+pub enum Submitted {
+    Closed(Cost),
+    Open(usize),
+}
+
+#[derive(Clone, Debug)]
+struct Waiting {
+    id: usize,
+    seq: u64,
+    req: Request,
+    arrival_ns: u64,
+    queued_ns: u64,
+    pre_ns: u64,
+    decide_ns: u64,
+    requeued: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct EngineWaitStats {
+    pub queued: u64,
+    pub unfittable: u64,
+    pub max_depth: usize,
+    pub waited: [u64; 2],
+    pub waited_ns: [u64; 2],
+    pub probe_ns: Vec<u64>,
+    pub probe_unplaceable: u64,
+}
+
+const FINISH_STEPS: u64 = 10_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Pairing {
@@ -430,7 +624,107 @@ impl Machine {
             buckets: HashMap::new(),
             tenant_flight: HashMap::new(),
             tenant_refused: HashMap::new(),
+            engine_wait: EngineWait::Off,
+            probe_engine: false,
+            engine_queues: vec![Vec::new(); n_domains],
+            next_request: 0,
+            closed: Vec::new(),
+            engine_waits: EngineWaitStats::default(),
+            queue: Queue::Off,
+            router_queue: Vec::new(),
+            queue_waits: QueueStats::default(),
+            claims: Claim::Static,
+            lengths: [Lengths::default(), Lengths::default()],
+            attained: HashMap::new(),
+            completions: BinaryHeap::new(),
+            cancel: CancelMode::Off,
+            victim: Victim::Recent,
+            flights: Vec::new(),
+            handles: None,
+            cancel_stats: CancelStats::default(),
+            aborted_requests: HashSet::new(),
+            finishing: false,
+            triggers: Triggers::Both,
+            departures: None,
+            departed: Vec::new(),
+            departure_stats: DepartureStats::default(),
+            track_stream: false,
+            stream: StreamStats {
+                samples: 0,
+                peak_tokens: vec![0; n_domains],
+                sum_tokens: vec![0; n_domains],
+            },
+            submitted: 0,
         }
+    }
+
+    pub fn set_engine_wait(&mut self, wait: EngineWait) {
+        self.engine_wait = wait;
+    }
+
+    pub fn set_queue(&mut self, queue: Queue) {
+        self.queue = queue;
+    }
+
+    pub fn set_cancel_triggers(&mut self, triggers: Triggers) {
+        self.triggers = triggers;
+    }
+
+    pub fn set_departures(&mut self, departures: Option<Departures>) {
+        self.departures = departures;
+    }
+
+    pub fn set_track_stream(&mut self, on: bool) {
+        self.track_stream = on;
+    }
+
+    #[must_use]
+    pub fn drain_departed(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.departed)
+    }
+
+    fn tracks_flights(&self) -> bool {
+        self.cancel != CancelMode::Off || self.departures.is_some() || self.track_stream
+    }
+
+    pub fn set_cancel(&mut self, cancel: CancelMode, victim: Victim) {
+        self.cancel = cancel;
+        self.victim = victim;
+    }
+
+    #[must_use]
+    pub fn cancelled_requests(&self) -> usize {
+        self.aborted_requests.len()
+    }
+
+    pub fn set_claim(&mut self, claims: Claim) {
+        self.claims = claims;
+    }
+
+    pub fn set_probe_engine(&mut self, on: bool) {
+        self.probe_engine = on;
+    }
+
+    #[must_use]
+    pub fn drain_closed(&mut self) -> Vec<(usize, Cost)> {
+        std::mem::take(&mut self.closed)
+    }
+
+    pub fn finish(&mut self) {
+        self.finishing = true;
+        let mut steps = 0u64;
+        while self.engine_queues.iter().any(|q| !q.is_empty())
+            || !self.router_queue.is_empty()
+            || !self.flights.is_empty()
+        {
+            steps += 1;
+            assert!(
+                steps <= FINISH_STEPS,
+                "a sequence waits on pins that never release"
+            );
+            self.arrive(false);
+        }
+        self.finishing = false;
     }
 
     pub fn set_planner(&mut self, kind: PlannerKind, interval_ns: u64) {
@@ -883,7 +1177,7 @@ impl Machine {
             let lost = self.domains[d].reload(bytes, partition);
             self.engines[d].flush();
             self.engines[d].set_step_base(base);
-            self.reserved[d] = Reservations::default();
+            self.reserved[d].clear();
             if let Some(fleet) = self.fleet.as_mut() {
                 fleet.assign(now, begin, d, model, load);
                 if self.pairing != Pairing::Off {
@@ -1115,11 +1409,56 @@ impl Machine {
     }
 
     fn router_admits(&self, d: usize, req: &Request, staged: bool) -> bool {
+        let Some((capacity, pinned)) = self.telemetry(d).partition() else {
+            return true;
+        };
+        if let Claim::Gate(theta) = self.claims
+            && !staged
+            && req.chain.iter().any(|(_, m)| m.kind == BlobKind::KvBlock)
+        {
+            return (pinned as f64) < theta * capacity as f64;
+        }
+        let staged = staged.then(|| (&self.staged[d], self.staged_kv[d]));
+        let (blocks, extra) = self.claim(req);
+        self.reserved[d].admits_claim(capacity, req, (&blocks, extra), staged)
+    }
+
+    fn router_ever_admits(&self, d: usize, req: &Request) -> bool {
         let Some((capacity, _)) = self.telemetry(d).partition() else {
             return true;
         };
-        let staged = staged.then(|| (&self.staged[d], self.staged_kv[d]));
-        self.reserved[d].admits(capacity, req, self.reserve, self.tokens_per_block, staged)
+        if matches!(self.claims, Claim::Gate(_)) {
+            return true;
+        }
+        let (blocks, extra) = self.claim(req);
+        Reservations::default().admits_claim(capacity, req, (&blocks, extra), None)
+    }
+
+    fn claim(&self, req: &Request) -> (Vec<(BlobId, BlobMeta)>, u64) {
+        let class = |slo: Slo| &self.lengths[slo.idx()];
+        let tokens = match self.claims {
+            Claim::Static | Claim::Gate(_) => {
+                return self.reserve.claim(req, self.tokens_per_block);
+            }
+            Claim::Quantile { q, pooled: false } => class(req.slo).quantile(q),
+            Claim::Quantile { q, pooled: true } => {
+                self.lengths[0].pooled_quantile(&self.lengths[1], q)
+            }
+            Claim::Tiered { q } => match req.slo {
+                Slo::Interactive => class(Slo::Interactive).quantile(q),
+                Slo::Throughput => class(Slo::Throughput).mean(),
+            },
+        };
+        let (blocks, _) = Reserve::Prompt.claim(req, self.tokens_per_block);
+        let output = if req.tokens == 0 {
+            0
+        } else {
+            tokens
+                .unwrap_or(req.max_tokens)
+                .div_ceil(self.tokens_per_block.max(1))
+                * crate::work::KV_BLOCK_BYTES
+        };
+        (blocks, output)
     }
 
     fn shared_ns(&self, d: usize, kind: BlobKind, bytes: u64) -> Option<u64> {
@@ -2688,12 +3027,19 @@ impl Machine {
             .filter(|&d| self.domains[d].can_decode())
             .collect();
         let n = engines.len().max(1) as u64;
-        for d in engines {
-            for (sum, bytes) in self.kv_sum.iter_mut().zip(self.domains[d].kv_bytes()) {
-                *sum += bytes / n;
+        if !self.finishing {
+            for d in engines {
+                for (sum, bytes) in self.kv_sum.iter_mut().zip(self.domains[d].kv_bytes()) {
+                    *sum += bytes / n;
+                }
             }
+            self.kv_samples += 1;
         }
-        self.kv_samples += 1;
+        self.depart_flights();
+        self.close_flights();
+        self.sample_stream();
+        self.serve_engine_queues();
+        self.serve_router_queue();
     }
 
     fn unplaced() -> Cost {
@@ -2703,18 +3049,20 @@ impl Machine {
         }
     }
 
-    pub fn serve_request(&mut self, req: &Request) -> Cost {
+    pub fn submit(&mut self, req: &Request) -> Submitted {
         self.arrive(req.concurrent);
+        let seq = self.submitted;
+        self.submitted += 1;
         if let Some(task) = req.completes
             && self.cancelled.remove(&task)
         {
-            return Cost {
+            return Submitted::Closed(Cost {
                 pending: true,
                 ..Cost::default()
-            };
+            });
         }
         if let Some(gang) = &req.gang {
-            return self.serve_gang(req, gang);
+            return Submitted::Closed(self.serve_gang(req, gang));
         }
         let decode_needed = Self::needs_decode(req);
         self.record_demand(model_of(&req.requires), req.tokens);
@@ -2727,12 +3075,137 @@ impl Machine {
             if let Some(fleet) = self.fleet.as_mut() {
                 fleet.stats.unplaced += 1;
             }
-            return Self::unplaced();
+            return Submitted::Closed(Self::unplaced());
         }
+        let fresh = Arrival {
+            id: None,
+            seq,
+            at_ns: self.arrival_ns,
+            abort_ns: 0,
+        };
+        if self.queue == Queue::Off || !decode_needed {
+            return self.place(req, &candidates, fresh);
+        }
+        let room = self.admitting(&candidates, req);
+        if self.router_queue.is_empty() && !room.is_empty() {
+            return self.place(req, &room, fresh);
+        }
+        let id = self.new_request();
+        self.router_enqueue(id, seq, req);
+        self.serve_router_queue();
+        Submitted::Open(id)
+    }
+
+    fn new_request(&mut self) -> usize {
+        let id = self.next_request;
+        self.next_request += 1;
+        id
+    }
+
+    fn admitting(&self, candidates: &[usize], req: &Request) -> Vec<usize> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|&d| self.router_admits(d, req, false))
+            .collect()
+    }
+
+    fn router_enqueue(&mut self, id: usize, seq: u64, req: &Request) {
+        self.queue_waits.queued += 1;
+        self.router_queue.push(Waiting {
+            id,
+            seq,
+            req: req.clone(),
+            arrival_ns: self.arrival_ns,
+            queued_ns: self.arrival_ns,
+            pre_ns: 0,
+            decide_ns: 0,
+            requeued: false,
+        });
+        self.queue_waits.max_depth = self.queue_waits.max_depth.max(self.router_queue.len());
+    }
+
+    fn queue_key(&self, w: &Waiting) -> (u64, u64, usize) {
+        match self.queue {
+            Queue::Off | Queue::Fifo => (0, w.arrival_ns, w.id),
+            Queue::Slo => (w.req.slo.idx() as u64, w.arrival_ns, w.id),
+            Queue::Plas => (
+                self.attained.get(&w.req.program).copied().unwrap_or(0),
+                w.arrival_ns,
+                w.id,
+            ),
+        }
+    }
+
+    fn accrue_attained(&mut self) {
+        while let Some(&Reverse((end, program, exec))) = self.completions.peek() {
+            if end > self.arrival_ns {
+                break;
+            }
+            self.completions.pop();
+            *self.attained.entry(program).or_insert(0) += exec;
+        }
+    }
+
+    fn serve_router_queue(&mut self) {
+        self.accrue_attained();
+        while let Some(head) =
+            (0..self.router_queue.len()).min_by_key(|&i| self.queue_key(&self.router_queue[i]))
+        {
+            let req = &self.router_queue[head].req;
+            let candidates = self.eligible(self.decode_pool(), req);
+            let mut room = self.admitting(&candidates, req);
+            let mut abort_ns = 0;
+            let never = room.is_empty()
+                && !candidates.is_empty()
+                && candidates.iter().all(|&d| !self.router_ever_admits(d, req));
+            if !candidates.is_empty() && room.is_empty() && !never {
+                if self.cancel == CancelMode::Off {
+                    return;
+                }
+                let blocked = self.router_queue[head].req.clone();
+                let Some(node) = self.cancel_for(&blocked, &candidates) else {
+                    return;
+                };
+                room = vec![node];
+                abort_ns = self.engines[node].step_base_ns();
+            }
+            let waiting = self.router_queue.remove(head);
+            if !waiting.requeued {
+                let slo = waiting.req.slo.idx();
+                self.queue_waits.waited[slo] += 1;
+                self.queue_waits.waited_ns[slo] += self.arrival_ns - waiting.arrival_ns;
+            }
+            let id = waiting.id;
+            let outcome = if candidates.is_empty() {
+                if let Some(fleet) = self.fleet.as_mut() {
+                    fleet.stats.unplaced += 1;
+                }
+                Submitted::Closed(Self::unplaced())
+            } else if never {
+                self.refused_by_router[waiting.req.kind_idx()] += 1;
+                Submitted::Closed(Self::unplaced())
+            } else {
+                let arrival = Arrival {
+                    id: Some(id),
+                    seq: waiting.seq,
+                    at_ns: waiting.arrival_ns,
+                    abort_ns,
+                };
+                self.place(&waiting.req, &room, arrival)
+            };
+            if let Submitted::Closed(cost) = outcome {
+                self.closed.push((id, cost));
+            }
+        }
+    }
+
+    fn place(&mut self, req: &Request, candidates: &[usize], arrival: Arrival) -> Submitted {
+        let decode_needed = Self::needs_decode(req);
         let decide_ns = self.decide(req.chain.len(), candidates.len());
         self.decide_ns += decide_ns;
         if self.placement != Placement::Blind {
-            self.sticky_unit = self.affinity_unit(&req.chain, &candidates);
+            self.sticky_unit = self.affinity_unit(&req.chain, candidates);
         }
         let flow: Vec<(usize, u64)> = req
             .completes
@@ -2742,9 +3215,9 @@ impl Machine {
         let scored = self.placement == Placement::Scored;
         let affinity = self.topo.units[self.sticky_unit].home as usize;
         let (best, decided_by) = if scored {
-            self.best_scored(&self.view_of(req), &flow, affinity, &candidates)
+            self.best_scored(&self.view_of(req), &flow, affinity, candidates)
         } else {
-            (self.greedy_best(req, &candidates), None)
+            (self.greedy_best(req, candidates), None)
         };
         let value = self.resident_value(best, req);
 
@@ -2752,8 +3225,13 @@ impl Machine {
             best
         } else {
             match flow.first() {
-                Some(&(d, _)) if !decode_needed || self.domains[d].can_decode() => d,
-                _ => self.policy_target(affinity, best, value, &candidates),
+                Some(&(d, _))
+                    if (!decode_needed || self.domains[d].can_decode())
+                        && (self.queue == Queue::Off || self.router_admits(d, req, false)) =>
+                {
+                    d
+                }
+                _ => self.policy_target(affinity, best, value, candidates),
             }
         };
         let home = self.topo.units[self.unit_in(target)].home as usize;
@@ -2763,7 +3241,7 @@ impl Machine {
             if let Some(t) = req.tenant {
                 *self.tenant_refused.entry(t).or_insert(0) += 1;
             }
-            return Self::unplaced();
+            return Submitted::Closed(Self::unplaced());
         }
 
         if self.placement == Placement::Aware
@@ -2775,9 +3253,9 @@ impl Machine {
 
         let pick = self
             .regret
-            .then(|| self.oracle_pick(req, &flow, &candidates, decode_needed, decide_ns, home));
+            .then(|| self.oracle_pick(req, &flow, candidates, decode_needed, decide_ns, home));
         if self.instrument {
-            self.instrument_decision(req, &candidates, home);
+            self.instrument_decision(req, candidates, home);
         }
 
         if let Some(hint) = &req.hint {
@@ -2790,19 +3268,451 @@ impl Machine {
             .and_then(|t| self.upstream.remove(&t))
             .unwrap_or_default();
         let handoff = self.collect(home, &sources);
-        let arrival = self.reach(home, req, decode_needed);
+        let reached = self.reach(home, req, decode_needed);
 
         self.observe_landing(req, home);
         let pair = self.decide_pair(home, req, &mut planned);
-        let mut cost = self.run_paired(home, req, pair);
+        let hops = handoff + reached + arrival.abort_ns;
+        let mut cost = match self.run_or_queue(home, req, pair, hops, decide_ns, arrival) {
+            Ok(cost) => cost,
+            Err(id) => return Submitted::Open(id),
+        };
         cost.decide_ns = decide_ns;
-        cost.transfer_ns += handoff + arrival;
+        cost.transfer_ns += hops;
+        cost.queue_ns += self.arrival_ns - arrival.at_ns;
         self.after_dispatch(req, home, &cost);
         if let Some(pick) = pick {
             let class = BlobKind::ALL[req.kind_idx()];
-            self.finish_regret(req, class, home, &candidates, pick, &cost, decided_by);
+            self.finish_regret(req, class, home, candidates, pick, &cost, decided_by);
         }
-        cost
+        self.settle_flight(home, req, cost, arrival)
+    }
+
+    pub fn serve_request(&mut self, req: &Request) -> Cost {
+        match self.submit(req) {
+            Submitted::Closed(cost) => cost,
+            Submitted::Open(_) => panic!("a request that waits is submitted, not served"),
+        }
+    }
+
+    fn run_or_queue(
+        &mut self,
+        home: usize,
+        req: &Request,
+        pair: Option<(usize, u64)>,
+        pre_ns: u64,
+        decide_ns: u64,
+        arrival: Arrival,
+    ) -> Result<Cost, usize> {
+        if !self.engine_gated(home, req) {
+            return Ok(self.run_paired(home, req, pair, self.resubmitted(arrival.id)));
+        }
+        if let Some(refused) = self.router_refusal(home, req) {
+            return Ok(refused);
+        }
+        if !self.engine_must_wait(home, req) {
+            return Ok(self.dispatch(home, req, pair, self.resubmitted(arrival.id)));
+        }
+        let id = arrival.id.unwrap_or_else(|| self.new_request());
+        self.engine_enqueue(
+            home,
+            Waiting {
+                id,
+                seq: arrival.seq,
+                req: req.clone(),
+                arrival_ns: arrival.at_ns,
+                queued_ns: self.arrival_ns,
+                pre_ns,
+                decide_ns,
+                requeued: false,
+            },
+        );
+        Err(id)
+    }
+
+    fn engine_gated(&self, home: usize, req: &Request) -> bool {
+        (self.engine_wait != EngineWait::Off || self.probe_engine)
+            && self.hold_decodes
+            && req.tokens > 0
+            && self.domains[home].engine_cache()
+    }
+
+    fn sequence_blocks(req: &Request) -> Vec<(BlobId, BlobMeta)> {
+        let mut blocks = req.chain.clone();
+        blocks.extend_from_slice(&req.produces);
+        blocks
+    }
+
+    fn engine_fits(&self, d: usize, req: &Request) -> bool {
+        self.domains[d]
+            .kv_fit(&Self::sequence_blocks(req))
+            .is_none_or(crate::cache::KvFit::fits)
+    }
+
+    fn engine_must_wait(&mut self, home: usize, req: &Request) -> bool {
+        let blocks = Self::sequence_blocks(req);
+        let Some(fit) = self.domains[home].kv_fit(&blocks) else {
+            return false;
+        };
+        if self.probe_engine && !fit.fits() {
+            match self.domains[home].kv_wait_ns(&blocks, self.arrival_ns) {
+                Some(ns) => self.engine_waits.probe_ns.push(ns),
+                None => self.engine_waits.probe_unplaceable += 1,
+            }
+        }
+        if fit.never() {
+            self.engine_waits.unfittable += u64::from(self.engine_wait != EngineWait::Off);
+            return false;
+        }
+        let behind_head = matches!(self.engine_wait, EngineWait::Fifo | EngineWait::Priority)
+            && !self.engine_queues[home].is_empty();
+        self.engine_wait != EngineWait::Off && (!fit.fits() || behind_head)
+    }
+
+    fn engine_enqueue(&mut self, home: usize, waiting: Waiting) {
+        self.engine_waits.queued += 1;
+        let position = match self.engine_wait {
+            EngineWait::Priority => {
+                let key = (waiting.req.slo.idx(), waiting.arrival_ns);
+                self.engine_queues[home]
+                    .iter()
+                    .position(|w| (w.req.slo.idx(), w.arrival_ns) > key)
+            }
+            _ => None,
+        };
+        let queue = &mut self.engine_queues[home];
+        match position {
+            Some(at) => queue.insert(at, waiting),
+            None => queue.push(waiting),
+        }
+        self.engine_waits.max_depth = self.engine_waits.max_depth.max(queue.len());
+    }
+
+    fn next_startable(&self, d: usize) -> Option<usize> {
+        let queue = &self.engine_queues[d];
+        match self.engine_wait {
+            EngineWait::Off => None,
+            EngineWait::FirstFit => queue.iter().position(|w| self.engine_fits(d, &w.req)),
+            EngineWait::Fifo | EngineWait::Priority => queue
+                .first()
+                .filter(|w| self.engine_fits(d, &w.req))
+                .map(|_| 0),
+        }
+    }
+
+    fn serve_engine_queues(&mut self) {
+        for d in 0..self.engine_queues.len() {
+            loop {
+                if let Some(i) = self.next_startable(d) {
+                    let waiting = self.engine_queues[d].remove(i);
+                    self.start_waiting(d, &waiting);
+                } else if !self.cancel_for_engine(d) {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn settle_flight(
+        &mut self,
+        home: usize,
+        req: &Request,
+        cost: Cost,
+        arrival: Arrival,
+    ) -> Submitted {
+        let handles = self.handles.take();
+        let Some(handles) =
+            handles.filter(|_| self.tracks_flights() && !cost.pending && req.tokens > 0)
+        else {
+            return Submitted::Closed(cost);
+        };
+        let id = arrival.id.unwrap_or_else(|| self.new_request());
+        let resubmitted = self.aborted_requests.contains(&id);
+        if resubmitted {
+            self.cancel_stats.reprefill_ns += cost.recompute_ns;
+        }
+        let leaves_at = self.departures.and_then(|d| {
+            (crate::rng::Rng::hashed_unit(arrival.seq) < d.share).then(|| {
+                let span = (handles.end_ns - handles.start_ns) as f64;
+                handles.start_ns
+                    + (span * crate::rng::Rng::hashed_unit(arrival.seq ^ DEPARTURE_POINT_KEY))
+                        as u64
+            })
+        });
+        self.departure_stats.leaving += u64::from(leaves_at.is_some() && !resubmitted);
+        self.flights.push(Flight {
+            id,
+            seq: arrival.seq,
+            leaves_at,
+            leaving: leaves_at.is_some(),
+            node: home,
+            handles,
+            dispatched_ns: self.arrival_ns,
+            arrival_ns: arrival.at_ns,
+            req: req.clone(),
+            cost,
+        });
+        Submitted::Open(id)
+    }
+
+    fn close_flights(&mut self) {
+        let now = self.arrival_ns;
+        let mut at = 0;
+        while at < self.flights.len() {
+            if self.flights[at].handles.end_ns > now {
+                at += 1;
+                continue;
+            }
+            let flight = self.flights.swap_remove(at);
+            if self.queue == Queue::Plas && self.cancel != CancelMode::Off {
+                *self.attained.entry(flight.req.program).or_insert(0) += flight.cost.exec_ns;
+            }
+            if flight.leaving {
+                self.departed.push(flight.id);
+            } else {
+                self.closed.push((flight.id, flight.cost));
+            }
+        }
+    }
+
+    fn depart_flights(&mut self) {
+        let Some(departures) = self.departures else {
+            return;
+        };
+        let now = self.arrival_ns;
+        let mut at = 0;
+        while at < self.flights.len() {
+            let flight = &self.flights[at];
+            let due = flight.leaves_at.filter(|&gone| gone <= now);
+            let Some(gone) = due.filter(|_| flight.handles.end_ns > now) else {
+                at += 1;
+                continue;
+            };
+            if departures.leak {
+                self.departure_stats.leaked_ns += flight.handles.end_ns - gone;
+                self.flights[at].leaves_at = None;
+                at += 1;
+                continue;
+            }
+            let flight = self.flights.swap_remove(at);
+            self.departure_stats.aborted += 1;
+            self.departure_stats.freed_ns += flight.handles.end_ns - now;
+            self.abort_flight(&flight);
+            self.departed.push(flight.id);
+        }
+    }
+
+    fn sample_stream(&mut self) {
+        if !self.track_stream || self.finishing {
+            return;
+        }
+        let now = self.arrival_ns;
+        let mut emitted = vec![0u64; self.domains.len()];
+        for f in &self.flights {
+            emitted[f.node] += (f.req.tokens as f64 * f.handles.progress(now)) as u64;
+        }
+        self.stream.samples += 1;
+        for (d, tokens) in emitted.into_iter().enumerate() {
+            self.stream.sum_tokens[d] += tokens;
+            self.stream.peak_tokens[d] = self.stream.peak_tokens[d].max(tokens);
+        }
+    }
+
+    fn attained_of(&self, program: u64) -> u64 {
+        self.attained.get(&program).copied().unwrap_or(0)
+    }
+
+    fn is_victim_for(&self, head: &Request, flight: &Flight) -> bool {
+        match self.victim {
+            Victim::Attained => {
+                self.attained_of(flight.req.program) > self.attained_of(head.program)
+            }
+            Victim::Recent | Victim::Remaining => {
+                head.slo == Slo::Interactive && flight.req.slo == Slo::Throughput
+            }
+        }
+    }
+
+    fn victims_at(&self, node: usize, head: &Request) -> Vec<usize> {
+        let now = self.arrival_ns;
+        let mut victims: Vec<usize> = (0..self.flights.len())
+            .filter(|&i| {
+                let f = &self.flights[i];
+                f.node == node && f.handles.end_ns > now && self.is_victim_for(head, f)
+            })
+            .collect();
+        match self.victim {
+            Victim::Recent => victims.sort_by_key(|&i| Reverse(self.flights[i].dispatched_ns)),
+            Victim::Remaining => {
+                victims.sort_by_key(|&i| Reverse(self.flights[i].handles.end_ns));
+            }
+            Victim::Attained => {
+                victims.sort_by_key(|&i| Reverse(self.attained_of(self.flights[i].req.program)));
+            }
+        }
+        victims
+    }
+
+    fn freed_by(&self, flight: &Flight) -> u64 {
+        flight
+            .handles
+            .resv_seq
+            .map_or(0, |seq| self.reserved[flight.node].exclusive_bytes(seq))
+    }
+
+    fn abort_flight(&mut self, flight: &Flight) -> (u64, f64) {
+        let node = flight.node;
+        if let Some(seq) = flight.handles.resv_seq {
+            self.cancel_stats.freed_bytes += self.reserved[node].cancel(seq);
+        }
+        if let Some(seq) = flight.handles.cache_seq {
+            self.domains[node].abort_seq(seq);
+        }
+        self.engines[node].cancel_inflight(flight.handles.end_ns, model_of(&flight.req.requires));
+        let progress = flight.handles.progress(self.arrival_ns);
+        let decoded = (flight.req.tokens as f64 * progress) as u64;
+        let written = self.written_blocks(&flight.req, decoded);
+        let unwritten: Vec<BlobId> = flight.req.produces[written..]
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        self.domains[node].kv_drop_unpinned(&unwritten);
+        (decoded, progress)
+    }
+
+    fn written_blocks(&self, req: &Request, decoded: u64) -> usize {
+        usize::try_from(decoded / self.tokens_per_block.max(1))
+            .unwrap_or(usize::MAX)
+            .min(req.produces.len())
+    }
+
+    fn continuation(&self, req: &Request, decoded: u64) -> Request {
+        let written = self.written_blocks(req, decoded);
+        let mut chain = req.chain.clone();
+        chain.extend_from_slice(&req.produces[..written]);
+        let tokens = req.tokens.saturating_sub(decoded).max(1);
+        Request {
+            chain,
+            produces: req.produces[written..].to_vec(),
+            tokens,
+            exec_ns: tokens * crate::work::DECODE_NS_PER_TOKEN,
+            max_tokens: req.max_tokens.saturating_sub(decoded).max(1),
+            hint: None,
+            completes: None,
+            ..req.clone()
+        }
+    }
+
+    fn cancel_flight(&mut self, at: usize, by_engine: bool) {
+        let flight = self.flights.swap_remove(at);
+        self.cancel_stats.cancels += 1;
+        self.cancel_stats.engine_cancels += u64::from(by_engine);
+        let (decoded, progress) = self.abort_flight(&flight);
+        let resubmitted = if self.cancel == CancelMode::Drop {
+            self.cancel_stats.wasted_decode_ns += (flight.cost.exec_ns as f64 * progress) as u64;
+            flight.req.clone()
+        } else {
+            self.continuation(&flight.req, decoded)
+        };
+        self.aborted_requests.insert(flight.id);
+        self.router_queue.push(Waiting {
+            id: flight.id,
+            seq: flight.seq,
+            req: resubmitted,
+            arrival_ns: flight.arrival_ns,
+            queued_ns: self.arrival_ns,
+            pre_ns: 0,
+            decide_ns: 0,
+            requeued: true,
+        });
+        self.queue_waits.max_depth = self.queue_waits.max_depth.max(self.router_queue.len());
+    }
+
+    fn cancel_for(&mut self, head: &Request, candidates: &[usize]) -> Option<usize> {
+        if matches!(self.claims, Claim::Gate(_)) {
+            return self.cancel_for_gate(head, candidates);
+        }
+        let claim = self.claim(head);
+        let mut best: Option<(usize, Vec<usize>)> = None;
+        for &node in candidates {
+            let Some((capacity, _)) = self.telemetry(node).partition() else {
+                continue;
+            };
+            let deficit = self.reserved[node].deficit_claim(capacity, head, (&claim.0, claim.1));
+            let mut freed = 0;
+            let mut chosen = Vec::new();
+            for i in self.victims_at(node, head) {
+                if freed >= deficit {
+                    break;
+                }
+                freed += self.freed_by(&self.flights[i]);
+                chosen.push(i);
+            }
+            if freed >= deficit && best.as_ref().is_none_or(|(_, c)| chosen.len() < c.len()) {
+                best = Some((node, chosen));
+            }
+        }
+        let (node, mut chosen) = best?;
+        chosen.sort_unstable_by(|a, b| b.cmp(a));
+        for i in chosen {
+            self.cancel_flight(i, false);
+        }
+        Some(node)
+    }
+
+    fn cancel_for_gate(&mut self, head: &Request, candidates: &[usize]) -> Option<usize> {
+        let node = candidates
+            .iter()
+            .copied()
+            .map(|d| (d, self.victims_at(d, head).len()))
+            .filter(|&(_, n)| n > 0)
+            .max_by_key(|&(_, n)| n)?
+            .0;
+        loop {
+            if self.router_admits(node, head, false) {
+                return Some(node);
+            }
+            let at = *self.victims_at(node, head).first()?;
+            self.cancel_flight(at, false);
+        }
+    }
+
+    fn cancel_for_engine(&mut self, node: usize) -> bool {
+        if self.cancel == CancelMode::Off
+            || self.engine_wait == EngineWait::Off
+            || self.triggers == Triggers::Router
+        {
+            return false;
+        }
+        let Some(head) = self.engine_queues[node].first().map(|w| w.req.clone()) else {
+            return false;
+        };
+        let Some(&at) = self.victims_at(node, &head).first() else {
+            return false;
+        };
+        self.cancel_flight(at, true);
+        true
+    }
+
+    fn start_waiting(&mut self, home: usize, waiting: &Waiting) {
+        let waited = self.arrival_ns - waiting.arrival_ns;
+        let slo = waiting.req.slo.idx();
+        self.engine_waits.waited[slo] += 1;
+        self.engine_waits.waited_ns[slo] += self.arrival_ns - waiting.queued_ns;
+        let mut cost = self.dispatch(home, &waiting.req, None, self.resubmitted(Some(waiting.id)));
+        cost.decide_ns = waiting.decide_ns;
+        cost.transfer_ns += waiting.pre_ns;
+        cost.queue_ns += waited;
+        self.after_dispatch(&waiting.req, home, &cost);
+        let arrival = Arrival {
+            id: Some(waiting.id),
+            seq: waiting.seq,
+            at_ns: waiting.arrival_ns,
+            abort_ns: 0,
+        };
+        if let Submitted::Closed(cost) = self.settle_flight(home, &waiting.req, cost, arrival) {
+            self.closed.push((waiting.id, cost));
+        }
     }
 
     fn reach(&mut self, home: usize, req: &Request, decode_needed: bool) -> u64 {
@@ -2835,18 +3745,45 @@ impl Machine {
     }
 
     fn run_here(&mut self, home: usize, req: &Request) -> Cost {
-        self.run_paired(home, req, None)
+        self.run_paired(home, req, None, false)
     }
 
-    fn run_paired(&mut self, home: usize, req: &Request, pair: Option<(usize, u64)>) -> Cost {
-        let class = req.kind_idx();
-        if !self.router_admits(home, req, false) {
-            self.refused_by_router[class] += 1;
-            return Cost {
-                pending: true,
-                ..Cost::default()
-            };
+    fn resubmitted(&self, id: Option<usize>) -> bool {
+        id.is_some_and(|id| self.aborted_requests.contains(&id))
+    }
+
+    fn router_refusal(&mut self, home: usize, req: &Request) -> Option<Cost> {
+        if self.router_admits(home, req, false) {
+            return None;
         }
+        self.refused_by_router[req.kind_idx()] += 1;
+        Some(Cost {
+            pending: true,
+            ..Cost::default()
+        })
+    }
+
+    fn run_paired(
+        &mut self,
+        home: usize,
+        req: &Request,
+        pair: Option<(usize, u64)>,
+        resubmitted: bool,
+    ) -> Cost {
+        if let Some(refused) = self.router_refusal(home, req) {
+            return refused;
+        }
+        self.dispatch(home, req, pair, resubmitted)
+    }
+
+    fn dispatch(
+        &mut self,
+        home: usize,
+        req: &Request,
+        pair: Option<(usize, u64)>,
+        resubmitted: bool,
+    ) -> Cost {
+        let class = req.kind_idx();
         if let Some(t) = self.instruments.tenants.as_mut() {
             t.set_requester(req.tenant);
         }
@@ -2896,10 +3833,15 @@ impl Machine {
             cost.dispatch_ns += self.dispatch.ns(DISPATCH_BYTES);
             self.dispatches += 1;
             let (exec, queue) = self.execute(home, req);
-            if req.tokens > 0 {
+            if req.tokens > 0 && !resubmitted {
                 let seen = &mut self.observed[req.slo.idx()];
                 seen.0 += req.tokens;
                 seen.1 += 1;
+                self.lengths[req.slo.idx()].record(req.tokens);
+            }
+            if req.tokens > 0 && self.queue == Queue::Plas && self.cancel == CancelMode::Off {
+                let end = self.arrival_ns + queue + exec;
+                self.completions.push(Reverse((end, req.program, exec)));
             }
             cost.exec_ns = exec;
             cost.queue_ns += queue;
@@ -2923,14 +3865,21 @@ impl Machine {
                 }
             }
         }
+        let mut resv_seq = None;
         if let Some(end) = until
             && self.domains[home].engine_cache()
         {
-            let (blocks, extra) = self.reserve.claim(req, self.tokens_per_block);
-            self.reserved[home].commit(&blocks, extra, end);
+            let (blocks, extra) = self.claim(req);
+            resv_seq = Some(self.reserved[home].commit(&blocks, extra, end));
             self.observe_pin(home, req, end);
         }
-        self.domains[home].seal(until);
+        let cache_seq = self.domains[home].seal(until);
+        self.handles = until.map(|end| Handles {
+            cache_seq,
+            resv_seq,
+            start_ns: end - cost.exec_ns,
+            end_ns: end,
+        });
         self.emit_directives(home, req, &cost);
         self.observe_emit(home);
         self.domains[home].set_owner(None);
@@ -2969,6 +3918,7 @@ impl Machine {
             retention: agent.retention,
             concurrent: false,
             tenant: agent.tenant,
+            program: 0,
         }
     }
 
@@ -2988,6 +3938,7 @@ impl Machine {
             retention: crate::work::Retention::default(),
             concurrent: false,
             tenant: None,
+            program: 0,
         }
     }
 
@@ -3103,7 +4054,7 @@ impl Machine {
             match self.place_agent(&probes[i], flow) {
                 Some((d, need)) => {
                     if self.domains[d].engine_cache() {
-                        let (blocks, extra) = self.reserve.claim(&probes[i], self.tokens_per_block);
+                        let (blocks, extra) = self.claim(&probes[i]);
                         self.staged_kv[d] +=
                             self.reserved[d].uncovered(&blocks, Some(&self.staged[d])) + extra;
                     }
@@ -3694,6 +4645,743 @@ mod tests {
             .collect()
     }
 
+    fn single_trace(seed: u64, ops: u64, throughput: f64) -> Vec<Request> {
+        Workload::with_fanout(seed, ops, 1.0, 0.0)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_throughput(throughput)
+            .collect()
+    }
+
+    fn waiting_machine(partition: u64, wait: EngineWait) -> Machine {
+        let mut mach = engine_machine(4 << 30, partition, Control::Unified);
+        mach.set_hold_decodes(true);
+        mach.set_arrival_rate(250.0);
+        mach.set_engine_wait(wait);
+        mach
+    }
+
+    fn submit_all(mach: &mut Machine, trace: &[Request]) -> (Vec<Cost>, usize) {
+        let mut costs = Vec::new();
+        let mut opened = 0;
+        for req in trace {
+            match mach.submit(req) {
+                Submitted::Closed(cost) => costs.push(cost),
+                Submitted::Open(_) => opened += 1,
+            }
+            costs.extend(mach.drain_closed().into_iter().map(|(_, cost)| cost));
+        }
+        mach.finish();
+        costs.extend(mach.drain_closed().into_iter().map(|(_, cost)| cost));
+        (costs, opened)
+    }
+
+    const TIGHT: u64 = 160 << 20;
+    const MILD: u64 = 320 << 20;
+
+    #[test]
+    fn an_engine_that_waits_preempts_no_single_request() {
+        let trace = single_trace(3, 3_000, 0.0);
+        let mut runs = waiting_machine(TIGHT, EngineWait::Off);
+        let (_, none_opened) = submit_all(&mut runs, &trace);
+        assert_eq!(none_opened, 0);
+        assert!(
+            runs.preempted.iter().sum::<u64>() > 0,
+            "the fixture must overcommit the partition under today's engine"
+        );
+        let mut waits = waiting_machine(TIGHT, EngineWait::Fifo);
+        let (costs, opened) = submit_all(&mut waits, &trace);
+        assert!(
+            opened > 0,
+            "an overcommitted partition must queue something"
+        );
+        assert_eq!(waits.preempted.iter().sum::<u64>(), 0);
+        assert!(costs.iter().all(|c| !c.preempted));
+    }
+
+    #[test]
+    fn every_request_that_waits_closes_once_and_carries_its_wait() {
+        let trace = single_trace(4, 3_000, 0.0);
+        let mut mach = waiting_machine(TIGHT, EngineWait::Fifo);
+        let (costs, opened) = submit_all(&mut mach, &trace);
+        assert_eq!(
+            costs.len(),
+            trace.len(),
+            "no request is lost or closed twice"
+        );
+        assert_eq!(mach.engine_waits.queued as usize, opened);
+        let waited: u64 = mach.engine_waits.waited.iter().sum();
+        assert_eq!(waited as usize, opened);
+        let carried: u64 = costs.iter().map(|c| c.queue_ns).sum();
+        let mut base = waiting_machine(TIGHT, EngineWait::Off);
+        let (plain, _) = submit_all(&mut base, &trace);
+        let engine_queue: u64 = plain.iter().map(|c| c.queue_ns).sum();
+        assert!(
+            carried >= mach.engine_waits.waited_ns.iter().sum::<u64>() + engine_queue / 2,
+            "the wait is charged to the request as queue time"
+        );
+        assert!(mach.engine_queues.iter().all(Vec::is_empty));
+    }
+
+    #[test]
+    fn a_sequence_larger_than_the_partition_runs_at_once_and_is_preempted() {
+        let partition = 64 * crate::work::KV_BLOCK_BYTES;
+        let mut req = single_trace(5, 400, 0.0)
+            .into_iter()
+            .find(|r| r.tokens > 0 && r.chain.len() <= 20)
+            .expect("a short chain among the first requests");
+        let mut parent = req.chain.last().expect("a chain").0;
+        req.produces = (0..80)
+            .map(|i| {
+                let id = BlobId::chain(parent, format!("oversize:{i}").as_bytes());
+                let meta = BlobMeta {
+                    kind: BlobKind::KvBlock,
+                    bytes: crate::work::KV_BLOCK_BYTES,
+                    parent: Some(parent),
+                    recompute_ns: crate::work::KV_BLOCK_NS,
+                };
+                parent = id;
+                (id, meta)
+            })
+            .collect();
+        let mut mach = waiting_machine(partition, EngineWait::Fifo);
+        let (costs, opened) = submit_all(&mut mach, &[req]);
+        assert_eq!(opened, 0, "a sequence that can never fit does not wait");
+        assert_eq!(mach.engine_waits.unfittable, 1);
+        assert_eq!(costs.len(), 1);
+        assert!(costs[0].preempted);
+    }
+
+    #[test]
+    fn first_fit_starts_sooner_than_arrival_order_and_priority_serves_interactive_first() {
+        let trace = single_trace(6, 4_000, 0.3);
+        let mean_wait = |mach: &Machine, slo: usize| {
+            mach.engine_waits.waited_ns[slo] as f64 / mach.engine_waits.waited[slo].max(1) as f64
+        };
+        let mut fifo = waiting_machine(TIGHT, EngineWait::Fifo);
+        let mut first_fit = waiting_machine(TIGHT, EngineWait::FirstFit);
+        let mut priority = waiting_machine(TIGHT, EngineWait::Priority);
+        for mach in [&mut fifo, &mut first_fit, &mut priority] {
+            submit_all(mach, &trace);
+        }
+        let all = |m: &Machine| m.engine_waits.waited_ns.iter().sum::<u64>() as f64;
+        assert!(all(&first_fit) < all(&fifo));
+        assert!(mean_wait(&priority, 0) < mean_wait(&fifo, 0));
+        assert!(mean_wait(&priority, 0) < mean_wait(&priority, 1));
+    }
+
+    #[test]
+    fn the_probe_reads_what_the_old_engine_hides_and_changes_nothing() {
+        let trace = single_trace(7, 3_000, 0.0);
+        let mut plain = waiting_machine(TIGHT, EngineWait::Off);
+        let (before, _) = submit_all(&mut plain, &trace);
+        let mut probed = waiting_machine(TIGHT, EngineWait::Off);
+        probed.set_probe_engine(true);
+        let (after, _) = submit_all(&mut probed, &trace);
+        assert_eq!(format!("{before:?}"), format!("{after:?}"));
+        let seen =
+            probed.engine_waits.probe_ns.len() as u64 + probed.engine_waits.probe_unplaceable;
+        assert!(seen > 0);
+        assert!(seen <= probed.preempted.iter().sum::<u64>());
+    }
+
+    fn queued_machine(partition: u64, queue: Queue) -> Machine {
+        let mut mach = waiting_machine(partition, EngineWait::Off);
+        mach.set_admission(Reserve::Perfect, crate::work::TOKENS_PER_KV_BLOCK);
+        mach.set_queue(queue);
+        mach
+    }
+
+    fn waiting_for(req: &Request, id: usize, arrival_ns: u64) -> Waiting {
+        Waiting {
+            id,
+            seq: 0,
+            req: req.clone(),
+            arrival_ns,
+            queued_ns: arrival_ns,
+            pre_ns: 0,
+            decide_ns: 0,
+            requeued: false,
+        }
+    }
+
+    #[test]
+    fn a_queue_holds_what_the_router_would_refuse_and_closes_every_request_once() {
+        let trace = single_trace(9, 3_000, 0.3);
+        let mut refusing = queued_machine(TIGHT, Queue::Off);
+        let (served, opened) = submit_all(&mut refusing, &trace);
+        assert_eq!(opened, 0);
+        assert!(refusing.refused_by_router.iter().sum::<u64>() > 0);
+        assert_eq!(served.len(), trace.len());
+        let mut queued = queued_machine(TIGHT, Queue::Fifo);
+        let (costs, opened) = submit_all(&mut queued, &trace);
+        assert!(
+            opened > 0,
+            "an overcommitted partition must queue something"
+        );
+        assert_eq!(
+            costs.len(),
+            trace.len(),
+            "no request is lost or closed twice"
+        );
+        assert_eq!(queued.refused_by_router.iter().sum::<u64>(), 0);
+        assert!(queued.router_queue.is_empty());
+        assert_eq!(
+            queued.queue_waits.waited.iter().sum::<u64>(),
+            queued.queue_waits.queued
+        );
+        assert!(costs.iter().all(|c| !c.pending));
+    }
+
+    #[test]
+    fn a_claim_no_partition_could_hold_is_refused_and_blocks_no_queue() {
+        let trace = single_trace(9, 600, 0.3);
+        let mut queued = queued_machine(4 * crate::work::KV_BLOCK_BYTES, Queue::Fifo);
+        let (costs, _) = submit_all(&mut queued, &trace);
+        assert_eq!(
+            costs.len(),
+            trace.len(),
+            "no request is lost or closed twice"
+        );
+        assert!(queued.refused_by_router.iter().sum::<u64>() > 0);
+        assert!(queued.router_queue.is_empty());
+        assert_eq!(
+            queued.queue_waits.waited.iter().sum::<u64>(),
+            queued.queue_waits.queued
+        );
+    }
+
+    #[test]
+    fn a_queued_request_carries_its_wait_as_queue_time() {
+        let trace = single_trace(10, 3_000, 0.0);
+        let mut plain = queued_machine(TIGHT, Queue::Off);
+        let (before, _) = submit_all(&mut plain, &trace);
+        let mut queued = queued_machine(TIGHT, Queue::Fifo);
+        let (after, _) = submit_all(&mut queued, &trace);
+        let queue_ns = |costs: &[Cost]| costs.iter().map(|c| c.queue_ns).sum::<u64>();
+        assert!(
+            queue_ns(&after)
+                >= queue_ns(&before) + queued.queue_waits.waited_ns.iter().sum::<u64>() / 2,
+            "the router's wait is charged to the request"
+        );
+    }
+
+    #[test]
+    fn a_queue_changes_nothing_where_every_check_passes() {
+        let trace = single_trace(11, 2_000, 0.3);
+        let mut off = queued_machine(3 << 30, Queue::Off);
+        let (a, _) = submit_all(&mut off, &trace);
+        for queue in [Queue::Fifo, Queue::Slo, Queue::Plas] {
+            let mut on = queued_machine(3 << 30, queue);
+            let (b, opened) = submit_all(&mut on, &trace);
+            assert_eq!(opened, 0, "{queue:?}");
+            assert_eq!(format!("{a:?}"), format!("{b:?}"), "{queue:?}");
+        }
+    }
+
+    #[test]
+    fn declared_class_order_serves_interactive_requests_first() {
+        let trace = single_trace(12, 4_000, 0.3);
+        let mean = |m: &Machine, slo: usize| {
+            m.queue_waits.waited_ns[slo] as f64 / m.queue_waits.waited[slo].max(1) as f64
+        };
+        let mut fifo = queued_machine(TIGHT, Queue::Fifo);
+        let mut slo = queued_machine(TIGHT, Queue::Slo);
+        submit_all(&mut fifo, &trace);
+        submit_all(&mut slo, &trace);
+        assert!(mean(&slo, 0) < mean(&fifo, 0));
+        assert!(mean(&slo, 0) < mean(&slo, 1));
+    }
+
+    #[test]
+    fn the_queue_orders_by_arrival_class_or_attained_service() {
+        let trace = single_trace(13, 400, 0.0);
+        let mut reqs = trace.iter().filter(|r| r.tokens > 0);
+        let (mut a, mut b) = (
+            reqs.next().expect("a decode").clone(),
+            reqs.next().expect("a decode").clone(),
+        );
+        a.program = 1;
+        b.program = 2;
+        b.slo = Slo::Throughput;
+        let (first, second) = (waiting_for(&a, 0, 10), waiting_for(&b, 1, 20));
+        let mut mach = queued_machine(TIGHT, Queue::Fifo);
+        assert!(mach.queue_key(&first) < mach.queue_key(&second));
+        mach.set_queue(Queue::Slo);
+        assert!(mach.queue_key(&first) < mach.queue_key(&second));
+        let (later_interactive, earlier_throughput) =
+            (waiting_for(&a, 2, 30), waiting_for(&b, 3, 5));
+        assert!(mach.queue_key(&later_interactive) < mach.queue_key(&earlier_throughput));
+        mach.set_queue(Queue::Plas);
+        mach.attained.insert(1, 900);
+        mach.attained.insert(2, 5);
+        assert!(mach.queue_key(&second) < mach.queue_key(&first));
+    }
+
+    #[test]
+    fn attained_service_accrues_when_a_call_completes_and_not_before() {
+        let trace = single_trace(14, 600, 0.0);
+        let mut mach = queued_machine(3 << 30, Queue::Plas);
+        let first = trace.iter().find(|r| r.tokens > 0).expect("a decode");
+        mach.submit(first);
+        assert!(mach.attained.is_empty(), "the call is still decoding");
+        let (_, exec) = (0, first.tokens * crate::work::DECODE_NS_PER_TOKEN);
+        mach.finish();
+        for _ in 0..(exec / mach.interval_ns + 200) {
+            mach.arrive(false);
+        }
+        assert!(mach.attained.get(&first.program).copied().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn a_claim_names_the_bytes_of_an_observed_quantile_mean_or_the_declared_bound() {
+        let trace = single_trace(15, 200, 0.0);
+        let mut req = trace
+            .iter()
+            .find(|r| r.tokens > 0)
+            .expect("a decode")
+            .clone();
+        req.max_tokens = 700;
+        let block = crate::work::KV_BLOCK_BYTES;
+        let tpb = crate::work::TOKENS_PER_KV_BLOCK;
+        let mut mach = queued_machine(3 << 30, Queue::Off);
+        mach.set_claim(Claim::Quantile {
+            q: 0.9,
+            pooled: false,
+        });
+        assert_eq!(
+            mach.claim(&req).1,
+            700u64.div_ceil(tpb) * block,
+            "unobserved: the bound"
+        );
+        for t in 1..=100 {
+            mach.lengths[0].record(t);
+        }
+        for t in 301..=400 {
+            mach.lengths[1].record(t);
+        }
+        assert_eq!(mach.claim(&req).1, 90u64.div_ceil(tpb) * block);
+        mach.set_claim(Claim::Quantile {
+            q: 0.9,
+            pooled: true,
+        });
+        assert_eq!(mach.claim(&req).1, 370u64.div_ceil(tpb) * block);
+        mach.set_claim(Claim::Tiered { q: 0.9 });
+        assert_eq!(mach.claim(&req).1, 90u64.div_ceil(tpb) * block);
+        req.slo = Slo::Throughput;
+        assert_eq!(mach.claim(&req).1, 350u64.div_ceil(tpb) * block);
+        mach.set_claim(Claim::Static);
+        let (blocks, extra) = Reserve::Perfect.claim(&req, tpb);
+        let (claimed, claimed_extra) = mach.claim(&req);
+        assert_eq!(claimed_extra, extra);
+        assert_eq!(
+            claimed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            blocks.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_gate_admits_below_its_threshold_and_queues_above_it() {
+        let trace = single_trace(16, 3_000, 0.3);
+        let run = |theta: f64| {
+            let mut mach = waiting_machine(TIGHT, EngineWait::Off);
+            mach.set_queue(Queue::Fifo);
+            mach.set_claim(Claim::Gate(theta));
+            let (costs, _) = submit_all(&mut mach, &trace);
+            assert_eq!(costs.len(), trace.len());
+            mach.queue_waits.queued
+        };
+        assert!(run(0.2) > run(0.95));
+        assert_eq!(run(1.0), 0, "a gate no node can exceed queues nothing");
+    }
+
+    fn cancelling_machine(
+        partition: u64,
+        queue: Queue,
+        mode: CancelMode,
+        wait: EngineWait,
+    ) -> Machine {
+        let mut mach = queued_machine(partition, queue);
+        mach.set_engine_wait(wait);
+        mach.set_cancel(mode, Victim::Recent);
+        mach
+    }
+
+    #[test]
+    fn an_abort_releases_the_ledgers_a_flight_held_and_only_those() {
+        let trace = single_trace(17, 600, 0.5);
+        let mut mach =
+            cancelling_machine(3 << 30, Queue::Slo, CancelMode::Continue, EngineWait::Off);
+        let mut held = None;
+        for req in &trace {
+            mach.submit(req);
+            held = (0..mach.flights.len()).find(|&i| mach.flights[i].req.slo == Slo::Throughput);
+            if held.is_some() {
+                break;
+            }
+        }
+        let at = held.expect("a throughput decode in flight");
+        let node = mach.flights[at].node;
+        let now = mach.arrival_ns;
+        let committed = mach.reserved[node].committed();
+        let exclusive = mach.freed_by(&mach.flights[at]);
+        let free = mach.domains[node]
+            .kv_fit(&[])
+            .expect("an engine cache")
+            .free;
+        let load = mach.engines[node].load(now);
+        let flights = mach.flights.len();
+        mach.cancel_flight(at, false);
+        assert_eq!(mach.reserved[node].committed(), committed - exclusive);
+        assert!(
+            mach.domains[node]
+                .kv_fit(&[])
+                .expect("an engine cache")
+                .free
+                >= free
+        );
+        assert_eq!(mach.engines[node].load(now), load - 1);
+        assert_eq!(mach.flights.len(), flights - 1);
+        assert_eq!(mach.router_queue.len(), 1);
+        assert_eq!(mach.cancelled_requests(), 1);
+        assert_eq!(mach.cancel_stats.cancels, 1);
+    }
+
+    #[test]
+    fn only_a_lower_class_sequence_is_a_victim() {
+        let trace = single_trace(18, 500, 0.5);
+        let mut mach =
+            cancelling_machine(3 << 30, Queue::Slo, CancelMode::Continue, EngineWait::Off);
+        for req in &trace {
+            mach.submit(req);
+        }
+        let head = |slo: Slo| {
+            let mut r = trace
+                .iter()
+                .find(|r| r.tokens > 0)
+                .expect("a decode")
+                .clone();
+            r.slo = slo;
+            r
+        };
+        let mut seen = 0;
+        for node in 0..mach.nodes() {
+            for i in mach.victims_at(node, &head(Slo::Interactive)) {
+                assert_eq!(mach.flights[i].req.slo, Slo::Throughput);
+                seen += 1;
+            }
+            assert_eq!(mach.victims_at(node, &head(Slo::Throughput)).len(), 0);
+        }
+        assert!(
+            seen > 0,
+            "the fixture must have a throughput decode in flight"
+        );
+    }
+
+    #[test]
+    fn a_continuation_is_the_prompt_plus_the_whole_blocks_decoded() {
+        let mach = cancelling_machine(3 << 30, Queue::Slo, CancelMode::Continue, EngineWait::Off);
+        let tpb = crate::work::TOKENS_PER_KV_BLOCK;
+        let mut req = single_trace(19, 200, 0.0)
+            .into_iter()
+            .find(|r| r.tokens > 100 && r.produces.len() >= 3)
+            .expect("a long decode");
+        req.hint = None;
+        let kept = mach.continuation(&req, 0);
+        assert_eq!(kept.chain.len(), req.chain.len());
+        assert_eq!(kept.tokens, req.tokens);
+        let decoded = 2 * tpb + 5;
+        let resumed = mach.continuation(&req, decoded);
+        assert_eq!(resumed.chain.len(), req.chain.len() + 2);
+        assert_eq!(resumed.produces.len(), req.produces.len() - 2);
+        assert_eq!(resumed.tokens, req.tokens - decoded);
+        assert_eq!(
+            resumed.exec_ns,
+            resumed.tokens * crate::work::DECODE_NS_PER_TOKEN
+        );
+        assert!(resumed.hint.is_none() && resumed.completes.is_none());
+        assert_eq!(mach.continuation(&req, req.tokens + 50).tokens, 1);
+    }
+
+    #[test]
+    fn a_cancelled_request_is_resubmitted_and_every_request_closes_once() {
+        let trace = single_trace(20, 3_000, 0.5);
+        let mut off = cancelling_machine(MILD, Queue::Slo, CancelMode::Off, EngineWait::Off);
+        submit_all(&mut off, &trace);
+        let mut on = cancelling_machine(MILD, Queue::Slo, CancelMode::Continue, EngineWait::Off);
+        let (costs, _) = submit_all(&mut on, &trace);
+        assert_eq!(
+            costs.len(),
+            trace.len(),
+            "no request is lost or closed twice"
+        );
+        assert!(on.cancel_stats.cancels > 0);
+        assert!(on.cancelled_requests() > 0);
+        assert!(on.flights.is_empty() && on.router_queue.is_empty());
+        assert!(
+            on.queue_waits.waited_ns[0] < off.queue_waits.waited_ns[0],
+            "a cancel shortens the wait of the class it protects"
+        );
+    }
+
+    #[test]
+    fn restarting_throws_decode_away_and_continuing_does_not() {
+        let trace = single_trace(21, 3_000, 0.3);
+        let mut resumed =
+            cancelling_machine(TIGHT, Queue::Slo, CancelMode::Continue, EngineWait::Off);
+        let mut restarted =
+            cancelling_machine(TIGHT, Queue::Slo, CancelMode::Drop, EngineWait::Off);
+        let (a, _) = submit_all(&mut resumed, &trace);
+        let (b, _) = submit_all(&mut restarted, &trace);
+        assert_eq!(a.len(), trace.len());
+        assert_eq!(b.len(), trace.len());
+        assert_eq!(resumed.cancel_stats.wasted_decode_ns, 0);
+        assert!(restarted.cancel_stats.wasted_decode_ns > 0);
+    }
+
+    #[test]
+    fn an_interactive_request_waiting_at_an_engine_cancels_a_lower_class_sequence_there() {
+        let trace = single_trace(22, 3_000, 0.5);
+        let run = |mode: CancelMode| {
+            let mut mach = cancelling_machine(TIGHT, Queue::Slo, mode, EngineWait::Priority);
+            mach.set_claim(Claim::Quantile {
+                q: 0.1,
+                pooled: false,
+            });
+            let (costs, _) = submit_all(&mut mach, &trace);
+            assert_eq!(costs.len(), trace.len());
+            mach
+        };
+        let on = run(CancelMode::Continue);
+        assert!(on.cancel_stats.engine_cancels > 0);
+        assert!(on.cancel_stats.engine_cancels <= on.cancel_stats.cancels);
+        assert_eq!(run(CancelMode::Off).cancel_stats.cancels, 0);
+    }
+
+    #[test]
+    fn a_cancel_changes_no_request_where_nothing_is_overcommitted() {
+        let trace = single_trace(23, 2_000, 0.3);
+        let mut off = cancelling_machine(3 << 30, Queue::Slo, CancelMode::Off, EngineWait::Off);
+        let mut on = cancelling_machine(3 << 30, Queue::Slo, CancelMode::Continue, EngineWait::Off);
+        let (a, _) = submit_all(&mut off, &trace);
+        let (b, _) = submit_all(&mut on, &trace);
+        assert_eq!(on.cancel_stats.cancels, 0);
+        let sorted = |costs: &[Cost]| {
+            let mut v: Vec<String> = costs.iter().map(|c| format!("{c:?}")).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(&a), sorted(&b));
+    }
+
+    #[test]
+    fn a_gate_that_evicts_resubmits_what_it_drops() {
+        let trace = single_trace(24, 3_000, 0.5);
+        let mut mach = cancelling_machine(TIGHT, Queue::Slo, CancelMode::Drop, EngineWait::Off);
+        mach.set_claim(Claim::Gate(0.5));
+        let (costs, _) = submit_all(&mut mach, &trace);
+        assert_eq!(costs.len(), trace.len());
+        assert!(mach.cancel_stats.cancels > 0);
+        assert!(mach.flights.is_empty() && mach.router_queue.is_empty());
+    }
+
+    #[test]
+    fn finishing_a_trace_samples_no_occupancy_and_so_leaves_the_grants_alone() {
+        let trace = single_trace(25, 1_500, 0.5);
+        let mut mach = cancelling_machine(MILD, Queue::Slo, CancelMode::Continue, EngineWait::Off);
+        for req in &trace {
+            mach.submit(req);
+        }
+        let (samples, mean) = (mach.kv_samples, mach.kv_mean());
+        assert!(
+            !mach.flights.is_empty(),
+            "the trace ends with decodes in flight"
+        );
+        mach.finish();
+        assert_eq!(mach.kv_samples, samples);
+        assert_eq!(mach.kv_mean(), mean);
+    }
+
+    fn leaving_machine(queue: Queue, share: f64, leak: bool) -> Machine {
+        let mut mach = queued_machine(MILD, queue);
+        mach.set_departures(Some(Departures { share, leak }));
+        mach
+    }
+
+    fn submit_counting_departures(mach: &mut Machine, trace: &[Request]) -> (usize, usize) {
+        let (costs, _) = submit_all(mach, trace);
+        let mut departed = mach.drain_departed().len();
+        mach.finish();
+        departed += mach.drain_departed().len();
+        (costs.len(), departed)
+    }
+
+    #[test]
+    fn a_departing_client_has_its_sequence_aborted_and_leaves_every_tally() {
+        let trace = single_trace(26, 3_000, 0.3);
+        let mut mach = leaving_machine(Queue::Fifo, 0.2, false);
+        let mut served = 0;
+        let mut departed = 0;
+        for req in &trace {
+            if let Submitted::Closed(_) = mach.submit(req) {
+                served += 1;
+            }
+            served += mach.drain_closed().len();
+            departed += mach.drain_departed().len();
+        }
+        mach.finish();
+        served += mach.drain_closed().len();
+        departed += mach.drain_departed().len();
+        assert!(departed > 0);
+        assert_eq!(
+            served + departed,
+            trace.len(),
+            "every request ends served or departed"
+        );
+        assert!(mach.departure_stats.aborted > 0);
+        assert!(mach.departure_stats.freed_ns > 0);
+        assert_eq!(mach.departure_stats.leaked_ns, 0);
+        assert!(mach.flights.is_empty());
+    }
+
+    #[test]
+    fn a_leaked_departure_runs_to_its_end_and_still_leaves_the_tally() {
+        let trace = single_trace(27, 3_000, 0.3);
+        let mut aborting = leaving_machine(Queue::Fifo, 0.2, false);
+        let mut leaking = leaving_machine(Queue::Fifo, 0.2, true);
+        let (served_a, departed_a) = submit_counting_departures(&mut aborting, &trace);
+        let (served_l, departed_l) = submit_counting_departures(&mut leaking, &trace);
+        assert_eq!(served_a + departed_a, trace.len());
+        assert_eq!(served_l + departed_l, trace.len());
+        assert_eq!(leaking.departure_stats.aborted, 0);
+        assert!(leaking.departure_stats.leaked_ns > 0);
+        assert_eq!(departed_l as u64, leaking.departure_stats.leaving);
+    }
+
+    #[test]
+    fn which_clients_leave_does_not_depend_on_the_arm() {
+        let trace = single_trace(28, 2_000, 0.3);
+        let leaving = |queue: Queue| {
+            let mut mach = leaving_machine(queue, 0.25, true);
+            submit_counting_departures(&mut mach, &trace);
+            mach.departure_stats.leaving
+        };
+        assert_eq!(leaving(Queue::Fifo), leaving(Queue::Slo));
+    }
+
+    #[test]
+    fn registering_flights_without_a_cancel_accrues_attained_service_once() {
+        let trace = single_trace(29, 1_500, 0.3);
+        let mut plain = queued_machine(MILD, Queue::Plas);
+        let mut sampled = queued_machine(MILD, Queue::Plas);
+        sampled.set_track_stream(true);
+        for mach in [&mut plain, &mut sampled] {
+            submit_all(mach, &trace);
+            while !mach.completions.is_empty() {
+                mach.arrive(false);
+            }
+        }
+        assert!(!plain.attained.is_empty());
+        assert_eq!(plain.attained, sampled.attained);
+    }
+
+    #[test]
+    fn the_stream_buffer_counts_tokens_emitted_so_far_and_changes_no_request() {
+        let trace = single_trace(29, 2_000, 0.3);
+        let mut plain = queued_machine(MILD, Queue::Slo);
+        let mut sampled = queued_machine(MILD, Queue::Slo);
+        sampled.set_track_stream(true);
+        let (a, _) = submit_all(&mut plain, &trace);
+        let (b, _) = submit_all(&mut sampled, &trace);
+        let sorted = |costs: &[Cost]| {
+            let mut v: Vec<String> = costs.iter().map(|c| format!("{c:?}")).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(&a), sorted(&b));
+        assert!(sampled.stream.samples > 0);
+        let peak = sampled
+            .stream
+            .peak_tokens
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        assert!(peak > 0);
+        let ceiling = (MAX_BATCH as u64) * 224;
+        assert!(
+            peak <= ceiling,
+            "a node cannot have emitted more than its batch can hold"
+        );
+        for (sum, top) in sampled
+            .stream
+            .sum_tokens
+            .iter()
+            .zip(&sampled.stream.peak_tokens)
+        {
+            assert!(*sum <= top * sampled.stream.samples);
+        }
+    }
+
+    #[test]
+    fn a_router_only_cancel_never_fires_at_an_engine() {
+        let trace = single_trace(30, 3_000, 0.5);
+        let run = |triggers: Triggers| {
+            let mut mach = cancelling_machine(
+                TIGHT,
+                Queue::Slo,
+                CancelMode::Continue,
+                EngineWait::Priority,
+            );
+            mach.set_claim(Claim::Quantile {
+                q: 0.1,
+                pooled: false,
+            });
+            mach.set_cancel_triggers(triggers);
+            let (costs, _) = submit_all(&mut mach, &trace);
+            assert_eq!(costs.len(), trace.len());
+            mach
+        };
+        assert_eq!(run(Triggers::Router).cancel_stats.engine_cancels, 0);
+        assert!(run(Triggers::Both).cancel_stats.engine_cancels > 0);
+    }
+
+    #[test]
+    fn a_resubmitted_request_is_observed_once() {
+        let trace = single_trace(32, 3_000, 0.5);
+        let decodes = trace.iter().filter(|r| r.tokens > 0).count() as u64;
+        for mode in [CancelMode::Continue, CancelMode::Drop] {
+            let mut mach = cancelling_machine(MILD, Queue::Slo, mode, EngineWait::Off);
+            let (costs, _) = submit_all(&mut mach, &trace);
+            assert_eq!(costs.len(), trace.len());
+            assert!(mach.cancel_stats.cancels > 0);
+            assert_eq!(mach.lengths[0].seen() + mach.lengths[1].seen(), decodes);
+            assert_eq!(mach.observed[0].1 + mach.observed[1].1, decodes);
+        }
+    }
+
+    #[test]
+    fn a_resubmitted_request_charges_its_recompute_to_the_cancel() {
+        let trace = single_trace(31, 3_000, 0.5);
+        let mut restarted = cancelling_machine(MILD, Queue::Slo, CancelMode::Drop, EngineWait::Off);
+        submit_all(&mut restarted, &trace);
+        assert!(restarted.cancel_stats.cancels > 0);
+        assert!(restarted.cancel_stats.reprefill_ns > 0);
+        let mut quiet = cancelling_machine(3 << 30, Queue::Slo, CancelMode::Drop, EngineWait::Off);
+        submit_all(&mut quiet, &trace);
+        assert_eq!(quiet.cancel_stats.reprefill_ns, 0);
+    }
+
+    #[test]
+    fn an_engine_that_waits_changes_nothing_where_every_sequence_fits() {
+        let trace = single_trace(8, 2_000, 0.3);
+        let mut off = waiting_machine(3 << 30, EngineWait::Off);
+        let mut fifo = waiting_machine(3 << 30, EngineWait::Fifo);
+        let (a, _) = submit_all(&mut off, &trace);
+        let (b, opened) = submit_all(&mut fifo, &trace);
+        assert_eq!(opened, 0);
+        assert_eq!(format!("{a:?}"), format!("{b:?}"));
+    }
+
     #[test]
     fn census_kvblock_row_is_zero_on_a_cluster_with_the_bit_on() {
         for control in [Control::Unified, Control::Gossip { period: 50 }] {
@@ -4088,6 +5776,7 @@ mod tests {
             retention: crate::work::Retention::default(),
             concurrent: false,
             tenant: None,
+            program: 0,
         };
         assert!(mach.domains[d].evict_unrecorded(&victim));
         let believed = mach.plan(d, &req.view(0), View::Belief);
@@ -4171,6 +5860,7 @@ mod tests {
             retention: crate::work::Retention::default(),
             concurrent: false,
             tenant: None,
+            program: 0,
         };
         let mut mach = gate_machine(Control::Unified, false);
         assert_eq!(mach.view_of(&request(50)).tokens, 50);

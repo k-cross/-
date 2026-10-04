@@ -1,18 +1,32 @@
+const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+
 #[derive(Debug, Clone)]
 pub struct Rng {
     state: [u64; 4],
 }
 
 impl Rng {
+    fn mix(z: u64) -> u64 {
+        let z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        let z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn to_unit(bits: u64) -> f64 {
+        (bits >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+    }
+
+    #[must_use]
+    pub fn hashed_unit(key: u64) -> f64 {
+        Self::to_unit(Self::mix(key.wrapping_add(GOLDEN)))
+    }
+
     #[must_use]
     pub fn new(seed: u64) -> Self {
-        let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = seed.wrapping_add(GOLDEN);
         let mut next = || {
-            z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            let mut x = z;
-            x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-            x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-            x ^ (x >> 31)
+            z = z.wrapping_add(GOLDEN);
+            Self::mix(z)
         };
         Self {
             state: [next(), next(), next(), next()],
@@ -37,7 +51,7 @@ impl Rng {
     }
 
     pub fn unit(&mut self) -> f64 {
-        (self.next_u64() >> 11) as f64 * (1.0 / (1u64 << 53) as f64)
+        Self::to_unit(self.next_u64())
     }
 
     pub fn chance(&mut self, p: f64) -> bool {

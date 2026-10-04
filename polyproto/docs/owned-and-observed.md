@@ -12,12 +12,14 @@ not about who wrote it; the HTTP itself is a linked library's (§2.6). **Cede th
 path** -- and the second is only defensible because of the first, since routing and cancellation
 are what is left to decide with once allocation is gone.
 
-**Status.** Phases 0-6 and 8 are built and measured; Phases 7 and 9-11 are design (§9). Current
+**Status.** Phases 0-6, 8 and 9 are built and measured; Phases 7, 10 and 11 are design (§9). Current
 results are in [`residency-ledger.md`](residency-ledger.md); each phase's plan, predictions and
 outcomes are in its own `phase-N.md`. The corrected architecture runs behind bits that are off by
 default -- `--engine-cache` (Phase 3), `--belief` (Phase 4), `--directives`, `--prefill-ahead` and
-`--retain` (Phase 5), and `--model-batches`, `--prefill-time`, `--model-keyed` and `--fleet`
-(Phase 6) -- so a published number is the ledger's unless it is marked otherwise.
+`--retain` (Phase 5), `--model-batches`, `--prefill-time`, `--model-keyed` and `--fleet`
+(Phase 6), and `--engine-wait`, `--queue`, `--admit quantile | tiered | gate`, `--cancel`,
+`--victim`, `--disconnect`, `--leak`, `--batch` and `--stream-buffer` (Phase 9) -- so a published
+number is the ledger's unless it is marked otherwise.
 
 **On the numbers.** Four grades of evidence, kept apart:
 
@@ -244,7 +246,11 @@ cost does not land on the request that caused it. The engine resolves it on its 
 tenant and priority (§3.8). Measured, the cost is **class-blind**: whichever sequence the engine
 preempts pays, and interactive turns and task stages lose p99 about equally (Phase 3). So an
 optimistic admission converts a *mean* utilisation gain into a *tail* loss spread across everyone,
-and a sweep reporting mean service time prices that at approximately zero.
+and a sweep reporting mean service time prices that at approximately zero. Phase 9 corrected the
+size and not the direction. At half the partition, the engine Phase 3 measured on ran a sixth to a
+fifth of its decodes with no memory instead of making them wait (on the `belief` cluster), so the
+half partition is an overload and the bracket understated it. The loss is class-blind on the engine's own order, and it
+moves onto the throughput class once the router chooses the victim (below).
 
 The asymmetry is also where a fix would live -- a **per-class mix of the two**, on an axis §4 turns
 out to need:
@@ -256,19 +262,31 @@ out to need:
   designated victim when the conservative class expands into the slack.
 
 §3.7 arrives at the same quantile from the routing side, which is the reason to believe the axis is
-real rather than convenient. **It is unbuilt and unproven.** Phase 3's admission sweep found the
-bracket narrow at the published partition and wide at half of it -- `bound` refuses 17%, `perfect`
-8.6%, and `none` refuses nothing but preempts 10.5% -- and while the loss is class-blind, a two-tier
-mix buys nothing a scalar bound would not until requests carry a class it can act on -- the `slo`
-field (§4), declared since Phase 4 -- and the router can choose the victim, which only cancellation
-allows (below). Phase 9 tests both.
+real rather than convenient. **Phase 9 built it, and the mean half survives only where memory binds
+lightly.** Phase 3's admission sweep found the bracket narrow at the published partition and wide at
+half of it -- `bound` refuses 17%, `perfect` 8.6%, and `none` refuses nothing but preempts 10.5% --
+and while the loss is class-blind, a two-tier mix buys nothing a scalar bound would not until
+requests carry a class it can act on -- the `slo` field (§4), declared since Phase 4 -- and the
+router can choose the victim, which only cancellation allows (below). Phase 9 gave it both and
+measured the form that works: **one declared quantile of each class's own observed distribution, a
+priority order at a router queue, and a victim class** ([`phase-9.md`](phase-9.md), P5). Where the
+classes are drawn alike one p90 and the tiered claim are a scalar; where they are not, the pooled
+quantile lets the interactive first-token p99 reach 0.5-6.7 s with a batch class and a class's own
+quantile holds it to 0.18-0.59 s, and 63-67 ms with a cancel. Borrowing against the mean lets more
+throughput work in and the cancel evicts it: at 0.6x of the grant with prefill taking engine time it
+finishes the throughput class 1.5-1.7x later than its own p90 does and the interactive class's first
+token 2.5-5.1x later, so the mean half is retired there; at 0.75x it is level, or ahead on two seeds
+of three. The half partition Phase 3 used is an overload for the engine once a sequence it cannot
+hold waits (`--engine-wait`), and its bracket compared different sets of served requests.
 
 **The catch is that the orchestrator cannot cash that understanding inside the engine.** Ceding
 eviction ceded the **choice of victim**: the engine still preempts and recomputes under pressure,
 but on its own order, and nothing the orchestrator can say makes it drop a draft to spare a chat
 turn. The only preemption primitive left never crossed into the allocator -- **cancel the request
 on the path it arrived on** (§2.3). Two-tier admission without that is a reservation policy with no
-enforcement arm.
+enforcement arm. vLLM's scheduler does reach the choice of victim for a running request's growth,
+by priority, and not for admission, where a waiting request never preempts; the arm that is
+authoritative for admission is the cancel (`phase-9.md` §1.2).
 
 **The save: macro-orchestration, dataflow placement, and targeted host DDR arbitration.** HBM and
 DDR are physically separate pools, so pricing an HBM KV block against a host DDR microVM cell in one
@@ -538,14 +556,17 @@ first is about speed.
    point is a hop from the belief, the belief is stale again when used, and divergence has two
    referents instead of one.
 4. **Cancellation is the only preemption left.** The engine still preempts; §1 ceded the choice of
-   victim, so none of it runs in the orchestrator's priority order. What remains is to stop
-   sending, and to stop a stream already in flight, since an abort propagated to the engine frees
-   its blocks at the next step boundary. That makes the request path the **enforcement arm for
-   every priority policy in this document** -- two-tier admission (§1), `DraftOnly` preemption
-   (§4) and the tenancy trade (§3.8) are reservation policies whose only teeth are a cancel. A
-   sidecar can carry a cancel; it carries it one hop from the component that decided to issue it,
-   and when the client simply disappears it decides on its own partial view whether that was a
-   preemption or a retry.
+   victim, so none of it runs in the orchestrator's priority order. What remains is to stop sending,
+   and to stop a stream already in flight, since an abort propagated to the engine frees its blocks
+   at the next step boundary. Measured (Phase 9), the cancel frees the pins, the reservation and the
+   batch slot together, a **continuation** -- the prompt plus the blocks already decoded -- beats a
+   restart, which finishes the batch class 26-183% later, and an llm-d-shaped utilisation gate costs
+   the evicted class 2.2-4.4x in completion against a claim where memory binds. That makes the
+   request path the **enforcement arm for every priority policy in this document** -- two-tier
+   admission (§1), `DraftOnly` preemption (§4) and the tenancy trade (§3.8) are reservation policies
+   whose only teeth are a cancel. A sidecar can carry a cancel; it carries it one hop from the
+   component that decided to issue it, and when the client simply disappears it decides on its own
+   partial view whether that was a preemption or a retry.
 
 ### 2.4 The split moves; it does not vanish
 
@@ -657,10 +678,13 @@ What remains, worst first:
      priority model, not just a wasted GPU.
    - **Backpressure, and where it lands.** A slow client stalls its HTTP/2 receive window and the
      tokens already generated have to go somewhere: buffered in host DDR, or pushed back into the
-     decode loop as head-of-line blocking that looks exactly like engine slowness. Neither is
-     free, and the first is **an occupant of the pool §5 prices** -- a few hundred stalled streams
-     are a memory-arbitration event and not only a latency one. That term does not exist in the
-     ledger.
+     decode loop as head-of-line blocking that looks exactly like engine slowness. For
+     text the first is cheap, and Phase 9 retracts the sentence that called it an occupant of the
+     pool §5 prices: if every decode in flight on a node stalled for its whole decode the buffer
+     peaks at 4,600 tokens a node on the published workload and 8,900 with a batch class, 0.9 and
+     1.8 MB at 200 bytes a token, 0.01-0.02% of a node's host DDR, against 15 KiB of HBM a token
+     for pausing the decode instead. The rule is to buffer and never pause; the sentence stands for
+     audio and image output, where a stalled stream carries tens of kilobytes a second.
    - **Retry, timeout and hedge against a stateful backend.** Re-issuing a partly-decoded request
      is not idempotent and throws away a warm prefix; hedging one duplicates prefill. These are
      scheduling decisions wearing transport clothes, which is an argument for holding them here,
@@ -1155,7 +1179,7 @@ an engine input: the scheduler needs a handful of fields it can act on, not a pa
 | Knowledge grounding | which blob classes, and their sharing shape | KV / snapshot / weights built; **RAG missing** |
 | State and time horizon | `retention: evict_first \| until(deadline) \| durable` | **built** for the first two (Phase 5): `evict_first` declared over one-shot scopes, `until(deadline)` from a hint's lead, both consumed by §3.3; `durable` is missing |
 | Authority to act | `authority: ReadOnly \| DraftOnly \| SideEffecting` + `pause_tolerance` | **missing**; drives speculation, sets which preemption primitive applies (§2.3) and which requests need a durable write (§1) |
-| *no dimension -- see below* | `slo: Interactive \| Throughput` | **declared** (Phase 4, `--throughput`); read by the scoring quantile (§3.7), not yet by admission (§1). `Deadline(t)` waits for something to consume it |
+| *no dimension -- see below* | `slo: Interactive \| Throughput` | **declared** (Phase 4, `--throughput`); read by the scoring quantile (§3.7), by admission and the router queue (Phase 9). `Deadline(t)` waits for something to consume it |
 
 **The fifth field has no dimension behind it.** §1's admission and §3.7's score both need to know
 how much of the cost distribution a request is priced against, and that is a property of the
@@ -1303,7 +1327,10 @@ whoever fills it.
    preemption -- reclaimed by eviction where the orchestrator still owns the pool and by
    cancellation where the engine does (§4). Both require knowing the authority class, which is a
    property of the *workload*, not of any one runtime. Its non-speculative core is built (Phase 5):
-   a declared flow's downstream prefilled when its hint arrives.
+   a declared flow's downstream prefilled when its hint arrives. The cancellation half is measured
+   (Phase 9): with a victim class, a cancel takes the interactive first-token p99 to 63-67 ms where
+   a pooled quantile lets it reach 0.5-6.7 s, and what it costs lands on the throughput class's
+   completion.
 10. **Joint prefill/decode pairing and ratio.** Disaggregation as a two-member gang with a
     direction, plus the fleet ratio behind it (§2.5). A sidecar picks a prefiller from a list.
     Measured (Phase 6), it is worth 1.6-2.6% at one prefiller in eight on the published mix and
@@ -1479,9 +1506,10 @@ Worst first.
    and hedge against a backend holding warm state. It threatens no result here -- the simulator
    charges seam costs from a measured ladder and never parses a byte of HTTP -- but it is the
    largest gap between this design being right and being shipped, and one piece of it has a
-   modelling consequence: **a stalled stream's buffer is an occupant of the host DDR pool §5's
-   shadow price arbitrates**, and that term does not exist in the ledger. Phase 9 adds it with
-   cancellation.
+   modelling consequence, which Phase 9 measured and retracted for text: a stalled stream's buffer
+   peaks under 2 MB a node, a counter and not a term of the ledger. A departure does matter: with
+   20% of clients leaving, an unpropagated one holds 200-830 sequence-seconds of decode and costs
+   the interactive first-token p99 1.7-3.2x where memory binds.
 
 ### What gets easier
 
@@ -1499,7 +1527,12 @@ Worst first.
   advisory. A retention directive the engine ignores costs a worse placement, and §3.6 counts it;
   an abort the engine ignores costs the priority model its only enforcement (§2.3). Both are
   model-agnostic -- neither needs to know what a block contains -- but an engine that cannot be
-  asked to stop is one this design cannot schedule priorities on.
+  asked to stop is one this design cannot schedule priorities on. As built (Phase 9), cancellation
+  is three things the engine provides: an abort that frees a sequence's batch slot and pins and
+  drops its never-written output, as vLLM's `finish_requests` does; a per-request priority by which
+  it orders the sequences waiting for blocks (`--engine-wait priority`); and the tokens a sequence
+  has decoded, returned with the stream (`return_token_ids`), so that the router can re-send them
+  as the prompt of a continuation. The reservation the cancel releases is the router's own.
 
   Context window earns its place because it is *declared metadata*, like size and load time, and
     Phase 6's fleet uses it: dispatching a 200k-token prompt to a 32k model produces a
@@ -1668,7 +1701,7 @@ run, and what was measured; the current numbers are in the ledger.
 | [6](phase-6.md) | macro authority: weight placement, partitions, disaggregated prefill/decode, tenancy (`--model-batches`, `--prefill-time`, `--model-keyed`, `--fleet`, `--planner`, `--pairing`, `--neighbour`) | done | one model per node is within 0.3% of the pooled engine and a late placement is the whole price (30 s start +77-82%); a pair wins 1.6-2.6% at one prefiller in eight and loses past it; a router quota beats sharing against a neighbour |
 | 7 | learned flows, speculative authority, sessions that suspend, the taxonomy | planned | |
 | [8](phase-8.md) | the data path as an arm | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
-| [9](phase-9.md) | enforcement: cancellation on the path, and two-tier admission | planned | |
+| [9](phase-9.md) | enforcement: a queue at the router, cancellation on the path, and two-tier admission (`--engine-wait`, `--queue`, `--admit`, `--cancel`, `--victim`, `--disconnect`, `--batch`, `--stream-buffer`) | done | a cancel by declared class takes the interactive first-token p99 to 63-66 ms, a restart is 26-183% later than a continuation, and the stalled-stream buffer is under 2 MB a node |
 | 10 | durability: what each tier writes, and what a crash costs | planned | |
 | 11 | regions: a scheduler per region under global budgets | planned | |
 
@@ -1742,30 +1775,41 @@ suspended-session records and approval pauses, so Phase 7 extends Phase 10's cou
 
 ### Phase 9 -- Enforcement: cancellation on the path, and two-tier admission
 
-Implementation plan: [`phase-9.md`](phase-9.md), which states its predictions before the run.
+Plan, predictions and outcomes: [`phase-9.md`](phase-9.md). **Status:** built and measured, behind
+`--engine-wait`, `--queue`, `--admit quantile | tiered | gate`, `--cancel`, `--victim`,
+`--disconnect`, `--leak`, `--batch` and `--stream-buffer`; current numbers are in the ledger's
+*Enforcement* section. `--engine-wait` stays off by default, so the published engine and every
+earlier phase's results are unchanged.
 
 §1 ceded the choice of victim, so every priority policy in this document -- two-tier admission
 (§1), `DraftOnly` preemption (§4), the tenancy trade (§3.8) -- has one enforcement arm: **cancel
-the request on the path it arrived on** (§2.3). The simulator has no cancel. Phase 8 priced the
-path's seams and left its stream semantics out of scope, so this phase adds them:
+the request on the path it arrived on** (§2.3). The simulator had no cancel and no engine that
+waits, so the phase added both, with a queue at the router and the stream semantics Phase 8 left
+out of scope:
 
-- **Cancellation.** The router aborts a request in flight; the engine frees its blocks at the next
-  step boundary, and the request is requeued or dropped by its authority.
-- **The stalled-stream buffer.** Tokens generated for a slow client wait in host DDR -- an occupant
-  of the pool §5's shadow price arbitrates, and a term the ledger does not have (§8).
+- **The engine that waits.** A sequence the partition cannot hold waits at its node instead of
+  running with no memory, which the published engine does at 18-20% of decodes at half the
+  partition. The half partition is an overload once it does.
+- **The router queue and the cancel.** Requests wait at the router in class order and are placed
+  when they leave; a cancel releases a flight's batch slot, pins and reservation, and the victim
+  continues from the blocks it decoded. It fires when the router's own check fails and when a
+  higher-class request waits at an engine.
+- **Departures and the stalled-stream buffer.** A client that leaves is an abort or a leak, and the
+  buffer is a counter.
 
-The test case is **two-tier admission** by declared `slo` (§4): latency-bearing work reserved at a
-high quantile of the output distribution Phase 4 observes, throughput work borrowing against the
-mean, and throughput work the designated victim, cancelled to make room.
-
-- **Deliverable:** where the overcommit's tail loss lands once the router can choose the victim.
-  Phase 3 found it class-blind, spread by arrival, because the engine picks victims on its own
-  order. The prediction: with cancellation, the latency-bearing class's p99 recovers most of what
-  `perfect` admission achieves and the loss moves onto throughput work; without it, two-tier
-  admission stays a scalar. Program-level attained service (Autellix's PLAS) is a comparison arm
-  that needs no prediction of output length at all.
-- **Risk:** low; if the loss does not move, §1's per-class mix is a scalar and should be retired.
-  **Size:** medium.
+**What it found.** Where the loss lands: with a victim class the interactive first-token p99 is at
+the 63 ms floor and the throughput class's completion pays. A claim at each class's own quantile is
+what separates the arms; the tiered claim's mean costs the throughput class 1.5-1.7x at 0.6x with
+prefill taking engine time, and at 0.75x it is level or ahead on two seeds of three. A second cancel
+trigger at the engine, predicted to be needed, is not: at 0.75x the router's own check keeps the
+interactive class under 1 s on every seed. A
+restart finishes the batch class 26-183% later than a continuation. An llm-d-shaped gate evicts up
+to 3.6x as often for a throughput completion 2.2-4.4x later where memory binds, and at 0.75x with
+prefill taking engine time it costs the interactive class too. Attained service orders the
+throughput class first and the interactive class last on this workload. A leaked departure costs
+1.7-3.2x on the interactive first-token p99 at 20% leaving and 0.9-1.3x at 5%. The buffer peaks
+under 1.8 MB a node. Several cells lie outside their stated bands and `phase-9.md` says which, and
+the batch arms are graded on bands against a draw that is not the pre-measurement's.
 
 ### Phase 10 -- Durability: what each tier writes, and what a crash costs
 

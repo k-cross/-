@@ -364,6 +364,20 @@ impl Engine {
         }
     }
 
+    pub fn cancel_inflight(&mut self, end: u64, model: Option<Model>) -> bool {
+        let mut found = false;
+        let mut kept = BinaryHeap::with_capacity(self.inflight.len());
+        for Reverse((e, m)) in self.inflight.drain() {
+            if !found && e == end && m == model {
+                found = true;
+                continue;
+            }
+            kept.push(Reverse((e, m)));
+        }
+        self.inflight = kept;
+        found
+    }
+
     #[must_use]
     pub fn mean_batch(&self) -> f64 {
         if self.admitted == 0 {
@@ -819,21 +833,48 @@ impl EngineCache {
         self.reslot(id, |b| b.key = key);
     }
 
-    pub fn seal(&mut self, until: Option<u64>) {
+    pub fn seal(&mut self, until: Option<u64>) -> Option<u64> {
         let blocks = std::mem::take(&mut self.staging);
-        match until {
-            Some(end) => {
-                let seq = self.next_seq;
-                self.next_seq += 1;
-                self.held.insert(seq, blocks);
-                self.inflight.push(Reverse((end, seq)));
+        let Some(end) = until else {
+            for id in blocks {
+                self.unpin(id);
             }
-            None => {
-                for id in blocks {
-                    self.unpin(id);
-                }
-            }
+            return None;
+        };
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.held.insert(seq, blocks);
+        self.inflight.push(Reverse((end, seq)));
+        Some(seq)
+    }
+
+    pub fn abort(&mut self, seq: u64) -> u64 {
+        let before = self.pinned;
+        for id in self.held.remove(&seq).unwrap_or_default() {
+            self.unpin(id);
         }
+        before - self.pinned
+    }
+
+    #[must_use]
+    pub fn is_pinned(&self, id: &BlobId) -> bool {
+        self.blocks.get(id).is_some_and(|b| b.pins > 0)
+    }
+
+    #[must_use]
+    pub fn pins_of(&self, id: &BlobId) -> u32 {
+        self.blocks.get(id).map_or(0, |b| b.pins)
+    }
+
+    #[must_use]
+    pub fn release_schedule(&self) -> Vec<(u64, Vec<BlobId>)> {
+        let mut schedule: Vec<(u64, Vec<BlobId>)> = self
+            .inflight
+            .iter()
+            .filter_map(|Reverse((end, seq))| self.held.get(seq).map(|ids| (*end, ids.clone())))
+            .collect();
+        schedule.sort_by_key(|(end, _)| *end);
+        schedule
     }
 
     pub fn release(&mut self, now_ns: u64) {
@@ -950,6 +991,54 @@ mod tests {
         );
         assert_eq!(cache.orphans(), 0);
         assert!(cache.contains(&b[0].0) && cache.contains(&b[1].0));
+    }
+
+    #[test]
+    fn an_abort_unpins_one_sequence_and_leaves_its_blocks_resident() {
+        let mut cache = EngineCache::new(8 * BLOCK, true);
+        let (first, second) = (chain("first", 2), chain("second", 3));
+        for &(id, meta) in &first {
+            cache.admit(id, meta, true);
+        }
+        let a = cache.seal(Some(1_000)).expect("a held sequence");
+        for &(id, meta) in &second {
+            cache.admit(id, meta, true);
+        }
+        let b = cache.seal(Some(2_000)).expect("a held sequence");
+        assert_eq!(cache.pinned(), 5 * BLOCK);
+        assert_eq!(cache.abort(a), 2 * BLOCK);
+        assert_eq!(cache.pinned(), 3 * BLOCK);
+        assert!(first.iter().all(|(id, _)| cache.contains(id)));
+        assert!(second.iter().all(|(id, _)| cache.is_pinned(id)));
+        assert_eq!(cache.abort(a), 0, "an abort is idempotent");
+        cache.release(1_000);
+        assert_eq!(
+            cache.pinned(),
+            3 * BLOCK,
+            "the released sequence is not unpinned twice"
+        );
+        assert_eq!(cache.abort(b), 3 * BLOCK);
+        assert_eq!(cache.pinned(), 0);
+    }
+
+    #[test]
+    fn cancelling_an_inflight_decode_removes_exactly_one_matching_entry() {
+        let mut engine = Engine::new(MAX_BATCH);
+        engine.decode_for(0, 10, Some(1));
+        engine.decode_for(0, 10, Some(1));
+        let end = engine.drained_by(0);
+        assert_eq!(engine.load(0), 2);
+        assert!(engine.cancel_inflight(end, Some(1)));
+        assert_eq!(engine.load(0), 1);
+        assert!(
+            !engine.cancel_inflight(end + 1, Some(1)),
+            "no entry ends then"
+        );
+        assert!(
+            !engine.cancel_inflight(end, Some(2)),
+            "no entry serves that model"
+        );
+        assert_eq!(engine.load(0), 1);
     }
 
     #[test]

@@ -772,6 +772,25 @@ impl Cost {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct KvFit {
+    pub need: u64,
+    pub free: u64,
+    pub capacity: u64,
+}
+
+impl KvFit {
+    #[must_use]
+    pub fn fits(self) -> bool {
+        self.need <= self.free
+    }
+
+    #[must_use]
+    pub fn never(self) -> bool {
+        self.need > self.capacity
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct NodeMemory {
     pub hbm: u64,
@@ -1574,10 +1593,76 @@ impl Hierarchy {
         self.kv.as_ref().map_or(0, |kv| kv.gpu.owned_by(owner))
     }
 
-    pub fn seal(&mut self, until: Option<u64>) {
-        if let Some(kv) = self.kv.as_mut() {
-            kv.gpu.seal(until);
+    #[must_use]
+    pub fn kv_fit(&self, blocks: &[(BlobId, BlobMeta)]) -> Option<KvFit> {
+        let kv = self.kv.as_ref()?;
+        let mut seen = HashSet::new();
+        let need = blocks
+            .iter()
+            .filter(|(id, m)| m.kind == BlobKind::KvBlock && seen.insert(*id))
+            .filter(|(id, _)| !kv.gpu.is_pinned(id))
+            .map(|(_, m)| m.bytes)
+            .sum();
+        Some(KvFit {
+            need,
+            free: kv.gpu.capacity().saturating_sub(kv.gpu.pinned()),
+            capacity: kv.gpu.capacity(),
+        })
+    }
+
+    #[must_use]
+    pub fn kv_wait_ns(&self, blocks: &[(BlobId, BlobMeta)], now_ns: u64) -> Option<u64> {
+        let kv = self.kv.as_ref()?;
+        let fit = self.kv_fit(blocks)?;
+        if fit.fits() {
+            return Some(0);
         }
+        if fit.never() {
+            return None;
+        }
+        let mine: HashSet<BlobId> = blocks.iter().map(|(id, _)| *id).collect();
+        let mut pins: HashMap<BlobId, u32> = HashMap::new();
+        let mut free = fit.free;
+        for (end, ids) in kv.gpu.release_schedule() {
+            for id in ids {
+                let left = pins.entry(id).or_insert_with(|| kv.gpu.pins_of(&id));
+                *left = left.saturating_sub(1);
+                if *left == 0 && !mine.contains(&id) {
+                    free += kv.gpu.meta_of(&id).map_or(0, |m| m.bytes);
+                }
+            }
+            if fit.need <= free {
+                return Some(end.saturating_sub(now_ns));
+            }
+        }
+        None
+    }
+
+    pub fn seal(&mut self, until: Option<u64>) -> Option<u64> {
+        self.kv.as_mut().and_then(|kv| kv.gpu.seal(until))
+    }
+
+    pub fn abort_seq(&mut self, seq: u64) -> u64 {
+        self.kv.as_mut().map_or(0, |kv| kv.gpu.abort(seq))
+    }
+
+    pub fn kv_drop_unpinned(&mut self, ids: &[BlobId]) -> usize {
+        let Some(kv) = self.kv.as_mut() else {
+            return 0;
+        };
+        let mut dropped = 0;
+        for id in ids.iter().rev() {
+            if !kv.gpu.is_pinned(id) && kv.gpu.remove(id).is_some() {
+                if let Some(log) = kv.events.as_mut() {
+                    log.push(KvEvent::Removed {
+                        id: *id,
+                        medium: Medium::Gpu,
+                    });
+                }
+                dropped += 1;
+            }
+        }
+        dropped
     }
 
     pub fn release(&mut self, now_ns: u64) {

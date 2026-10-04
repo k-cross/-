@@ -7,7 +7,14 @@ admit, then use both on §1's test case, two-tier admission by declared `slo`. T
 asks for is where an overcommit's tail loss lands once the router can choose the victim; Phase 3
 found it class-blind, spread by arrival, because the engine picks victims on its own order.
 
-**Status: planned.** Nothing below is built. §2's predictions are stated before the run, per
+**Status: built and measured.** Outcomes by request and the engine that waits (§4.1, §4.2) are
+behind `--engine-wait` and `--probe-engine`; the router queue, the per-class claims and the program
+id (§4.3 to §4.5) behind `--queue` and `--admit quantile`, `tiered` or `gate`; the abort and the
+cancel (§4.6, §4.7) behind `--cancel`, `--victim` and `--cancel-at`; departures, the batch class and
+the buffer (§4.8 to §4.10) behind `--disconnect`, `--leak`, `--batch` and `--stream-buffer`. Every
+bit is off by default and every result behind one is an A/B against the run without it, so the
+published numbers stay the ledger's. `polyphonic enforce` runs §4.12's sweeps. §9 records what the
+build found and §10 how it was verified. §2's predictions are stated before the run, per
 `owned-and-observed.md` §7, and like Phases 4 to 6 they lean on **pre-measurements**: numbers
 taken on an instrumented copy of `01b2c1e`, run outside the repository and not committed, with
 every hook off reproducing the published run to four decimals. They are labelled wherever quoted
@@ -320,7 +327,7 @@ classes are claimed at different quantiles; borrowing against the mean lets more
 in, which the cancel then evicts, and where prefill takes engine time every eviction's re-prefill
 is someone's step.
 
-**Chosen: `--admit quantile` claims each request at `--quantile` of its own class's observed
+**Chosen: `--admit quantile` claims each request at `--claim-quantile` of its own class's observed
 distribution, `--pooled` for the pooled one, and `--admit tiered` keeps §1's form.** The classes'
 distributions are observed per declared class on the path, Phase 4's per-class running mean
 widened to a histogram.
@@ -519,6 +526,27 @@ place of FIFO leaves the half partition above 4 s at p99.
 - *If wrong* (the half partition stays within 2x under the wait): releases come faster than the
   pin schedule says, and the first thing to check is a pin held past its sequence's end.
 
+**Measured: holds, with two bands exceeded by the router's check (§9.1).** `polyphonic enforce`,
+section 2, seeds 1 / 2 / 3, prefill free. Today's engine ran 1111 / 1253 / 1166 sequences at the
+half partition that it could not place, against the pre-measurement's 1111 / 1256 / 1167; the wait
+each would have had is 39.6 / 45.4 / 43.8 ms at the median and 244 / 265 / 266 ms at p99. With
+`--engine-wait fifo` the interactive class's service p99 against today's engine:
+
+| partition | today's | waiting | factor |
+|---|---|---|---|
+| 0.5x | 1912 / 1927 / 1924 ms | 7689 / 13971 / 11546 ms | 4.0 / 7.3 / 6.0x |
+| 0.6x | 1919 / 1913 / 1928 ms | 4364 / 6303 / 5204 ms | 2.3 / 3.3 / 2.7x |
+| 0.75x | 1910 / 1911 / 1928 ms | 1975 / 2299 / 2110 ms | +3 / +20 / +9% |
+| 1.0x | 1909 / 1911 / 1921 ms | 1909 / 1911 / 1923 ms | 0.0 / 0.0 / +0.1% |
+
+The first-token tail at 0.75x is 497 / 907 / 698 ms against 49 / 49 / 49, 10-19x; at 0.6x it is
+3247 / 5376 / 4396 ms. First fit leaves the half partition at 4494 / 4833 / 5250 ms of service p99,
+above 4 s on every seed. The 0.6x service factor and the 0.6x first-token tail exceed the stated
+bands, by 10% and 8%, on seed 2 only: those bands were set from a pre-measurement that skipped the
+router's check for a queued sequence (§9.1). With prefill taking engine time every row is larger
+-- at 0.6x the service p99 is 3812 / 4224 / 3918 ms today and 12166 / 16184 / 14652 ms waiting --
+and the old engine's unplaced sequences number 1506 / 1865 / 1633.
+
 **P2 -- A refusal removes the tail it is measured on.**
 
 With a FIFO queue, `perfect` serves every request but the fan-outs it cannot stage, and its
@@ -529,6 +557,21 @@ partition, where the refusing arm refuses 1-3.5%, 4.5-8% and 9-12% of requests.
   Phase 9 comparison holds the served set equal.
 - *If wrong* (queue and refusal within 2x at 0.6x): the refused requests were not the ones whose
   wait sets the tail, and refusal is a cheaper enforcement than this plan assumes.
+
+**Measured: holds, with one cell below its band.** `polyphonic enforce`, section 3, seeds 1 / 2 /
+3, `perfect` reservations. The queue's interactive first-token p99 against the refusing arm's, and
+what each arm leaves unserved:
+
+| partition | refusing: unserved | queue: unserved | queue's first-token p99 over refusing's |
+|---|---|---|---|
+| 0.75x | 1.2 / 2.0 / 1.7% | 0.21 / 0.28 / 0.37% | 1.2 / 3.7 / 2.9x |
+| 0.75x, prefill taking engine time | 2.4 / 3.4 / 2.5% | 0.8 / 0.9 / 0.9% | 2.9 / 1.9 / 2.4x |
+| 0.6x | 4.6 / 6.0 / 5.1% | 1.4 / 1.9 / 1.8% | 13.4 / 6.7 / 11.5x |
+| 0.6x, prefill taking engine time | 6.3 / 7.6 / 6.8% | 2.3 / 2.6 / 2.3% | 24 / 23 / 25x |
+| 0.5x | 8.9 / 9.8 / 9.4% | 3.2 / 3.4 / 3.0% | 43 / 45 / 45x |
+
+Seed 2 at 0.6x with prefill free is 6.7x against a stated 7-25x. The queue's remaining unserved
+share is the fan-outs it cannot stage whole and the continuations their refusal cancels (§9.7).
 
 **P3 -- The order does more than the claim, and it has to be the router's.**
 
@@ -541,6 +584,20 @@ ordered by class beats its FIFO by 1.5-4.5x and stays 5-36x above the router's o
   provide, and an engine priority is not a substitute for admission at the router.
 - *If wrong* (the claim moves the tail more than the order does): admission is binding at the
   claim's margin, and the claim deserves the attention this plan gives the order.
+
+**Measured: holds, with two cells past their bands.** `polyphonic enforce`, section 4, interactive
+first-token p99, seeds 1 / 2 / 3. The router's queue in class order against arrival order at 0.6x:
+`perfect` 2.6 / 1.6 / 1.8x with prefill free and 7.6 / 6.7 / 5.6x with prefill taking engine time;
+a p90 of the pooled observed length 3.1 / 1.7 / 3.6x and 11.5 / 9.8 / 8.7x. The top of that range,
+11.5x, is above the stated 11x. With the order by class, `perfect`, the pooled p90 and the tiered
+claim are within 30% of each other in every cell at 0.6x, against a stated 40%: with prefill taking
+engine time, 173 / 188 / 245 ms, 155 / 191 / 188 ms and 167 / 184 / 218 ms. The engine's own queue
+by class beats its arrival order 1.5-3.5x across the three regimes and stays 6-50x above the
+router's order under `perfect`; the 50x is seed 2 with prefill taking engine time (9481 against
+188 ms) and is above the stated 36x. Re-run once every arm was on the corrected engine (§9.14),
+only the tiered rows moved: with prefill taking engine time the tiered claim reads 177 / 184 /
+236 ms, against `perfect`'s 173 / 188 / 245 ms and the pooled p90's 155 / 191 / 188 ms, still within
+30% of each other.
 
 **P4 -- The cancel takes the interactive class to the rebuild floor, and the loss moves.**
 
@@ -558,6 +615,33 @@ are cancelled at least once from 0.75x to 0.6x. The interactive class's service 
 - *If wrong* (the interactive tail stays above twice the floor with a cancel): the cancel frees
   less than the head of the queue needs, and the first suspect is the victims' exclusive bytes
   being smaller than their claims.
+
+**Measured: the interactive half holds; the throughput half is wrong in three cells from 0.6x up
+and on two seeds at the half partition.**
+`polyphonic enforce`, section 5, the tiered claim, the queue in class order, continuation, victims
+the most recently dispatched; seeds 1 / 2 / 3. The interactive first-token p99 with the cancel
+against without it:
+
+| partition | no cancel | cancel | change |
+|---|---|---|---|
+| 0.75x | 62 / 68 / 63 ms | 56 / 59 / 56 ms | -10 / -13 / -11% |
+| 0.75x, prefill taking engine time | 114 / 101 / 88 ms | 60 / 61 / 60 ms | -47 / -40 / -32% |
+| 0.6x | 112 / 135 / 108 ms | 63 / 63 / 63 ms | -44 / -53 / -42% |
+| 0.6x, prefill taking engine time | 177 / 184 / 236 ms | 66 / 63 / 64 ms | -63 / -66 / -73% |
+| 0.5x | 193 / 255 / 236 ms | 66 / 161 / 68 ms | -66 / -37 / -71% |
+
+Every cell from 0.6x up is 56-66 ms, the floor `perfect` reaches by refusing, and the half partition
+is 66-161 ms against a stated 80-450. The interactive service p99 moves by under 2.5% in every cell.
+The throughput class pays, and more than predicted: its first-token p99 rises 4.0 / 8.9 / 4.5x at
+0.75x, 2.7 / 3.4 / 4.0x with prefill taking engine time, 2.0 / 2.3 / 2.2x at 0.6x, 1.7 / 1.2 / 1.3x
+with prefill, and 1.14 / 0.97 / 0.99x at 0.5x, against a stated 1.03-6x, two seeds under it. Its
+completion p99 is within 20% in nine of the twelve cells from 0.6x up, against a stated eleven: +20
+/ +22% on seeds 2 and 3 at 0.6x with prefill free and +54% on seed 1 with prefill taking engine time
+(11895 against 7743 ms). At the half partition it is +9 / -6 / -4%, against a stated 3-50%: on two
+seeds the cancel finishes the throughput class sooner. The share of decodes cancelled at least once
+is 1.2 / 2.3 / 1.5% at 0.75x, 2.8 / 3.3 / 3.2% with prefill, 5.2 / 6.8 / 6.3% at 0.6x, 6.6 / 7.2 /
+6.5% with prefill and 8.2 / 9.1 / 8.5% at 0.5x. The tail moves onto the throughput class as
+predicted, and onto its completion more than the prediction allowed in the tightest cells.
 
 **P5 -- Two quantiles are a scalar where the classes are drawn alike, and each class's own
 distribution is what matters where they are not.**
@@ -577,6 +661,36 @@ the throughput class finishes it later than its own p90 does where prefill takes
 - *If wrong* (the tiered claim beats a per-class p90 with the batch class): borrowing buys more
   admitted work than its evictions cost, and the mean half of §1 stands.
 
+**Measured, the published-workload half: the scalar holds on the interactive class and not within
+10% on the throughput class's completion.** `polyphonic enforce`, section 6, a cancel, the queue in
+class order, seeds 1 / 2 / 3. A p90 of the pooled lengths and a p90 of each class's own are the
+same run on seeds 1 and 2 in every regime and differ only on seed 3, which is the claim that two
+quantiles are a scalar where the classes are drawn alike. Against the tiered claim, in the nine
+cells at 0.75x with prefill and at 0.6x: the interactive first-token p99 is within 10% of the pooled
+p90's in all nine (0.95-1.03x). The throughput class's completion p99 is within 10% in four: the
+tiered claim reads 1.01 / 1.00 / 0.88x at 0.75x with prefill, 1.11 / 1.03 / 0.86x at 0.6x and 1.41 /
+1.03 / 1.31x with prefill at 0.6x, against a stated eleven of twelve, and the 41% is the largest
+(11895 against 8451 ms). At the half partition the tiered claim is 0.96 / 1.05 / 0.84x the pooled
+p90's completion p99 and 0.99 / 1.85 / 0.93x its interactive first-token p99; the 1.85x is past the
+stated 1.7x.
+
+With the batch class, section 9, seeds 1 / 2 / 3. At 0.75x a pooled p90 lets the interactive
+first-token p99 reach 473 / 661 / 3960 ms with prefill free and 3794 / 1762 / 6746 ms with prefill
+taking engine time, without a cancel, against a stated 0.3-1.9 s and 1.7-4.6 s; the two seed-3
+cells are past their bands. A p90 of each class's own lengths holds it to 180 / 241 / 290 ms and
+586 / 264 / 547 ms, against a stated 0.16-0.44 s (the two prefill cells at 0.59 and 0.55 s are
+past it), and with a cancel to 63 / 63 / 63 and 67 / 64 / 63 ms, against 62-71. The tiered claim's
+throughput completion p99 under a cancel is 1.00 / 1.01 / 0.98x the own-class p90's with prefill
+free and 0.87 / 1.49 / 0.88x with prefill taking engine time -- 8156 / 11722 / 10676 ms against
+9396 / 7857 / 12080 -- where 13-17 s against 8-12 s was stated. On two seeds of three the tiered
+claim finishes the throughput class sooner, which is the stated *if wrong*. At 0.6x with prefill it
+is 1.59 / 1.68 / 1.52x later (36415 / 44009 / 43492 ms against 22972 / 26153 / 28620) and leaves
+the interactive first-token p99 at 4164 / 5320 / 3613 ms against 1493 / 1040 / 1454. Where nothing
+binds (1.0x) the claims are within 3% on the throughput completion p99. So what separates the arms
+is a class's own distribution, as stated. Borrowing against the mean costs both classes where memory
+binds hardest and not at 0.75x, so the condition the prediction named -- prefill taking engine
+time -- is too broad: the mean half is retired at 0.6x with prefill and stands at 0.75x.
+
 **P6 -- A quantile claim needs a second trigger.**
 
 With the batch class and the tiered claim, a cancel only at the router's own check leaves the
@@ -588,6 +702,24 @@ trigger never fires under each class's own p90.
   the dispatch log.
 - *If wrong* (one trigger suffices): overruns land where the router's check already sees them,
   and the engine-side trigger is dropped from the build.
+
+**Measured: wrong. At 0.75x the router's trigger alone stays under 1 s on every seed, and the
+second trigger helps one seed there and hurts at 0.6x.** `polyphonic enforce`, section 9, the tiered
+claim, the batch class, seeds 1 / 2 / 3. With prefill taking engine time at 0.75x the router's
+trigger alone leaves the interactive first-token p99 at 75 / 65 / 691 ms, none above 1 s, against
+75 / 69 / 64 ms with both; the engine-side trigger fires 0 / 30 / 8 times, and its eight firings on
+seed 3 are the difference between 691 and 64 ms. With prefill free both arrangements are 63 / 63 /
+63 ms, the engine trigger firing 1 / 0 / 13 times. At 0.6x with prefill the router alone is 2.7 /
+2.3 / 2.7 s and both 4.2 / 5.3 / 3.6 s, the engine trigger firing 34 / 19 / 43 times. Under each
+class's own p90 the engine trigger fires 0 times in every regime, as stated.
+
+The first sweep graded this prediction as holding: the router's trigger alone at 3995 / 1174 / 770
+ms, the engine trigger firing 86 / 230 / 285 times at 0.75x and 632-830 at 0.6x with prefill. That
+build recorded a resubmitted request's remaining length as a new observation (§9.25), so the tiered
+claim was drawn from a sample its own cancels had skewed, and the engines overflowed behind it. The
+plan's consequence of a wrong P6 was to drop the engine-side trigger. The build keeps it behind
+`--cancel-at`, with `both` the default: it differs from `router` only where it fires, and on one
+seed in three at 0.75x it is what reaches the floor.
 
 **P7 -- Continuation, not restart, is what the path adds.**
 
@@ -603,6 +735,38 @@ away up to 2.5% of the run's decode on the published workload and 4-9% with the 
   the time it returns, so a continuation re-prefills most of what a restart does, and the first
   thing to measure is how much of a continuation's chain hits.
 
+**Measured: holds on the published workload.** `polyphonic enforce`, section 7, the tiered claim, a
+cancel, victims the most recently dispatched; the throughput class's completion p99 under a restart
+against a continuation, seeds 1 / 2 / 3.
+
+| partition | continuation | restart | restart over continuation | decode thrown away |
+|---|---|---|---|---|
+| 0.75x | 1931 / 1905 / 1945 ms | 2694 / 2277 / 2099 ms | +40 / +20 / +8% | 24 / 42 / 20 s |
+| 0.75x, prefill taking engine time | 2369 / 2124 / 2300 ms | 4021 / 3107 / 2845 ms | +70 / +46 / +24% | 75 / 83 / 67 s |
+| 0.6x | 2486 / 2564 / 2756 ms | 4640 / 5693 / 4232 ms | +87 / +122 / +54% | 112 / 140 / 134 s |
+| 0.6x, prefill taking engine time | 11895 / 6966 / 7368 ms | 14208 / 11436 / 11502 ms | +19 / +64 / +56% | 161 / 231 / 178 s |
+| 0.5x | 8960 / 8903 / 9122 ms | 16399 / 18829 / 12628 ms | +83 / +111 / +38% | 239 / 320 / 227 s |
+
+Of the nine seeds at 0.6x and at 0.75x with prefill, seven are 46-122% later under a restart and two
+are 19% and 24%, against a stated seven of nine at 30-140%. The interactive first-token p99 is
+within 1.15x either way in every cell from 0.6x up. The decode a restart throws away is up to 231
+sequence-seconds at 0.6x; by §1.10's arithmetic of some 8,000 sequence-seconds decoded in a run
+that is up to about 3%, against a stated 2.5%. The victim that decodes the most last is not better
+than the newest: its completion p99 is 0.81-1.53x the newest victim's across the cells, in both
+directions.
+
+With the batch class, section 9, the tiered claim, both triggers; the batch class's completion p99
+under a restart against a continuation, seeds 1 / 2 / 3: +109 / +119 / +183% at 0.75x with prefill
+free, +137 / +90 / +118% with prefill, +57 / +52 / +84% at 1.0x with prefill and +40 / +26 / +26%
+at 0.6x with prefill, against a stated +30-180%; the 183% is over it and the two 26% under. The
+interactive first-token p99 is within 1.4x either way at 1.0x and at 0.75x with prefill free; with
+prefill at 0.75x a restart makes it 1.59 / 1.07 / 1.67x (119 / 74 / 107 against 75 / 69 / 64 ms)
+and at 0.6x 0.51 / 0.54 / 1.42x, so seven of the twelve cells are within 1.4x. The decode thrown
+away is 442-606 sequence-seconds at 0.75x with prefill free, 553-1007 with prefill, 171-287 at 1.0x
+and 648-700 at 0.6x. §1.10's batch row threw away 418 / 641 / 534 s at 0.75x, which is where the
+stated 4-9% came from, and 442-606 s is in that range. The share of the run's decode is not graded,
+since the run records the seconds thrown away and no total to divide them by.
+
 **P8 -- A threshold gate's cost lands on the evicted class.**
 
 At θ = 0.9 the llm-d-shaped arm protects the interactive stall p99 within 2.2x of the claim arm's,
@@ -616,6 +780,33 @@ within 1.5x at 0.75x with prefill free. At θ = 0.8 the throughput class's is 3-
   makes it the next victim.
 - *If wrong* (a θ exists within 1.3x of the claim arm in every regime): utilisation predicts
   overflow well enough on this workload, and the claim's advantage is the continuation alone.
+
+**Measured: holds on the published workload, with one cell past its band.**
+`polyphonic enforce`, section 8, the claim arm being a p90 of each class's own lengths with a
+cancel and continuation, the gate arm a threshold, class order, eviction of the newest lower-class
+sequence and a restart; seeds 1 / 2 / 3. At θ = 0.9 the interactive first-token p99 is within 1.1x
+of the claim arm's at 0.75x, with prefill and at 0.6x, and 1.1 / 2.0 / 1.1x with prefill at 0.6x,
+against a stated 2.2x. The throughput class's completion p99 is 1.0 / 1.3 / 1.2x at 0.75x, 2.1 / 2.2
+/ 1.8x with prefill, 3.3 / 4.3 / 4.0x at 0.6x and 1.9 / 2.5 / 2.1x with prefill (the 2.5 is past
+2.3). The gate aborts 2.3 / 3.5 / 4.0x, 2.6 / 5.8 / 4.2x, 3.2 / 4.0 / 3.5x and 3.5 / 4.2 / 4.7x
+as many sequences, inside the stated 2-6x. At θ = 0.8 the completion p99 is 4.0 / 4.5 / 4.2x with
+prefill at 0.75x, 5.4 / 8.6 / 5.1x at 0.6x and 3.0 / 6.6 / 4.9x with prefill, inside the stated
+3-9x; the interactive tail reaches 6.9x with prefill at 0.6x, inside 7x; and the aborts are 3-12x
+the claim arm's. A threshold has no unit and the claim does: the protected class sees the same
+tail and the evicted class pays for the constant and for the retry that makes it the next victim.
+
+With the batch class, section 9, the gate arm at θ = 0.9 against the claim arm (a p90 of each
+class's own lengths, a cancel, a continuation), seeds 1 / 2 / 3. The interactive first-token p99 is
+1.0 / 1.1 / 1.1x with prefill free at 0.75x, 2.7 / 3.0 / 3.5x with prefill taking engine time and
+3.6 / 7.0 / 1.9x at 0.6x with prefill, against a stated 2.2x: five of the nine cells are past it,
+and at 1.0x the gate arm is the faster, 0.6 / 0.4 / 0.8x. The throughput class's completion p99 is
+2.47 / 4.17 / 3.30x with prefill free, 2.32 / 4.44 / 2.40x with prefill and 2.90 / 2.74 / 2.19x at
+0.6x with prefill, against a stated 2.5-4.7x, four cells under it, and 1.3 / 1.5 / 1.6x at 1.0x.
+The gate aborts 2.3 / 3.6 / 2.6x, 2.5 / 2.0 / 2.1x and 1.2 / 0.8 / 0.8x as many sequences, inside
+the stated 2-6x in six of nine; at 0.6x with prefill its aborts are fewer than the claim arm's on
+two seeds. With a batch class the protected class's tail is therefore not the same under the gate
+where memory binds: the evicted class pays a little less than stated, and the interactive class
+pays too.
 
 **P9 -- PLAS needs a class it can see.**
 
@@ -631,6 +822,27 @@ tail worse than no cancel in every regime.
 - *If wrong* (PLAS within 1.5x of class order at 0.6x on the published workload): attained service
   tracks the declared class on this trace, and the declaration is worth less than it looks.
 
+**Measured, the order half: holds, with one cell past its band; the cancel half holds in all 15
+cells.** Section 4, a pooled p90 claim,
+no cancel, interactive first-token p99 at 0.6x. By attained service against arrival order, seeds 1
+/ 2 / 3: 0.68 / 1.5 / 0.74x with prefill free and 1.2 / 1.9 / 0.72x with prefill taking engine
+time, so within 2x on either side. Against class order: 2.1 / 2.5 / 2.7x and 14 / 19 / 6.3x; the
+19x is above the stated 15x. The cancel half, as a comparison arm that takes the program with the
+most attained service (`--victim attained`, §9.15), makes the interactive first-token p99 worse
+than the same order without a cancel in every cell of section 5: 348 / 971 / 355 ms against 59 / 72
+/ 61 at 0.75x, 1420 / 1605 / 1406 against 168 / 152 / 104 with prefill, 2064 / 2832 / 1724 against
+260 / 400 / 219 at 0.6x, 6500 / 8013 / 7104 against 2134 / 3548 / 990 with prefill, and 9868 /
+11684 / 9582 against 4814 / 6580 / 4356 at 0.5x.
+
+With the batch class, section 9, a p90 of each class's own lengths, no cancel, seeds 1 / 2 / 3: by
+attained service the batch class's first-token p99 is 71 / 83 / 78 ms with prefill free at 0.75x,
+138 / 82 / 130 ms with prefill and 106 / 138 / 147 ms at 0.6x with prefill, under 110 ms in five of
+the nine memory-bound cells and 147 ms at most. The interactive class's is 256 / 384 / 721 ms
+(stated 0.2-0.7 s; the 721 is past it), 3.0 / 4.6 / 8.0 s (stated 3.6-8 s; the 3.0 is under and the
+8.011 over) and 17.9-23.8 s. Arrival order puts both classes at 1.0-2.2 s with prefill at 0.75x.
+Where nothing binds (1.0x) the two orders are indistinguishable: 288 / 219 / 308 ms against 268 /
+201 / 282 ms for the interactive class.
+
 **P10 -- A client that leaves is the cancel's first job.**
 
 With the engine's own wait, 20% of clients leaving mid-decode costs the interactive class 1.9-3.4x
@@ -643,6 +855,20 @@ stall p99 2-4x at 20% and within 15% at 5%.
 - *If wrong* (a leak within 1.2x at 20%): the leaked decodes end before the queue would have used
   their space, which would put the cost in batch slots rather than memory.
 
+**Measured: holds at 20%, and at 5% only where prefill is free.** `polyphonic enforce`, section 10,
+the interactive first-token p99 of a leaked departure over an aborted one, seeds 1 / 2 / 3. Under
+the engine's own wait: 20% leaving, 2.3 / 1.7 / 2.1x at 0.75x with prefill, 2.2 / 1.8 / 2.1x at 0.6x
+with prefill and 2.1 / 2.4 / 3.2x at 0.6x with prefill free, against a stated 1.9-3.4x, two cells
+under; 5% leaving, 1.1 / 1.1 / 0.9x and 0.9 / 1.0 / 1.3x with prefill and 1.2 / 1.3 / 1.3x free,
+against a stated 1.2-1.6x, so the 5% prediction holds only with prefill free. The cell with nobody
+leaving at 0.6x with prefill free is 3247 / 5376 / 4396 ms against §1.13's 3247 / 4560 / 4545: seed
+1 to the millisecond and the others not, the cause not isolated. The leak holds 200-830
+sequence-seconds of decode that an abort frees, in proportion to the share leaving, and a leaked
+run's tails equal the run where nobody leaves: a departure that is not propagated costs nothing it
+did not already cost. Under the router queue in class order at 0.6x with prefill, the throughput
+class's first-token p99 is 2.3 / 6.8 / 3.5x at 20% (stated 2-4x; the 6.8 is past it) and 1.3 / 1.2 /
+1.1x at 5% (stated within 15%; the 27% is past it), and with prefill free 2.2 / 2.3 / 1.8x at 20%.
+
 **P11 -- The stalled-stream buffer is under two megabytes a node.**
 
 If every stream on a node stalled for its whole decode, the buffered tokens peak at 3,200-4,700 a
@@ -654,6 +880,16 @@ node on the published workload and 8,200 with the batch class: 0.6-1.7 MB at 200
 - *If wrong* (a peak above 10 MB): long outputs stall together, and the buffer becomes a ledger
   occupant after all.
 
+**Measured: holds, with the batch class's peak past its figure.** `polyphonic enforce`, section 11,
+seeds 1 / 2 / 3, the tokens every single decode in flight has emitted, per node, at each arrival. On
+the published workload the busiest node's peak is 3853 / 4053 / 4161 tokens at 1.0x, 4092 / 3956 /
+4638 at 0.75x with prefill and 3884 / 4028 / 4340 at 0.6x with prefill, against a stated
+3,200-4,700; the mean a node holds is 1936-2177. That is 0.77-0.93 MB at 200 bytes a token and
+0.009-0.011% of a node's 8 GiB of DDR. With the batch class the peak is 7110-8876 tokens, 1.42-1.78
+MB and 0.017-0.021%, against a stated 8,200 and 1.7 MB; the 8876 and the 1.78 MB are past them, and
+every cell is under two megabytes. Fan-out agents, 22% of decodes, are in no flight and so in no
+count.
+
 ---
 
 ## 3. What enforcement must and must not do
@@ -663,8 +899,9 @@ reason.
 
 1. **The gate.** With every new bit off, byte-identical to `HEAD` on the reproducible set as
    `phase-6.md` left it, including the change to how outcomes are recorded (§4.1). And each bit has
-   a case in which it must change nothing: `--engine-wait` at the published partition, where no
-   sequence fails to fit; `--queue` where no check fails; `--cancel` with no lower-class sequence in
+   a case in which it must change nothing: `--engine-wait` at four times the published grant,
+   where no sequence fails to fit (§9.2: at the published partition a few do); `--queue` where no
+   check fails; `--cancel` with no lower-class sequence in
    flight; `--disconnect 0`; `--batch 0`. Checked after every work item.
 2. **Enforcement follows `own::authority`.** The router cancels what it dispatched and releases
    what it reserved. It never names an engine block: the pins released and the never-written output
@@ -681,7 +918,7 @@ reason.
 6. **The served set is held equal.** Queue arms are compared with queue arms. A refusing arm is
    printed with its refused share and never quoted against a queue arm without it.
 7. **One bit per mechanism.** `--engine-wait`, `--queue`, `--admit quantile | tiered | gate` with
-   `--quantile`, `--pooled` and `--gate`, `--cancel`, `--victim`, `--disconnect`, `--leak` and
+   `--claim-quantile`, `--pooled` and `--gate`, `--cancel`, `--victim`, `--disconnect`, `--leak` and
    `--batch` are separately selectable, and the headline runs change one at a time.
 8. **A condition's randomness is its own stream** (Phase 4's rule 6). Departures and the batch
    class draw from streams separate from the workload's, so the base trace is byte-identical at
@@ -734,10 +971,10 @@ each arrival while it waits. The queue's depth and each request's wait there are
 ### 4.4 The claims
 
 Observed output lengths, per declared class, as histograms on the path -- the per-class means of
-Phase 4's `--observables` widened. `--admit quantile` claims each request at `--quantile` (0.9) of
-its own class's distribution, `--pooled` of the pooled one; `--admit tiered` claims interactive
-work at the quantile and throughput work at its class's mean; `--admit gate` admits at a node
-while its pinned KV is under `--gate` of the partition, requests with no KV exempt. `Reserve`
+Phase 4's `--observables` widened. `--admit quantile` claims each request at `--claim-quantile`
+(0.9) of its own class's distribution, `--pooled` of the pooled one; `--admit tiered` claims
+interactive work at the quantile and throughput work at its class's mean; `--admit gate` admits at a
+node while its pinned KV is under `--gate` of the partition, requests with no KV exempt. `Reserve`
 gains the three, and the claim a request was admitted against is what its reservation holds.
 
 ### 4.5 Programs and attained service
@@ -959,3 +1196,358 @@ tail below excludes their agents.
 | *plas* | Autellix's order | `Request::program` added -- the session, the task, the batch request -- and attained service accrued as each call's decode time when it completes; the queue ordered by its program's attained service; a cancel arm aborting the flight with the most attained service above the head's | §1.12's table; the cancel arm's 1,300-2,500 cancels at 0.6x |
 | *disconnect* | departures | a deterministic 5% or 20% of decodes leave at a uniform point of the decode; propagated as an abort at the next arrival, or run to the end; under the engine's own wait with `none`, and under the router queue in class order with a p90 claim | §1.13's table |
 | *buffer* | what a stalled stream holds | at each arrival, per node, the tokens every flight has emitted so far, its progress times its output | §1.14: peak 3,200-4,700 a node, 8,226 with the batch class |
+
+---
+
+## 9. What the build found
+
+Increment 1, in the order the findings arrived.
+
+### 9.1 The router's check, applied to a queued sequence, moves an overload's tail by up to 18%
+
+The pre-measurement dispatched a sequence out of an engine queue without asking the router again,
+and queued it without asking at all. The build asks once, when the sequence arrives, as every
+dispatch has: a request whose prompt cannot be reserved is refused before it can wait. At the
+published `none` reservation that refuses 0.01-0.06% of requests, and it moves the half-loaded
+regimes by more than its size:
+
+| 0.6x, prefill free, arrival order | seed 1 | seed 2 | seed 3 |
+|---|---|---|---|
+| interactive service p99, check skipped (pre-measurement) | 4364 ms | 5435 ms | 5362 ms |
+| interactive service p99, check applied (built) | 4364 ms | 6303 ms | 5204 ms |
+| interactive first-token p99, check skipped | 3247 ms | 4560 ms | 4545 ms |
+| interactive first-token p99, check applied | 3247 ms | 5376 ms | 4396 ms |
+
+With the check skipped, a build with the same switch reproduces every pre-measured figure of
+§1.1's second table to the digit, first fit and class order included (2698 / 3094 / 2917 and 2522
+/ 3127 / 3251 ms of service p99 at 0.6x), which is what reconciles the two. Seed 1's figures are
+unchanged by the check. The lesson is §6 risk 4's, measured: a regime that is queueing without bound
+amplifies a handful of changed admissions into a different tail, so a number at 0.6x or below is
+quoted with its seeds and its router check, and the plan's bands for those cells were too narrow.
+The check stays, because it is the router's existing policy and the queue, in increment 2, will
+replace it with a wait.
+
+### 9.2 At the published partition a few sequences do wait, so the gate moves to 4x
+
+Rule 1 said `--engine-wait` changes nothing at the published partition, "where no sequence fails to
+fit". Some do: 0.0 / 0.0 / 0.1% of requests queue with prefill free and 0.6 / 0.0 / 0.4% with
+prefill taking engine time, and the old engine ran 0 / 1 / 3 and 19 / 15 / 10 sequences it could
+not place. Their waits are short -- median up to 44 ms, p99 up to 116 ms -- and move no
+interactive tail, but the arm is not byte-identical there and §3 is corrected. The gate is four
+times the grant, where every sequence fits: identical to off for arrival order, first fit and class
+order, with and without prefill time, on three seeds, and nothing queued.
+
+### 9.3 A sequence larger than the whole partition runs at once
+
+A sequence whose unpinned blocks exceed the partition can never fit, and waiting for it would
+never end. It starts at once and is preempted as today, counted as `unfittable`. None is reached
+at any partition measured -- 0 in each of 198 arm results over three seeds, three partitions and
+both prefill settings -- because the router refuses a prompt larger than the partition first; the
+case is exercised by a constructed sequence in the tests.
+
+### 9.4 `serve_request` cannot defer, so the machine has `submit`
+
+A request that waits has no cost when its call returns. `Machine::submit` returns `Closed(cost)` or
+`Open(id)`, closed outcomes are drained with `drain_closed`, and `finish` advances the clock until
+nothing waits. `serve_request` is a wrapper that panics if asked to defer. `drive` tallies a
+request from a `Shape` taken at submission and the cost that closes it, so a request tallied late
+is tallied as it would have been at once; with every bit off every request closes at submission and
+the reproducible set is byte-identical.
+
+### 9.5 `distributed` is deterministic once its measured lines are set aside
+
+`phase-6.md` runs `distributed` as a structural smoke check because it charges a measured crossing.
+With `--crossing native` its per-arm tables are byte-identical between builds and between runs; what
+still varies is a trailing block of overhead lines measured on the host (the gRPC and ring cost per
+decision, the warm-rate shares and the hypothetical-work rows). The gate compares `distributed`
+under `--crossing native` with those four kinds of line filtered, so it is now a byte comparison
+and not a smoke run.
+
+### 9.6 The instruments
+
+`--probe-engine` reads, for each sequence today's engine runs with no memory, the wait it would
+have had from the cache's own release schedule, and changes nothing: the arm is byte-identical with
+it on at 0.75x and 0.5x. `polyphonic enforce` takes sections `gate` and `engine`; the others are
+§4.12's, later.
+
+### 9.7 A fan-out is refused, not queued
+
+§4.3 said a fan-out is "retried at each arrival while it waits". The build keeps today's path for
+a gang, as the pre-measurement did: staged whole on the router's check and refused if it does not
+fit, which also cancels the task its continuation would have run. Retrying from the queue would
+need a feasibility test with no side effects -- staging counts a refusal and cancels a downstream
+each time it fails -- and a gang that holds its place in the queue is §7's successor. The
+consequence is the "not served" column: under a queue it is the fan-outs refused and the
+requests their refusal cancels, 0.2-3.4% across the partitions, against 1.2-9.8% when the router
+refuses single requests too.
+
+### 9.8 The queue arms reproduce the pre-measurement to the digit
+
+Unlike the engine arm (§9.1), every figure of §1.4's table reproduces exactly: the refusing arm's
+first-token p99 at 0.6x is 22 / 33 / 22 ms and 54 / 56 / 54 with prefill taking engine time, the
+queue's 294 / 221 / 252 and 1311 / 1268 / 1360, and at the half partition 2138 / 2360 / 2305. A
+queued request is placed when it leaves, among the nodes whose check admits it, so no check is
+skipped, which was the one place the engine arm's emulation differed from the build.
+
+### 9.9 A request waits once and is placed once
+
+Placement moved into `Machine::place`, which both a fresh arrival and a request leaving the queue
+enter. A queued request is decided, scored and counted as a decision when it leaves and not when it
+arrives, so `decisions` is the same under a queue as without, and `d` of §2.3 is unchanged. It
+carries its original arrival through the router queue and the engine queue alike: a request that
+waits at the router and again at an engine has both waits in its `queue_ns`, measured from the
+arrival that started the first.
+
+### 9.10 `--quantile` was taken
+
+`--quantile` is Phase 4's scoring quantile in `BeliefArgs`, and a second flag of the name made
+clap lose its default and fail every `distributed` run. The claim's quantile is `--claim-quantile`,
+and §1.8, §3 and §4.4 say so.
+
+### 9.11 Attained service accrues at completion
+
+A call's decode time is added to its program when the call ends, not when it is dispatched, which is
+Autellix's definition and the pre-measurement's. A completion heap holds `(end, program, decode)`
+and is drained at each arrival before the queue is served. It is filled only under `--queue plas`.
+
+### 9.12 What the claims observe
+
+Output lengths are recorded per declared class, at dispatch, as a histogram of 2048 bins, and a
+claim before any observation falls back to the request's declared `max_tokens`, Phase 4's rule. The
+pooled claim merges the two classes' histograms at each decision. `--admit gate` reads the node's
+pinned KV through the engine cache and exempts a request that holds no KV, as the pre-measurement
+did; it is applied only to a request at the router and never to a fan-out agent's staging.
+
+### 9.13 With a cancel every decode stays open until it ends
+
+A cancel can reach a request after its first dispatch, so under `--cancel` no single decode closes
+at submission. Each registers a flight -- its node, its handles on the three ledgers, its decode's
+start and end, its request and its cost -- and `submit` returns `Open`; a flight closes at the first
+arrival at or after its end, and `finish` runs the clock until none is left. A cancelled flight's
+cost is discarded and its resubmission closes the request, so the tally is the continuation's cost
+with the wait measured from the original arrival. The stall that follows includes the decode done
+before the cancel, since stall is service less the final dispatch's decode; that is the
+pre-measurement's convention and part of why the throughput class's first-token tail rises 1-9x.
+
+### 9.14 Every arm in `enforce` is on the corrected engine
+
+§1.1 chose to grade every Phase 9 arm on the engine that waits. Increment 2's `enforce` arms left
+the quantile, tiered and gate arms on today's engine, which runs a sequence it cannot place. The
+builder now defaults to a waiting engine, in arrival order and by class under a class-ordered queue,
+and the sweep was run again. Only rows with an under-reserving claim moved, because only they
+overflow an engine: the tiered rows of section 4, 167 / 184 / 218 ms becoming 177 / 184 / 236 ms
+with prefill at 0.6x. The queue and `perfect` rows are identical.
+
+### 9.15 P9's cancel half needs a victim rule §3 forbids
+
+§3 rule 4 says PLAS orders the queue and chooses no victims, and §1.12 chose "an order with no
+cancel", yet P9 predicts what a cancel by attained service does. The prediction can only be graded
+by building the arm, so `--victim attained` is a labelled comparison arm that takes the sequence
+whose program has attained more service than the head's. The integrated arm's victims are still
+chosen by declared class alone.
+
+### 9.16 The claims observe every decode, fan-out agents included
+
+Output lengths are recorded where a decode is dispatched, which includes the agents of a fan-out,
+as Phase 4's observed mean always did; the pre-measurement recorded only single requests. The
+quantile arms move by up to 10% of a first-token p99 against the pre-measurement for that reason
+alone: the pooled p90 with arrival order at 0.6x is 380 / 269 / 421 ms built against 362 / 289 /
+411 pre-measured.
+
+### 9.17 A decode in flight is identified by its end
+
+`Engine` keeps its in-flight decodes as a heap of `(end, model)` with no id, and an abort removes
+one entry that matches. Two decodes with the same end and model are interchangeable to every
+reader, so an id would add nothing, and the abort's test asserts the entry is found. The pins and
+the reservation, which readers distinguish, do carry sequence ids.
+
+### 9.18 The cancel changes no request where nothing is overcommitted
+
+Under a cancel the order in which requests close differs from submission, so the gate compares the
+sorted per-class tallies and the totals and not the arrival-order vectors `identical` checks.
+
+### 9.19 Grants were sized by whichever arm ran first
+
+`Lab` sizes an engine's partition from a ledger run and caches it by distance, regime, trace and
+batch class; the ledger run has no engine and reads no partition scale, so one run serves every
+scale. The ledger run inherited the first arm's enforcement flags, and under a cancel `finish` ticks
+the clock past the last arrival to close the decodes still in flight, each tick adding an occupancy
+sample that is nearly empty. A sweep whose first arm at a partition cancelled therefore sized every
+later arm's grant a little smaller, and the claims, restart and llm-d sections did exactly that:
+their first arm at each partition was a cancel arm. The same configuration read 441 / 873 / 492 ms
+of throughput first-token p99 in one section and 668 / 1156 / 669 ms in another. The ledger run now
+takes no enforcement, `finish` samples no occupancy, a test asserts the second, and sections 6 to 8
+were run again from a clean cache; sections 3 to 5, whose first arm never cancelled, are unchanged
+row for row. Every P5, P7 and P8 figure above is from the clean run.
+
+### 9.20 Which clients leave is fixed by submission order
+
+A departure has to be the same decode in every arm or two arms are comparing different clients. The
+build numbers each request at submission and carries that number through the router queue, the
+engine queue and a cancel's resubmission; a client leaves when a hash of the number falls under the
+share, at a point of the decode taken from a second hash of it. A test asserts that the set leaving
+is the same under two queue orders.
+
+### 9.21 Departures, cancels and the buffer share one registry of flights
+
+A flight is registered when a cancel, a departure or the stream buffer is on, so a decode that no
+cancel could reach is still closed when its decode ends. `--stream-buffer` is identical to off in
+sorted tallies at 4x and at 0.75x the grant.
+
+### 9.22 The batch class's draws are the build's own
+
+The batch class is a stream of its own, so the base trace is the published one with the batch
+requests removed, which a test asserts. It is not the pre-measurement's draw, and its arms do not
+reproduce §1.8's and §1.9's tables to the digit: a p90 of each class's own lengths without a cancel
+is 180 / 241 / 290 ms here against 178 / 159 / 428 ms, and with a cancel 63 / 63 / 63 ms, 5581 /
+5515 / 5894 ms against 63 / 63 / 63 ms, 5496 / 5674 / 6357 ms. The predictions are graded on their
+bands and every cell outside one is said so above. §4.11 asks for a pre-measurement the build does
+not reproduce to be reconciled before a prediction resting on it is graded, and the batch arms
+were not: the cause of the difference is not isolated, so the batch halves of P5 to P9 stand as
+graded on bands against a different draw, and a reconciliation is open.
+The ledger run that sizes each partition takes the batch class and none of the enforcement bits
+(§9.19), and the grant key includes it.
+
+### 9.23 §1.9's 1 s tail is not reproduced
+
+§1.9's pre-measurement had the router's trigger alone at 66 / 165 / 1316 ms with prefill free and
+218 / 3049 / 2985 ms with prefill taking engine time. The build, once it observes each request once
+(§9.25), has 63 / 63 / 63 and 75 / 65 / 691 ms. In the first sweep the same arm's tail came from
+claims drawn from a sample their own cancels had skewed; whether the pre-measurement's came from
+the same mechanism is not isolated (§9.22).
+
+### 9.24 `--engine-wait` stays off
+
+§4.13 left the default to the numbers. §1.1 already chose it off, because the engine that waits
+moves the published numbers wherever a partition binds, and the byte-identity gate is what lets
+every earlier phase's results stand. None of Phase 9's results asks for more: its arms are all
+A/Bs on the corrected engine, which §1.1 names as the baseline for them and for no other result.
+
+### 9.25 A resubmission was observed as a new request
+
+The claims' length histograms and Phase 4's per-class mean were recorded at every dispatch, so a
+continuation added its remaining tokens as a fresh observation and a restart added its whole length
+a second time. On a test trace with continuation, 1,635 lengths were recorded for 1,241 decodes. A
+review found it after the first sweep. Lengths are now recorded at a request's first dispatch only,
+a test asserts one observation per decode under continuation and restart, and every section was run
+again. Nothing changes with every bit off, and nothing changes in an arm without a cancel. On the
+published workload eight rows of sections 5 to 8 move, four distinct runs: the tiered claim at the
+half partition and the own-class p90 on seed 3 at 0.6x and below. With the batch class 16 of 44 rows
+move, every cancel arm with a quantile or tiered claim. The double counting changed the sample each
+claim was drawn from, by the cancels' own choice of victims; which way it moved each quantile and
+mean was not measured. What was measured is the engines: at 0.75x and 0.6x with prefill taking
+engine time the engine-side trigger, which fires only when an interactive request waits at an
+engine, fired 86-830 times a run on the first build and 0-43 on the corrected one, so the first
+build's claims let the engines overflow. P6's grade reverses (wrong, where the first sweep had it
+holding), P5's batch half narrows to 0.6x, and P7's and P8's batch figures move inside and across
+their bands. Every figure above is from the corrected build.
+
+### 9.26 What a review of the build fixed
+
+The same review found and fixed, before the rerun, ten defects that moved no figure above: every
+row of sections 2 to 11 was identical before and after. With a queue, a request whose claim no
+node's partition could ever hold waited at the head forever and blocked the queue; it is now
+refused, as it is without a queue. A request placed on its upstream's node bypassed the queue's
+admission check; that node is now used only if it admits the request. Attained service was counted
+twice when flights were tracked without a cancel. A fleet reload restarted reservation sequence
+numbers, so an old flight could name a new holder. Flag checks were skipped when no other
+enforcement flag was set, and `--victim attained` was accepted without `--queue plas`. The abort's
+removal of never-written output went unlogged in the KV event log. The engine queue's wait
+statistic included time at the router. A cancelled client that was due to leave was counted as
+leaving again on resubmission. The oracle planner was built without the batch class. The grant
+cache was keyed on a scale the ledger run never reads. Two remain open: a restart re-sends the
+original request's hint and so re-registers its upstream, and a request waiting at an engine holds
+no reservation until it starts. A third, `--admit quantile | tiered | gate` read silently as `none`
+everywhere but `distributed`'s main arms, was fixed after the phase's commit. The six commands that
+never apply a claim now refuse one. `distributed` names the claim in its header, and skips its
+fan-out admission table when any Phase 9 bit is on, since that table drives fan-outs without them.
+Nothing changes with every bit off.
+
+---
+
+## 10. Verification, as run
+
+Increment 1.
+
+- **Byte-identity with every bit off**: `residency` (ledger and `--engine-cache --decode-kv`),
+  `flows`, `placement`, `volatility`, `ownership`, `price`, `belief`, `influence` and `fleet` at
+  `--ops 3000 --seed 2`, and `distributed --crossing native --engine-cache --decode-kv --admit
+  perfect` with its four measured line kinds filtered, all identical to the build before this
+  phase.
+- **The gate**, eight check lines in `enforce`'s section 1: three orders at 4x the grant with
+  prefill free and taking engine time, identical to off with nothing queued; the probe at 0.75x and
+  0.5x, identical to off.
+- **Tests**, six new, 196 in all: an engine that waits preempts no single request where today's
+  does; every request that waits closes once and carries its wait as queue time; a sequence larger
+  than the partition runs at once and is preempted; first fit starts sooner than arrival order and
+  class order serves interactive work first; the probe reads and changes nothing; and the wait
+  changes nothing where every sequence fits.
+- **The census**: `cargo build --release --features census` emits 13 warnings.
+- `cargo fmt --check` and `cargo clippy --all-targets` clean; the three `assert!(..is_empty())`
+  warnings the installed clippy reports in `cache.rs`, `fleet.rs` and `stream.rs` predate this
+  phase.
+
+Increment 2.
+
+- **Byte-identity with every bit off**: the same eleven outputs, identical to the build before this
+  phase, after the queue, the claims and the program id landed.
+- **The gate**, nine more check lines in `enforce`'s section 1: `--queue` in each of its three
+  orders with `--admit perfect`, `quantile` and `tiered` at 4x the grant, identical to no queue
+  with nothing queued.
+- **Tests**, eleven more, 207 in all: a queue holds what the router would refuse and closes every
+  request once; a queued request carries its wait as queue time; a queue changes nothing where
+  every check passes; class order serves interactive requests first; the queue's key orders by
+  arrival, class and attained service; attained service accrues at completion and not before; a
+  claim names the bytes of an observed quantile, the pooled quantile, a tiered mean or the declared
+  bound; a gate admits below its threshold and queues above it; `Lengths` reports quantiles and a
+  mean; an admission by claim counts the bytes it names; every decode names a program and a program
+  spans several calls.
+- **The census** is 13. `cargo fmt --check` and `cargo clippy --all-targets` are clean, apart from
+  the three warnings noted above.
+
+Increment 3.
+
+- **Byte-identity with every bit off**: the same eleven outputs, identical to the build before this
+  phase, after the abort and the cancel landed.
+- **The gate**, four more check lines in `enforce`'s section 1: `--cancel` with continuation and
+  with restart, each with `--admit perfect` and `tiered` at 4x the grant, equal to no cancel in
+  sorted tallies with nothing cancelled.
+- **Tests**, thirteen more, 220 in all: an abort unpins one sequence and leaves its blocks resident;
+  cancelling an in-flight decode removes exactly one matching entry; a cancelled reservation
+  returns its exclusive bytes and leaves the shared ones; a deficit is what a claim lacks; an abort
+  releases the three ledgers a flight held and only those; only a lower-class sequence is a victim;
+  a continuation is the prompt plus the whole blocks decoded; a cancelled request is resubmitted
+  and every request closes once, with the protected class waiting less; restarting throws decode
+  away and continuing does not; an interactive request waiting at an engine cancels a lower-class
+  sequence there; a cancel changes no request where nothing is overcommitted; a gate that evicts
+  resubmits what it drops; and finishing a trace samples no occupancy.
+- **The census** is 13. `cargo fmt --check` and `cargo clippy --all-targets` are clean, apart from
+  the three warnings noted above.
+- **Not checked**: that a cancel's freed bytes cover the deficit it was issued for. The router's
+  trigger takes victims only when their exclusive bytes cover it, so it cannot be futile; the
+  engine's trigger takes victims until the head fits and a count of futile cancels is not kept.
+
+Increment 4.
+
+- **Byte-identity with every bit off**: the eleven outputs of the reproducible set identical to the
+  build before this phase, after departures, the batch class, the buffer, the router-only trigger,
+  the review's fixes (§9.26) and the length fix (§9.25) landed.
+- **The gate**: two more check lines, `--stream-buffer` at 4x and at 0.75x the grant, identical to
+  off in sorted tallies, and every earlier check line still identical. `--disconnect`, `--batch` and
+  `--stream-buffer` default to off and `--cancel-at` to both.
+- **Tests**, eleven more, 231 in all: a departing client has its sequence aborted and leaves every
+  tally; a leaked departure runs to its end and still leaves the tally; which clients leave does
+  not depend on the arm; the stream buffer counts the tokens emitted so far and changes no request;
+  a router-only cancel never fires at an engine; a resubmitted request charges its recompute to the
+  cancel; the batch class is a stream of its own and an unshared throughput shape; and, after the
+  review, a claim no partition could hold is refused and blocks no queue, registering flights
+  without a cancel accrues attained service once, a cleared ledger keeps its numbering so an old
+  handle names no new holder, and a resubmitted request is observed once. The last fails without
+  its fix, with 1,635 observations for 1,241 decodes.
+- **The census** is 13. `cargo fmt --check` and `cargo clippy --all-targets` are clean apart from
+  three `assert_is_empty` warnings in lines this phase did not write (`cache.rs`, `fleet.rs`,
+  `stream.rs`).
+- **The sweep**: `polyphonic enforce`, every section, three seeds, on the final build. Sections 9 to
+  11 were also run in reverse order, with every row identical, so no section depends on what ran
+  before it. The reviewed build reproduced every row of sections 2 to 11 of the first sweep, and the
+  final build differs from it only in the rows §9.25 names.

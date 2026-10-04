@@ -58,6 +58,9 @@ pub(super) struct Lab<'a> {
     env: &'a Env,
     memory: NodeMemory,
     grants: HashMap<(u64, Regime, TraceKey), [u64; 3]>,
+    pub(super) scale: Option<f64>,
+    pub(super) admit: Option<AdmitArg>,
+    pub(super) enforce: super::EnforceArgs,
 }
 
 pub(super) fn scored_fetch() -> Arm {
@@ -111,6 +114,9 @@ impl<'a> Lab<'a> {
             env,
             memory: node_memory(env.hbm / n, env.dram / n, env.nvme / n, [0, 1, 2, 1], false),
             grants: HashMap::new(),
+            scale: None,
+            admit: None,
+            enforce: super::EnforceArgs::OFF,
         }
     }
 
@@ -125,6 +131,7 @@ impl<'a> Lab<'a> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scenario(
         &self,
         dist: Distance,
@@ -132,6 +139,7 @@ impl<'a> Lab<'a> {
         b: BeliefArgs,
         influence: InfluenceArgs,
         fleet: FleetArgs,
+        enforce: super::EnforceArgs,
         regret: bool,
     ) -> Scenario {
         Scenario {
@@ -150,6 +158,7 @@ impl<'a> Lab<'a> {
             belief: b,
             influence,
             fleet,
+            enforce,
             lag_ns: dist.one_way_ns(),
         }
     }
@@ -189,9 +198,17 @@ impl<'a> Lab<'a> {
         regret: bool,
     ) -> ArmRun {
         let topo = self.topo(dist);
-        let p3 = regime.p3();
+        let p3 = Correct {
+            kv_scale: self.scale.unwrap_or(regime.p3().kv_scale),
+            admit: self.admit.unwrap_or(regime.p3().admit),
+            ..regime.p3()
+        };
         let trace = fleet.trace_only();
-        let key = (dist.one_way_ns(), regime, trace.trace_key());
+        let key = (
+            dist.one_way_ns(),
+            regime,
+            format!("{} batch {}", trace.trace_key(), self.enforce.batch),
+        );
         if !self.grants.contains_key(&key) {
             let ledger = Correct {
                 engine_cache: false,
@@ -203,13 +220,17 @@ impl<'a> Lab<'a> {
                 BeliefArgs::OFF,
                 InfluenceArgs::OFF,
                 trace,
+                super::EnforceArgs {
+                    batch: self.enforce.batch,
+                    ..super::EnforceArgs::OFF
+                },
                 false,
             );
             let run = distributed_run(&scored_fetch(), &topo, self.memory, &sc);
             self.grants.insert(key.clone(), run.mach.kv_mean());
         }
         let mean = self.grants[&key];
-        let sc = self.scenario(dist, p3, b, influence, fleet, regret);
+        let sc = self.scenario(dist, p3, b, influence, fleet, self.enforce, regret);
         distributed_run(a, &topo, p3.engine_memory(self.memory, mean), &sc)
     }
 }

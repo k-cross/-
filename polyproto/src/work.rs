@@ -72,6 +72,11 @@ const FLOW_PROMPT_BLOCKS: u64 = 24;
 const MIX_SEED: u64 = 0x4D49_585F_5345_4544;
 const FRESH_SEED: u64 = 0x4652_4553_485F_5345;
 const NEIGHBOUR_SEED: u64 = 0x4E45_4947_4842_5352;
+const BATCH_SEED: u64 = 0x4241_5443_485F_5345;
+pub const BATCH_TENANT: u32 = 4_000;
+pub const BATCH_BLOCKS: u64 = 8;
+const BATCH_TOKENS_MIN: u64 = 200;
+const BATCH_TOKENS_SPAN: u64 = 400;
 pub const FRESH_TENANT: u32 = 3_000;
 pub const NEIGHBOUR_TENANT: u32 = 2_000;
 pub const SHARED_PREFIX_BLOCKS: u64 = 8;
@@ -138,6 +143,16 @@ struct Session {
 }
 
 pub const PHASES: usize = 4;
+
+const PROGRAM_TASK: u64 = 1 << 62;
+const PROGRAM_FRESH: u64 = 1 << 61;
+const PROGRAM_BATCH: u64 = 1 << 60;
+
+#[derive(Clone, Copy)]
+enum Unshared {
+    Fresh { tenant: u32, neighbour: bool },
+    Batch,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Slo {
@@ -287,6 +302,7 @@ pub struct Request {
     pub retention: Retention,
     pub concurrent: bool,
     pub tenant: Option<u32>,
+    pub program: u64,
 }
 
 #[must_use]
@@ -389,6 +405,8 @@ pub struct Workload {
     neighbour_window: (f64, f64),
     neighbour_rng: Rng,
     shared_prefix: bool,
+    batch_fraction: f64,
+    batch_rng: Rng,
 }
 
 fn kv(origins: Option<&Origins>, parent: BlobId, tag: &[u8], origin: Origin) -> (BlobId, BlobMeta) {
@@ -499,6 +517,8 @@ impl Workload {
             neighbour_window: (NEIGHBOUR_FROM, NEIGHBOUR_TO),
             neighbour_rng: Rng::new(seed ^ NEIGHBOUR_SEED),
             shared_prefix: false,
+            batch_fraction: 0.0,
+            batch_rng: Rng::new(seed ^ BATCH_SEED),
         };
         for _ in 0..SESSIONS {
             let s = w.fresh_session();
@@ -611,6 +631,12 @@ impl Workload {
                 }
             }
         }
+        self
+    }
+
+    #[must_use]
+    pub fn with_batch(mut self, fraction: f64) -> Self {
+        self.batch_fraction = fraction;
         self
     }
 
@@ -1010,8 +1036,18 @@ impl Iterator for Workload {
             return Some(extra);
         }
         let req = self.next_base()?;
+        if self.batch_fraction > 0.0 && self.batch_rng.chance(self.batch_fraction) {
+            let batch = self.unshared_request(req.phase, Unshared::Batch);
+            self.fresh_pending.push_back(batch);
+        }
         if self.fresh_fraction > 0.0 && self.fresh_rng.chance(self.fresh_fraction) {
-            let fresh = self.fresh_request(req.phase, FRESH_TENANT, false);
+            let fresh = self.unshared_request(
+                req.phase,
+                Unshared::Fresh {
+                    tenant: FRESH_TENANT,
+                    neighbour: false,
+                },
+            );
             self.fresh_pending.push_back(fresh);
         }
         let lo = (self.neighbour_window.0 * self.ops as f64) as u64;
@@ -1020,7 +1056,13 @@ impl Iterator for Workload {
             && (lo..hi).contains(&self.issued)
             && self.neighbour_rng.chance(self.neighbour_rate)
         {
-            let burst = self.fresh_request(req.phase, NEIGHBOUR_TENANT, true);
+            let burst = self.unshared_request(
+                req.phase,
+                Unshared::Fresh {
+                    tenant: NEIGHBOUR_TENANT,
+                    neighbour: true,
+                },
+            );
             self.fresh_pending.push_back(burst);
         }
         Some(req)
@@ -1028,43 +1070,52 @@ impl Iterator for Workload {
 }
 
 impl Workload {
-    fn fresh_request(&mut self, phase: usize, tenant: u32, neighbour: bool) -> Request {
+    fn unshared_request(&mut self, phase: usize, kind: Unshared) -> Request {
         self.fresh_n += 1;
         let n = self.fresh_n;
-        let rng = if neighbour {
-            &mut self.neighbour_rng
-        } else {
-            &mut self.fresh_rng
+        let (tag, blocks, tokens_min, tokens_span) = match kind {
+            Unshared::Fresh { .. } => ("fresh", FRESH_BLOCKS, FRESH_TOKENS_MIN, FRESH_TOKENS_SPAN),
+            Unshared::Batch => ("batch", BATCH_BLOCKS, BATCH_TOKENS_MIN, BATCH_TOKENS_SPAN),
+        };
+        let rng = match kind {
+            Unshared::Fresh {
+                neighbour: true, ..
+            } => &mut self.neighbour_rng,
+            Unshared::Fresh {
+                neighbour: false, ..
+            } => &mut self.fresh_rng,
+            Unshared::Batch => &mut self.batch_rng,
         };
         let model = if self.one_model { 0 } else { rng.below(MODELS) };
-        let tokens = FRESH_TOKENS_MIN + rng.below(FRESH_TOKENS_SPAN);
+        let tokens = tokens_min + rng.below(tokens_span);
         let mut parent = ROOT;
-        let chain: Chain = (0..FRESH_BLOCKS)
-            .map(|d| {
-                let (id, meta) = kv(
-                    None,
-                    parent,
-                    format!("fresh:{n}:{d}").as_bytes(),
-                    Origin::Session,
-                );
-                parent = id;
-                (id, meta)
-            })
+        let mut link = |label: String| {
+            let (id, meta) = kv(None, parent, label.as_bytes(), Origin::Session);
+            parent = id;
+            (id, meta)
+        };
+        let chain: Chain = (0..blocks)
+            .map(|d| link(format!("{tag}:{n}:{d}")))
             .collect();
         let produces = self.tokens_per_block.map_or_else(Vec::new, |per_block| {
             (0..tokens.div_ceil(per_block))
-                .map(|d| {
-                    let (id, meta) = kv(
-                        None,
-                        parent,
-                        format!("fresh:{n}:out:{d}").as_bytes(),
-                        Origin::Session,
-                    );
-                    parent = id;
-                    (id, meta)
-                })
+                .map(|d| link(format!("{tag}:{n}:out:{d}")))
                 .collect()
         });
+        let (max_tokens, slo, tenant, program) = match kind {
+            Unshared::Fresh { tenant, .. } => (
+                self.max_tokens(tokens),
+                Slo::Interactive,
+                tenant,
+                PROGRAM_FRESH | n,
+            ),
+            Unshared::Batch => (
+                self.max_tokens(tokens).max(tokens),
+                Slo::Throughput,
+                BATCH_TENANT,
+                PROGRAM_BATCH | n,
+            ),
+        };
         Request {
             phase,
             chain,
@@ -1075,11 +1126,12 @@ impl Workload {
             tokens,
             gang: None,
             produces,
-            max_tokens: self.max_tokens(tokens),
-            slo: Slo::Interactive,
+            max_tokens,
+            slo,
             retention: Retention::default(),
             concurrent: true,
             tenant: Some(tenant),
+            program,
         }
     }
 
@@ -1120,6 +1172,7 @@ impl Workload {
                     retention: Retention::default(),
                     concurrent: false,
                     tenant: None,
+                    program: PROGRAM_TASK | q.task,
                 });
             }
             let tail = q.chain.last().map_or(ROOT, |(id, _)| *id);
@@ -1147,6 +1200,7 @@ impl Workload {
                 retention,
                 concurrent: false,
                 tenant: q.tenant,
+                program: PROGRAM_TASK | q.task,
             });
         }
         let mix = self.mix();
@@ -1173,6 +1227,7 @@ impl Workload {
             retention: Retention::default(),
             concurrent: false,
             tenant: None,
+            program: 0,
         })
     }
 }
@@ -1293,6 +1348,7 @@ impl Workload {
             retention: Retention::default(),
             concurrent: false,
             tenant: Some(tenant as u32),
+            program: turn.session,
         }
     }
 
@@ -1334,6 +1390,7 @@ impl Workload {
             retention: Retention::default(),
             concurrent: false,
             tenant: None,
+            program: 0,
         }
     }
 }
@@ -1349,6 +1406,45 @@ mod tests {
             Some(o) => w.with_origins(o).collect(),
             None => w.collect(),
         }
+    }
+
+    #[test]
+    fn every_decode_names_a_program_and_a_program_spans_several_calls() {
+        let decodes: Vec<Request> = trace(None).into_iter().filter(|r| r.tokens > 0).collect();
+        assert!(decodes.iter().all(|r| r.program != 0));
+        let programs: HashSet<u64> = decodes.iter().map(|r| r.program).collect();
+        assert!(
+            programs.len() < decodes.len(),
+            "a session's turns share one program"
+        );
+    }
+
+    #[test]
+    fn the_batch_class_is_a_stream_of_its_own_and_an_unshared_throughput_shape() {
+        let plain: Vec<Request> = Workload::with_fanout(3, 2_000, 1.0, 0.1)
+            .with_decode_kv(TOKENS_PER_KV_BLOCK)
+            .collect();
+        let mixed: Vec<Request> = Workload::with_fanout(3, 2_000, 1.0, 0.1)
+            .with_decode_kv(TOKENS_PER_KV_BLOCK)
+            .with_batch(0.1)
+            .collect();
+        let batch = |r: &&Request| r.tenant == Some(BATCH_TENANT);
+        let (others, batched): (Vec<&Request>, Vec<&Request>) =
+            mixed.iter().partition(|r| !batch(r));
+        assert_eq!(format!("{plain:?}"), format!("{others:?}"));
+        assert!(batched.len() > 100);
+        for r in &batched {
+            assert_eq!(r.slo, Slo::Throughput);
+            assert_eq!(r.chain.len() as u64, BATCH_BLOCKS);
+            assert!((BATCH_TOKENS_MIN..BATCH_TOKENS_MIN + BATCH_TOKENS_SPAN).contains(&r.tokens));
+            assert!(r.concurrent && r.completes.is_none() && r.hint.is_none());
+        }
+        let programs: HashSet<u64> = batched.iter().map(|r| r.program).collect();
+        assert_eq!(
+            programs.len(),
+            batched.len(),
+            "every batch request is a program of one call"
+        );
     }
 
     #[test]

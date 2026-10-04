@@ -1,4 +1,5 @@
 mod belief_cmd;
+mod enforce_cmd;
 mod fleet_cmd;
 mod influence_cmd;
 
@@ -181,6 +182,8 @@ enum Cmd {
         influence: InfluenceArgs,
         #[command(flatten)]
         fleet: FleetArgs,
+        #[command(flatten)]
+        enforce: EnforceArgs,
     },
 
     /// One model host and one agent-framework host, swept from same-socket to cross-region.
@@ -451,6 +454,42 @@ enum Cmd {
         sections: String,
     },
 
+    /// What enforcement does when the engine cannot place a sequence: phase-9.md §4.12's sweeps.
+    /// Charges no control crossing, so every number is reproducible from the seed
+    Enforce {
+        #[arg(long, default_value_t = 4)]
+        nodes: usize,
+        #[arg(long, default_value_t = 3)]
+        units_per_node: usize,
+        #[arg(long, default_value = "16GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        #[arg(long, default_value = "32GiB", value_parser = parse_bytes)]
+        dram: u64,
+        #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
+        nvme: u64,
+        #[arg(long, default_value_t = 15_000)]
+        ops: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value_t = 250.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 0.10)]
+        fanout: f64,
+        /// Seeds per cell
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..))]
+        seeds: u64,
+        /// Fraction of sessions that declare a throughput objective
+        #[arg(long, default_value_t = 0.3)]
+        throughput: f64,
+        /// Sections to run, comma-separated, printed in phase-9.md §4.12's order: gate, engine,
+        /// queue, order, cancel, claims, restart, llmd, batch, departures, buffer
+        #[arg(
+            long,
+            default_value = "gate,engine,queue,order,cancel,claims,restart,llmd,batch,departures,buffer"
+        )]
+        sections: String,
+    },
+
     /// The price of the engine boundary: phase-3.md §4.11's sweeps, per class and at p99.
     /// Charges no control crossing, so every number is reproducible from the seed
     Price {
@@ -500,7 +539,8 @@ struct Correct {
     /// Tokens per KV block under --decode-kv; 35 keeps today's mean chain growth
     #[arg(long, default_value_t = polyphonic::work::TOKENS_PER_KV_BLOCK)]
     tokens_per_block: u64,
-    /// What the router reserves per request against the partition
+    /// What the router reserves per request against the partition; quantile, tiered and gate are
+    /// router-queue claims, which only `distributed` runs
     #[arg(long, value_enum, default_value_t = AdmitArg::None)]
     admit: AdmitArg,
     /// `max_tokens` as a multiple of the workload's longest output
@@ -1118,6 +1158,235 @@ impl FleetArgs {
     }
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum EngineWaitArg {
+    Off,
+    Fifo,
+    FirstFit,
+    Priority,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum QueueArg {
+    Off,
+    Fifo,
+    Slo,
+    Plas,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum CancelArg {
+    Off,
+    Continue,
+    Drop,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum VictimArg {
+    Recent,
+    Remaining,
+    Attained,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum CancelAtArg {
+    Both,
+    Router,
+}
+
+#[derive(clap::Args, Debug, Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
+struct EnforceArgs {
+    /// Engine arm: a sequence the partition cannot hold waits at its node until its blocks fit,
+    /// in arrival order, first fit, or by declared class, instead of running with no memory
+    /// (needs --engine-cache, --decode-kv, a positive --rate, no --pairing and no --regret)
+    #[arg(long, value_enum, default_value_t = EngineWaitArg::Off)]
+    engine_wait: EngineWaitArg,
+    /// Instrument: for each sequence today's engine runs with no memory, read the wait it would
+    /// have had from the engine's own release schedule; changes nothing
+    #[arg(long)]
+    probe_engine: bool,
+    /// Router arm: a request no node's check admits waits at the router, served in arrival order,
+    /// declared class first, or by the attained service of its program, and is placed among the
+    /// nodes that admit it when it leaves (needs what --engine-wait needs)
+    #[arg(long, value_enum, default_value_t = QueueArg::Off)]
+    queue: QueueArg,
+    /// The quantile of a class's observed output length that --admit quantile and --admit tiered
+    /// reserve a request against
+    #[arg(long, default_value_t = 0.9)]
+    claim_quantile: f64,
+    /// Under --admit quantile, reserve against the pooled distribution instead of the request's
+    /// own class's
+    #[arg(long)]
+    pooled: bool,
+    /// Under --admit gate, a node admits a request while its pinned KV is under this share of its
+    /// partition
+    #[arg(long, default_value_t = 0.9)]
+    gate: f64,
+    /// Router and engine arm: abort a lower-class sequence in flight to admit a higher-class
+    /// request, and resubmit it as a continuation of what it decoded or drop it and send it again
+    /// whole (needs --queue, --engine-cache, --decode-kv, a positive --rate, no --belief, no
+    /// --regret and no --pairing)
+    #[arg(long, value_enum, default_value_t = CancelArg::Off)]
+    cancel: CancelArg,
+    /// Which sequence a cancel takes first: the most recently dispatched, the one with the most
+    /// decode left, or, as a comparison arm, the one whose program has attained the most service
+    #[arg(long, value_enum, default_value_t = VictimArg::Recent)]
+    victim: VictimArg,
+    /// Where a cancel may be triggered: at the router when the head of its queue fits nowhere, and
+    /// also at an engine where a higher-class request waits for its blocks
+    #[arg(long, value_enum, default_value_t = CancelAtArg::Both)]
+    cancel_at: CancelAtArg,
+    /// The share of decodes whose client leaves part-way through, chosen from a stream of its own;
+    /// the router aborts the sequence at the next arrival unless --leak (needs what --cancel
+    /// needs, bar --queue)
+    #[arg(long, default_value_t = 0.0)]
+    disconnect: f64,
+    /// A departed client's sequence runs to its end instead of being aborted
+    #[arg(long)]
+    leak: bool,
+    /// Instrument: the tokens every decode in flight has emitted, per node, sampled at each
+    /// arrival; changes nothing
+    #[arg(long)]
+    stream_buffer: bool,
+    /// After each request, with this chance from a stream of its own, a throughput request with an
+    /// unshared 8-block prompt and 200-600 output tokens
+    #[arg(long, default_value_t = 0.0)]
+    batch: f64,
+}
+
+impl EnforceArgs {
+    const OFF: Self = Self {
+        engine_wait: EngineWaitArg::Off,
+        probe_engine: false,
+        queue: QueueArg::Off,
+        claim_quantile: 0.9,
+        pooled: false,
+        gate: 0.9,
+        cancel: CancelArg::Off,
+        victim: VictimArg::Recent,
+        cancel_at: CancelAtArg::Both,
+        disconnect: 0.0,
+        leak: false,
+        stream_buffer: false,
+        batch: 0.0,
+    };
+
+    fn refusal(
+        self,
+        p3: Correct,
+        rate: f64,
+        regret: bool,
+        fleet: FleetArgs,
+        belief: BeliefArgs,
+    ) -> Option<&'static str> {
+        if !(0.0..=1.0).contains(&self.disconnect) || !(0.0..=1.0).contains(&self.batch) {
+            return Some("--disconnect and --batch are shares between 0 and 1");
+        }
+        if self.leak && self.disconnect <= 0.0 {
+            return Some("--leak needs --disconnect");
+        }
+        if !(self.claim_quantile > 0.0 && self.claim_quantile <= 1.0) {
+            return Some("--claim-quantile is a share above 0 and at most 1");
+        }
+        if !(self.gate > 0.0 && self.gate <= 1.0) {
+            return Some("--gate is a share of the partition, above 0 and at most 1");
+        }
+        if self.pooled && p3.admit != AdmitArg::Quantile {
+            return Some("--pooled needs --admit quantile");
+        }
+        if self.cancel != CancelArg::Off
+            && self.victim == VictimArg::Attained
+            && self.queue != QueueArg::Plas
+        {
+            return Some("--victim attained needs --queue plas, which accrues attained service");
+        }
+        if self.is_off(p3.admit) {
+            return None;
+        }
+        if !(p3.engine_cache && p3.decode_kv && rate > 0.0) {
+            return Some(
+                "--engine-wait, --probe-engine, --queue and --admit quantile, tiered or gate need \
+                 --engine-cache, --decode-kv and a positive --rate",
+            );
+        }
+        if regret || fleet.pairing != PairingArg::Off {
+            return Some(
+                "--engine-wait, --probe-engine, --queue and --admit quantile, tiered or gate need \
+                 no --regret and no --pairing",
+            );
+        }
+        if self.cancel != CancelArg::Off && (self.queue == QueueArg::Off || belief.belief) {
+            return Some("--cancel needs --queue to resubmit into and no --belief");
+        }
+        if (self.disconnect > 0.0 || self.stream_buffer) && belief.belief {
+            return Some("--disconnect and --stream-buffer need no --belief");
+        }
+        None
+    }
+
+    fn is_off(self, admit: AdmitArg) -> bool {
+        self.engine_wait == EngineWaitArg::Off
+            && !self.probe_engine
+            && self.queue == QueueArg::Off
+            && self.cancel == CancelArg::Off
+            && self.disconnect <= 0.0
+            && !self.stream_buffer
+            && !admit.is_claim()
+    }
+
+    fn apply(self, mach: &mut polyphonic::machine::Machine, admit: AdmitArg) {
+        use polyphonic::machine::{
+            CancelMode, Claim, Departures, EngineWait, Queue, Triggers, Victim,
+        };
+        mach.set_claim(match admit {
+            AdmitArg::Quantile => Claim::Quantile {
+                q: self.claim_quantile,
+                pooled: self.pooled,
+            },
+            AdmitArg::Tiered => Claim::Tiered {
+                q: self.claim_quantile,
+            },
+            AdmitArg::Gate => Claim::Gate(self.gate),
+            AdmitArg::Bound | AdmitArg::Perfect | AdmitArg::None => Claim::Static,
+        });
+        mach.set_queue(match self.queue {
+            QueueArg::Off => Queue::Off,
+            QueueArg::Fifo => Queue::Fifo,
+            QueueArg::Slo => Queue::Slo,
+            QueueArg::Plas => Queue::Plas,
+        });
+        mach.set_cancel(
+            match self.cancel {
+                CancelArg::Off => CancelMode::Off,
+                CancelArg::Continue => CancelMode::Continue,
+                CancelArg::Drop => CancelMode::Drop,
+            },
+            match self.victim {
+                VictimArg::Recent => Victim::Recent,
+                VictimArg::Remaining => Victim::Remaining,
+                VictimArg::Attained => Victim::Attained,
+            },
+        );
+        mach.set_cancel_triggers(match self.cancel_at {
+            CancelAtArg::Both => Triggers::Both,
+            CancelAtArg::Router => Triggers::Router,
+        });
+        mach.set_departures((self.disconnect > 0.0).then_some(Departures {
+            share: self.disconnect,
+            leak: self.leak,
+        }));
+        mach.set_track_stream(self.stream_buffer);
+        mach.set_probe_engine(self.probe_engine);
+        mach.set_engine_wait(match self.engine_wait {
+            EngineWaitArg::Off => EngineWait::Off,
+            EngineWaitArg::Fifo => EngineWait::Fifo,
+            EngineWaitArg::FirstFit => EngineWait::FirstFit,
+            EngineWaitArg::Priority => EngineWait::Priority,
+        });
+    }
+}
+
 #[derive(clap::Args, Debug, Clone, Copy)]
 struct AheadArgs {
     /// Engine arm: prefill a declared downstream's missing blocks when its hint arrives
@@ -1164,11 +1433,20 @@ impl AheadArgs {
     }
 }
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum AdmitArg {
     Bound,
     Perfect,
     None,
+    Quantile,
+    Tiered,
+    Gate,
+}
+
+impl AdmitArg {
+    fn is_claim(self) -> bool {
+        matches!(self, Self::Quantile | Self::Tiered | Self::Gate)
+    }
 }
 
 #[derive(clap::Args, Debug, Clone, Copy)]
@@ -1186,7 +1464,9 @@ impl Correct {
         match self.admit {
             AdmitArg::Bound => Reserve::Bound,
             AdmitArg::Perfect => Reserve::Perfect,
-            AdmitArg::None => Reserve::Prompt,
+            AdmitArg::None | AdmitArg::Quantile | AdmitArg::Tiered | AdmitArg::Gate => {
+                Reserve::Prompt
+            }
         }
     }
 
@@ -1259,9 +1539,18 @@ impl Correct {
         };
         format!(
             "router reserves {}, max_tokens {:.0}x, {decode}",
-            self.reserve().label(),
+            self.admission(),
             self.max_token_slack
         )
+    }
+
+    fn admission(self) -> &'static str {
+        match self.admit {
+            AdmitArg::Quantile => "a quantile claim of observed lengths",
+            AdmitArg::Tiered => "the tiered claim",
+            AdmitArg::Gate => "under a utilisation gate",
+            AdmitArg::Bound | AdmitArg::Perfect | AdmitArg::None => self.reserve().label(),
+        }
     }
 }
 
@@ -2449,9 +2738,34 @@ fn residency_report(
     }
 }
 
+impl Cmd {
+    fn correct_without_enforcement(&self) -> Option<Correct> {
+        match self {
+            Self::Residency { p3, .. }
+            | Self::Flows { p3, .. }
+            | Self::Placement { p3, .. }
+            | Self::CodeReview { p3, .. }
+            | Self::Volatility { p3, .. }
+            | Self::Ownership { p3, .. } => Some(*p3),
+            _ => None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() {
-    match Cli::parse().cmd {
+    let cmd = Cli::parse().cmd;
+    if cmd
+        .correct_without_enforcement()
+        .is_some_and(|p3| p3.admit.is_claim())
+    {
+        println!(
+            "--admit quantile, tiered and gate are claims the router queue makes, which only \
+             `distributed` runs"
+        );
+        return;
+    }
+    match cmd {
         Cmd::Residency {
             hbm,
             dram,
@@ -2501,6 +2815,7 @@ fn main() {
             belief,
             influence,
             fleet,
+            enforce,
         } => distributed(
             nodes,
             units_per_node,
@@ -2523,6 +2838,7 @@ fn main() {
             belief,
             influence,
             fleet,
+            enforce,
         ),
         Cmd::CodeReview {
             hbm,
@@ -2718,6 +3034,33 @@ fn main() {
             rate,
             fanout,
             seeds,
+            sections,
+        }),
+        Cmd::Enforce {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            rate,
+            fanout,
+            seeds,
+            throughput,
+            sections,
+        } => enforce_cmd::run(&enforce_cmd::Env {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            rate,
+            fanout,
+            seeds,
+            throughput,
             sections,
         }),
         Cmd::Influence {
@@ -2987,6 +3330,7 @@ struct ClassTally {
     tenant_samples: Vec<(u64, u32, u64)>,
     base: u64,
     window: (f64, f64),
+    departed: u64,
 }
 
 type ClassRow<'a> = (&'a str, ClassTally);
@@ -3304,6 +3648,7 @@ struct Scenario {
     belief: BeliefArgs,
     influence: InfluenceArgs,
     fleet: FleetArgs,
+    enforce: EnforceArgs,
     lag_ns: u64,
 }
 
@@ -3319,7 +3664,8 @@ fn oracle_of(sc: &Scenario, nodes: usize) -> Option<polyphonic::fleet::OraclePla
                         sc.fleet.volatility(),
                         sc.fanout,
                     )
-                    .with_throughput(sc.belief.throughput),
+                    .with_throughput(sc.belief.throughput)
+                    .with_batch(sc.enforce.batch),
                 ),
             )
             .collect();
@@ -3397,6 +3743,7 @@ fn distributed_run(
         mach.set_instrument(true);
     }
     sc.fleet.apply(&mut mach);
+    sc.enforce.apply(&mut mach, sc.p3.admit);
     mach.set_directives(inf.directives());
     mach.set_prefill_ahead(inf.prefill_ahead);
     mach.set_prefill_target(match inf.prefill_target {
@@ -3405,7 +3752,8 @@ fn distributed_run(
     });
     let workload = sc.fleet.workload(
         polyphonic::work::Workload::with_fanout(sc.seed, sc.ops, sc.fleet.volatility(), sc.fanout)
-            .with_throughput(sc.belief.throughput),
+            .with_throughput(sc.belief.throughput)
+            .with_batch(sc.enforce.batch),
     );
     let workload = match sc.flow_payload {
         Some(bytes) => workload.with_flow_payload(bytes),
@@ -3507,6 +3855,19 @@ fn correction_terms(mach: &polyphonic::machine::Machine, r: &ArmRun, bits: Clust
             100.0 * mach.shared_requests[w] as f64 / r.served.max(1) as f64,
         );
     }
+    let waits = &mach.engine_waits;
+    if waits.queued > 0 || waits.unfittable > 0 {
+        let mean_ms = |i: usize| waits.waited_ns[i] as f64 / waits.waited[i].max(1) as f64 / 1e6;
+        print!(
+            "; engine queued {:.2}% of requests, mean wait {:.1} ms interactive and {:.1} ms \
+             throughput, deepest queue {}, {} too large to wait",
+            pct(waits.queued),
+            mean_ms(0),
+            mean_ms(1),
+            waits.max_depth,
+            waits.unfittable,
+        );
+    }
     println!();
 }
 
@@ -3534,8 +3895,14 @@ fn distributed(
     belief: BeliefArgs,
     influence: InfluenceArgs,
     fleet: FleetArgs,
+    enforce: EnforceArgs,
 ) {
     use polyphonic::topo::{Distance, Topology};
+
+    if let Some(why) = enforce.refusal(p3, rate, regret, fleet, belief) {
+        println!("{why}");
+        return;
+    }
 
     if fleet.needs_engine() && rate <= 0.0 {
         println!("--model-batches, --prefill-time and --fleet need a positive --rate");
@@ -3645,6 +4012,7 @@ fn distributed(
         belief,
         influence,
         fleet,
+        enforce,
         lag_ns: 0,
     };
 
@@ -3902,57 +4270,122 @@ fn code_review(
     crossover(&ladder, cost, &warm_seen);
 }
 
+struct Shape {
+    class: usize,
+    base_at: u64,
+    tenant: u32,
+    phase: usize,
+    decodes: bool,
+    slo: polyphonic::work::Slo,
+    produced: u64,
+    stage: bool,
+}
+
+impl Shape {
+    fn of(req: &polyphonic::work::Request, base_at: u64) -> Self {
+        Self {
+            class: req.kind_idx(),
+            base_at,
+            tenant: req.tenant.unwrap_or(u32::MAX),
+            phase: req.phase,
+            decodes: req.tokens > 0,
+            slo: req.slo,
+            produced: req.produces.iter().map(|(_, m)| m.bytes).sum(),
+            stage: req.completes.is_some(),
+        }
+    }
+}
+
+fn tally(
+    t: &mut ClassTally,
+    total: &mut u64,
+    served: &mut u64,
+    shape: &Shape,
+    c: &polyphonic::cache::Cost,
+) {
+    if c.pending {
+        return;
+    }
+    let k = shape.class;
+    t.tenant_samples
+        .push((shape.base_at, shape.tenant, c.service_ns()));
+    *total += c.total_ns();
+    t.stall[k] += c.total_ns();
+    t.service[k] += c.service_ns();
+    t.decide[k] += c.decide_ns;
+    t.ops[k] += 1;
+    t.samples[k].push(c.service_ns());
+    t.phase[shape.phase].0 += c.service_ns();
+    t.phase[shape.phase].1 += 1;
+    if k == BlobKind::KvBlock.idx() && shape.decodes {
+        t.slo_service[shape.slo.idx()].push(c.service_ns());
+        t.slo_stall[shape.slo.idx()].push(c.total_ns());
+    }
+    if k == BlobKind::KvBlock.idx() {
+        if shape.stage {
+            t.stage.push(c.service_ns());
+            t.produced[1] += shape.produced;
+        } else {
+            t.chat.push(c.service_ns());
+            t.produced[0] += shape.produced;
+        }
+    }
+
+    if c.transfer_ns == 0 && c.recompute_ns == 0 {
+        t.warm[k] += 1;
+        t.warm_ns[k] += c.service_ns();
+    }
+    t.regime[polyphonic::oracle::classify(c).idx()] += 1;
+    *served += 1;
+}
+
+fn settle(
+    mach: &mut polyphonic::machine::Machine,
+    open: &mut std::collections::HashMap<usize, Shape>,
+    t: &mut ClassTally,
+    total: &mut u64,
+    served: &mut u64,
+) {
+    for (id, cost) in mach.drain_closed() {
+        let shape = open.remove(&id).expect("a closed request was open");
+        tally(t, total, served, &shape, &cost);
+    }
+    for id in mach.drain_departed() {
+        open.remove(&id).expect("a departed request was open");
+        t.departed += 1;
+    }
+}
+
 fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
     mach: &mut polyphonic::machine::Machine,
     rate: f64,
     workload: impl IntoIterator<Item = R>,
 ) -> (ClassTally, u64, u64, u64) {
+    use polyphonic::machine::Submitted;
     mach.set_arrival_rate(rate);
     let mut t = ClassTally::default();
     let (mut total, mut served, mut offered) = (0u64, 0u64, 0u64);
+    let mut open = std::collections::HashMap::new();
     for (position, req) in workload.into_iter().enumerate() {
         let req = req.borrow();
         mach.set_position(position as u64);
-        let k = req.kind_idx();
         offered += 1;
-        let base_at = t.base;
+        let shape = Shape::of(req, t.base);
         t.base += u64::from(!req.concurrent);
-        let c = mach.serve_request(req);
-        if c.pending {
-            continue;
-        }
-        t.tenant_samples
-            .push((base_at, req.tenant.unwrap_or(u32::MAX), c.service_ns()));
-        total += c.total_ns();
-        t.stall[k] += c.total_ns();
-        t.service[k] += c.service_ns();
-        t.decide[k] += c.decide_ns;
-        t.ops[k] += 1;
-        t.samples[k].push(c.service_ns());
-        t.phase[req.phase].0 += c.service_ns();
-        t.phase[req.phase].1 += 1;
-        if k == BlobKind::KvBlock.idx() && req.tokens > 0 {
-            t.slo_service[req.slo.idx()].push(c.service_ns());
-            t.slo_stall[req.slo.idx()].push(c.total_ns());
-        }
-        if k == BlobKind::KvBlock.idx() {
-            let out: u64 = req.produces.iter().map(|(_, m)| m.bytes).sum();
-            if req.completes.is_some() {
-                t.stage.push(c.service_ns());
-                t.produced[1] += out;
-            } else {
-                t.chat.push(c.service_ns());
-                t.produced[0] += out;
+        match mach.submit(req) {
+            Submitted::Closed(c) => tally(&mut t, &mut total, &mut served, &shape, &c),
+            Submitted::Open(id) => {
+                open.insert(id, shape);
             }
         }
-
-        if c.transfer_ns == 0 && c.recompute_ns == 0 {
-            t.warm[k] += 1;
-            t.warm_ns[k] += c.service_ns();
-        }
-        t.regime[polyphonic::oracle::classify(&c).idx()] += 1;
-        served += 1;
+        settle(mach, &mut open, &mut t, &mut total, &mut served);
     }
+    mach.finish();
+    settle(mach, &mut open, &mut t, &mut total, &mut served);
+    assert!(
+        open.is_empty(),
+        "every request is closed once the trace drains"
+    );
     (t, total, served, offered)
 }
 
@@ -4024,6 +4457,13 @@ fn fanout_row(atomic: bool, r: &ArmRun) {
 
 fn engine_fanout_admission(topo: &polyphonic::topo::Topology, memory: NodeMemory, sc: &Scenario) {
     if sc.fanout <= 0.0 {
+        return;
+    }
+    if !sc.enforce.is_off(sc.p3.admit) {
+        println!(
+            "\n  fan-out admission, engine allocates KV: not run, since it drives fan-outs \
+             without the engine wait, router queue, claims and cancel this run sets"
+        );
         return;
     }
     println!(
@@ -4493,6 +4933,7 @@ fn price(a: &PriceArgs) {
             belief: BeliefArgs::OFF,
             influence: InfluenceArgs::OFF,
             fleet: FleetArgs::OFF,
+            enforce: EnforceArgs::OFF,
             lag_ns: 0,
         };
         let cell = |p3: Correct| -> String {

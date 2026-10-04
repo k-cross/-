@@ -1169,7 +1169,12 @@ it reads can see that coming.
 Where the partition binds, the bracket is wide and each rule buys goodput with recompute or
 recompute with goodput. `bound`'s cost is mostly its ceiling (0.10% refused at 1x slack, 9.61% at
 8x). The p99 cost of `none` lands on a session's own turns and on stages other work waits on about
-equally (+14% each at a quarter of the partition): class-blind, spread by arrival.
+equally (+14% each at a quarter of the partition): class-blind, spread by arrival. The engine these
+rows ran on decodes a sequence it cannot place with no memory rather than making it wait (18-20% of
+decodes at half the partition on the `belief` cluster). With an engine that waits, the half
+partition is past saturation, and the three rules served different sets of requests, so the
+bracket's sizes there are an overload's. The loss is class-blind on the engine's own order; once the
+router chooses the victim it moves onto the throughput class (*Enforcement*).
 
 **Fan-out admission survives on the coarsened test** (`price` section 6, fan-outs completed per
 agent / all-or-nothing):
@@ -1443,6 +1448,50 @@ points; at half the partition with prefill taking engine time the quiet half gai
 weight loads run 3.9 / 4.5 / 3.2 a second on the `belief` cluster and scored decisions 306-308 a
 second at 250 req/s.
 
+### Enforcement: a queue, a cancel, and who leaves
+
+`phase-9.md`, implemented. `polyphonic enforce` runs its sections on seeds 1-3 on the `belief`
+cluster at 250 req/s with `--throughput 0.3`, no control crossing charged, the partition at a stated
+share of the published grant and prefill free or taking engine time. Every arm is graded on the
+corrected engine, in which a sequence the partition cannot hold waits (`--engine-wait`), so none of
+it is a figure for the published engine. Seeds are listed in order; first-token p99 is the time
+before the first token, and completion p99 is a request's service.
+
+**The overload.** At the half partition the published engine runs 18-20% of decodes with no memory
+and the corrected one is past saturation, so the half partition is an overload and Phase 3's
+bracket compared different sets of served requests.
+
+**Where the loss lands.** With a batch class (5% of requests, 8-block unshared prompts, 200-599
+tokens, throughput) at 0.75x, a pooled p90 lets the interactive first-token p99 reach 473 / 661 /
+3960 ms with prefill free and 3794 / 1762 / 6746 ms with prefill taking engine time; a p90 of each
+class's own lengths holds it to 180 / 241 / 290 and 586 / 264 / 547 ms, and a cancel takes it to 63
+/ 63 / 63 and 67 / 64 / 63 ms, the floor. The tiered claim's throughput completion p99 is 1.00 /
+1.01 / 0.98x the own-class p90's with prefill free, 0.87 / 1.49 / 0.88x with prefill taking engine
+time, and 1.59 / 1.68 / 1.52x at 0.6x with prefill, where it also leaves the interactive first-token
+p99 at 3.6-5.3 s against 1.0-1.5 s. At 1.0x the claims are within 3%. These arms are graded against
+a batch draw that is not the pre-measurement's; they agree in kind and not to the digit.
+
+**Triggers, restart and the gate.** With the tiered claim and prefill taking engine time at 0.75x,
+a cancel at the router's check alone leaves the interactive first-token p99 at 75 / 65 / 691 ms and
+the engine-side trigger too at 75 / 69 / 64 ms; at 0.6x with prefill the router's alone is 2.7 / 2.3
+/ 2.7 s and both 4.2 / 5.3 / 3.6 s. Under each class's own p90 the engine trigger never fires. A
+restart finishes the batch class +137 / +90 / +118% later than a continuation at 0.75x with
+prefill, +109 / +119 / +183% with prefill free, and throws away 442-1007 sequence-seconds. An
+llm-d-shaped gate at θ = 0.9 finishes the throughput class 2.2-4.4x later than the claim with a
+continuation where memory binds, and the interactive class 1.0-1.1x with prefill free and 2.7-3.5x
+with prefill taking engine time at 0.75x. Ordering by attained service puts the batch class's
+first-token p99 at 71-147 ms and the interactive class's at 0.3-0.7 s free and 3.0-8.0 s with
+prefill; arrival order is 1.0-2.2 s for both.
+
+**Who leaves.** Under the engine's own wait a leaked departure over an aborted one is 1.7-2.3x on
+the interactive first-token p99 at 20% leaving at 0.75x with prefill and 1.8-2.2x at 0.6x, 2.1-3.2x
+at 0.6x with prefill free, and 0.9-1.3x at 5% with prefill; a leaked run holds 200-830
+sequence-seconds of decode that an abort frees.
+
+**The stalled-stream buffer.** If every decode in flight on a node stalled for its whole decode,
+the busiest node holds 3853-4638 tokens on the published workload and 7110-8876 with the batch
+class: 0.77-0.93 and 1.42-1.78 MB at 200 bytes a token, 0.009-0.021% of a node's DDR.
+
 ## Method
 
 **On the fairness caveat.** Every comparison above between arms this repository wrote is a delta
@@ -1580,7 +1629,7 @@ a replica set is one neighbour's.
 | out-of-process hook caps scheduler fleet size | holds — ~20 nodes (`ext_proc`) vs ~1000 (`Wasm`), `d` measured not assumed |
 | the ledger allocates the engine's KV | **corrected** — `--engine-cache` hands allocation to an engine LRU inside an orchestrator-sized partition; off by default so every row above stays the ledger's |
 | ceding KV allocation costs service time | **no, where decode dominates** — −0.2% mean, −0.4% p99 on the cluster; on one node it is cheaper, because the partition hands weights the slack |
-| optimistic admission moves its cost onto another class | **class-blind, not class-shifted** — the preempted arrival pays; chat turns and task stages lose p99 about equally |
+| optimistic admission moves its cost onto another class | **class-blind on the engine's own order** — the preempted arrival pays; chat turns and task stages lose p99 about equally, sized at half the partition on an engine that gave memory away. **Class-shifted once the router chooses the victim** (*Enforcement*): the interactive first-token p99 at the 63 ms floor, the throughput class's completion paying |
 | a better block manager is worth asking for | ~3% of stall at 17–23pp KV hit, at every partition size — more than the partition's size moves the A/B below 1x |
 | shared L2 tier | fires on KV within a rack, on weights only from zone out |
 | the router's view of the engine's KV can be a lossy belief | **yes, at almost no cost** -- within 0.16% of the exact view at 20% batch loss with no recovery, within 0.075% with replay; the belief is wrong 37-60% of the time in the worst cell and it does not show |
@@ -1607,3 +1656,11 @@ a replica set is one neighbour's.
 | a noisy neighbour's damage is cache | **no** -- engine time: +1-3% while prefill is free, +11% to +62% once it takes engine time |
 | a router quota on prefill work isolates a neighbour | **yes** -- +1.9-3.5% to the others against +11% shared; a replica set is the hard version, +3% and nothing outside at one of eight, and ahead of a quota at the same allowance at every duty cycle; a cap on sequences per tenant refuses the others |
 | a tenant-aware block manager is worth asking for | **no at the published partition** (under 0.3% of service for every group), up to 1.8% to the quiet half at half of it |
+| a cancel by declared class moves the loss to the class that waits | **yes** -- the interactive first-token p99 at the 63 ms floor and the throughput class's completion later; where the classes are drawn alike one p90 and the tiered claim are a scalar |
+| borrowing against the mean for throughput work | **retired where memory binds hardest** -- at 0.6x with prefill taking engine time the throughput class finishes 1.5-1.7x later than under its own p90; level or ahead at 0.75x |
+| restart against continuation | continuation, by +26% to +183% on the batch class's completion; a restart throws away 171-1007 sequence-seconds |
+| an llm-d-shaped utilisation gate against a per-class claim | the evicted class pays 2.2-4.4x in completion where memory binds, and the interactive class up to 7.0x at 0.75x with prefill and at 0.6x |
+| a quantile claim needs a second cancel trigger at the engine | **no** -- the router's check alone keeps the interactive first-token p99 under 1 s on every seed; the engine trigger takes one seed from 691 to 64 ms and costs 1.3-2.4x at 0.6x with prefill |
+| a client that leaves is the cancel's first job | **holds at 20%** (1.7-3.2x on the interactive first-token p99 leaked against aborted), at 5% only with prefill free |
+| the stalled-stream buffer is a memory-arbitration event | **retracted for text** -- under 1.8 MB a node |
+
