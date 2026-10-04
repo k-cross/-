@@ -563,13 +563,13 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                     // Card 01: Active White card with Crimson Corner Splatter
                     (0.0, "01", "ON THE ROAD TO LOCK FREEDOM", "[CURRENT ROUTE]", P5_WHITE, BorderColor::all(P5_BLACK), P5_BLACK, CardCorner::TopLeft, P5_RED, true, false),
                     // Card 02: Black card with Crimson Corner Splatter on Top-Right
-                    (26.0, "02", "THE COST OF SERIALIZATION", "[MUTEX BOTTLENECK]", P5_BLACK, BorderColor::all(P5_RED), P5_WHITE, CardCorner::TopRight, P5_RED, false, false),
+                    (26.0, "02", "SYNCHRONOUS WITH ATOMICS", "[THE SIZE RACE]", P5_BLACK, BorderColor::all(P5_RED), P5_WHITE, CardCorner::TopRight, P5_RED, false, false),
                     // Card 03: Off-Black card with Dark Crimson Corner Splatter on Bottom-Left
-                    (52.0, "03", "ATOMIC PRIMITIVES & CAS LOOPS", "[HARDWARE ENGINE]", P5_OFF_BLACK, BorderColor::all(P5_BORDER), P5_OFF_WHITE, CardCorner::BottomLeft, P5_DARK_RED, false, false),
+                    (52.0, "03", "MEMORY SEQUENCING & ABA", "[TURN-STAMP RESOLUTION]", P5_OFF_BLACK, BorderColor::all(P5_BORDER), P5_OFF_WHITE, CardCorner::BottomLeft, P5_DARK_RED, false, false),
                     // Card 04: Charcoal card with Red Corner Splatter on Top-Left
-                    (78.0, "04", "MEMORY ORDERING & CPU CACHES", "[ORDERING FENCES]", P5_CHARCOAL, BorderColor::all(P5_BORDER), P5_LIGHT_GREY, CardCorner::TopLeft, P5_RED, false, false),
+                    (78.0, "04", "HARDWARE CACHE CONTENTION", "[APPLE SILICON 128B]", P5_CHARCOAL, BorderColor::all(P5_BORDER), P5_LIGHT_GREY, CardCorner::TopLeft, P5_RED, false, false),
                     // Card 05: Climax Amber-Gold card with Black Corner Splatter (Iwai Shop SELL card style!)
-                    (104.0, "05", "WAIT-FREE DATA STRUCTURES", "[CLIMAX ROUTE ★]", P5_GOLD, BorderColor::all(P5_BLACK), P5_BLACK, CardCorner::BottomLeft, P5_BLACK, false, true),
+                    (104.0, "05", "BRANCHLESS & TAIL LATENCY", "[CLIMAX ROUTE ★]", P5_GOLD, BorderColor::all(P5_BLACK), P5_BLACK, CardCorner::BottomLeft, P5_BLACK, false, true),
                 ];
 
                 for (indent, num, title, sub, bg, border_color, fg, corner, splat_color, active, is_climax) in menu_cards {
@@ -801,7 +801,7 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                     InheritedVisibility::default(),
                 )).with_children(|letter| {
                     letter.spawn((
-                        Text::new("A great sinner of thread captivity. You have locked CPU cores and forced execution into agonizing sleep states for far too long.\n\nTonight, we shall break the chains of mutexes and liberate pure lock-free atomics to the world."),
+                        Text::new("A great sinner of thread captivity. You have locked CPU cores and forced execution into agonizing sleep states for far too long.\n\nTonight, we shall break the chains of blocking synchronization, conquer false sharing, and expose the road to true lock freedom."),
                         TextFont::from_font_size(FONT_LABEL).with_font(font_assets.serif.clone()),
                         TextColor(P5_OFF_WHITE),
                     ));

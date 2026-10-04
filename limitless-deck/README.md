@@ -16,20 +16,22 @@ The entire technical narrative, code snippets, hardware profiling data, and math
    - Why `AtomicBool` is insufficient for memory initialization (lapping disaster across turns).
    - Generational turn tracking: embedded metadata in `Slot<T>` vs. global bitmaps.
    - Dmitry Vyukov's bounded MPMC turn-stamp algorithm and ABA immunity.
-   - Deterministic model checking with [Loom](https://github.com/tokio-rs/loom) across 68,000+ atomic interleavings.
-   - Critical section vulnerabilities: why lockless algorithms can still deadlock on thread death.
+   - Model checking with [Loom](https://github.com/tokio-rs/loom): uncovering spin lock branch explosion and concurrent `UnsafeCell` race conditions.
+   - Critical section vulnerabilities: why lockless algorithms block on thread death/preemption.
    - Automated peer-thread recovery and why heuristic healing reintroduces ABA hazards.
-
-2. **Part 2:** [**Paving the Way to Lock Freedom (Part 2)**](https://k-cross.github.io/limits2)
    - Measuring hardware cache contention using macOS Instruments and Apple Silicon performance counters.
    - L1 load miss rate ($50.74\%$), CAS contention failure rate ($67.17\%$), and IPC ($0.0306$).
-   - Disassembly analysis: identifying false sharing when `read_idx` and `write_idx` occupy the same 64-byte L1 cache line.
-   - Hardware cache padding using `#[repr(align(64))]` / `crossbeam_utils::CachePadded`.
-   - Branchless power-of-two index bitmasking (`idx & (cap - 1)`) vs. modulo integer division.
+   - Disassembly analysis: identifying false sharing when `read_idx` and `write_idx` occupy the same 128-byte L1 cache line on Apple Silicon.
+   - Hardware cache padding using `#[repr(align(128))]` / `crossbeam_utils::CachePadded`.
+
+2. **Part 2:** [**Paving the Way to Lock Freedom (Part 2)**](https://k-cross.github.io/limits2)
+   - Review of core architectural changes: size removal, turn-stamps, and bit-walk generation tracking.
+   - Branchless index computation: eliminating branch mispredictions via arithmetic bitmasking (`((idx + 1) & at_capacity.wrapping_sub(1)) | (at_capacity * ((idx & mcb) ^ mcb))`).
+   - CPU instruction pipeline hazards: visualization of pipeline flushes, gaps, and refills on mispredicted branches.
    - Production observability with User-Level Statically Defined Tracing (USDT) and DTrace probes.
    - Quantizing unbounded tail latency: $64\times$ read latency multipliers ($16.4\ \mu\text{s}$) and $256\times$ write spikes ($131\ \mu\text{s}$).
-   - Exponential backoff mitigation using `crossbeam_utils::Backoff` to stabilize tail latency under $1\ \mu\text{s}$.
-   - Core scaling ceilings: interconnect MESI invalidation bus saturation on high-core-count processors.
+   - Exponential backoff mitigation using `crossbeam_utils::Backoff` to reduce interconnect bus storms and match Crossbeam benchmarks.
+   - Multi-core scaling ceilings: interconnect MESI invalidation bus saturation across cores.
    - Architectural simplification: transitioning to Single-Producer Single-Consumer (SPSC) with thread pinning and local index caching.
 
 ---
@@ -82,7 +84,7 @@ Beyond standard text callouts, technical slides embed custom Persona 5-styled UI
 
 ---
 
-## 📑 Slide Deck Breakdown (18 Slides)
+## 📑 Slide Deck Breakdown (23 Slides)
 
 | # | Slide Title | Technical Topic & Source Content | Visual / Math Component |
 | :---: | :--- | :--- | :--- |
@@ -91,19 +93,24 @@ Beyond standard text callouts, technical slides embed custom Persona 5-styled UI
 | **03** | **The Size Variable Race** | Atomic counter underflow in `read()` and LLDB breakpoint analysis. | Math formula: $\text{size} = 0 \to 18{,}446{,}744{,}073{,}709{,}551{,}615$ |
 | **04** | **State Ambiguity** | Removing `size` and resolving the `head == tail` boundary condition. | Math formulas: Empty ($\text{head} == \text{tail}$), Full ($(\text{tail}+1)\%\text{cap} == \text{head}$) |
 | **05** | **AtomicBool Is Not Enough** | Memory initialization and data corruption when producers lap consumers. | Math formula: 2-state lapping sequence ($\text{false} \to \text{true} \to \text{false} \to \text{true}$) |
-| **06** | **Manual Memory Tracking** | Generational sequence stamps in `Slot<T>` and fixing test stack overflows. | Locality formula: $\text{bitmap\_words} = \frac{\text{capacity}}{64}$ vs embedded $\text{Slot}\langle T \rangle$ |
-| **07** | **The ABA Problem Resolution** | Dmitry Vyukov's MPMC turn-stamp algorithm and monotonic progression. | 4-slot ring buffer memory diagram + Vyukov invariant formula |
-| **08** | **Testing with Loom** | Model checking 68,000+ atomic interleavings for exhaustive correctness. | Loom permutation metrics panel ($68{,}005$ explored, $0$ data races) |
-| **09** | **Crash in Critical Section** | Lockless slot progression vulnerabilities: thread death in critical section. | Critical section flow diagram: `CAS` $\to$ `Write` $\to$ `Commit Stamp` |
-| **10** | **Automating Recovery** | Why peer-thread healing heuristics cannot distinguish preemption from death. | Lap distance invariant formula: $|\lfloor\text{rd}/\text{cap}\rfloor - \lfloor\text{st}/\text{cap}\rfloor| \ge 2$ |
-| **11** | **Measuring Cache Contention** | Hardware counter metrics on Apple Silicon using macOS Instruments. | Bar chart: L1 Miss Rate ($50.74\%$), CAS Contention ($67.17\%$), IPC ($0.03$) |
-| **12** | **Disassembly & Cache Lines** | Decompilation analysis: false sharing between `read_idx` and `write_idx`. | 64-byte L1 cache line diagram + `#[repr(align(64))]` fix |
-| **13** | **Branchless Computation** | Bitwise index masking (`idx & (cap - 1)`) vs modulo division instructions. | Instruction comparison: Modulo ($10\text{–}30$ cycles) vs Bitwise ($1$ cycle) |
-| **14** | **Measuring Tail Latency** | Production tracing using User-Level Statically Defined Tracing (USDT). | DTrace USDT probe overhead formula ($0\text{ ns}$ when disabled) |
-| **15** | **Unbounded Tail Latency** | DTrace quantize histograms revealing extreme latency outlier multipliers. | Power-of-2 histogram: $64\times$ read spike ($16.4\ \mu\text{s}$), $256\times$ write spike ($131\ \mu\text{s}$) |
-| **16** | **Backoff Mitigation** | Exponential backoff (`crossbeam_utils::Backoff`) relieving interconnect storms. | Backoff progression flow: `CAS` $\to$ `spin_loop` $\to$ `yield_now` $\to$ `Snooze` |
-| **17** | **Core Scaling Limitations** | Multi-threaded scaling ceiling caused by MESI invalidation bus saturation. | Bar chart: Throughput vs Core Count (scaling collapse past 8 cores) |
-| **18** | **SPSC & Architectural Paths** | Single-Producer Single-Consumer queues with core pinning & zero CAS ops. | Synchronization architecture panel: 0 CAS ops, Acquire/Release ordering |
+| **06** | **Who Checks What, and When** | Graphic execution lanes showing race windows between check and commit. | Full-width multi-thread step timeline with highlighted race gaps |
+| **07** | **The Sleeping Reader** | Visualizing ABA when a reader deschedules and wakeups up after a full lap. | 4-slot ring buffer state scenes before and after buffer wrap |
+| **08** | **Manual Memory Tracking** | Generational sequence stamps in `Slot<T>` and fixing test stack overflows. | Locality formula: $\text{bitmap\_words} = \frac{\text{capacity}}{64}$ vs embedded $\text{Slot}\langle T \rangle$ |
+| **09** | **The ABA Problem Resolution** | Dmitry Vyukov's MPMC turn-stamp algorithm and monotonic progression. | 4-slot ring buffer memory diagram + Vyukov invariant formula |
+| **10** | **Testing with Loom** | Model checking reveals spin lock branch explosion and concurrent `UnsafeCell` race. | Metrics panel: Iteration $68{,}005$ branch limit panic + race alert |
+| **11** | **Crash in Critical Section** | Lockless slot progression vulnerabilities: thread death in critical section. | Critical section flow diagram: `CAS` $\to$ `Write` $\to$ `Commit Stamp` |
+| **12** | **Automating Recovery** | Why peer-thread healing heuristics cannot distinguish preemption from death. | Lap distance invariant formula: $|\lfloor\text{rd}/\text{cap}\rfloor - \lfloor\text{st}/\text{cap}\rfloor| \ge 2$ |
+| **13** | **Measuring Cache Contention** | Hardware counter metrics on Apple Silicon using macOS Instruments. | Bar chart: L1 Miss Rate ($50.74\%$), CAS Contention ($67.17\%$), IPC ($0.03$) |
+| **14** | **Disassembly & Cache Lines** | Decompilation analysis: false sharing across 128-byte cache lines on Apple Silicon. | 128-byte L1 cache line diagram + `#[repr(align(128))]` fix |
+| **15** | **The Lap Bit** | Bit-walk generation tracking: shifting and flipping the furthest-reaching bit. | Dual binary bit-row comparison table with XOR flip demonstrations |
+| **16** | **Branchless Computation** | Pure arithmetic wrapping via `wrapping_sub(1)` bitmasking without branches. | Math formulas: `at_capacity.wrapping_sub(1)` mask + XOR flip |
+| **17** | **When the CPU Guesses Wrong** | CPU pipeline stall visualization: fetch/decode stalls and bubble flushes. | 5-stage CPU pipeline grid across misprediction, flush, and refill |
+| **18** | **Measuring Tail Latency** | Production tracing using User-Level Statically Defined Tracing (USDT). | DTrace USDT probe overhead formula ($0\text{ ns}$ when disabled) |
+| **19** | **Unbounded Tail Latency** | DTrace quantize histograms revealing extreme latency outlier multipliers. | Power-of-2 histogram: $64\times$ read spike ($16.4\ \mu\text{s}$), $256\times$ write spike ($131\ \mu\text{s}$) |
+| **20** | **Backoff Mitigation** | Exponential backoff (`crossbeam_utils::Backoff`) relieving interconnect storms. | Backoff progression flow: `CAS` $\to$ `spin_loop` $\to$ `yield_now` $\to$ `Snooze` |
+| **21** | **Four Cores, One Index** | Multi-core contention topology: 4 readers and 4 writers hammering single lines. | Dual multi-core cluster topology mapping cores to index lines |
+| **22** | **Core Scaling Limitations** | Multi-threaded scaling ceiling caused by MESI invalidation bus saturation. | Bar chart: Throughput vs Core Count (scaling collapse past 8 cores) |
+| **23** | **SPSC & Architectural Paths** | Single-Producer Single-Consumer queues with core pinning & zero CAS ops. | Synchronization architecture panel: 0 CAS ops, Acquire/Release ordering |
 
 ---
 
@@ -121,14 +128,16 @@ limitless-deck/
     ├── slides/                 # Slide implementations
     │   ├── mod.rs              # SlidesPlugin registration & OnEnter state routing
     │   ├── intro.rs            # Slide 1: 3D extruded comic title banners, agenda staircase, calling card
-    │   └── auto_slides.rs      # Slides 2–18: Code blocks, diagrams, math panels, bar charts, callout cards
+    │   ├── auto_slides.rs      # Code blocks, diagrams, math panels, bar charts, callout cards
+    │   └── figure_slides.rs    # Full-width graphic diagram slides (lanes, scenes, bit-walk, pipeline, topology)
     └── slideshow/              # Presentation engine systems & reusable widgets
-        ├── mod.rs              # SlideState (18 variants), SlideController, slide navigation
+        ├── mod.rs              # SlideState (23 variants), SlideController, slide navigation
         ├── animation.rs        # SlamEntrance, PunkJitter, BobbingCursor, ScreenSlashBlade
         ├── background.rs       # Hazard stripes, speed lines, tumbling fractured chains
         ├── character.rs        # Phantom Thief silhouette, breathing idle & slash lunges
         ├── code_view.rs        # Monospace tokenized syntax highlighter & scrollable terminal frame
         ├── diagrams.rs         # Flow diagrams, math formula panels, bar charts, ring buffer diagrams, histograms
+        ├── figures.rs          # Graphic lane, bit-row, pipeline, and core topology widgets
         ├── fonts.rs            # FontAssets resource & font registration system
         ├── hud.rs              # Calendar date, palace security gauge, slide counters
         └── splatter.rs         # Procedural ink blotches, UI splatters & corner-stamped card ink droplets

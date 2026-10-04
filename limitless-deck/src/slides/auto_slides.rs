@@ -532,8 +532,8 @@ pub fn spawn_size_focus_slide(mut commands: Commands, font_assets: Res<FontAsset
                 fonts,
                 CalloutCard {
                     icon: "!",
-                    title: "PHANTOM SATURATION",
-                    text: "Because size wrapped to usize::MAX, readers believe the ring is 100% full and spin endlessly attempting to read uninitialized memory.",
+                    title: "PHANTOM DATA RACE",
+                    text: "Because size wrapped to usize::MAX, is_empty() returned false. Readers believed the buffer had data and spun endlessly in CAS/read loops instead of returning Err(()).",
                     is_alert: true,
                 },
             );
@@ -1020,12 +1020,12 @@ pub fn spawn_thread_safety_slide(mut commands: Commands, font_assets: Res<FontAs
             TokenKind::Plain,
         )],
         vec![(
-            "// Exhaustive permutation explores 68,000+ atomic interleavings!",
-            TokenKind::Comment,
+            "// Panicked: Model exceeded maximum number of branches (spin locks!)",
+            TokenKind::Alert,
         )],
         vec![(
-            "// Proves zero data races or invalid state transitions exist!",
-            TokenKind::Comment,
+            "// Later in test_two_threads: Causality violation on UnsafeCell!",
+            TokenKind::Alert,
         )],
     ];
 
@@ -1042,19 +1042,19 @@ pub fn spawn_thread_safety_slide(mut commands: Commands, font_assets: Res<FontAs
             spawn_math_formula(
                 side,
                 fonts,
-                "/// LOOM PERMUTATION METRICS ///",
+                "/// SPIN LOCK BRANCH EXPLOSION ///",
                 &[
-                    ("Schedules Explored: ", P5_MUTED),
-                    ("68,005 Permutations", P5_CYAN),
+                    ("Iter 68,005: ", P5_MUTED),
+                    ("Max Branches Exceeded (19! × 3)", P5_RED),
                 ],
             );
             spawn_math_formula(
                 side,
                 fonts,
-                "/// FORMAL MODEL CHECK RESULT ///",
+                "/// BOUNDARY RACE DISCOVERY ///",
                 &[
-                    ("Data Races Detected: ", P5_MUTED),
-                    ("0 (VERIFIED SAFE)", P5_WHITE),
+                    ("Loom Detected: ", P5_MUTED),
+                    ("Causality Violation (UnsafeCell)", P5_BRIGHT_RED),
                 ],
             );
             spawn_callout_card(
@@ -1062,8 +1062,8 @@ pub fn spawn_thread_safety_slide(mut commands: Commands, font_assets: Res<FontAs
                 fonts,
                 CalloutCard {
                     icon: "!",
-                    title: "REPETITION IS INSUFFICIENT",
-                    text: "Running cargo test 10,000 times relies on random OS scheduling. Rare memory ordering bugs only trigger 1 in 100,000 runs.",
+                    title: "MODEL CHECKING REALITY",
+                    text: "Loom exposed spin lock branch explosion in 3-thread tests and caught a concurrent UnsafeCell data race on empty/full boundaries that random cargo test loops missed.",
                     is_alert: true,
                 },
             );
@@ -1365,7 +1365,7 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
             ("AtomicUsize", TokenKind::Type),
             (",  ", TokenKind::Plain),
             (
-                "// Offset 0x00..0x08 (Shared 64-byte line)",
+                "// Offset 0x00..0x08 (Shared 128B Apple Silicon line)",
                 TokenKind::Comment,
             ),
         ],
@@ -1374,7 +1374,7 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
             ("AtomicUsize", TokenKind::Type),
             (", ", TokenKind::Plain),
             (
-                "// Offset 0x08..0x10 (Shared 64-byte line)",
+                "// Offset 0x08..0x10 (Shared 128B Apple Silicon line)",
                 TokenKind::Comment,
             ),
         ],
@@ -1385,10 +1385,10 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
             TokenKind::Comment,
         )],
         vec![(
-            "// Fix: Hardware cache-line padding (64 bytes on ARM64/x86_64)",
+            "// Fix: Hardware cache-line padding (128 bytes on Apple Silicon)",
             TokenKind::Comment,
         )],
-        vec![("#[repr(align(64))]", TokenKind::Keyword)],
+        vec![("#[repr(align(128))]", TokenKind::Keyword)],
         vec![
             ("pub struct ", TokenKind::Keyword),
             ("CachePadded", TokenKind::Type),
@@ -1412,12 +1412,12 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
             spawn_math_formula(
                 side,
                 fonts,
-                "/// CACHE LINE CONTENTION (64 BYTES) ///",
+                "/// CACHE LINE CONTENTION (128 BYTES) ///",
                 &[
                     ("read_idx [0x00] ", P5_WHITE),
                     ("| ", P5_MUTED),
                     ("write_idx [0x08] ", P5_WHITE),
-                    ("(SAME 64B LINE!)", P5_RED),
+                    ("(SAME 128B LINE!)", P5_RED),
                 ],
             );
             spawn_math_formula(
@@ -1425,9 +1425,9 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
                 fonts,
                 "/// PADDED HARDWARE ISOLATION ///",
                 &[
-                    ("#[repr(align(64))] ", P5_CYAN),
+                    ("#[repr(align(128))] ", P5_CYAN),
                     ("⟹ ", P5_MUTED),
-                    ("Isolated MESI Lines", P5_WHITE),
+                    ("128B Offset in ASM (#128)", P5_WHITE),
                 ],
             );
             spawn_callout_card(
@@ -1436,7 +1436,7 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
                 CalloutCard {
                     icon: "!",
                     title: "FALSE SHARING",
-                    text: "Because read_idx and write_idx share a 64-byte line, writing by a producer invalidates the L1 cache of the consumer, destroying throughput.",
+                    text: "On Apple Silicon, L1 cache lines are 128 bytes. Because read_idx and write_idx sit 8 bytes apart, producer writes continuously invalidate the consumer's L1 cache line.",
                     is_alert: true,
                 },
             );
@@ -1450,39 +1450,54 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
 pub fn spawn_branchless_index_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
-            "// Slow: Modulo division instruction (div / idiv takes 10-30 cycles)",
+            "// Ken's branchless index computation (Paving Lock Freedom Part 2):",
+            TokenKind::Comment,
+        )],
+        vec![
+            ("let idx = self.read_idx.", TokenKind::Plain),
+            ("load", TokenKind::Function),
+            ("(Ordering::Acquire);", TokenKind::Plain),
+        ],
+        vec![
+            ("let mcb = (self.capacity + 1).", TokenKind::Plain),
+            ("next_power_of_two", TokenKind::Function),
+            ("();", TokenKind::Plain),
+        ],
+        vec![
+            ("let i = idx & (mcb - 1); ", TokenKind::Plain),
+            ("// Mask lower bits for counter", TokenKind::Comment),
+        ],
+        vec![("", TokenKind::Plain)],
+        vec![(
+            "// Save condition to 0 or 1 without branching:",
             TokenKind::Comment,
         )],
         vec![
             (
-                "let next_idx = (idx + 1) % self.capacity; ",
+                "let at_capacity = (i + 1 >= self.capacity) as ",
                 TokenKind::Plain,
             ),
-            ("// Expensive branch", TokenKind::Comment),
+            ("usize", TokenKind::Type),
+            (";", TokenKind::Plain),
         ],
         vec![("", TokenKind::Plain)],
         vec![(
-            "// Fast: Power-of-two bitwise masking (Single CPU clock cycle!)",
+            "// at_capacity=0 => 0.wrapping_sub(1) = usize::MAX, passes idx + 1",
             TokenKind::Comment,
         )],
         vec![(
-            "// Precondition: capacity must be a power of two (e.g. 1024, 4096)",
+            "// at_capacity=1 => 1.wrapping_sub(1) = 0, zeroes idx & flips lap bit:",
             TokenKind::Comment,
         )],
-        vec![("let mask = self.capacity - 1;", TokenKind::Plain)],
-        vec![("", TokenKind::Plain)],
         vec![
-            ("let slot_idx = idx & mask;           ", TokenKind::Plain),
-            ("// Direct array mapping", TokenKind::Comment),
+            ("let new_idx = ((idx + 1) & at_capacity.", TokenKind::Plain),
+            ("wrapping_sub", TokenKind::Function),
+            ("(1))", TokenKind::Plain),
         ],
-        vec![
-            ("let next_idx = (idx + 1) & mask;     ", TokenKind::Plain),
-            ("// Zero-branch wrap", TokenKind::Comment),
-        ],
-        vec![
-            ("let lap_gen  = idx & !mask;          ", TokenKind::Plain),
-            ("// Cycle generation", TokenKind::Comment),
-        ],
+        vec![(
+            "    | (at_capacity * ((idx & mcb) ^ mcb));",
+            TokenKind::Plain,
+        )],
     ];
 
     spawn_slide_scaffold(
@@ -1491,38 +1506,36 @@ pub fn spawn_branchless_index_slide(mut commands: Commands, font_assets: Res<Fon
         SlideState::BranchlessIndex,
         "/// EXHIBIT L // INSTRUCTION TUNING ///",
         "BRANCHLESS COMPUTATION",
-        "branchless_mask.rs",
+        "branchless_index.rs",
         "RUST // ZERO BRANCHES",
         code_lines,
         |side, fonts| {
             spawn_math_formula(
                 side,
                 fonts,
-                "/// MODULO DIVISION (10-30 CYCLES) ///",
+                "/// BRANCHLESS MASK: wrapping_sub(1) ///",
                 &[
-                    ("next_idx ", P5_MUTED),
-                    ("= ", P5_MUTED),
-                    ("(idx + 1) mod capacity (DIV/IDIV)", P5_RED),
+                    ("at_cap=0: 0 - 1 = ", P5_MUTED),
+                    ("usize::MAX", P5_CYAN),
+                    (" ⟹ idx + 1", P5_WHITE),
                 ],
             );
             spawn_math_formula(
                 side,
                 fonts,
-                "/// BITWISE MASKING (1 CLOCK CYCLE) ///",
+                "/// LAP BIT FLIP: at_capacity=1 ///",
                 &[
-                    ("slot_idx ", P5_CYAN),
-                    ("= ", P5_MUTED),
-                    ("idx & (capacity - 1)", P5_WHITE),
+                    ("1 - 1 = 0 ⟹ ", P5_MUTED),
+                    ("0 | ((idx & mcb) ^ mcb)", P5_GOLD),
                 ],
             );
             spawn_math_formula(
                 side,
                 fonts,
-                "/// GENERATIONAL LAP EXTRACTION ///",
+                "/// UNCONDITIONAL EVALUATION ///",
                 &[
-                    ("lap_gen  ", P5_GOLD),
-                    ("= ", P5_MUTED),
-                    ("idx & !(capacity - 1)", P5_WHITE),
+                    ("Identical ALU Op: ", P5_MUTED),
+                    ("1 Cycle (No Jump)", P5_WHITE),
                 ],
             );
             spawn_callout_card(
@@ -1530,8 +1543,8 @@ pub fn spawn_branchless_index_slide(mut commands: Commands, font_assets: Res<Fon
                 fonts,
                 CalloutCard {
                     icon: "⚡",
-                    title: "PIPELINE EFFICIENCY",
-                    text: "Branchless wrapping prevents CPU branch predictor misses and pipeline stalls in the hot path, maximizing instruction throughput.",
+                    title: "PURE ARITHMETIC WRAPPING",
+                    text: "Replaces `if i + 1 >= capacity` with wrapping arithmetic bitmasks. The CPU pipeline executes identical instructions whether wrapping or incrementing, eliminating branch mispredictions.",
                     is_alert: false,
                 },
             );
@@ -1811,10 +1824,10 @@ pub fn spawn_backoffs_slide(mut commands: Commands, font_assets: Res<FontAssets>
             spawn_math_formula(
                 side,
                 fonts,
-                "/// STABILIZED TAIL LATENCY ///",
+                "/// BUS STORM RELIEF ///",
                 &[
-                    ("With Exponential Backoff: ", P5_MUTED),
-                    ("< 1,000 ns (p99)", P5_WHITE),
+                    ("With Backoff: ", P5_MUTED),
+                    ("Matches Crossbeam Queue", P5_WHITE),
                 ],
             );
             spawn_callout_card(
@@ -1823,7 +1836,7 @@ pub fn spawn_backoffs_slide(mut commands: Commands, font_assets: Res<FontAssets>
                 CalloutCard {
                     icon: "★",
                     title: "BUS STORM RELIEF",
-                    text: "Spinning aggressively saturates the L1/L2 memory bus interconnect. Backoff throttles atomic retry frequency, bringing down tail latency outliers.",
+                    text: "Spinning aggressively saturates the memory bus. Backoff throttles atomic retry frequency and matches Crossbeam's benchmark performance, though preemption tail latency remains unbounded.",
                     is_alert: false,
                 },
             );
