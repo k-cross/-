@@ -61,6 +61,7 @@ pub(super) struct Lab<'a> {
     pub(super) scale: Option<f64>,
     pub(super) admit: Option<AdmitArg>,
     pub(super) enforce: super::EnforceArgs,
+    pub(super) fault: Option<super::FaultPlan>,
 }
 
 pub(super) fn scored_fetch() -> Arm {
@@ -117,6 +118,7 @@ impl<'a> Lab<'a> {
             scale: None,
             admit: None,
             enforce: super::EnforceArgs::OFF,
+            fault: None,
         }
     }
 
@@ -160,6 +162,7 @@ impl<'a> Lab<'a> {
             fleet,
             enforce,
             lag_ns: dist.one_way_ns(),
+            fault: self.fault,
         }
     }
 
@@ -214,18 +217,21 @@ impl<'a> Lab<'a> {
                 engine_cache: false,
                 ..p3
             };
-            let sc = self.scenario(
-                dist,
-                ledger,
-                BeliefArgs::OFF,
-                InfluenceArgs::OFF,
-                trace,
-                super::EnforceArgs {
-                    batch: self.enforce.batch,
-                    ..super::EnforceArgs::OFF
-                },
-                false,
-            );
+            let sc = Scenario {
+                fault: None,
+                ..self.scenario(
+                    dist,
+                    ledger,
+                    BeliefArgs::OFF,
+                    InfluenceArgs::OFF,
+                    trace,
+                    super::EnforceArgs {
+                        batch: self.enforce.batch,
+                        ..super::EnforceArgs::OFF
+                    },
+                    false,
+                )
+            };
             let run = distributed_run(&scored_fetch(), &topo, self.memory, &sc);
             self.grants.insert(key.clone(), run.mach.kv_mean());
         }

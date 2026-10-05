@@ -4,6 +4,10 @@ use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::boundary::Cost as Crossing;
 use crate::cache::{CellState, Cost, Hierarchy, NodeMemory, Policy};
 use crate::engine::{Batching, Engine, MAX_BATCH, MODEL_COUNT, Model, PrefillLoad};
+use crate::fault::{
+    Client, Degrade, EngineCrash, Estimators, Fate, Fault, FaultStats, NodeLoss, Observe, Rebuild,
+    Restart, Spill, Subscriber,
+};
 use crate::fleet::{Costs, Fleet, FleetView, PlannerKind, Role, moves_between, retarget};
 use crate::flow::FlowHint;
 use crate::foresight::Foresight;
@@ -18,6 +22,8 @@ use crate::work::{
     Agent, Authority, Gang, Origin, Origins, Pattern, Request, RequestView, Slo, ToolCall,
     WEIGHT_BYTES, WEIGHT_NS, model_of,
 };
+use crate::writes::{Counted, Writes};
+use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -284,6 +290,132 @@ pub struct Machine {
     last_home: usize,
     hint_grade: HintGrade,
     learner: FlowLearner,
+    counted: Counted,
+    count_events: bool,
+    armed: bool,
+    gang_parts: Vec<Part>,
+    gangs: Vec<GangFlight>,
+    orphans: Vec<Part>,
+    retry_gangs: Vec<GangRetry>,
+    down_until: u64,
+    known: Option<Known>,
+    unknown_reads: Cell<u64>,
+    observe: Observe,
+    pending_lengths: Vec<PendingLength>,
+    shadow: Option<Shadow>,
+    node_check: bool,
+    snapshot_every_ns: Option<u64>,
+    next_snapshot_ns: u64,
+    snapshot: Option<EstimatorState>,
+    refused_ids: HashSet<usize>,
+    decode_out: Vec<u64>,
+    lost: Vec<Option<u64>>,
+    limbo: Vec<Limbo>,
+    copy_durable: bool,
+    durable_copies: HashMap<BlobId, u64>,
+    lost_durable: Vec<BlobId>,
+    degraded: Option<Degraded>,
+    pub fault_stats: FaultStats,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Degraded {
+    until_ns: u64,
+    placement: Placement,
+    flow_aware: bool,
+    state_transfer: bool,
+}
+
+#[derive(Clone, Debug)]
+struct Limbo {
+    release_ns: u64,
+    parked_ns: u64,
+    waiting: Waiting,
+}
+
+#[derive(Debug)]
+struct Shadow {
+    until_ns: u64,
+    reserved: Vec<Reservations>,
+    load: Vec<BinaryHeap<Reverse<u64>>>,
+    seqs: HashMap<(usize, u64), u64>,
+}
+
+#[derive(Clone, Debug)]
+struct EstimatorState {
+    lengths: [Lengths; 2],
+    observed: [(u64, u64); 2],
+    root_lengths: HashMap<u32, Lengths>,
+    root_observed: HashMap<u32, (u64, u64)>,
+    learner: FlowLearner,
+    attained: HashMap<u64, u64>,
+    taken_ns: u64,
+}
+
+impl EstimatorState {
+    fn bytes(&self) -> u64 {
+        let histograms: u64 = self
+            .lengths
+            .iter()
+            .chain(self.root_lengths.values())
+            .map(Lengths::bytes)
+            .sum();
+        let templates: usize = self
+            .learner
+            .template
+            .values()
+            .map(|chain| size_of::<BlobId>() + chain.len() * size_of::<(BlobId, BlobMeta)>())
+            .sum();
+        let entries = size_of_val(&self.observed)
+            + self.root_lengths.len() * size_of::<u32>()
+            + self.root_observed.len() * size_of::<(u32, (u64, u64))>()
+            + self.attained.len() * size_of::<(u64, u64)>()
+            + self.learner.seen.len() * size_of::<(BlobId, (u64, u64))>()
+            + self.learner.task_fn.len() * size_of::<(u64, (BlobId, usize))>()
+            + templates;
+        histograms + entries as u64
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Part {
+    node: usize,
+    handles: Handles,
+    req: Request,
+}
+
+#[derive(Clone, Debug)]
+struct GangFlight {
+    id: usize,
+    seq: u64,
+    arrival_ns: u64,
+    req: Request,
+    cost: Cost,
+    end_ns: u64,
+    parts: Vec<Part>,
+}
+
+#[derive(Clone, Debug)]
+struct GangRetry {
+    id: usize,
+    seq: u64,
+    arrival_ns: u64,
+    req: Request,
+}
+
+#[derive(Clone, Debug)]
+struct Known {
+    until_ns: u64,
+    sets: Vec<HashSet<BlobId>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingLength {
+    end_ns: u64,
+    node: usize,
+    slo: usize,
+    tokens: u64,
+    root: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,7 +449,7 @@ pub struct LearnStats {
     pub calls: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct FlowLearner {
     seen: HashMap<BlobId, (u64, u64)>,
     task_fn: HashMap<u64, (BlobId, usize)>,
@@ -418,6 +550,7 @@ pub enum Victim {
 struct Handles {
     cache_seq: Option<u64>,
     resv_seq: Option<u64>,
+    belief_hold: Option<u64>,
     start_ns: u64,
     end_ns: u64,
 }
@@ -443,6 +576,7 @@ struct Flight {
     arrival_ns: u64,
     req: Request,
     cost: Cost,
+    pre_crash: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -478,6 +612,7 @@ struct Waiting {
     pre_ns: u64,
     decide_ns: u64,
     requeued: bool,
+    not_before: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -719,6 +854,652 @@ impl Machine {
             last_home: 0,
             hint_grade: HintGrade::Declared,
             learner: FlowLearner::default(),
+            counted: Counted::default(),
+            count_events: false,
+            armed: false,
+            gang_parts: Vec::new(),
+            gangs: Vec::new(),
+            orphans: Vec::new(),
+            retry_gangs: Vec::new(),
+            down_until: 0,
+            known: None,
+            unknown_reads: Cell::new(0),
+            observe: Observe::Dispatch,
+            pending_lengths: Vec::new(),
+            shadow: None,
+            node_check: false,
+            snapshot_every_ns: None,
+            next_snapshot_ns: 0,
+            snapshot: None,
+            refused_ids: HashSet::new(),
+            decode_out: vec![0; n_domains],
+            lost: vec![None; n_domains],
+            limbo: Vec::new(),
+            copy_durable: false,
+            durable_copies: HashMap::new(),
+            lost_durable: Vec::new(),
+            degraded: None,
+            fault_stats: FaultStats::default(),
+        }
+    }
+
+    pub fn set_copy_durable(&mut self, on: bool) {
+        self.copy_durable = on;
+    }
+
+    pub fn set_node_check(&mut self, on: bool) {
+        self.node_check = on;
+    }
+
+    pub fn set_snapshot_every(&mut self, every_ns: Option<u64>) {
+        self.snapshot_every_ns = every_ns;
+        self.next_snapshot_ns = every_ns.unwrap_or(0);
+    }
+
+    fn take_snapshot(&mut self) {
+        let state = EstimatorState {
+            lengths: self.lengths.clone(),
+            observed: self.observed,
+            root_lengths: self.root_lengths.clone(),
+            root_observed: self.root_observed.clone(),
+            learner: self.learner.clone(),
+            attained: self.attained.clone(),
+            taken_ns: self.arrival_ns,
+        };
+        self.counted.snapshots += 1;
+        self.counted.snapshot_bytes += state.bytes();
+        self.snapshot = Some(state);
+    }
+
+    fn restore_snapshot(&mut self) -> bool {
+        let Some(state) = self.snapshot.clone() else {
+            return false;
+        };
+        self.fault_stats.snapshot_restores += 1;
+        self.fault_stats.snapshot_age_ns += self.arrival_ns - state.taken_ns;
+        self.lengths = state.lengths;
+        self.observed = state.observed;
+        self.root_lengths = state.root_lengths;
+        self.root_observed = state.root_observed;
+        self.attained = state.attained;
+        self.learner = FlowLearner {
+            gate: self.learner.gate,
+            stats: self.learner.stats,
+            ..state.learner
+        };
+        true
+    }
+
+    fn blind_ledger(&mut self, restart: Restart) {
+        let now = self.arrival_ns;
+        for flight in &mut self.flights {
+            flight.pre_crash = true;
+        }
+        self.fault_stats.hidden_flights += (self.flights.len() + self.orphans.len()) as u64;
+        self.fault_stats.hidden_holders += self
+            .reserved
+            .iter()
+            .map(Reservations::holders)
+            .sum::<usize>() as u64;
+        let n = self.domains.len();
+        self.shadow = Some(Shadow {
+            until_ns: match restart.ledger {
+                Rebuild::After { after_ns } => now + restart.outage_ns + after_ns,
+                Rebuild::Now | Rebuild::Never => u64::MAX,
+            },
+            reserved: (0..n).map(|_| Reservations::default()).collect(),
+            load: vec![BinaryHeap::new(); n],
+            seqs: HashMap::new(),
+        });
+    }
+
+    fn shadow_load(&self, d: usize) -> Option<usize> {
+        self.shadow.as_ref().map(|s| s.load[d].len())
+    }
+
+    fn note_blind_admission(
+        &mut self,
+        home: usize,
+        req: &Request,
+        blocks: &[(BlobId, BlobMeta)],
+        extra: u64,
+    ) {
+        self.fault_stats.blind_admissions += 1;
+        let capacity = self.domains[home]
+            .kv_partition()
+            .map_or(u64::MAX, |(c, _)| c);
+        if !self.reserved[home].admits_claim(capacity, req, (blocks, extra), None) {
+            self.fault_stats.over_admissions += 1;
+        }
+    }
+
+    fn node_accepts(&self, d: usize, req: &Request) -> bool {
+        !(self.node_check && self.shadow.is_some()) || self.node_admits(d, req)
+    }
+
+    fn node_admits(&self, d: usize, req: &Request) -> bool {
+        let Some((capacity, _)) = self.domains[d].kv_partition().filter(|_| req.tokens > 0) else {
+            return true;
+        };
+        let (blocks, extra) = self.claim(req);
+        self.reserved[d].admits_claim(capacity, req, (&blocks, extra), None)
+    }
+
+    fn refuse_at_node(&mut self, req: &Request, arrival: Arrival) -> Submitted {
+        let id = arrival.id.unwrap_or_else(|| self.new_request());
+        self.fault_stats.refusal_attempts += 1;
+        if self.refused_ids.insert(id) {
+            self.fault_stats.refused_at_node += 1;
+        }
+        self.router_queue.push(Waiting {
+            id,
+            seq: arrival.seq,
+            req: req.clone(),
+            arrival_ns: arrival.at_ns,
+            queued_ns: self.arrival_ns,
+            pre_ns: 0,
+            decide_ns: 0,
+            requeued: true,
+            not_before: self.arrival_ns + 1,
+        });
+        Submitted::Open(id)
+    }
+
+    pub fn set_armed(&mut self, on: bool) {
+        self.armed = on;
+    }
+
+    pub fn set_observe(&mut self, observe: Observe) {
+        self.observe = observe;
+    }
+
+    #[must_use]
+    pub fn unknown_reads(&self) -> u64 {
+        self.unknown_reads.get()
+    }
+
+    #[must_use]
+    pub fn is_down(&self) -> bool {
+        self.arrival_ns < self.down_until
+    }
+
+    pub fn inject(&mut self, fault: Fault) {
+        match fault {
+            Fault::Scheduler(restart) => self.restart_scheduler(restart),
+            Fault::Estimators => self.reset_estimators(),
+            Fault::Engine(crash) => self.crash_engine(crash),
+            Fault::Node(loss) => self.lose_node(loss),
+            Fault::Degrade(degrade) => self.degrade_routing(degrade),
+        }
+    }
+
+    #[must_use]
+    pub fn lost_durable(&self) -> &[BlobId] {
+        &self.lost_durable
+    }
+
+    fn degrade_routing(&mut self, degrade: Degrade) {
+        if self.degraded.is_none() {
+            self.degraded = Some(Degraded {
+                until_ns: self.arrival_ns + degrade.for_ns,
+                placement: self.placement,
+                flow_aware: self.flow_aware,
+                state_transfer: self.state_transfer,
+            });
+        }
+        self.fault_stats.degraded += 1;
+        self.placement = Placement::Sticky;
+        self.flow_aware = false;
+        self.state_transfer = false;
+    }
+
+    fn crash_engine(&mut self, crash: EngineCrash) {
+        let node = crash.node;
+        self.fault_stats.engine_crashes += 1;
+        self.fail_node_streams(node, crash.client);
+        self.fault_stats.kv_lost +=
+            self.domains[node].crash_engine(crash.spill == Spill::Kept) as u64;
+        self.forget_engine(node);
+        self.decode_out[node] = self.arrival_ns + crash.restart_ns;
+        self.observe_emit(node);
+    }
+
+    fn lose_node(&mut self, loss: NodeLoss) {
+        let node = loss.node;
+        self.fault_stats.nodes_lost += 1;
+        self.fail_node_streams(node, loss.client);
+        let gone = self.domains[node].lose_node();
+        self.fault_stats.kv_lost += gone.kv_blocks as u64;
+        self.fault_stats.host_lost += gone.host_blobs as u64;
+        for (id, _) in gone.durable {
+            if self.durable_copies.contains_key(&id) {
+                self.fault_stats.durable_saved += 1;
+            } else {
+                self.lost_durable.push(id);
+                self.fault_stats.durable_lost_with_node += 1;
+            }
+        }
+        self.forget_engine(node);
+        self.lost[node] = Some(self.arrival_ns + loss.declare_ns);
+        self.observe_emit(node);
+    }
+
+    fn fail_node_streams(&mut self, node: usize, client: Client) {
+        let (hit, kept): (Vec<Flight>, Vec<Flight>) = std::mem::take(&mut self.flights)
+            .into_iter()
+            .partition(|f| f.node == node);
+        self.flights = kept;
+        for flight in hit {
+            self.fail_flight(&flight, client);
+        }
+        let (hit, kept): (Vec<GangFlight>, Vec<GangFlight>) = std::mem::take(&mut self.gangs)
+            .into_iter()
+            .partition(|g| g.parts.iter().any(|p| p.node == node));
+        self.gangs = kept;
+        for gang in hit {
+            self.fail_gang(gang);
+        }
+        let (hit, kept): (Vec<Part>, Vec<Part>) = std::mem::take(&mut self.orphans)
+            .into_iter()
+            .partition(|p| p.node == node);
+        self.orphans = kept;
+        for part in &hit {
+            self.fail_part(part);
+        }
+        self.unqueue_engine(node);
+    }
+
+    fn forget_engine(&mut self, node: usize) {
+        self.engines[node].flush();
+        self.reserved[node].clear();
+        self.redispatched[node].clear();
+        self.pending_lengths.retain(|p| p.node != node);
+        if let Some(known) = self.known.as_mut() {
+            known.sets[node].clear();
+        }
+    }
+
+    fn park_for_lease(&mut self, req: &Request, arrival: Arrival, release_ns: u64) -> Submitted {
+        let id = arrival.id.unwrap_or_else(|| self.new_request());
+        self.fault_stats.limbo_requests += 1;
+        self.limbo.push(Limbo {
+            release_ns,
+            parked_ns: self.arrival_ns,
+            waiting: Waiting {
+                id,
+                seq: arrival.seq,
+                req: req.clone(),
+                arrival_ns: arrival.at_ns,
+                queued_ns: self.arrival_ns,
+                pre_ns: 0,
+                decide_ns: 0,
+                requeued: true,
+                not_before: 0,
+            },
+        });
+        Submitted::Open(id)
+    }
+
+    fn declare_lost_nodes(&mut self, now: u64) {
+        for d in 0..self.lost.len() {
+            if self.lost[d].is_some_and(|at| at <= now) && self.active.len() > 1 {
+                self.active.retain(|&a| a != d);
+            }
+        }
+        let (due, rest): (Vec<Limbo>, Vec<Limbo>) = std::mem::take(&mut self.limbo)
+            .into_iter()
+            .partition(|l| l.release_ns <= now);
+        self.limbo = rest;
+        for parked in due {
+            self.fault_stats.limbo_wait_ns += now - parked.parked_ns;
+            self.router_queue.push(parked.waiting);
+        }
+    }
+
+    fn restart_scheduler(&mut self, restart: Restart) {
+        let now = self.arrival_ns;
+        self.fault_stats.restarts += 1;
+        self.fault_stats.router_held += self.router_queue.len() as u64;
+        if restart.fate == Fate::Shared {
+            for flight in std::mem::take(&mut self.flights) {
+                self.fail_flight(&flight, restart.client);
+            }
+            for gang in std::mem::take(&mut self.gangs) {
+                self.fail_gang(gang);
+            }
+            for part in std::mem::take(&mut self.orphans) {
+                self.fail_part(&part);
+            }
+            self.unqueue_engines();
+        } else {
+            self.fault_stats.held_through += (self.flights.len()
+                + self.orphans.len()
+                + self.gangs.iter().map(|g| g.parts.len()).sum::<usize>())
+                as u64;
+        }
+        self.lose_owned_soft();
+        match restart.estimators {
+            Estimators::Kept => {}
+            Estimators::Lost => self.reset_estimators(),
+            Estimators::Snapshot => {
+                if !self.restore_snapshot() {
+                    self.reset_estimators();
+                }
+            }
+        }
+        if restart.fate == Fate::Held && restart.ledger != Rebuild::Now {
+            self.blind_ledger(restart);
+        }
+        let blank = || vec![HashSet::new(); self.domains.len()];
+        self.known = match restart.subscriber {
+            Subscriber::Warm => None,
+            Subscriber::Cold => Some(Known {
+                until_ns: u64::MAX,
+                sets: blank(),
+            }),
+            Subscriber::Snapshot { after_ns } => Some(Known {
+                until_ns: now + restart.outage_ns + after_ns,
+                sets: blank(),
+            }),
+        };
+        self.down_until = now + restart.outage_ns;
+    }
+
+    fn fail_flight(&mut self, flight: &Flight, client: Client) {
+        let (decoded, progress) = self.abort_flight(flight);
+        self.fault_stats.streams_aborted += 1;
+        let resubmitted = match client {
+            Client::Continue => {
+                self.fault_stats.kept_tokens += decoded;
+                self.continuation(&flight.req, decoded)
+            }
+            Client::Restart => {
+                let span = flight.handles.end_ns - flight.handles.start_ns;
+                self.fault_stats.lost_decode_ns += (span as f64 * progress) as u64;
+                flight.req.clone()
+            }
+        };
+        self.aborted_requests.insert(flight.id);
+        self.router_queue.push(Waiting {
+            id: flight.id,
+            seq: flight.seq,
+            req: resubmitted,
+            arrival_ns: flight.arrival_ns,
+            queued_ns: self.arrival_ns,
+            pre_ns: 0,
+            decide_ns: 0,
+            requeued: true,
+            not_before: 0,
+        });
+    }
+
+    fn fail_part(&mut self, part: &Part) {
+        let (_, progress) = self.abort_held(part.node, part.handles, &part.req);
+        let span = part.handles.end_ns - part.handles.start_ns;
+        self.fault_stats.streams_aborted += 1;
+        self.fault_stats.lost_decode_ns += (span as f64 * progress) as u64;
+    }
+
+    fn fail_gang(&mut self, gang: GangFlight) {
+        self.fault_stats.gangs_aborted += 1;
+        for part in &gang.parts {
+            self.fail_part(part);
+        }
+        self.retry_gangs.push(GangRetry {
+            id: gang.id,
+            seq: gang.seq,
+            arrival_ns: gang.arrival_ns,
+            req: gang.req,
+        });
+    }
+
+    fn unqueue_engines(&mut self) {
+        for d in 0..self.engine_queues.len() {
+            self.unqueue_engine(d);
+        }
+    }
+
+    fn unqueue_engine(&mut self, d: usize) {
+        for mut waiting in std::mem::take(&mut self.engine_queues[d]) {
+            self.fault_stats.moved_from_engine += 1;
+            waiting.pre_ns = 0;
+            waiting.decide_ns = 0;
+            waiting.queued_ns = self.arrival_ns;
+            self.router_queue.push(waiting);
+        }
+    }
+
+    fn lose_owned_soft(&mut self) {
+        self.upstream.clear();
+        self.landing.clear();
+        self.prefill_ready.clear();
+        self.buckets.clear();
+        self.tenant_flight.clear();
+        self.cancelled.clear();
+    }
+
+    fn reset_estimators(&mut self) {
+        self.fault_stats.estimator_resets += 1;
+        self.lengths = [Lengths::default(), Lengths::default()];
+        self.observed = [(0, 0); 2];
+        self.root_lengths.clear();
+        self.root_observed.clear();
+        self.learner = FlowLearner {
+            gate: self.learner.gate,
+            stats: self.learner.stats,
+            ..FlowLearner::default()
+        };
+        self.attained.clear();
+        self.completions.clear();
+        self.fleet_view = FleetView::default();
+        if let Some(planner) = self.planner.as_mut() {
+            planner.accrued_ns = 0.0;
+        }
+    }
+
+    fn fault_tick(&mut self, now: u64) {
+        self.declare_lost_nodes(now);
+        if let Some(saved) = self.degraded.filter(|d| d.until_ns <= now) {
+            self.placement = saved.placement;
+            self.flow_aware = saved.flow_aware;
+            self.state_transfer = saved.state_transfer;
+            self.degraded = None;
+        }
+        if self.known.as_ref().is_some_and(|k| k.until_ns <= now) {
+            self.known = None;
+        }
+        if let Some(every) = self.snapshot_every_ns
+            && now >= self.next_snapshot_ns
+            && !self.is_down()
+        {
+            self.take_snapshot();
+            self.next_snapshot_ns = now + every;
+        }
+        let hidden = self.flights.iter().any(|f| f.pre_crash);
+        if let Some(shadow) = self.shadow.as_mut() {
+            if shadow.until_ns <= now || !hidden {
+                self.shadow = None;
+                for flight in &mut self.flights {
+                    flight.pre_crash = false;
+                }
+            } else {
+                for ledger in &mut shadow.reserved {
+                    ledger.release(now);
+                }
+                for ends in &mut shadow.load {
+                    while ends.peek().is_some_and(|&Reverse(e)| e <= now) {
+                        ends.pop();
+                    }
+                }
+            }
+        }
+    }
+
+    fn known_filter(&self, d: usize, id: &BlobId, kind: BlobKind) -> bool {
+        let Some(known) = &self.known else {
+            return true;
+        };
+        if kind != BlobKind::KvBlock {
+            return true;
+        }
+        let seen = known.sets[d].contains(id);
+        if !seen && self.domains[d].is_hot(id, kind) {
+            self.unknown_reads.set(self.unknown_reads.get() + 1);
+        }
+        seen
+    }
+
+    fn drain_lengths(&mut self) {
+        if self.pending_lengths.is_empty() {
+            return;
+        }
+        let now = self.arrival_ns;
+        let (due, rest): (Vec<PendingLength>, Vec<PendingLength>) =
+            std::mem::take(&mut self.pending_lengths)
+                .into_iter()
+                .partition(|p| p.end_ns <= now);
+        self.pending_lengths = rest;
+        for p in due {
+            self.record_length(p.slo, p.tokens, p.root);
+        }
+    }
+
+    fn note_length(&mut self, home: usize, req: &Request, after_ns: u64) {
+        match self.observe {
+            Observe::Dispatch => self.record_length(req.slo.idx(), req.tokens, req.root),
+            Observe::Completion => self.pending_lengths.push(PendingLength {
+                end_ns: self.arrival_ns + after_ns,
+                node: home,
+                slo: req.slo.idx(),
+                tokens: req.tokens,
+                root: req.root,
+            }),
+        }
+    }
+
+    fn settle_gang(
+        &mut self,
+        req: &Request,
+        cost: Cost,
+        seq: u64,
+        arrival_ns: u64,
+        id: Option<usize>,
+    ) -> Submitted {
+        let parts = std::mem::take(&mut self.gang_parts);
+        if self.armed && cost.pending {
+            self.orphans.extend(parts);
+            return Submitted::Closed(cost);
+        }
+        if !self.armed || parts.is_empty() {
+            return Submitted::Closed(cost);
+        }
+        let id = id.unwrap_or_else(|| self.new_request());
+        let end_ns = parts
+            .iter()
+            .map(|p| p.handles.end_ns)
+            .max()
+            .unwrap_or(arrival_ns);
+        self.gangs.push(GangFlight {
+            id,
+            seq,
+            arrival_ns,
+            req: req.clone(),
+            cost,
+            end_ns,
+            parts,
+        });
+        self.counted.flights_opened += 1;
+        Submitted::Open(id)
+    }
+
+    fn serve_gang_retries(&mut self) {
+        for retry in std::mem::take(&mut self.retry_gangs) {
+            let Some(gang) = retry.req.gang.as_ref() else {
+                continue;
+            };
+            let mut cost = self.serve_gang(&retry.req, gang);
+            cost.queue_ns += self.arrival_ns.saturating_sub(retry.arrival_ns);
+            if let Submitted::Closed(done) = self.settle_gang(
+                &retry.req,
+                cost,
+                retry.seq,
+                retry.arrival_ns,
+                Some(retry.id),
+            ) {
+                self.closed.push((retry.id, done));
+            }
+        }
+    }
+
+    pub fn set_count_events(&mut self, on: bool) {
+        self.count_events = on;
+        if on && self.observer.is_none() {
+            self.record_kv_events(true);
+        }
+    }
+
+    #[must_use]
+    pub fn writes(&self) -> Writes {
+        let (commits, releases) = self
+            .reserved
+            .iter()
+            .map(Reservations::writes)
+            .fold((0, 0), |(c, r), (dc, dr)| (c + dc, r + dr));
+        let owned = [BlobKind::Snapshot, BlobKind::ServiceHeap];
+        let (mut admissions, mut evictions, mut weight_loads) = (0, 0, 0);
+        for h in &self.domains {
+            let evicted = h.evicted();
+            admissions += owned.iter().map(|k| h.misses[k.idx()]).sum::<u64>();
+            evictions += owned.iter().map(|k| evicted[k.idx()]).sum::<u64>();
+            weight_loads += h.misses[BlobKind::WeightShard.idx()];
+        }
+        Writes {
+            decisions: self.decisions,
+            dispatches: self.dispatches,
+            reservations_committed: commits,
+            reservations_released: releases,
+            flights_opened: self.counted.flights_opened,
+            flights_closed: self.counted.flights_closed,
+            queue_enqueued: self.queue_waits.queued,
+            queue_served: self.counted.router_served,
+            engine_enqueued: self.engine_waits.queued,
+            engine_started: self.counted.engine_started,
+            cancels: self.cancel_stats.cancels,
+            refusals: self.refused_by_router.iter().sum(),
+            flow_graph: self.counted.flow_graph,
+            fanouts_staged: self.fanouts_admitted + self.fanouts_refused,
+            host_admissions: admissions,
+            host_evictions: evictions,
+            weight_loads,
+            length_observations: self.counted.length_observations,
+            snapshots: self.counted.snapshots,
+            snapshot_bytes: self.counted.snapshot_bytes,
+            planner_moves: self
+                .fleet
+                .as_ref()
+                .map_or(0, |f| f.stats.moves.len() as u64),
+            kv_events: self.counted.kv_events,
+        }
+    }
+
+    fn flow_put(&mut self, task: u64, sources: Vec<(usize, u64)>) {
+        self.upstream.insert(task, sources);
+        self.counted.flow_graph += 1;
+    }
+
+    fn flow_take(&mut self, task: u64) -> Option<Vec<(usize, u64)>> {
+        let taken = self.upstream.remove(&task);
+        self.counted.flow_graph += u64::from(taken.is_some());
+        taken
+    }
+
+    fn drain_event_counts(&mut self) {
+        if !self.count_events || self.observer.is_some() || self.instruments.reuse.is_some() {
+            return;
+        }
+        for d in 0..self.domains.len() {
+            let events = self.domains[d].take_kv_events();
+            self.counted.count_events(&events);
         }
     }
 
@@ -800,6 +1581,15 @@ impl Machine {
             .and_then(|sources| sources.first())
             .map(|&(d, _)| d);
         let d = anchor.unwrap_or(fallback);
+        let d = if self.lost[d].is_some() {
+            self.active
+                .iter()
+                .copied()
+                .find(|&a| self.lost[a].is_none())
+                .unwrap_or(d)
+        } else {
+            d
+        };
         self.domains[d].set_pattern(pattern);
         let c = self.domains[d].access(&[cell]);
         c.recompute_ns + c.transfer_ns
@@ -820,19 +1610,27 @@ impl Machine {
         any
     }
 
-    pub fn mark_durable(&mut self, id: BlobId) {
+    fn copy_out(&mut self, id: BlobId, bytes: u64) {
+        if self.copy_durable && self.durable_copies.insert(id, bytes).is_none() {
+            self.fault_stats.durable_copied_bytes += bytes;
+        }
+    }
+
+    pub fn mark_durable(&mut self, id: BlobId, bytes: u64) {
+        self.copy_out(id, bytes);
         for h in &mut self.domains {
             h.mark_durable(id);
         }
     }
 
     pub fn forget_flow(&mut self, task: u64) {
-        self.upstream.remove(&task);
+        self.flow_take(task);
         self.landing.remove(&task);
         self.prefill_ready.remove(&task);
     }
 
     pub fn release_durable(&mut self, id: &BlobId) {
+        self.durable_copies.remove(id);
         for h in &mut self.domains {
             h.release_durable(id);
         }
@@ -905,7 +1703,12 @@ impl Machine {
         let mut any = 0;
         for &d in &self.active {
             let h = &self.domains[d];
-            lead = lead.max(chain.partition_point(|(id, m)| h.is_hot(id, m.kind)));
+            lead = lead.max(
+                chain
+                    .iter()
+                    .take_while(|(id, m)| h.is_hot(id, m.kind))
+                    .count(),
+            );
             any = any.max(chain.iter().filter(|(id, m)| h.is_hot(id, m.kind)).count());
         }
         (lead, any)
@@ -984,7 +1787,10 @@ impl Machine {
     }
 
     fn tracks_flights(&self) -> bool {
-        self.cancel != CancelMode::Off || self.departures.is_some() || self.track_stream
+        self.cancel != CancelMode::Off
+            || self.departures.is_some()
+            || self.track_stream
+            || self.armed
     }
 
     pub fn set_cancel(&mut self, cancel: CancelMode, victim: Victim) {
@@ -1016,6 +1822,9 @@ impl Machine {
         while self.engine_queues.iter().any(|q| !q.is_empty())
             || !self.router_queue.is_empty()
             || !self.flights.is_empty()
+            || !self.gangs.is_empty()
+            || !self.retry_gangs.is_empty()
+            || !self.limbo.is_empty()
         {
             steps += 1;
             assert!(
@@ -1720,7 +2529,11 @@ impl Machine {
         }
         let staged = staged.then(|| (&self.staged[d], self.staged_kv[d]));
         let (blocks, extra) = self.claim(req);
-        self.reserved[d].admits_claim(capacity, req, (&blocks, extra), staged)
+        let ledger = self
+            .shadow
+            .as_ref()
+            .map_or(&self.reserved[d], |s| &s.reserved[d]);
+        ledger.admits_claim(capacity, req, (&blocks, extra), staged)
     }
 
     fn router_ever_admits(&self, d: usize, req: &Request) -> bool {
@@ -1939,6 +2752,13 @@ impl Machine {
     }
 
     fn observe_dispatch(&mut self, d: usize, req: &Request) {
+        if let Some(known) = self.known.as_mut() {
+            for (id, meta) in req.chain.iter().chain(&req.produces) {
+                if meta.kind == BlobKind::KvBlock {
+                    known.sets[d].insert(*id);
+                }
+            }
+        }
         if self.observer.is_none() || !self.domains[d].engine_cache() {
             return;
         }
@@ -2324,7 +3144,31 @@ impl Machine {
         }
     }
 
-    fn observe_pin(&mut self, d: usize, req: &Request, until: u64) {
+    fn hold_claim(
+        &mut self,
+        home: usize,
+        req: &Request,
+        until: Option<u64>,
+    ) -> (Option<u64>, Option<u64>) {
+        match until {
+            Some(end) if self.domains[home].engine_cache() => {
+                let (blocks, extra) = self.claim(req);
+                if self.shadow.is_some() {
+                    self.note_blind_admission(home, req, &blocks, extra);
+                }
+                let seq = self.reserved[home].commit(&blocks, extra, end);
+                if let Some(shadow) = self.shadow.as_mut() {
+                    let blind = shadow.reserved[home].commit(&blocks, extra, end);
+                    shadow.seqs.insert((home, seq), blind);
+                    shadow.load[home].push(Reverse(end));
+                }
+                (Some(seq), self.observe_pin(home, req, end))
+            }
+            _ => (None, None),
+        }
+    }
+
+    fn observe_pin(&mut self, d: usize, req: &Request, until: u64) -> Option<u64> {
         let ids: Vec<BlobId> = req
             .chain
             .iter()
@@ -2332,9 +3176,7 @@ impl Machine {
             .filter(|(_, m)| m.kind == BlobKind::KvBlock)
             .map(|(id, _)| *id)
             .collect();
-        if let Some(o) = self.observer.as_mut() {
-            o.pin(d, ids, until);
-        }
+        self.observer.as_mut().map(|o| o.pin(d, ids, until))
     }
 
     fn observe_arrival(&mut self, now: u64) {
@@ -2358,6 +3200,9 @@ impl Machine {
             return;
         }
         let events: Vec<KvEvent> = self.domains[d].take_kv_events();
+        if self.count_events {
+            self.counted.count_events(&events);
+        }
         let now = self.arrival_ns;
         if let Some(r) = self.instruments.reuse.as_mut() {
             r.events(d, now, &events);
@@ -2481,19 +3326,22 @@ impl Machine {
 
     fn believes_resident(&self, d: usize, id: &BlobId, kind: BlobKind) -> bool {
         self.staged[d].contains(id)
-            || match self.control {
-                Control::Gossip { .. } if !self.sees_belief(d, kind) => self.view[d].contains(id),
-                Control::Gossip { .. } | Control::Unified | Control::Query => {
-                    let seen = self.telemetry(d).resident(id, kind);
-                    debug_assert!(
-                        self.exact_belief_agrees(d, kind, || {
-                            seen == self.domains[d].is_hot(id, kind)
-                        }),
-                        "an exact belief must read the truth"
-                    );
-                    seen
+            || self.known_filter(d, id, kind)
+                && match self.control {
+                    Control::Gossip { .. } if !self.sees_belief(d, kind) => {
+                        self.view[d].contains(id)
+                    }
+                    Control::Gossip { .. } | Control::Unified | Control::Query => {
+                        let seen = self.telemetry(d).resident(id, kind);
+                        debug_assert!(
+                            self.exact_belief_agrees(d, kind, || {
+                                seen == self.domains[d].is_hot(id, kind)
+                            }),
+                            "an exact belief must read the truth"
+                        );
+                        seen
+                    }
                 }
-            }
     }
 
     fn exact_belief_agrees(&self, d: usize, kind: BlobKind, check: impl Fn() -> bool) -> bool {
@@ -2505,17 +3353,19 @@ impl Machine {
     }
 
     fn believes_held(&self, p: usize, id: &BlobId, kind: BlobKind) -> bool {
-        match self.control {
-            Control::Gossip { .. } if !self.sees_belief(p, kind) => self.view[p].contains(id),
-            Control::Gossip { .. } | Control::Unified | Control::Query => {
-                let seen = self.telemetry(p).held(id, kind);
-                debug_assert!(
-                    self.exact_belief_agrees(p, kind, || seen == self.domains[p].holds(id, kind)),
-                    "an exact belief must read the truth"
-                );
-                seen
+        self.known_filter(p, id, kind)
+            && match self.control {
+                Control::Gossip { .. } if !self.sees_belief(p, kind) => self.view[p].contains(id),
+                Control::Gossip { .. } | Control::Unified | Control::Query => {
+                    let seen = self.telemetry(p).held(id, kind);
+                    debug_assert!(
+                        self.exact_belief_agrees(p, kind, || seen
+                            == self.domains[p].holds(id, kind)),
+                        "an exact belief must read the truth"
+                    );
+                    seen
+                }
             }
-        }
     }
 
     fn ground_truth_holds(&self, p: usize, id: &BlobId, kind: BlobKind) -> bool {
@@ -2566,11 +3416,7 @@ impl Machine {
     }
 
     fn decode_pool_len(&self) -> usize {
-        let n = self
-            .active
-            .iter()
-            .filter(|&&d| self.domains[d].can_decode())
-            .count();
+        let n = self.active.iter().filter(|&&d| self.decodes_now(d)).count();
         if n == 0 { self.active.len() } else { n }
     }
 
@@ -2579,13 +3425,17 @@ impl Machine {
             .active
             .iter()
             .copied()
-            .filter(|&d| self.domains[d].can_decode())
+            .filter(|&d| self.decodes_now(d))
             .collect();
         if pool.is_empty() {
             self.active.clone()
         } else {
             pool
         }
+    }
+
+    fn decodes_now(&self, d: usize) -> bool {
+        self.domains[d].can_decode() && self.decode_out[d] <= self.arrival_ns
     }
 
     fn needs_decode(req: &Request) -> bool {
@@ -2935,9 +3785,10 @@ impl Machine {
     ) -> Terms {
         let plan = self.plan(d, req, view);
         let tele = match view {
-            View::Belief => self
-                .telemetry(d)
-                .with_load(self.observed_by(d).and_then(|o| o.reported_load(d))),
+            View::Belief => self.telemetry(d).with_load(
+                self.shadow_load(d)
+                    .or_else(|| self.observed_by(d).and_then(|o| o.reported_load(d))),
+            ),
             View::Truth => self.telemetry_in(d, view),
         };
         let tele = tele.with_model(if self.priced_models || view == View::Truth {
@@ -3424,6 +4275,9 @@ impl Machine {
             self.arrival_ns += self.interval_ns;
         }
         let now = self.arrival_ns;
+        self.fault_tick(now);
+        self.drain_lengths();
+        self.drain_event_counts();
         for (h, r) in self.domains.iter_mut().zip(&mut self.reserved) {
             h.release(now);
             r.release(now);
@@ -3496,7 +4350,8 @@ impl Machine {
             });
         }
         if let Some(gang) = &req.gang {
-            return Submitted::Closed(self.serve_gang(req, gang));
+            let cost = self.serve_gang(req, gang);
+            return self.settle_gang(req, cost, seq, self.arrival_ns, None);
         }
         let decode_needed = Self::needs_decode(req);
         self.record_demand(model_of(&req.requires), req.tokens);
@@ -3555,6 +4410,7 @@ impl Machine {
             pre_ns: 0,
             decide_ns: 0,
             requeued: false,
+            not_before: 0,
         });
         self.queue_waits.max_depth = self.queue_waits.max_depth.max(self.router_queue.len());
     }
@@ -3582,9 +4438,15 @@ impl Machine {
     }
 
     fn serve_router_queue(&mut self) {
+        if self.is_down() {
+            return;
+        }
+        self.serve_gang_retries();
         self.accrue_attained();
-        while let Some(head) =
-            (0..self.router_queue.len()).min_by_key(|&i| self.queue_key(&self.router_queue[i]))
+        let now = self.arrival_ns;
+        while let Some(head) = (0..self.router_queue.len())
+            .filter(|&i| self.router_queue[i].not_before <= now)
+            .min_by_key(|&i| self.queue_key(&self.router_queue[i]))
         {
             let req = &self.router_queue[head].req;
             let candidates = self.eligible(self.decode_pool(), req);
@@ -3605,6 +4467,7 @@ impl Machine {
                 abort_ns = self.engines[node].step_base_ns();
             }
             let waiting = self.router_queue.remove(head);
+            self.counted.router_served += 1;
             if !waiting.requeued {
                 let slo = waiting.req.slo.idx();
                 self.queue_waits.waited[slo] += 1;
@@ -3661,7 +4524,8 @@ impl Machine {
         } else {
             match flow.first() {
                 Some(&(d, _))
-                    if (!decode_needed || self.domains[d].can_decode())
+                    if (!decode_needed || self.decodes_now(d))
+                        && self.lost[d].is_none_or(|at| at > self.arrival_ns)
                         && (self.queue == Queue::Off || self.router_admits(d, req, false)) =>
                 {
                     d
@@ -3678,6 +4542,12 @@ impl Machine {
                 *self.tenant_refused.entry(t).or_insert(0) += 1;
             }
             return Submitted::Closed(Self::unplaced());
+        }
+        if let Some(declared) = self.lost[home].filter(|&at| at > self.arrival_ns) {
+            return self.park_for_lease(req, arrival, declared);
+        }
+        if !self.node_accepts(home, req) {
+            return self.refuse_at_node(req, arrival);
         }
 
         if self.placement == Placement::Aware
@@ -3696,12 +4566,11 @@ impl Machine {
 
         if let Some(hint) = &req.hint {
             let recorded = self.tool_anchor.unwrap_or(home);
-            self.upstream
-                .insert(hint.task, vec![(recorded, hint.payload_bytes)]);
+            self.flow_put(hint.task, vec![(recorded, hint.payload_bytes)]);
         }
         let sources = req
             .completes
-            .and_then(|t| self.upstream.remove(&t))
+            .and_then(|t| self.flow_take(t))
             .unwrap_or_default();
         let handoff = self.collect(home, &sources);
         let reached = self.reach(home, req, decode_needed);
@@ -3761,6 +4630,7 @@ impl Machine {
                 pre_ns,
                 decide_ns,
                 requeued: false,
+                not_before: 0,
             },
         );
         Err(id)
@@ -3842,7 +4712,7 @@ impl Machine {
                 if let Some(i) = self.next_startable(d) {
                     let waiting = self.engine_queues[d].remove(i);
                     self.start_waiting(d, &waiting);
-                } else if !self.cancel_for_engine(d) {
+                } else if self.is_down() || !self.cancel_for_engine(d) {
                     break;
                 }
             }
@@ -3887,7 +4757,9 @@ impl Machine {
             arrival_ns: arrival.at_ns,
             req: req.clone(),
             cost,
+            pre_crash: false,
         });
+        self.counted.flights_opened += 1;
         Submitted::Open(id)
     }
 
@@ -3900,6 +4772,7 @@ impl Machine {
                 continue;
             }
             let flight = self.flights.swap_remove(at);
+            self.counted.flights_closed += 1;
             if self.queue == Queue::Plas && self.cancel != CancelMode::Off {
                 *self.attained.entry(flight.req.program).or_insert(0) += flight.cost.exec_ns;
             }
@@ -3909,6 +4782,17 @@ impl Machine {
                 self.closed.push((flight.id, flight.cost));
             }
         }
+        let mut at = 0;
+        while at < self.gangs.len() {
+            if self.gangs[at].end_ns > now {
+                at += 1;
+                continue;
+            }
+            let gang = self.gangs.swap_remove(at);
+            self.counted.flights_closed += 1;
+            self.closed.push((gang.id, gang.cost));
+        }
+        self.orphans.retain(|p| p.handles.end_ns > now);
     }
 
     fn depart_flights(&mut self) {
@@ -3931,6 +4815,7 @@ impl Machine {
                 continue;
             }
             let flight = self.flights.swap_remove(at);
+            self.counted.flights_closed += 1;
             self.departure_stats.aborted += 1;
             self.departure_stats.freed_ns += flight.handles.end_ns - now;
             self.abort_flight(&flight);
@@ -3974,7 +4859,10 @@ impl Machine {
         let mut victims: Vec<usize> = (0..self.flights.len())
             .filter(|&i| {
                 let f = &self.flights[i];
-                f.node == node && f.handles.end_ns > now && self.is_victim_for(head, f)
+                f.node == node
+                    && f.handles.end_ns > now
+                    && !f.pre_crash
+                    && self.is_victim_for(head, f)
             })
             .collect();
         match self.victim {
@@ -3997,21 +4885,43 @@ impl Machine {
     }
 
     fn abort_flight(&mut self, flight: &Flight) -> (u64, f64) {
-        let node = flight.node;
-        if let Some(seq) = flight.handles.resv_seq {
+        self.abort_held(flight.node, flight.handles, &flight.req)
+    }
+
+    fn abort_held(&mut self, node: usize, handles: Handles, req: &Request) -> (u64, f64) {
+        if let Some(seq) = handles.resv_seq {
             self.cancel_stats.freed_bytes += self.reserved[node].cancel(seq);
+            if let Some(shadow) = self.shadow.as_mut() {
+                if let Some(blind) = shadow.seqs.remove(&(node, seq)) {
+                    shadow.reserved[node].cancel(blind);
+                }
+                let mut ends = std::mem::take(&mut shadow.load[node]).into_vec();
+                if let Some(i) = ends.iter().position(|Reverse(e)| *e == handles.end_ns) {
+                    ends.swap_remove(i);
+                }
+                shadow.load[node] = BinaryHeap::from(ends);
+            }
         }
-        if let Some(seq) = flight.handles.cache_seq {
+        if let Some(seq) = handles.cache_seq {
             self.domains[node].abort_seq(seq);
         }
-        self.engines[node].cancel_inflight(flight.handles.end_ns, model_of(&flight.req.requires));
-        let progress = flight.handles.progress(self.arrival_ns);
-        let decoded = (flight.req.tokens as f64 * progress) as u64;
-        let written = self.written_blocks(&flight.req, decoded);
-        let unwritten: Vec<BlobId> = flight.req.produces[written..]
+        if let Some(seq) = handles.belief_hold
+            && let Some(o) = self.observer.as_mut()
+        {
+            o.unpin(node, seq);
+        }
+        if let Some(i) = self
+            .pending_lengths
             .iter()
-            .map(|(id, _)| *id)
-            .collect();
+            .position(|p| p.node == node && p.end_ns == handles.end_ns && p.tokens == req.tokens)
+        {
+            self.pending_lengths.remove(i);
+        }
+        self.engines[node].cancel_inflight(handles.end_ns, model_of(&req.requires));
+        let progress = handles.progress(self.arrival_ns);
+        let decoded = (req.tokens as f64 * progress) as u64;
+        let written = self.written_blocks(req, decoded);
+        let unwritten: Vec<BlobId> = req.produces[written..].iter().map(|(id, _)| *id).collect();
         self.domains[node].kv_drop_unpinned(&unwritten);
         (decoded, progress)
     }
@@ -4060,6 +4970,7 @@ impl Machine {
             pre_ns: 0,
             decide_ns: 0,
             requeued: true,
+            not_before: 0,
         });
         self.queue_waits.max_depth = self.queue_waits.max_depth.max(self.router_queue.len());
     }
@@ -4131,6 +5042,7 @@ impl Machine {
     }
 
     fn start_waiting(&mut self, home: usize, waiting: &Waiting) {
+        self.counted.engine_started += 1;
         let waited = self.arrival_ns - waiting.arrival_ns;
         let slo = waiting.req.slo.idx();
         self.engine_waits.waited[slo] += 1;
@@ -4271,7 +5183,7 @@ impl Machine {
             self.dispatches += 1;
             let (exec, queue) = self.execute(home, req);
             if req.tokens > 0 && !resubmitted {
-                self.observe_length(req);
+                self.note_length(home, req, queue + exec);
             }
             if req.tokens > 0 && self.queue == Queue::Plas && self.cancel == CancelMode::Off {
                 let end = self.arrival_ns + queue + exec;
@@ -4300,18 +5212,12 @@ impl Machine {
                 }
             }
         }
-        let mut resv_seq = None;
-        if let Some(end) = until
-            && self.domains[home].engine_cache()
-        {
-            let (blocks, extra) = self.claim(req);
-            resv_seq = Some(self.reserved[home].commit(&blocks, extra, end));
-            self.observe_pin(home, req, end);
-        }
+        let (resv_seq, belief_hold) = self.hold_claim(home, req, until);
         let cache_seq = self.domains[home].seal(until);
         self.handles = until.map(|end| Handles {
             cache_seq,
             resv_seq,
+            belief_hold,
             start_ns: end - cost.exec_ns,
             end_ns: end,
         });
@@ -4324,19 +5230,17 @@ impl Machine {
         cost
     }
 
-    fn observe_length(&mut self, req: &Request) {
-        let seen = &mut self.observed[req.slo.idx()];
-        seen.0 += req.tokens;
+    fn record_length(&mut self, slo: usize, tokens: u64, root: u32) {
+        self.counted.length_observations += 1;
+        let seen = &mut self.observed[slo];
+        seen.0 += tokens;
         seen.1 += 1;
-        self.lengths[req.slo.idx()].record(req.tokens);
+        self.lengths[slo].record(tokens);
         if self.claim_key == ClaimKey::Root {
-            let by_root = self.root_observed.entry(req.root).or_insert((0, 0));
-            by_root.0 += req.tokens;
+            let by_root = self.root_observed.entry(root).or_insert((0, 0));
+            by_root.0 += tokens;
             by_root.1 += 1;
-            self.root_lengths
-                .entry(req.root)
-                .or_default()
-                .record(req.tokens);
+            self.root_lengths.entry(root).or_default().record(tokens);
         }
     }
 
@@ -4347,6 +5251,7 @@ impl Machine {
         let until = self.arrival_ns + duration_ns;
         for &(id, meta) in &req.chain {
             self.domains[home].lease(id, meta.kind, until);
+            self.copy_out(id, meta.bytes);
             self.domains[home].mark_durable(id);
         }
     }
@@ -4463,6 +5368,7 @@ impl Machine {
     }
 
     fn serve_gang(&mut self, req: &Request, gang: &Gang) -> Cost {
+        self.gang_parts.clear();
         self.deciding = Pattern::MultiAgent;
         let n = gang.agents.len().max(1);
         for a in &gang.agents {
@@ -4478,7 +5384,7 @@ impl Machine {
         };
         let dispatch: Vec<(usize, u64)> = req
             .completes
-            .and_then(|t| self.upstream.remove(&t))
+            .and_then(|t| self.flow_take(t))
             .unwrap_or_default()
             .into_iter()
             .map(|(d, payload)| (d, payload / n as u64))
@@ -4537,7 +5443,7 @@ impl Machine {
             if cost.pending {
                 self.cancelled.insert(hint.task);
             } else {
-                self.upstream.insert(hint.task, results);
+                self.flow_put(hint.task, results);
             }
         }
         cost.transfer_ns += worst.transfer_ns;
@@ -4615,7 +5521,8 @@ impl Machine {
 
     fn place_agent(&mut self, probe: &Request, flow: &[(usize, u64)]) -> Option<(usize, Need)> {
         let seen = self.view_of(probe);
-        let eligible = self.eligible(self.decode_pool(), probe);
+        let mut eligible = self.eligible(self.decode_pool(), probe);
+        eligible.retain(|&d| self.lost[d].is_none());
         if eligible.is_empty()
             && let Some(fleet) = self.fleet.as_mut()
         {
@@ -4626,7 +5533,8 @@ impl Machine {
             .filter_map(|&d| {
                 let need = self.plan(d, &seen, View::Belief).need;
                 (self.telemetry(d).could_admit(&need, &self.staged_bytes[d])
-                    && self.router_admits(d, probe, true))
+                    && self.router_admits(d, probe, true)
+                    && self.node_accepts(d, probe))
                 .then_some((d, need))
             })
             .collect();
@@ -4697,6 +5605,15 @@ impl Machine {
         dispatch: &[(usize, u64)],
     ) -> Cost {
         let mut cost = self.run_here(d, probe);
+        if self.armed
+            && let Some(handles) = self.handles.take()
+        {
+            self.gang_parts.push(Part {
+                node: d,
+                handles,
+                req: probe.clone(),
+            });
+        }
         if cost.pending {
             return cost;
         }
@@ -4715,7 +5632,12 @@ impl Machine {
     fn run_tool(&mut self, caller: usize, tool: &ToolCall) -> Cost {
         let probe = Self::tool_request(tool);
         let flow = [(caller, tool.payload_bytes), (caller, tool.payload_bytes)];
-        let candidates = self.active.clone();
+        let candidates: Vec<usize> = self
+            .active
+            .iter()
+            .copied()
+            .filter(|&d| self.lost[d].is_none())
+            .collect();
 
         let scored = if self.placement == Placement::Scored || !self.flow_aware {
             candidates.len()
@@ -5322,6 +6244,7 @@ mod tests {
             pre_ns: 0,
             decide_ns: 0,
             requeued: false,
+            not_before: 0,
         }
     }
 
@@ -7618,5 +8541,634 @@ mod tests {
         let refused: u64 = mach.tenant_refused.values().sum();
         assert!(refused > 50, "{refused}");
         assert!(costs.iter().any(|c| !c.contains("pending: true")));
+    }
+
+    fn flush_counts(mach: &mut Machine) {
+        let now = mach.now_ns();
+        mach.advance_to(now + 1_000_000_000_000);
+    }
+
+    #[test]
+    fn counting_kv_events_changes_no_cost_and_balances_against_what_each_tier_holds() {
+        let trace = single_trace(21, 3_000, 0.5);
+        let mut plain = cancelling_machine(MILD, Queue::Slo, CancelMode::Continue, EngineWait::Off);
+        let (plain_costs, _) = submit_all(&mut plain, &trace);
+        let mut counting =
+            cancelling_machine(MILD, Queue::Slo, CancelMode::Continue, EngineWait::Off);
+        counting.set_count_events(true);
+        let (counted_costs, _) = submit_all(&mut counting, &trace);
+        flush_counts(&mut counting);
+        assert_eq!(format!("{plain_costs:?}"), format!("{counted_costs:?}"));
+        assert_eq!(plain.writes().kv_total(), 0);
+        let writes = counting.writes();
+        assert!(writes.kv_total() > 0);
+        for (slot, medium) in [Medium::Gpu, Medium::Cpu, Medium::Storage]
+            .into_iter()
+            .enumerate()
+        {
+            let held: usize = counting
+                .domains
+                .iter()
+                .map(|h| h.kv_ids(medium).len())
+                .sum();
+            assert_eq!(
+                writes.kv_events[slot] - writes.kv_events[3 + slot],
+                held as u64,
+                "{medium:?}: stores less removals is what the tier holds"
+            );
+        }
+    }
+
+    #[test]
+    fn every_reservation_is_released_and_every_flight_ends_closed_or_cancelled() {
+        let trace = single_trace(20, 3_000, 0.5);
+        let mut mach = cancelling_machine(MILD, Queue::Slo, CancelMode::Continue, EngineWait::Off);
+        submit_all(&mut mach, &trace);
+        flush_counts(&mut mach);
+        let writes = mach.writes();
+        assert!(writes.reservations_committed > 0);
+        assert_eq!(writes.reservations_committed, writes.reservations_released);
+        assert!(writes.cancels > 0);
+        assert_eq!(
+            writes.flights_opened,
+            writes.flights_closed + writes.cancels
+        );
+        assert!(writes.queue_served >= writes.queue_enqueued);
+    }
+
+    #[test]
+    fn a_machine_that_enforces_nothing_writes_no_reservation_flight_or_queue_entry() {
+        let trace = decode_trace(3, 1_500);
+        let mut mach = engine_machine(4 << 30, MILD, Control::Unified);
+        mach.set_arrival_rate(250.0);
+        let _ = submit_all(&mut mach, &trace);
+        let writes = mach.writes();
+        assert_eq!(writes.reservations_committed + writes.flights_opened, 0);
+        assert_eq!(
+            writes.queue_enqueued + writes.engine_enqueued + writes.cancels,
+            0
+        );
+        assert_eq!(writes.decisions, mach.decisions);
+        assert!(writes.flow_graph > 0 && writes.length_observations > 0);
+        assert!(writes.owned() >= writes.decisions + writes.dispatches);
+    }
+
+    #[test]
+    fn the_flow_graph_counts_each_insert_and_each_removal_that_finds_something() {
+        let mut mach = engine_machine(4 << 30, MILD, Control::Unified);
+        mach.flow_put(7, vec![(0, 10)]);
+        mach.flow_put(8, vec![(1, 10)]);
+        assert!(mach.flow_take(7).is_some());
+        assert!(mach.flow_take(7).is_none());
+        mach.forget_flow(8);
+        mach.forget_flow(9);
+        assert_eq!(mach.writes().flow_graph, 4);
+    }
+
+    fn armed_machine() -> Machine {
+        let mut mach = queued_machine(MILD, Queue::Slo);
+        mach.set_armed(true);
+        mach
+    }
+
+    fn restart(fate: Fate, client: Client, outage_ns: u64, subscriber: Subscriber) -> Fault {
+        Fault::Scheduler(Restart {
+            fate,
+            client,
+            outage_ns,
+            subscriber,
+            estimators: Estimators::Kept,
+            ledger: Rebuild::Now,
+        })
+    }
+
+    fn submit_until_busy(mach: &mut Machine, trace: &[Request]) -> (Vec<Cost>, usize) {
+        let mut costs = Vec::new();
+        for (i, req) in trace.iter().enumerate() {
+            if let Submitted::Closed(cost) = mach.submit(req) {
+                costs.push(cost);
+            }
+            costs.extend(mach.drain_closed().into_iter().map(|(_, cost)| cost));
+            if i > 200 && !mach.flights.is_empty() && !mach.gangs.is_empty() {
+                return (costs, i + 1);
+            }
+        }
+        panic!("no moment with a stream and a gang in flight");
+    }
+
+    fn submit_until(mach: &mut Machine, trace: &[Request], stop: usize) -> Vec<Cost> {
+        let mut costs = Vec::new();
+        for req in &trace[..stop] {
+            if let Submitted::Closed(cost) = mach.submit(req) {
+                costs.push(cost);
+            }
+            costs.extend(mach.drain_closed().into_iter().map(|(_, cost)| cost));
+        }
+        costs
+    }
+
+    fn drain_rest(mach: &mut Machine, trace: &[Request], from: usize) -> Vec<Cost> {
+        let mut costs = Vec::new();
+        for req in &trace[from..] {
+            if let Submitted::Closed(cost) = mach.submit(req) {
+                costs.push(cost);
+            }
+            costs.extend(mach.drain_closed().into_iter().map(|(_, cost)| cost));
+        }
+        mach.finish();
+        costs.extend(mach.drain_closed().into_iter().map(|(_, cost)| cost));
+        costs
+    }
+
+    fn sorted_debug(costs: &[Cost]) -> Vec<String> {
+        let mut out: Vec<String> = costs.iter().map(|c| format!("{c:?}")).collect();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn registering_every_decode_as_a_flight_changes_no_request() {
+        let trace = decode_trace(5, 2_500);
+        let mut plain = queued_machine(MILD, Queue::Slo);
+        let (plain_costs, _) = submit_all(&mut plain, &trace);
+        let mut armed = armed_machine();
+        let (armed_costs, opened) = submit_all(&mut armed, &trace);
+        assert!(opened > 0, "decodes stay open until they end");
+        assert_eq!(sorted_debug(&plain_costs), sorted_debug(&armed_costs));
+        assert!(armed.flights.is_empty() && armed.gangs.is_empty());
+        let writes = armed.writes();
+        assert_eq!(writes.flights_opened, writes.flights_closed);
+        assert!(writes.flights_opened > plain.writes().flights_opened);
+    }
+
+    #[test]
+    fn a_shared_restart_aborts_every_stream_and_gang_and_every_request_still_closes_once() {
+        let trace = decode_trace(5, 2_500);
+        let mut mach = armed_machine();
+        let (mut costs, stop) = submit_until_busy(&mut mach, &trace);
+        mach.inject(restart(Fate::Shared, Client::Restart, 0, Subscriber::Warm));
+        assert!(mach.flights.is_empty() && mach.gangs.is_empty());
+        let stats = mach.fault_stats.clone();
+        assert!(stats.streams_aborted > 0 && stats.gangs_aborted > 0);
+        assert!(stats.lost_decode_ns > 0);
+        let holders: usize = mach.reserved.iter().map(Reservations::holders).sum();
+        assert_eq!(holders, 0, "an aborted stream holds no reservation");
+        let pinned: u64 = mach
+            .domains
+            .iter()
+            .filter_map(crate::cache::Hierarchy::kv_partition)
+            .map(|(_, pinned)| pinned)
+            .sum();
+        assert_eq!(pinned, 0, "an aborted stream pins no block");
+        assert_eq!(mach.engines[0].load(mach.now_ns()), 0);
+        costs.extend(drain_rest(&mut mach, &trace, stop));
+        assert_eq!(costs.len(), trace.len());
+        flush_counts(&mut mach);
+        let writes = mach.writes();
+        assert_eq!(writes.reservations_committed, writes.reservations_released);
+    }
+
+    #[test]
+    fn a_held_restart_aborts_nothing_and_a_continuation_keeps_the_tokens_decoded() {
+        let trace = decode_trace(5, 2_500);
+        let mut held = armed_machine();
+        let _ = submit_until(&mut held, &trace, 1_200);
+        held.inject(restart(Fate::Held, Client::Restart, 0, Subscriber::Warm));
+        assert_eq!(held.fault_stats.streams_aborted, 0);
+        assert!(held.fault_stats.held_through > 0);
+        assert!(!held.flights.is_empty());
+
+        let mut cont = armed_machine();
+        let _ = submit_until(&mut cont, &trace, 1_200);
+        cont.inject(restart(Fate::Shared, Client::Continue, 0, Subscriber::Warm));
+        assert!(cont.fault_stats.kept_tokens > 0);
+    }
+
+    #[test]
+    fn the_router_serves_nothing_while_down_and_everything_when_it_is_back() {
+        let trace = decode_trace(5, 2_500);
+        let mut mach = armed_machine();
+        let _ = submit_until(&mut mach, &trace, 1_200);
+        let down = 2_000_000_000;
+        mach.inject(restart(
+            Fate::Shared,
+            Client::Restart,
+            down,
+            Subscriber::Warm,
+        ));
+        let held = mach.router_queue.len() + mach.retry_gangs.len();
+        assert!(held > 0);
+        let start = mach.now_ns();
+        mach.advance_to(start + down / 2);
+        assert!(mach.is_down());
+        assert_eq!(mach.router_queue.len() + mach.retry_gangs.len(), held);
+        assert!(mach.drain_closed().is_empty());
+        mach.advance_to(start + down + 1);
+        assert!(!mach.is_down());
+        assert!(mach.router_queue.len() + mach.retry_gangs.len() < held);
+    }
+
+    #[test]
+    fn an_aborted_decode_releases_the_beliefs_pin_on_its_blocks() {
+        let trace = single_trace(21, 2_000, 0.5);
+        let mut mach = armed_machine();
+        mach.set_belief(crate::belief::Conditions::exact());
+        let _ = submit_until(&mut mach, &trace, 800);
+        let pinned = |m: &Machine| {
+            m.observer().map_or(0, |o| {
+                (0..4).map(|d| o.belief(d).pinned_blocks()).sum::<usize>()
+            })
+        };
+        assert!(pinned(&mach) > 0);
+        mach.inject(restart(Fate::Shared, Client::Restart, 0, Subscriber::Warm));
+        assert_eq!(pinned(&mach), 0);
+    }
+
+    #[test]
+    fn an_estimator_reset_sends_every_claim_back_to_max_tokens() {
+        let trace = single_trace(21, 1_500, 0.5);
+        let mut mach = armed_machine();
+        mach.set_claim(Claim::Quantile {
+            q: 0.9,
+            pooled: false,
+        });
+        let _ = submit_until(&mut mach, &trace, 800);
+        let probe = trace
+            .iter()
+            .find(|r| r.tokens > 0)
+            .expect("a request that decodes");
+        let learned = mach.claimed_tokens(probe).expect("a claim");
+        assert!(learned < probe.max_tokens, "{learned} {}", probe.max_tokens);
+        mach.inject(Fault::Estimators);
+        assert_eq!(mach.claimed_tokens(probe), Some(probe.max_tokens));
+        assert_eq!(mach.fault_stats.estimator_resets, 1);
+    }
+
+    #[test]
+    fn a_length_is_observed_when_its_decode_ends_and_never_if_it_is_aborted() {
+        let trace = single_trace(22, 1_500, 0.5);
+        let mut dispatch = armed_machine();
+        let _ = submit_until(&mut dispatch, &trace, 400);
+        let mut completion = armed_machine();
+        completion.set_observe(Observe::Completion);
+        let _ = submit_until(&mut completion, &trace, 400);
+        assert!(
+            completion.writes().length_observations < dispatch.writes().length_observations,
+            "decodes in flight are not yet observed"
+        );
+        for mach in [&mut completion, &mut dispatch] {
+            flush_counts(mach);
+            flush_counts(mach);
+        }
+        assert_eq!(
+            completion.writes().length_observations,
+            dispatch.writes().length_observations
+        );
+
+        let mut aborted = armed_machine();
+        aborted.set_observe(Observe::Completion);
+        let _ = submit_until(&mut aborted, &trace, 400);
+        let before = aborted.writes().length_observations;
+        let in_flight = aborted.flights.len() as u64;
+        assert!(in_flight > 0);
+        aborted.inject(restart(Fate::Shared, Client::Continue, 0, Subscriber::Warm));
+        flush_counts(&mut aborted);
+        assert!(aborted.writes().length_observations - before < in_flight);
+    }
+
+    #[test]
+    fn a_cold_scheduler_does_not_know_residency_it_did_not_dispatch_and_a_warm_one_does() {
+        let trace = single_trace(23, 2_000, 0.5);
+        let reads = |subscriber: Subscriber| {
+            let mut mach = armed_machine();
+            let _ = submit_until(&mut mach, &trace, 1_000);
+            mach.inject(restart(Fate::Held, Client::Restart, 0, subscriber));
+            let _ = drain_rest(&mut mach, &trace, 1_000);
+            mach.unknown_reads()
+        };
+        assert_eq!(reads(Subscriber::Warm), 0);
+        assert!(reads(Subscriber::Cold) > 0);
+        assert!(
+            reads(Subscriber::Snapshot {
+                after_ns: 1_000_000_000
+            }) > 0
+        );
+    }
+
+    fn blind_restart(ledger: Rebuild) -> Fault {
+        Fault::Scheduler(Restart {
+            fate: Fate::Held,
+            client: Client::Restart,
+            outage_ns: 0,
+            subscriber: Subscriber::Warm,
+            estimators: Estimators::Kept,
+            ledger,
+        })
+    }
+
+    const BLIND_PARTITION: u64 = 200 << 20;
+
+    fn tight_machine(node_check: bool) -> Machine {
+        let mut mach = queued_machine(BLIND_PARTITION, Queue::Slo);
+        mach.set_armed(true);
+        mach.set_node_check(node_check);
+        mach
+    }
+
+    fn fill_real_ledgers(mach: &mut Machine, until_ns: u64) {
+        for d in 0..mach.domains.len() {
+            if let Some((capacity, _)) = mach.domains[d].kv_partition() {
+                mach.reserved[d].commit(&[], capacity, until_ns);
+            }
+        }
+    }
+
+    fn first_decode(trace: &[Request]) -> &Request {
+        trace
+            .iter()
+            .find(|r| r.tokens > 0 && r.chain.iter().any(|(_, m)| m.kind == BlobKind::KvBlock))
+            .expect("a decode with a KV chain")
+    }
+
+    #[test]
+    fn a_blind_ledger_admits_what_the_real_one_would_refuse_and_a_node_check_refuses_it() {
+        let trace = decode_trace(7, 3_000);
+        let mut mach = tight_machine(true);
+        let _ = submit_until(&mut mach, &trace, 300);
+        mach.inject(blind_restart(Rebuild::Never));
+        assert!(mach.fault_stats.hidden_holders > 0);
+        fill_real_ledgers(&mut mach, u64::MAX);
+        let req = first_decode(&trace);
+        assert!(
+            mach.router_admits(0, req, false),
+            "the blind ledger has room"
+        );
+        assert!(!mach.node_admits(0, req), "the node's own ledger has none");
+        let end = mach.now_ns() + 1_000_000;
+        let _ = mach.hold_claim(0, req, Some(end));
+        assert_eq!(mach.fault_stats.blind_admissions, 1);
+        assert_eq!(mach.fault_stats.over_admissions, 1);
+
+        let mut rebuilt = tight_machine(true);
+        let _ = submit_until(&mut rebuilt, &trace, 300);
+        rebuilt.inject(blind_restart(Rebuild::Now));
+        fill_real_ledgers(&mut rebuilt, u64::MAX);
+        assert!(
+            !rebuilt.router_admits(0, req, false),
+            "a rebuilt ledger sees it"
+        );
+    }
+
+    #[test]
+    fn a_refused_dispatch_returns_to_the_router_and_every_request_still_closes_once() {
+        let trace = decode_trace(7, 3_000);
+        let mut mach = tight_machine(true);
+        let mut costs = submit_until(&mut mach, &trace, 300);
+        mach.inject(blind_restart(Rebuild::Never));
+        let until = mach.now_ns() + 200_000_000;
+        fill_real_ledgers(&mut mach, until);
+        costs.extend(drain_rest(&mut mach, &trace, 300));
+        assert!(mach.fault_stats.refused_at_node > 0);
+        assert_eq!(costs.len(), trace.len());
+        assert!(mach.router_queue.is_empty() && mach.flights.is_empty());
+    }
+
+    #[test]
+    fn the_blind_view_ends_when_the_pre_restart_decodes_have_ended_or_at_its_deadline() {
+        let trace = decode_trace(7, 3_000);
+        let mut mach = tight_machine(false);
+        let _ = submit_until(&mut mach, &trace, 1_000);
+        mach.inject(blind_restart(Rebuild::Never));
+        assert!(mach.shadow.is_some());
+        flush_counts(&mut mach);
+        flush_counts(&mut mach);
+        assert!(mach.shadow.is_none());
+        assert!(mach.flights.iter().all(|f| !f.pre_crash));
+
+        let mut timed = tight_machine(false);
+        let _ = submit_until(&mut timed, &trace, 1_000);
+        timed.inject(blind_restart(Rebuild::After { after_ns: 1 }));
+        let now = timed.now_ns();
+        timed.advance_to(now + 10);
+        assert!(timed.shadow.is_none());
+    }
+
+    #[test]
+    fn a_snapshot_is_written_on_its_cadence_and_a_restart_restores_what_it_held() {
+        let trace = single_trace(21, 1_500, 0.5);
+        let mut mach = armed_machine();
+        mach.set_claim(Claim::Quantile {
+            q: 0.9,
+            pooled: false,
+        });
+        mach.set_snapshot_every(Some(500_000_000));
+        let _ = submit_until(&mut mach, &trace, 800);
+        let written = mach.writes();
+        assert!(written.snapshots >= 2 && written.snapshot_bytes > 0);
+        let probe = trace.iter().find(|r| r.tokens > 0).expect("a decode");
+        let learned = mach.claimed_tokens(probe).expect("a claim");
+        mach.inject(Fault::Scheduler(Restart {
+            fate: Fate::Held,
+            client: Client::Restart,
+            outage_ns: 0,
+            subscriber: Subscriber::Warm,
+            estimators: Estimators::Snapshot,
+            ledger: Rebuild::Now,
+        }));
+        assert_eq!(mach.fault_stats.snapshot_restores, 1);
+        assert!(mach.fault_stats.snapshot_age_ns <= 500_000_000 + 4_000_000);
+        let restored = mach.claimed_tokens(probe).expect("a claim");
+        assert!(restored < probe.max_tokens && restored.abs_diff(learned) <= learned / 2);
+        mach.inject(Fault::Scheduler(Restart {
+            fate: Fate::Held,
+            client: Client::Restart,
+            outage_ns: 0,
+            subscriber: Subscriber::Warm,
+            estimators: Estimators::Lost,
+            ledger: Rebuild::Now,
+        }));
+        assert_eq!(mach.claimed_tokens(probe), Some(probe.max_tokens));
+    }
+
+    #[test]
+    fn taking_snapshots_changes_no_cost() {
+        let trace = single_trace(21, 1_500, 0.5);
+        let mut plain = armed_machine();
+        let (plain_costs, _) = submit_all(&mut plain, &trace);
+        let mut snapped = armed_machine();
+        snapped.set_snapshot_every(Some(250_000_000));
+        let (snapped_costs, _) = submit_all(&mut snapped, &trace);
+        assert_eq!(sorted_debug(&plain_costs), sorted_debug(&snapped_costs));
+        assert_eq!(plain.writes().snapshots, 0);
+        assert!(snapped.writes().snapshots > 0);
+    }
+
+    #[test]
+    fn a_snapshot_counts_the_bytes_of_everything_a_restart_restores() {
+        let mut mach = armed_machine();
+        mach.take_snapshot();
+        let bare = mach.writes().snapshot_bytes;
+        assert!(bare > 0);
+        mach.attained.insert(1, 900);
+        mach.attained.insert(2, 5);
+        mach.learner.seen.insert(BlobId::leaf(b"f"), (3, 1));
+        mach.take_snapshot();
+        let grown = (2 * size_of::<(u64, u64)>() + size_of::<(BlobId, (u64, u64))>()) as u64;
+        assert_eq!(mach.writes().snapshot_bytes, 2 * bare + grown);
+    }
+
+    fn crash(node: usize, restart_ns: u64, spill: Spill, client: Client) -> Fault {
+        Fault::Engine(EngineCrash {
+            node,
+            restart_ns,
+            spill,
+            client,
+        })
+    }
+
+    fn lose(node: usize, declare_ns: u64, client: Client) -> Fault {
+        Fault::Node(NodeLoss {
+            node,
+            declare_ns,
+            client,
+        })
+    }
+
+    #[test]
+    fn an_engine_crash_takes_one_nodes_streams_and_kv_and_its_decoding_until_it_restarts() {
+        let trace = decode_trace(5, 2_500);
+        let mut mach = armed_machine();
+        let (mut costs, stop) = submit_until_busy(&mut mach, &trace);
+        let node = mach.flights.first().map(|f| f.node).expect("a stream");
+        let elsewhere = mach.flights.iter().filter(|f| f.node != node).count();
+        let spilled = mach.domains[node].kv_ids(Medium::Storage);
+        let restart_ns = 5_000_000_000;
+        mach.inject(crash(node, restart_ns, Spill::Kept, Client::Continue));
+        assert_eq!(mach.flights.len(), elsewhere);
+        assert!(mach.flights.iter().all(|f| f.node != node));
+        assert!(
+            mach.gangs
+                .iter()
+                .all(|g| g.parts.iter().all(|p| p.node != node))
+        );
+        assert_eq!(mach.reserved[node].holders(), 0);
+        assert_eq!(mach.domains[node].kv_ids(Medium::Gpu).len(), 0);
+        assert_eq!(mach.domains[node].kv_ids(Medium::Cpu).len(), 0);
+        assert_eq!(mach.domains[node].kv_ids(Medium::Storage), spilled);
+        assert!(mach.fault_stats.kv_lost > 0);
+        assert!(!mach.decodes_now(node) && !mach.decode_pool().contains(&node));
+        assert!(mach.active.contains(&node), "its host work runs on");
+        let now = mach.now_ns();
+        mach.advance_to(now + restart_ns + 1);
+        assert!(mach.decodes_now(node));
+        costs.extend(drain_rest(&mut mach, &trace, stop));
+        assert_eq!(costs.len(), trace.len());
+    }
+
+    #[test]
+    fn a_crash_that_loses_the_spill_loses_every_tier_and_one_that_keeps_it_loses_two() {
+        let trace = decode_trace(5, 2_500);
+        let lost = |spill: Spill| {
+            let mut mach = armed_machine();
+            let _ = submit_until(&mut mach, &trace, 1_800);
+            let node = 0;
+            let before = mach.domains[node].kv_ids(Medium::Storage).len();
+            mach.inject(crash(node, 1, spill, Client::Restart));
+            (
+                before,
+                mach.domains[node].kv_ids(Medium::Storage).len(),
+                mach.fault_stats.kv_lost,
+            )
+        };
+        let (before, kept_after, kept_lost) = lost(Spill::Kept);
+        let (_, lost_after, lost_lost) = lost(Spill::Lost);
+        assert_eq!(kept_after, before);
+        assert_eq!(lost_after, 0);
+        assert_eq!(lost_lost, kept_lost + before as u64);
+    }
+
+    #[test]
+    fn a_lost_node_parks_what_is_placed_on_it_until_it_is_declared_and_then_leaves_placement() {
+        let trace = decode_trace(5, 3_000);
+        let mut mach = armed_machine();
+        let mut costs = submit_until(&mut mach, &trace, 600);
+        let declare_ns = 3_000_000_000;
+        mach.inject(lose(0, declare_ns, Client::Continue));
+        assert!(
+            mach.active.contains(&0),
+            "still placed on until it is declared"
+        );
+        assert_eq!(mach.domains[0].kv_ids(Medium::Gpu).len(), 0);
+        costs.extend(drain_rest(&mut mach, &trace, 600));
+        assert_eq!(costs.len(), trace.len(), "every request closes once");
+        assert!(
+            mach.fault_stats.limbo_requests > 0,
+            "{:?}",
+            mach.fault_stats
+        );
+        assert!(mach.fault_stats.limbo_wait_ns > 0);
+        assert!(!mach.active.contains(&0));
+        assert!(mach.limbo.is_empty());
+    }
+
+    #[test]
+    fn a_node_declared_at_once_is_never_parked_on() {
+        let trace = decode_trace(5, 3_000);
+        let mut mach = armed_machine();
+        let mut costs = submit_until(&mut mach, &trace, 600);
+        mach.inject(lose(0, 0, Client::Continue));
+        costs.extend(drain_rest(&mut mach, &trace, 600));
+        assert_eq!(costs.len(), trace.len());
+        assert_eq!(mach.fault_stats.limbo_requests, 0);
+        assert!(!mach.active.contains(&0));
+    }
+
+    #[test]
+    fn losing_a_node_counts_its_durable_cells_and_a_copy_made_when_they_were_marked_saves_them() {
+        let cell = (
+            BlobId::leaf(b"sandbox"),
+            BlobMeta {
+                kind: BlobKind::Snapshot,
+                bytes: 32 << 20,
+                parent: None,
+                recompute_ns: 1,
+            },
+        );
+        for copy in [false, true] {
+            let mut mach = armed_machine();
+            mach.set_copy_durable(copy);
+            let _ = mach.domains[1].access(&[cell]);
+            mach.mark_durable(cell.0, cell.1.bytes);
+            mach.inject(lose(1, 0, Client::Restart));
+            let stats = &mach.fault_stats;
+            assert_eq!(stats.durable_lost_with_node, u64::from(!copy));
+            assert_eq!(stats.durable_saved, u64::from(copy));
+            assert_eq!(stats.durable_copied_bytes, if copy { 32 << 20 } else { 0 });
+            assert_eq!(mach.durable_lost(), 0, "a lost node is not a dropped cell");
+        }
+    }
+
+    #[test]
+    fn a_degraded_router_places_by_hash_for_its_window_and_aborts_nothing() {
+        let trace = decode_trace(5, 2_500);
+        let mut mach = armed_machine();
+        let before = (mach.placement, mach.flow_aware, mach.state_transfer);
+        let mut costs = submit_until(&mut mach, &trace, 800);
+        let streams = mach.flights.len();
+        mach.inject(Fault::Degrade(Degrade {
+            for_ns: 2_000_000_000,
+        }));
+        assert_eq!(mach.placement, Placement::Sticky);
+        assert!(!mach.flow_aware && !mach.state_transfer);
+        assert_eq!(mach.flights.len(), streams);
+        assert_eq!(mach.fault_stats.streams_aborted, 0);
+        let now = mach.now_ns();
+        mach.advance_to(now + 2_000_000_001);
+        assert_eq!(
+            (mach.placement, mach.flow_aware, mach.state_transfer),
+            before
+        );
+        costs.extend(drain_rest(&mut mach, &trace, 800));
+        assert_eq!(costs.len(), trace.len());
     }
 }

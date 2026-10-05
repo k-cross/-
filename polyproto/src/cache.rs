@@ -325,6 +325,15 @@ impl TierPool {
         self.durable_ids.contains(id)
     }
 
+    pub fn durable_ids(&self) -> impl Iterator<Item = &BlobId> + '_ {
+        self.durable_ids.iter()
+    }
+
+    #[must_use]
+    pub fn bytes_of(&self, id: &BlobId) -> Option<u64> {
+        self.entries.get(id).map(|e| e.meta.bytes)
+    }
+
     #[must_use]
     pub fn is_leased(&self, id: &BlobId) -> bool {
         self.entries.get(id).is_some_and(|e| e.leases > 0)
@@ -1099,6 +1108,13 @@ pub struct Hierarchy {
     pub leases_taken: u64,
     pub lease_breaks: u64,
     pub durable_lost: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct LostNode {
+    pub kv_blocks: usize,
+    pub host_blobs: usize,
+    pub durable: Vec<(BlobId, u64)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2406,6 +2422,66 @@ impl Hierarchy {
             }
         }
         (hot, cold)
+    }
+
+    pub fn crash_engine(&mut self, keep_spill: bool) -> usize {
+        let Some(kv) = self.kv.as_mut() else {
+            return 0;
+        };
+        let gpu: Vec<BlobId> = kv.gpu.ids().collect();
+        let cpu: Vec<BlobId> = kv.offload.ids().collect();
+        let spill: Vec<BlobId> = kv.spill.ids().collect();
+        kv.gpu.drain();
+        kv.offload.drain();
+        if !keep_spill {
+            kv.spill.drain();
+        }
+        if let Some(log) = kv.events.as_mut() {
+            if keep_spill {
+                log.extend(gpu.iter().map(|&id| KvEvent::Removed {
+                    id,
+                    medium: Medium::Gpu,
+                }));
+                log.extend(cpu.iter().map(|&id| KvEvent::Removed {
+                    id,
+                    medium: Medium::Cpu,
+                }));
+            } else {
+                log.push(KvEvent::Cleared);
+            }
+        }
+        gpu.len() + cpu.len() + if keep_spill { 0 } else { spill.len() }
+    }
+
+    #[must_use]
+    pub fn blob_bytes(&self, id: &BlobId) -> Option<u64> {
+        [&self.hbm, &self.ddr, &self.nvme]
+            .into_iter()
+            .find_map(|pool| pool.bytes_of(id))
+    }
+
+    #[must_use]
+    pub fn durable_cells(&self) -> Vec<(BlobId, u64)> {
+        let mut cells: Vec<(BlobId, u64)> = self
+            .nvme
+            .durable_ids()
+            .filter_map(|id| self.blob_bytes(id).map(|bytes| (*id, bytes)))
+            .collect();
+        cells.sort_unstable();
+        cells
+    }
+
+    pub fn lose_node(&mut self) -> LostNode {
+        let durable = self.durable_cells();
+        let kv_blocks = self.crash_engine(false);
+        let host_blobs =
+            self.hbm.drain_all().len() + self.ddr.drain_all().len() + self.nvme.drain_all().len();
+        self.leases.clear();
+        LostNode {
+            kv_blocks,
+            host_blobs,
+            durable,
+        }
     }
 
     #[cfg_attr(

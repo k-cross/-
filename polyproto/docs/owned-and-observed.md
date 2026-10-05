@@ -12,7 +12,7 @@ not about who wrote it; the HTTP itself is a linked library's (§2.6). **Cede th
 path** -- and the second is only defensible because of the first, since routing and cancellation
 are what is left to decide with once allocation is gone.
 
-**Status.** Phases 0-9 are built and measured; Phases 10 and 11 are design (§9). Current
+**Status.** Phases 0-10 are built and measured; Phase 11 is design (§9). Current
 results are in [`residency-ledger.md`](residency-ledger.md); each phase's plan, predictions and
 outcomes are in its own `phase-N.md`. The corrected architecture runs behind bits that are off by
 default -- `--engine-cache` (Phase 3), `--belief` (Phase 4), `--directives`, `--prefill-ahead` and
@@ -20,7 +20,9 @@ default -- `--engine-cache` (Phase 3), `--belief` (Phase 4), `--directives`, `--
 (Phase 6), and `--engine-wait`, `--queue`, `--admit quantile | tiered | gate`, `--cancel`,
 `--victim`, `--disconnect`, `--leak`, `--batch` and `--stream-buffer` (Phase 9), and `--hint-grade`
 and `--learn-gate` for the base trace and `polyphonic programs` for closed-loop agent programs
-(Phase 7) -- so a published number is the ledger's unless it is marked otherwise.
+(Phase 7), and `--count-writes`, `--track-flights`, `--observe`, `--node-check`,
+`--snapshot-estimators` and `--copy-durable` with `polyphonic durability` for faults (Phase 10) --
+so a published number is the ledger's unless it is marked otherwise.
 
 **On the numbers.** Four grades of evidence, kept apart:
 
@@ -122,26 +124,51 @@ rollback and zero compensation, so after a crash they are simply redone. `SideEf
 class that writes to the log before dispatch, and it can afford to: the external action dwarfs a
 commit, and a side effect run twice is a correctness failure rather than a cost.
 
-**The column assumes a failure model.** A scheduler crash loses soft state and the streams in
-flight through it; restart rebuilds residency and load from node agents and engines, which hold the
-facts, and node agents' backpressure (§2.4) bounds what a rebuilding scheduler can over-admit. An
-engine crash drops its KV, so every belief about it goes to `P(resident) = 0` and its in-flight
-requests face §2.6's retry question. A node is dead when its lease in the record expires -- which
-makes liveness **owned**, not observed: "is this replica still serving" is a correctness question
-by the second test above, and two schedulers must never hand out one node's capacity. Utilisation
-and power stay observed.
+**The column assumes a failure model, and Phase 10 injected each crash.** A scheduler crash loses
+soft state, and what it costs is mostly not the state. With the streams held below the scheduler, a
+restart costs the arrivals its outage delays, `λD²/2`: 0.7-1.3 request-seconds at 0.1 s, 126-139 at
+1 s and 32,000-39,000 at a 15 s lease, on four nodes at 250 req/s. A 15 s lease is therefore not a
+takeover for a scheduler on the request path, and node agents enforcing their own partitions are
+what let a standby take over without one. With the streams fate-shared with the scheduler (§2.6) a
+crash adds 61-73 decode-seconds thrown away and costs 63-75 request-seconds at a 0.1 s takeover,
+284-370 at 1 s with a restart and 233-276 with the client's continuation. Of the soft state, the
+belief, the flow graph, the tenant meters and the length estimators cost nothing a run can see when
+lost (within 10 request-seconds where memory does not bind hardest): residency is re-learned from
+the scheduler's own dispatches within a second or two. A reservation ledger that is not rebuilt from
+node agents over-admits 3-30% of what it admits blind, and only at 0.6x of the granted partition and
+below; the engine's wait absorbs it, and node agents that check their own partitions leave 0-4. The
+estimators' snapshot (32 KiB every 10 s) is not needed, since lengths observed when a decode ends
+re-learn within a fraction of a second. An engine crash costs its replica's restart, 3.6-5
+request-seconds for every second one engine of four is down whatever happens to its KV or its spill,
+so every belief about it going to `P(resident) = 0` costs nothing measurable. A node is dead when
+its lease in the record expires, which makes liveness **owned**, not observed: "is this replica
+still serving" is a correctness question by the second test above, and two schedulers must never
+hand out one node's capacity. But routing cannot wait for the lease: a router that learns of a lost
+node after 10 s pays 4,200-4,800 request-seconds and after 40 s about 65,000, the requests placed on
+it parked until then, so suspicion routes at the first failed dispatch and the lease decides only
+re-placement and budgets. Utilisation and power stay observed.
 
-The logged tier's rate is now counted (Phase 7): an intent and an outcome per `SideEffecting` call
-are 20% of the soft tier's decision rate on the agentic preset (7.1 writes a second against 36.3
-decisions), 38% with MCP's defaults for edits, 40-44% on the pipeline and multi-agent presets, and
-the long-running preset writes 0.59 a second, 0.27 of intents and outcomes and 0.32 of approval, suspend,
-resume and task records, against 0.9 decisions; the five
-presets with no side effect write nothing. That is within a factor of five of the soft tier, not
-orders of magnitude below it; the record tier's one writer so far is 1 in 790 of the agentic soft
-tier. The other rates in the table are asserted, not measured. Counting owned-state changes per tier per
-simulated second -- mostly from counters the runs already keep, `decisions` and `dispatches` among
-them -- is what would check that the tiers sit orders of magnitude apart; Phase 10 does that, and
-tests the failure model above by injecting each crash.
+**The tiers' rates are counted** (Phases 7 and 10), on four nodes at 250 req/s with the engine
+allocating. The soft tier makes 3.1 owned changes a request with nothing enforced and 5.0 under
+Phase 9's enforcement -- 770 and 1,200 a second, 190 and 300 a node -- of which decisions are 1.23 a
+request; the KV event stream a scheduler would ingest is a further 51-77 events a request, thirteen
+to seventeen times that and inferred, rebuilt rather than stored. The logged tier is Phase 7's: an
+intent and an outcome per `SideEffecting` call are 20% of the soft tier's decision rate on the
+agentic preset (7.1 writes a second against 36.3 decisions), 38% with MCP's defaults for edits,
+40-44% on the pipeline and multi-agent presets, and the long-running preset writes 0.59 a second
+against 0.9 decisions; the five presets with no side effect write nothing. That is within a factor
+of five of the soft tier, not orders of magnitude below it. The record tier has two writers: the
+planner, 0.046 a second on eight nodes, and liveness, which at Kubernetes' 10 s lease renewal is 0.1
+a second a node -- 94-95% of the record's writes, seventeen times the planner's on eight nodes, and
+set by the fleet's size rather than its traffic. The record is three orders below the soft tier at
+four nodes (1,400-3,000 times) and the logged tier is not. At 10,000 nodes the soft tier is 3.0
+million owned changes a second (0.14 cores a node at FoundationDB's published cluster write rate),
+the logged tier 146,000-491,000 a second on the agent presets, under the 820,000 writes a second of
+FoundationDB's published 384-core benchmark, and the record about 1,060 a second. A commit per
+decision costs a request 72 us on a protected drive within a rack, 0.8 ms across a zone and 1.5-2.5
+ms at FoundationDB's published commit -- 0.6-21 times a warm `FaaS` invocation -- and 4 ms with this
+host's full flush (an append is 1.6 us and an `fsync` 18 us), so write-through is ruled out on
+latency before any restart is priced.
 
 ### Where polyproto's state falls
 
@@ -159,7 +186,7 @@ tests the failure model above by injecting each crash.
 | partition sizes, model placement | **owned** | record | `Fleet` under `--fleet`: a replica per node, its role, and the partition its weights leave, changed by the planner about once in 20 s on the rotating mix (§9, Phase 6) |
 | side-effect intents, suspended sessions, approval pauses | **owned** | logged | **counted, not stored** (Phase 7): `programs::LogCause` counts the writes by cause; the log's store is §8's and the simulator has none |
 | tenant identity and per-tenant quota | **owned** | record | identity declared on `Request`, and the router's two per-tenant meters built (§3.8); the per-tenant axis on `Quota` is **missing** |
-| node liveness and membership | **owned** | record | **missing** -- a lease in the record |
+| node liveness and membership | **owned** | record | counted, not stored (Phase 10): a lease renewal a node every 10 s is the record's largest writer; a node declared lost leaves placement, and a router that waits for the lease parks a quarter of its traffic |
 | shadow price per pool | **inferred** | soft | `TierPool::marginal_price` |
 | regret rate per class | **inferred** | soft | `TierPool::regret_rate`, from a ghost list |
 | per-tool re-arrival gap | **inferred** | soft | built for programs (Phase 7): the tool-transition estimator and the idle-gap survival the lifecycle reads; not on the base trace |
@@ -389,7 +416,9 @@ emits directly, batched at the engine's own step boundary:
    **evicted** under pressure and where capacity stands. A 32-byte `TelemetryBatchHeader`
    (`engine_id`, `epoch`, `seq`, `free_kv_blocks`, `total_kv_blocks`, `queued`, `running`, `flags`
    for normal/yellow >80%/red >95%, eviction and allocation counts) followed by truncated 64-bit
-   blake3 hashes. 100-400 bytes typical, under 15 KB/s per engine.
+   blake3 hashes. 100-400 bytes typical, under 15 KB/s per engine. Counted (Phase 10), the removals
+   from GPU and host offload alone are 1,140-1,590 a second an engine, 9-13.5 KB/s of hashes; the
+   full stream, stores included, would be 26-35 KB/s.
 4. **Drop detection.** The router tracks `seq`; a gap means the ZMQ high-water mark dropped a
    message, so the engine's reported eviction count becomes a **lower bound** rather than a fact
    (§3.7 turns that into a decision, by extrapolating the missing evictions at the last observed
@@ -698,6 +727,15 @@ What remains, worst first:
      is not idempotent and throws away a warm prefix; hedging one duplicates prefill. These are
      scheduling decisions wearing transport clothes, which is an argument for holding them here,
      but they still have to be made.
+   - **Whose crash ends the stream.** In the scheduler's address space a scheduler crash ends every
+     stream through it, and Phase 10 prices that: the node agent aborts the engine's sequence, and
+     with a 0.1 s takeover the crash throws away 61-73 decode-seconds and costs 63-75
+     request-seconds beyond the outage's own, 284-370 at 1 s with a restart and 233-276 with the
+     client's continuation, against nothing beyond the outage with the stream held. Holding it below
+     the scheduler -- the node agent keeps the engine's connection and its buffer, under 1.8 MB a
+     node, and the client re-attaches through whichever scheduler answers, as OpenAI's background
+     mode resumes a stream `starting_after` a sequence number -- makes a crash cost its outage and
+     no more. The scheduler owns the decision and the node agent the connection.
 2. **In-process extensions trade isolation for the 0 ns.** `ext_proc`'s 36-63 us buys a separate
    address space. A first-party ABI extension can corrupt the scheduler, and a segfault takes the
    node's control plane with it.
@@ -1198,7 +1236,7 @@ an engine input: the scheduler needs a handful of fields it can act on, not a pa
 |---|---|---|
 | Control flow | `flow: None \| Declared \| Predicted(dist) \| Fanout(n)` | 4 of 4 built; **Predicted** is a learned template (§3.2, Phase 7) |
 | Knowledge grounding | which blob classes, and their sharing shape | KV / snapshot / weights / **retrieved chunks** built (Phase 7) |
-| State and time horizon | `retention: evict_first \| until(deadline) \| durable` | **built** for the first two (Phase 5): `evict_first` declared over one-shot scopes, `until(deadline)` from a hint's lead, both consumed by §3.3; `durable` is **built** for sandboxes (Phase 7): a cell that is demoted and never dropped |
+| State and time horizon | `retention: evict_first \| until(deadline) \| durable` | **built** for the first two (Phase 5): `evict_first` declared over one-shot scopes, `until(deadline)` from a hint's lead, both consumed by §3.3; `durable` is **built** for sandboxes (Phase 7): a cell that is demoted and never dropped; only the loss of its node takes it, unless it was copied when marked (Phase 10) |
 | Authority to act | `authority: ReadOnly \| DraftOnly \| SideEffecting` + `pause_tolerance` | **built** (Phase 7): derived from MCP's `ToolAnnotations` defaults, pessimistically, so an unannotated tool is `SideEffecting`; drives speculation, the lease and the log write. `pause_tolerance` is not built as a field |
 | *no dimension -- see below* | `slo: Interactive \| Throughput` | **declared** (Phase 4, `--throughput`); read by the scoring quantile (§3.7), by admission and the router queue (Phase 9). `Deadline(t)` waits for something to consume it |
 
@@ -1238,7 +1276,12 @@ position-independent figure is a residency counterfactual, not an executed arm.
 **Durable memory breaks an invariant, and the invariant holds (Phase 7).** Every class in the ledger is evictable at a priced cost.
 Durable state must never be *lost*, only demoted -- a correctness constraint, not a cost tradeoff.
 Before Phase 7 that existed only as `ServiceHeap`'s serving pin; a durable cell is now pinned to
-the cold tier and demoted, never dropped, and no durable cell was lost in any run.
+the cold tier and demoted, never dropped, and no durable cell was lost in any run. The one fault
+it does not hold against is losing the node (Phase 10): a long-running run that loses a node half
+way through the arrivals loses 18-20 durable cells and leaves a program each holding lost state --
+a correctness failure that turn latency does not show (0.1-0.4%) -- while a copy made when each cell
+is marked loses none, for 6.0-6.2 GiB over the run, 0.14-0.29 MiB/s a node, 0.012-0.024% of a zone
+link.
 
 ### Authority drives speculation, preemption, and idempotency
 
@@ -1346,7 +1389,8 @@ whoever fills it.
 4. **Cross-workload atomic admission.** All-or-nothing placement of a fan-out across nodes is not
    expressible per request. Where it binds: 22% more fan-outs completed and 10% less inference
    stall; it holds on the router's partition check, though its size is sensitive to the control
-   crossing (§1).
+   crossing (§1). It is also where a lost node shows first (Phase 10): refused fan-outs rise from 0
+   to 23-28 at the published load and from 28-44 to 103-142 at 0.75x of the partition.
 5. **One currency for host hints.** A prewarm, a retention directive and an eviction priced in the
    same host DDR units can be traded against each other. A siloed hint is advisory and unpriced. On
    the ledger the trade comes out lopsided (Phase 5): a host hint's retention half is worth 0.0-0.7%
@@ -1359,7 +1403,14 @@ whoever fills it.
    the sidecar's stream kept open, 1.38-1.43 ms / 7.18-7.43 ms on Envoy's per-request default. An
    inference-only stack buys a proxy out of the decode budget; a FaaS control plane cannot. **Only a
    unified orchestrator is forced to pick one path for both**, which makes "integrate, do not
-   proxy" a consequence of unification rather than a preference.
+   proxy" a consequence of unification rather than a preference. It has a price under failure
+   (Phase 10), at 250 req/s: with the streams held and a 0.1 s takeover a crash costs as much as
+   the sidecar's tax saves in under 90 s, and with a 1 s takeover in 1.9-3.2 hours; with streams
+   that die, 1.0-1.8 hours at 0.1 s and 4.4-7.5 hours at 1 s with a restart; under a 15 s lease
+   2.9-5.8 weeks. A fail-open proxy's own window, 15 s of hash-only routing, costs 12-53
+   request-seconds, less than any restart that kills streams, so the property holds as a
+   consequence of unification only while the integrated process crashes no more often than about
+   once a minute or two with its streams held and once an hour or two with them fate-shared.
 7. **Extension cost as an expressiveness bound, and a fleet-size ceiling with a number on it.** A
    hook at 36-63 us (`ext_proc`) must be a constant attached to the request; at 0-180 ns (native
    through ring) it can be a function of each candidate inside the argmin. The same ladder prices
@@ -1689,12 +1740,13 @@ simulate-first method, one level down.
 
 **The logged tier is FoundationDB too** -- a second cluster, appending with versionstamps, so one
 technology spans two failure domains; AX chose Redis for the same tier. It stays FoundationDB until
-evidence says otherwise, and the evidence that would is Phase 10's per-tier count showing
-FoundationDB cannot carry the rate. Phase 7 gave the logged tier its writers and counted them: 7 to
-15 writes a simulated second on a program mix whose soft tier makes 6 to 36 decisions, which is the
-rate Phase 10 must carry at fleet scale. A purpose-built log is the one place building below the layer could pay, and
-that count is what would justify it. The simulator models no store at all, so no result here
-depends on the choice.
+evidence says otherwise, and the evidence that would is a per-tier count showing FoundationDB cannot
+carry the rate. Phases 7 and 10 counted it: at 10,000 nodes the logged tier writes 146,000-491,000 a
+second on the agent presets, under the 820,000 writes a second of FoundationDB's published 384-core
+benchmark (7-25 cores at its single-core write rate), so the case for a purpose-built log does not
+arise from the rate; it remains the one place building below the layer could pay if side-effecting
+work proves denser per node than those presets. The simulator models no store at all, so no result
+here depends on the choice.
 
 ### Security: what the architecture answers, what a prototype defers
 
@@ -1757,7 +1809,7 @@ run, and what was measured; the current numbers are in the ledger.
 | [7](phase-7.md) | learned flows, speculative authority, sessions that suspend, the taxonomy (`--hint-grade`, `--learn-gate`, `polyphonic programs`) | done | closed-loop turns are 3.6-3.8x the open-loop trace's, and the same hints cut the flow stall by 0-5% rather than 47-63%; speculation is worth about 1% on coding tools; the logged tier writes 20-66% of the soft tier's decisions on agent presets |
 | [8](phase-8.md) | the data path as an arm | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
 | [9](phase-9.md) | enforcement: a queue at the router, cancellation on the path, and two-tier admission (`--engine-wait`, `--queue`, `--admit`, `--cancel`, `--victim`, `--disconnect`, `--batch`, `--stream-buffer`) | done | a cancel by declared class takes the interactive first-token p99 to 63-66 ms, a restart is 26-183% later than a continuation, and the stalled-stream buffer is under 2 MB a node |
-| [10](phase-10.md) | durability: what each tier writes, and what a crash costs | planned | |
+| [10](phase-10.md) | durability: what each tier writes, and what a crash costs (`--count-writes`, `--track-flights`, `--observe`, `--node-check`, `--snapshot-estimators`, `--copy-durable`, `polyphonic durability`) | done | a restart costs its outage (112-143 request-seconds at 1 s, 32,000-39,000 at a 15 s lease) and the streams that die with it; the soft state it loses costs nothing a run can see; the record's largest writer is liveness; a router that waits 40 s for a lease pays about 65,000 request-seconds |
 | 11 | regions: a scheduler per region under global budgets | planned | |
 
 Built bits are off by default, and every result behind them is an A/B against the run without them.
@@ -1872,31 +1924,39 @@ the batch arms are graded on bands against a draw that is not the pre-measuremen
 
 ### Phase 10 -- Durability: what each tier writes, and what a crash costs
 
-Implementation plan: [`phase-10.md`](phase-10.md), which states its predictions before the run.
+Plan, predictions and outcomes: [`phase-10.md`](phase-10.md). **Status:** built and measured, behind
+`--count-writes`, `--track-flights`, `--observe`, `--node-check`, `--snapshot-estimators` and
+`--copy-durable`; current numbers are in the ledger's *Durability* section. Every bit is off by
+default and the byte-identity gate holds on the thirteen-command set.
 
-§1 makes two claims about durability that no run tests: the three tiers' write rates sit orders of
-magnitude apart, and soft state can be rebuilt rather than stored.
+§1 made two claims about durability that no run tested: the three tiers' write rates sit orders of
+magnitude apart, and soft state can be rebuilt rather than stored. The phase counted the tiers,
+injected a scheduler restart, an engine crash and a node loss into runs whose requests were still
+open, and priced the crossover against the sidecar's tax.
 
-- **The per-tier count.** Owned-state changes per tier per simulated second, from counters the
-  runs mostly already keep. Phase 6 measured the record tier's first writer, the planner, at 0.046
-  writes a simulated second on the rotating mix, against 3-5 weight loads a second from the lazy
-  cache and about 600 scored decisions a second at 500 req/s in the soft tier; Phase 7 adds the
-  logged tier's, and each extends the count.
-- **Failure injection.** A scheduler restart -- soft state gone, rebuilt from node agents and
-  engines, with node agents' backpressure the only bound on what the rebuilding scheduler
-  over-admits; an engine crash -- its KV gone, every belief about it at `P(resident) = 0`, its
-  in-flight requests retried (§2.6's retry question); and node loss by lease expiry. Phase 4's
-  belief is most of the machinery: a restart is a belief reset plus a rebuild window.
-- **Optionally, the persistence seam.** A FoundationDB commit on the boundary ladder, behind its
-  own feature, so the consensus-commit latency §1 argues from is measured on the host rather than
-  published.
+- **The count.** The soft tier makes 3.1-5.0 owned changes a request and the KV event stream 51-77
+  events; the logged tier is 20-66% of the soft tier's decisions on the agent presets; the record's
+  largest writer is liveness. The record is three orders below the soft tier and the logged tier is
+  not (§1). A commit per decision is 0.6-21 times a warm `FaaS` invocation.
+- **A restart costs its outage and its streams, not its state.** `λD²/2` with the streams held;
+  61-73 decode-seconds more when they die with the scheduler. Losing the belief, the flow graph and
+  the estimators costs nothing a run can see; a blind ledger over-admits only at 0.6x and below, and
+  node agents that check their own partitions remove it. A client that backs off costs more
+  request-seconds than a burst and refuses fewer requests.
+- **An engine crash costs its replica's restart; a node loss adds its host work and its gangs, and
+  the lease sets the price.** 3.6-5 request-seconds a second down; 32-62 more for a lost node;
+  4,200-4,800 request-seconds if the router waits 10 s to learn of it and about 65,000 at 40 s.
+- **The crossover.** A crash costs as much as the sidecar's tax saves in under 90 s to 7.5 hours at
+  sub-second takeovers and weeks under a 15 s lease; a fail-open proxy's window costs 12-53
+  request-seconds (§5).
 
-- **Deliverable:** the soft tier's write rate -- what persisting every decision would face -- and
-  the cost of losing soft state: over-admission, service and goodput through the rebuild window.
-  If a restart costs more than checkpointing would, soft state needs checkpoints in the logged tier
-  and §1 changes; the count then also carries those writes.
-- **Risk:** low; it can overturn a decision already made, which is why it should run early.
-  **Size:** medium.
+**Predictions that failed:** that spreading retries by a client's backoff removes the burst's cost
+(it adds 7-32%), that losing the estimators costs a first-token tail at the tightest partition (it
+does not), that continuing a failed stream beats restarting it on every seed (it does on two of
+three), and that the sidecar's failover costs 300-900 request-seconds (it costs 12-53).
+
+**Not built:** the FoundationDB commit rung, a replaying subscriber, re-placement of a lost node's
+replicas under `--fleet`, fan-outs parked on a lease, and active-active schedulers (Phase 11).
 
 ### Phase 11 -- Regions: a scheduler per region under global budgets
 
@@ -1928,9 +1988,10 @@ depends on it, so Phase 9 precedes 7.
 
 **The path chain: 0 -> 8**, done.
 
-**Phase 7** follows Phase 9. **Phase 10** is independent and can run now; its count grows as 7 adds
-writers. **Phase 11** follows 6, whose budgets and partitions it moves across regions.
+**Phase 7** follows Phase 9. **Phase 10** was independent and ran after 7 added its writers.
+**Phase 11** follows 6, whose budgets and partitions it moves across regions.
 
 **The system of record** (§8) is built after Phase 6, whose decisions are now real and whose first
-writer is counted, and sized by Phase 10's count. It is infrastructure rather than a phase, since
+writer is counted, and sized by Phase 10's count, which finds the logged tier within FoundationDB's
+published rate. It is infrastructure rather than a phase, since
 the simulator models no store.

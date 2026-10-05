@@ -844,6 +844,8 @@ pub struct Config {
     pub kv_spill_mib: u64,
     pub engine_rate: f64,
     pub reclaim_drafts: bool,
+    pub fault: Option<(u64, crate::fault::Fault)>,
+    pub copy_durable: bool,
 }
 
 impl Default for Config {
@@ -879,6 +881,8 @@ impl Default for Config {
             kv_spill_mib: 4096,
             engine_rate: 250.0,
             reclaim_drafts: true,
+            fault: None,
+            copy_durable: false,
         }
     }
 }
@@ -1090,6 +1094,8 @@ pub struct Outcome {
     pub tool_exec_ns: u64,
     pub drafts: u64,
     pub marks: (u64, u64),
+    pub fault: crate::fault::FaultStats,
+    pub state_lost: u64,
 }
 
 impl Outcome {
@@ -1120,12 +1126,7 @@ pub fn mean(values: &[u64]) -> f64 {
 
 #[must_use]
 pub fn quantile(values: &[u64], q: f64) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    let mut sorted = values.to_vec();
-    sorted.sort_unstable();
-    sorted[((sorted.len() as f64 * q) as usize).min(sorted.len() - 1)] as f64
+    crate::instruments::percentile(&mut values.to_vec(), q).map_or(0.0, |v| v as f64)
 }
 
 const NO_TOOL: usize = TOOL_KINDS;
@@ -1293,6 +1294,7 @@ enum Event {
     Joint { p: usize, epoch: u64 },
     Warm { p: usize, k: usize },
     ToolStart { p: usize, k: usize },
+    Fault,
 }
 
 #[derive(Clone, Debug)]
@@ -1403,6 +1405,7 @@ pub fn build_machine(cfg: &Config, hold_decodes: bool) -> Machine {
     mach.set_claim(cfg.claim);
     mach.set_claim_key(cfg.claim_key);
     mach.set_observables(cfg.observables);
+    mach.set_copy_durable(cfg.copy_durable);
     if cfg.ttl {
         mach.set_directives(Some(Directives {
             emit: Emit::Declared {
@@ -1551,6 +1554,9 @@ impl<'a> Driver<'a> {
 
     fn run(mut self) -> Outcome {
         self.seed_programs();
+        if let Some((at, _)) = self.cfg.fault {
+            self.push(at, Event::Fault);
+        }
         loop {
             while let Some(Reverse((t, idx))) = self.heap.pop() {
                 let event = self.events[idx];
@@ -1562,6 +1568,7 @@ impl<'a> Driver<'a> {
                     Event::Joint { p, epoch } => self.joint(p, epoch, t),
                     Event::Warm { p, k } => self.warm_event(p, k, t),
                     Event::ToolStart { p, k } => self.tool_start(p, k, t),
+                    Event::Fault => self.inject_fault(t),
                 }
             }
             self.mach.finish();
@@ -1571,6 +1578,20 @@ impl<'a> Driver<'a> {
             }
         }
         self.finalize()
+    }
+
+    fn inject_fault(&mut self, t: u64) {
+        let Some((_, fault)) = self.cfg.fault else {
+            return;
+        };
+        self.mach.advance_to(t);
+        self.mach.inject(fault);
+        let lost = self.mach.lost_durable();
+        self.out.state_lost += self
+            .progs
+            .iter()
+            .filter(|p| !p.dead && lost.contains(&p.sandbox.0))
+            .count() as u64;
     }
 
     fn settle(&mut self) {
@@ -1585,6 +1606,7 @@ impl<'a> Driver<'a> {
         let (taken, breaks, peak) = self.mach.leases();
         self.out.leases = (taken, breaks, peak);
         self.out.durable_lost = self.mach.durable_lost();
+        self.out.fault = self.mach.fault_stats.clone();
         self.out.locality = self.mach.locality_by;
         self.out.memory = self.mach.memory_by_pattern();
         self.out.fanouts = (self.mach.fanouts_admitted, self.mach.fanouts_refused);
@@ -1746,7 +1768,7 @@ impl<'a> Driver<'a> {
             self.log(pattern, LogCause::Approval);
         } else if self.progs[p].draft_dirty {
             let sandbox = self.progs[p].sandbox;
-            self.mach.mark_durable(sandbox.0);
+            self.mach.mark_durable(sandbox.0, sandbox.1.bytes);
             self.progs[p].draft_dirty = false;
             if pattern == Pattern::LongRunning {
                 self.log(pattern, LogCause::TaskState);
@@ -3145,5 +3167,60 @@ mod tests {
         assert!(c_prefix > r_prefix);
         assert!((c_any - r_any).abs() < 0.02);
         assert!(c_any > c_prefix);
+    }
+
+    fn lose_node_zero(at_ns: u64, copy: bool) -> Config {
+        use crate::fault::{Client, Fault, NodeLoss};
+        Config {
+            suspend: Suspend::Timers,
+            fault: Some((
+                at_ns,
+                Fault::Node(NodeLoss {
+                    node: 0,
+                    declare_ns: 0,
+                    client: Client::Restart,
+                }),
+            )),
+            copy_durable: copy,
+            ..small(Preset::LongRunning, 60)
+        }
+    }
+
+    #[test]
+    fn a_lost_node_takes_the_durable_sandboxes_it_holds_unless_they_were_copied() {
+        let at = 10_000_000_000;
+        let bare = run(&lose_node_zero(at, false));
+        assert_eq!(bare.fault.nodes_lost, 1);
+        assert!(bare.fault.durable_lost_with_node > 0, "{:?}", bare.fault);
+        assert_eq!(bare.fault.durable_saved, 0);
+        assert!(bare.state_lost > 0);
+        assert_eq!(bare.durable_lost, 0, "a lost node is not a dropped cell");
+
+        let copied = run(&lose_node_zero(at, true));
+        assert_eq!(copied.fault.durable_lost_with_node, 0);
+        assert!(copied.fault.durable_saved >= bare.fault.durable_lost_with_node);
+        assert!(copied.fault.durable_copied_bytes > 0);
+        assert_eq!(copied.state_lost, 0);
+    }
+
+    #[test]
+    fn copying_durable_cells_changes_no_program_and_charges_their_bytes() {
+        let run_with = |copy: bool| {
+            run(&Config {
+                suspend: Suspend::Timers,
+                copy_durable: copy,
+                ..small(Preset::LongRunning, 40)
+            })
+        };
+        let plain = run_with(false);
+        let copying = run_with(true);
+        let turns = |o: &Outcome| o.by_pattern[Pattern::LongRunning.idx()].turns.clone();
+        assert_eq!(
+            format!("{:?}", plain.logged),
+            format!("{:?}", copying.logged)
+        );
+        assert_eq!(turns(&plain), turns(&copying));
+        assert_eq!(plain.fault.durable_copied_bytes, 0);
+        assert!(copying.fault.durable_copied_bytes > 0);
     }
 }

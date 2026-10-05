@@ -70,6 +70,11 @@ impl Lengths {
     }
 
     #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.bins.len() as u64 * 8
+    }
+
+    #[must_use]
     pub fn seen(&self) -> u64 {
         self.seen
     }
@@ -123,9 +128,21 @@ pub struct Reservations {
     inflight: BinaryHeap<Reverse<(u64, u64)>>,
     held: HashMap<u64, (Vec<BlobId>, u64)>,
     next: u64,
+    commits: u64,
+    releases: u64,
 }
 
 impl Reservations {
+    #[must_use]
+    pub fn holders(&self) -> usize {
+        self.held.len()
+    }
+
+    #[must_use]
+    pub fn writes(&self) -> (u64, u64) {
+        (self.commits, self.releases)
+    }
+
     #[must_use]
     pub fn committed(&self) -> u64 {
         self.covered_bytes + self.output_bytes
@@ -216,6 +233,7 @@ impl Reservations {
         let Some((ids, output)) = self.held.remove(&seq) else {
             return;
         };
+        self.releases += 1;
         self.output_bytes -= output;
         for id in ids {
             if let Some(e) = self.covered.get_mut(&id) {
@@ -231,6 +249,8 @@ impl Reservations {
     pub fn clear(&mut self) {
         *self = Self {
             next: self.next,
+            commits: self.commits,
+            releases: self.releases,
             ..Self::default()
         };
     }
@@ -248,6 +268,7 @@ impl Reservations {
         self.output_bytes += output;
         let seq = self.next;
         self.next += 1;
+        self.commits += 1;
         self.held.insert(seq, (ids, output));
         self.inflight.push(Reverse((until, seq)));
         seq

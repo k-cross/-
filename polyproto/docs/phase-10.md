@@ -8,7 +8,19 @@ which is what persisting every decision would face, and the cost of losing soft 
 over-admission, service and goodput through the rebuild window -- with the rule that if a restart
 costs more than checkpointing would, soft state needs checkpoints in the logged tier and §1 changes.
 
-**Status: planned.** Nothing below is built. §2's predictions are stated before the run, per
+**Status: built and measured.** Increment 1 is the count, the record's liveness and the
+durable-append rung (§4.1 to §4.3); increment 2 is every decode a flight, observations at
+completion, and the scheduler-restart fault with its outage, stream fate and client retry (§4.4 to
+§4.8); increment 3 is the restarted scheduler's sources and node agents' enforcement (§4.9, §4.10);
+increment 4 is the engine crash and node loss (§4.11, §4.12); increment 5 is the crossover and the
+durable sandboxes under node loss (§4.14). They are in `writes.rs`, `durable.rs`, `fault.rs`,
+`machine.rs` and `programs.rs`, behind `--count-writes`, `--track-flights`, `--observe`,
+`--node-check`, `--snapshot-estimators` and `--copy-durable` and driven by `polyphonic durability`,
+whose sections are `gate`, `count`, `logged`, `restart`, `routing`, `estimators`, `engine`, `node`,
+`crossover`, `durable`, `rung` and `fleet`; §9 records what the builds found, including a review
+that corrected the fault driver's clock and re-ran what it moves (§9.27), and §10 how they were
+verified. The FoundationDB commit rung and a command-line flag for faults in `programs` (the hook is
+`programs::Config::fault`) are not built. §2's predictions are stated before the run, per
 `owned-and-observed.md` §7, and like Phases 4 to 7 and 9 they lean on **pre-measurements**: numbers
 taken on an instrumented copy of `aeeb943`, run outside the repository and not committed, with every
 hook off reproducing `enforce`, `belief`, `residency` and `fleet` byte for byte. One reads the
@@ -466,6 +478,18 @@ reproduces Phase 7's 20-66% of decisions on the agent presets and nothing elsewh
   something writes owned state per request that the counters missed, or liveness renews faster than
   Kubernetes does, and §8's record is sized from that writer.
 
+**Measured: P1 holds at the two partitions it named, and is just above its band at the half.** Owned
+changes are 3.08-3.10 a request with nothing enforced and 4.95-5.02 under Phase 9's integrated arm
+at 0.75x and 1.0x of the grant (5.16-5.22 at 0.6x and 5.39-5.53 at 0.5x, the top of the band
+exceeded in the overload), 770-776 and 1,200-1,218 a second, 193-194 and 300-305 a node; decisions
+1.21-1.23 a request. The KV event stream is 51-53 events a request with nothing enforced, 69-72 at
+0.75x, 65-66 at 1.0x, 73-74 at 0.6x and 75-77 at 0.5x, of which removals from GPU and host offload
+are 1,140-1,590 a second an engine at the first three partitions and 9.1-13.5 KB/s of hashes. The
+record tier is 0.40 a second on four nodes and 0.80 (plus the planner's 0.046) on eight at a 10 s
+renewal, 94% of it liveness, three orders below the owned changes at four nodes (1,400-3,000 times).
+The logged tier is Phase 7's to the digit: 40, 20, 44 and 66% of decisions on the pipeline,
+agentic, multi-agent and long-running presets.
+
 **P2 -- A commit per decision costs a warm `FaaS` invocation at least half its own service.**
 
 *A measurement and arithmetic; no simulation.* The built rung reproduces the host's ordering --
@@ -479,6 +503,13 @@ FoundationDB's published commit: 0.5-25 times a warm `FaaS` invocation, under 0.
 - *If wrong* (a full flush under 100 us on the host): the host's drive acknowledges from a protected
   cache and behaves like a datacenter's, and the argument rests on the quorum's round trip alone, 60
   us within a rack -- still half a warm invocation.
+
+**Measured: right, and the host's own flush is above the band.** The rung is 1.6 us for an append
+(p99 4.6), 17.9 us with `fsync` (62.1) and 3.995 ms with a full flush (4.91), the lowest of five
+runs. A commit per decision is 72.4 us on a protected drive in a rack (0.60 times a warm `FaaS`
+invocation of 120 us, the chosen constants' mean), 812 us across a zone (6.8 times), 1.5-2.5 ms at
+FoundationDB's published commit (12.5-20.8 times), and 4.07-4.81 ms with this host's full flush
+(34-40 times, above the band's 25), 0.007-0.48% of a one-second agent turn.
 
 **P3 -- Losing the scheduler's routing state costs nothing a run can see where memory does not bind
 hardest.**
@@ -496,6 +527,42 @@ three; rebuilt from node agents at once, it over-admits nothing.
 - *If wrong* (losing the belief costs more than 1% of the run's service at 1.0x): routing depends on
   pre-crash residency more than Phase 4 found, and the engine's snapshot (§1.8) is worth asking for.
 
+**Measured (increment 2, the belief and the estimators): the clause holds where it was built.** A
+restart with no outage that loses the belief -- the scheduler reads only what it has dispatched
+since -- and the flow graph costs 10.0 / 0.6 / 3.9 request-seconds at 0.75x of the grant and 0.6 /
+-0.3 / -0.5 at 1.0x (within 15 and within 1), with 3,700-5,600 reads of a resident block it does not
+know across the two (the band's 2,000-7,000), and a snapshot after 1 s makes 3,000-3,800 and costs
+8.1 / 8.8 / -2.1 and -0.1 / -0.1 / -0.2. Losing the estimators alone costs 0.0 on every
+seed, observed at dispatch. The reservation ledger and the over-admission clause are not built.
+
+**Measured (increment 3, the ledger): right where it was predicted, and the engine's wait absorbs
+less than the tail suggested.** Rebuilt from node agents at once, a held restart admits nothing
+blind at any partition. Never rebuilt, it admits 129-203 requests blind at every partition and
+over-admits none at 1.0x and 0.75x. At 0.6x with a 1 s outage 11 / 27 / 7 / 25 / 4 of 154 / 159 /
+139 / 169 / 150 are over-admissions (3-17%), 63 / 45 / 30 / 56 / 27 of 195 / 196 / 150 / 194 / 172
+with prefill taking engine time (16-32%), and 15 / 17 / 29 / 30 / 31 of 129-149 at 0.5x (11-22%);
+the 0.1 s outage gives 0-14, 8-42 and 4-46. The engine's wait absorbs them: 32 / 14 / 1 / 41 / 0
+sequences wait at an engine, 8-109 with prefill and 42-103 at 0.5x, against none rebuilt. The
+interactive first-token p99 in the window rises on one or two of five seeds at a 1 s outage by
+50-190 ms over a tail the outage sets at 0.7-0.8 s, and at a 0.1 s outage on three of five seeds at
+0.5x (0.17-0.28 s against 0.07-0.10 s) and on one with prefill (0.39 s against 0.07). Node agents
+that check their own partitions leave 0 over-admissions at 0.6x with prefill free and 0-4 elsewhere,
+send 5-90 requests back to the router (up to 5,070 refusals, one per arrival while a request waits)
+and leave no sequence waiting at an engine; no cost moves outside the overload's noise of -800 to
++600 request-seconds, and the 0.1 s tail comes back on two of the four cells that rose (0.28 to 0.09
+s, 0.17 to 0.07 s) and falls by a third to a half on the others (0.24 to 0.17 s, 0.39 to 0.20 s).
+The residual over-admissions are fan-out agents staged together, whose claims the node checks one at
+a time. Re-run with the driver's clock corrected (§9.27), the verdict stands and the figures move
+within the overload's noise: 131-203 admitted blind; at 0.6x with a 1 s outage 10 / 27 / 9 / 25 / 5
+of 154 / 161 / 140 / 167 / 150 over-admitted (3-17%), 53 / 49 / 38 / 59 / 23 of 189 / 202 / 151 /
+199 / 170 with prefill taking engine time (14-30%) and 15 / 18 / 30 / 33 / 31 of 131-144 at 0.5x
+(11-23%), and 0-15, 5-40 and 6-42 at 0.1 s; 33 / 24 / 1 / 37 / 0 sequences wait at an engine, 11-88
+with prefill and 41-118 at 0.5x. The 1 s tail rises on one or two seeds of five by 56-190 ms. The
+0.1 s tail rises on one seed at 0.5x (0.34 s against 0.07 s) and one with prefill (0.40 s against
+0.07 s), and the node check brings the first back to 0.09 s and halves the second to 0.20 s. Node
+agents that check leave 0-1 over-admissions at 0.6x with prefill free and 0-4 elsewhere, and send
+7-90 requests back to the router (up to 5,168 refusals).
+
 **P4 -- The one checkpoint worth taking is the estimators', and only where memory binds hardest.**
 
 With observations at completion, losing the estimators costs nothing at 1.0x of the grant and stays
@@ -507,6 +574,17 @@ restoring them from a snapshot at most 10 s old brings both to within noise of n
   logged tier's slowest writer, not a per-decision one -- and §1 says so, with the count carrying it.
 - *If wrong* (the snapshot's arm no better than losing them): claims re-learn within one decode on
   this workload, and nothing the scheduler holds needs a checkpoint.
+
+**Measured (increment 3): wrong.** With every length observed when its decode ends, losing the
+estimators costs -0.5 to +9 request-seconds at 1.0x and 0.75x (zero with prefill) and moves no
+count, and at 0.6x with prefill taking engine time -148 to +364 against the overload's noise of -300
+to +300, with the interactive first-token p99 in the window at 63-69 ms on every seed against 63-66
+with no fault, 14 fewer to 13 more requests unserved, the router queue within 5% and the cancels
+within 16% of the run without the fault. Restoring a snapshot 4.0 s old (written every 10 s) gives
+the kept run to the digit in every cell. Claims re-learn from the first decodes that end, a fraction
+of a second at 100 decodes a second, so the dispatch-time observations of §1.3 did not hide a
+transient and nothing the scheduler holds needs a checkpoint. The snapshot costs 6 writes of 32 KiB
+in a 60 s run: 0.1 a second and 3.2 KiB/s.
 
 **P5 -- A restart costs its outage, and a lease-length outage costs weeks of the sidecar's tax.**
 
@@ -522,6 +600,27 @@ client's backoff removes most of the burst's share at 15 s and changes nothing a
 - *If wrong* (the 1 s cost more than 1.5 times `λD²/2`): the burst, not the outage's length, sets the
   price, and admission of retries at the restarted scheduler is the mechanism to build.
 
+**Measured (increment 2): the held and burst figures are right; spreading the retries is wrong.**
+With streams held, a 0.1 s outage costs -11 / -3 / +8 at 0.75x of the grant and 0.5 / 1.2 / 0.8 at
+1.0x; a 1 s outage 125.5 / 111.6 / 142.7 and 127.6 / 126.7 / 125.6 against `λD²/2` of 125 (within
+11%); a 15 s outage 38,698 / 39,050 / 38,043 and 32,950 / 32,875 / 32,454 request-seconds, 15-17% of
+it beyond `λD²/2` at 1.0x and 35-39% at 0.75x, with 238-377 requests unserved. The interactive
+first-token p99 in the window is 0.68-0.82 s at 1 s and 14.7-14.8 s at 15 s. A client that backs off
+-- 100 ms doubling, jittered -- costs more, not less: at 15 s with streams held 45,011 / 45,289 /
+44,260 and 42,007 / 42,109 / 41,871 (+16% and +28%) and a window p99 of 22-23 s, and 1 s with streams
+dying 390 / 375 / 364 and 363 / 361 / 347 against 383 / 336 / 346 and 301 / 302 / 284 for the burst
+(+2 to +22%). It leaves fewer requests unserved (99-260 against 238-377 at 15 s), so what the
+burst loses is requests and what backoff loses is the time they wait: a retry lands up to twice as
+late as the outage lasted. Re-run with the driver's clock corrected (§9.27): held, a 0.1 s outage
+costs -0.5 / 6.9 / 5.2 at 0.75x and 1.3 / 0.7 / 0.8 at 1.0x; 1 s 130.2 / 127.7 / 139.1 and 127.3 /
+126.8 / 125.8, within 12% of `λD²/2`; 15 s 38,829 / 38,673 / 38,535 and 32,993 / 32,860 / 32,426,
+37-38% and 15-17% beyond it, with 236-374 requests unserved and the window's p99 unchanged. Backing
+off costs 50,822 / 51,203 / 49,580 and 43,379 / 43,531 / 42,573 at 15 s held (+29% to +32%), with a
+window p99 of 22-24 s, and 423 / 391 / 360 and 371 / 365 / 348 at 1 s with streams dying against 370
+/ 346 / 338 and 297 / 303 / 284 (+7 to +25%). It leaves 197-324 requests unserved against 236-374 at
+15 s, 9-18% fewer where the first run had 26-58%: the drift had thinned the arrivals after a
+backoff's retries. The verdict stands, and backoff buys less than the first run showed.
+
 **P6 -- Streams that die with the scheduler cost half a one-second outage, and held they cost
 nothing.**
 
@@ -535,6 +634,20 @@ recovers 50-120 request-seconds of the 1 s figure.
 - *If wrong* (streams that die within 1.5x of held ones at 1 s): few decodes are in flight at a
   crash, or a continuation restores what a restart loses, and fate-sharing is cheap enough to keep.
 
+**Measured (increment 2): the costs are in the band and the streams reached are above it.** A restart
+whose streams die reaches 109 / 112 / 102 of them at 0.75x and 110 / 111 / 102 at 1.0x (75-95
+predicted; 20-24 of them the agents of 4-5 gangs), throws away 68 / 73 / 61 decode-seconds (40-60), and
+costs 75 / 66 / 65 and 72 / 74 / 62 request-seconds at a 0.1 s outage (half of a 1 s outage's 125;
+50-80 predicted) and 383 / 336 / 346 and 301 / 302 / 284 at 1 s (270-380; the first seed is 3 over).
+A client that continues recovers 106 / 103 / 99 and 57 / 62 / 52 of them (50-120), throwing away
+13-16 decode-seconds, the agents' that a continuation cannot keep. Kept belief and estimators are
+worth 11 and 15 request-seconds of the 1 s figure on two of six cells and at most 3 on the other
+four. Re-run with the driver's clock corrected (§9.27), the streams reached and the decode-seconds
+thrown away do not move; a 0.1 s outage costs 74 / 74 / 71 and 71 / 75 / 63 and 1 s 370 / 346 /
+338 and 297 / 303 / 284, all inside 270-380; a continuation recovers 93 / 110 / 91 and 54 / 63 /
+51; and kept belief and estimators are worth -25 to +9 request-seconds of the 1 s figure, inside the
+noise on every cell.
+
 **P7 -- An engine crash costs its replica's restart; its KV and its streams are second-order.**
 
 On one node of four, an engine back after 2, 8 or 30 s costs under 20, 20-50 and 90-190
@@ -547,6 +660,20 @@ engine that never returns leaves 50-200 requests unserved, half or more of them 
 - *If wrong* (the KV's loss measurable, or continuation worth more than 50): sessions return to
   their crashed node's replacement often enough that its cache matters, and the connector's spill
   belongs outside the engine's process.
+
+**Measured (increment 4): right on the costs, and wrong that continuing always wins.** On node 0 of
+four, an engine back after 2, 8 and 30 s costs 17.1 / 9.9 / 13.4, 45.8 / 39.8 / 45.0 and 156.4 /
+139.9 / 114.8 request-seconds at 1.0x of the grant (under 20, 20-50 and 90-190 predicted), 3.6-5.0
+for each second it is down, and at 0.75x 18.5 / 19.0 / 27.5, 59.8 / 24.9 / 49.5 and 217.6 / 246.0 /
+112.5 (27.5, 59.8 and 246.0 above their bands). A restart of 120 s, longer than the 36 s of the run
+that is left, costs 165 / 140 / 117 and 565 / 635 / 344, with 50-61 and 72-129 more requests
+unserved and 25-30 and 79-92 more fan-outs refused (half or more of the unserved at 1.0x, and all of
+them at 0.75x). Losing the spill changes nothing (156.1 / 139.9 / 115.0 against 156.4 / 139.9 /
+114.8) while it loses 7,971-11,187 KV blocks against 3,099-3,614. The crash fails 34-42 streams, 2-4
+of them gangs' agents, where the pre-measurement had 18-24 and no gangs. Continuing them rather than
+restarting is cheaper on two of three seeds at 1.0x (by 7 and 24 request-seconds, dearer by 6 on the
+first) and on two of three at 0.75x (by 13 and 74, dearer by 45): a difference inside the noise, not
+the 'every seed' predicted.
 
 **P8 -- Node loss is an engine crash that never returns, plus its gangs and its durable sandboxes.**
 
@@ -565,6 +692,24 @@ quarter of its traffic, where one that acts on the first failed dispatch pays no
 - *If wrong* (the node's host work costs more than its engine): a lost node is mostly a host-DDR
   event -- its service heaps' cold starts -- and §5's host DDR properties are measured under loss.
 
+**Measured (increment 4): the costs hold, and the lease is the largest term by two to three orders
+of magnitude.** A node declared lost at once costs 196.6 / 201.9 / 179.1 request-seconds at 1.0x of
+the grant, 32-62 over an engine that never returns (30-90 predicted), and 885 / 443 / 458 at 0.75x
+against that engine's 565 / 635 / 344, which is inside the noise; refused fan-outs rise from 0 to 26
+/ 23 / 28 at 1.0x and from 28 / 44 / 42 to 103 / 142 / 121 at 0.75x (20-35 and 100-150), and it
+loses 96-115 host blobs (99 / 115 / 96 at 1.0x). A router that learns of it after 2 s pays 371 / 407
+/ 343 and 933 / 783 / 902 and an interactive first-token p99 of 1.4-1.7 s; after 10 s, 4,286 / 4,781
+/ 4,217 and 5,973 / 9,784 / 6,093 with a p99 of 9.4-9.7 s; after 40 s, Kubernetes' node grace,
+65,786 / 66,742 / 64,524 and 70,255 / 71,402 / 68,772 with a p99 of 39.4-39.7 s. The requests parked
+on the dead node are the quarter of the window's arrivals the arithmetic named: 2,481-2,510 against
+2,500, waiting 55,442-56,755 s between them. The unit test checks that a node declared at once is
+never parked on. The copy's clause is graded on the long-running programs, where losing node 0 half
+way through the arrivals takes 18 / 18 / 20 durable cells and leaves one program each holding lost
+state, with 23-25 host blobs gone; with each cell copied when it is marked none is lost, 18 / 18 / 20
+are saved and 6.0-6.2 GiB is copied over the run, 0.14-0.29 MiB/s a node (0.012-0.024% of a zone
+link; the arithmetic said about 0.6 MiB/s). Turn latency moves by 0.1-0.4% with or without the
+loss, so a lost sandbox is a correctness failure and not a latency one.
+
 **P9 -- The crossover: integration's saving pays for a crash whose streams die about once an hour or
 two at a sub-second takeover, and for one whose streams are held about once a minute.**
 
@@ -579,6 +724,30 @@ of `hash only` routing with every stream intact -- costs 300-900 request-seconds
   in-process extensions -- as a reliability requirement on policy code.
 - *If wrong* (the sidecar's failover above three times a 1 s restart whose streams die): a fail-open
   proxy is this comparison's expensive failure, and the integrated path's case grows.
+
+**Measured (increment 5): the table holds, and the sidecar's failover is an order of magnitude
+cheaper than predicted.** At 1.0x of the grant, with the integrated path's saving at 11-19 ms of
+request time a second (Phase 8's 44-75 us a request at 250 req/s), a crash costs in request-seconds
+and as much of that saving: streams held with a 0.1 s takeover 0.5 / 1.2 / 0.8, under 75 s; streams
+dying with a 0.1 s takeover and a client that restarts 72 / 74 / 62, 1.0-1.8 hours; streams held
+with a 1 s takeover 128 / 127 / 126, 1.9-3.2 hours; streams dying at 1 s with a continuation 244 /
+240 / 232, 3.5-6.0 hours, and with a restart 301 / 302 / 284, 4.4-7.5 hours; a 15 s lease 32,950 /
+32,875 / 32,454, 2.9-4.9 weeks; one engine of four down for 30 s 156 / 140 / 115, 2.0-3.5 hours. At
+0.75x the same arms cost 75 / 66 / 65, 126 / 112 / 143, 276 / 233 / 247, 383 / 336 / 346 and 38,698
+/ 39,050 / 38,043 (1.0-9.0 hours and 3.4-5.8 weeks). The sidecar's fail-open window, 15 s of `hash
+only` routing with every stream intact, costs 30 / 53 / 38 at 1.0x and 21 / 12 / 41 at 0.75x:
+0.4-1.0 hours of the saving, not the 300-900 request-seconds predicted. It is cheaper than any
+restart that kills streams (62-75 even at a 0.1 s takeover) and than a 1 s takeover that holds them,
+so the *if wrong* branch does not fire, and its opposite does: an integrated scheduler whose streams
+die in a crash may crash only about as often as a fail-open proxy fails over -- a 0.1 s takeover
+costs 1.7 times the window at 1.0x -- and no more often than once an hour or two for the sum to
+favour it over a proxy that never takes streams down. Re-run with the driver's clock corrected
+(§9.27), only the held 0.1 s takeover moves at 1.0x: 1.3 / 0.7 / 0.8, or 51-87 s of the saving.
+The others stay within a tenth of an hour (71 / 75 / 63, 127 / 127 / 126, 243 / 241 / 233, 297 / 303
+/ 284 and 32,993 / 32,860 / 32,426). At 0.75x the held 0.1 s takeover costs -0.5 / 6.9 / 5.2, about
+0.1 hours, and the rest 74 / 74 / 71, 130 / 128 / 139, 276 / 235 / 247, 370 / 346 / 338 and 38,829 /
+38,673 / 38,535 (1.1-8.9 hours and 3.4-5.8 weeks). The engine and the fail-open window do not move,
+a restart that kills streams costs 63-75 at a 0.1 s takeover, and the conclusion stands.
 
 **P10 -- At fleet scale FoundationDB carries the logged tier with a cluster smaller than its
 published benchmark.**
@@ -595,6 +764,13 @@ of its 384-core benchmark; the record 1,000-1,100 a second, 95% of it liveness.
 - *If wrong* (the logged tier above 820,000 writes a second at 10,000 nodes): side-effecting work is
   denser per node than Phase 7's presets, and the log is the one place §8 allows that building below
   the layer could pay.
+
+**Measured: right.** From the integrated arm at 1.0x of the grant at 10,000 nodes: owned changes
+3.01 million a second, 151 cores at FoundationDB's single-core write rate and 1,411 at its cluster
+rate, 0.14 cores a node; the logged tier 146,000 (agentic), 298,000 (pipeline), 330,000 (multi-agent)
+and 491,000 (long-running) a second, 7-25 cores at the single-core rate and 68-230 at the cluster
+rate, every one under the 820,000 writes a second of its 384-core benchmark; the record 1,058 a
+second, 95% of it liveness. The agentic figure is just below the band's 150,000.
 
 ---
 
@@ -904,3 +1080,391 @@ llm-d's [router operations guide](https://llm-d.ai/docs/dev/operations/router),
 [background mode](https://developers.openai.com/api/docs/guides/background); Mark Callaghan,
 [*SSDs, power loss protection and fsync latency*](http://smalldatum.blogspot.com/2026/01/ssds-power-loss-protection-and-fsync.html);
 and Foundry, [arXiv 2604.06664](https://arxiv.org/abs/2604.06664).
+
+---
+
+## 9. What the build found
+
+Increment 1, in the order the findings arrived.
+
+### 9.1 Where it landed
+
+`writes.rs` holds the counters (`Counted`), their snapshot (`Writes`), the KV events' seven slots and
+liveness as arithmetic. `Machine::writes()` assembles the snapshot from the counters the machine
+already kept (decisions, dispatches, queue, cancel and fan-out statistics, refusals) and the ones it
+gained: reservations committed and released (`Reservations`), flights opened and closed, requests
+served from the router's queue, sequences started from an engine's, flow-graph writes, length
+observations, and the KV events an engine emits. `--count-writes` is an instrument on `EnforceArgs`
+beside `--probe-engine` and `--stream-buffer`: it turns on the engines' event logs and drains them
+at each arrival, or at each dispatch where an observer or the reuse instrument already does, and
+changes nothing else. `durable.rs` holds the rung and `polyphonic durability` the sweep.
+
+### 9.2 The rung is its own module, so no existing ladder output moves
+
+§4.3 put the rung in `boundary.rs`. `boundary::measure` feeds every command that prints or charges a
+ladder, so a rung there would have changed `distributed`'s and `data-path`'s output; `durable.rs`
+keeps it out. A `Flush` is `fsync` through `libc`, and a `FullFlush` is `File::sync_all`, which Rust
+implements as `F_FULLFSYNC` on darwin and `fsync` elsewhere, so on Linux the two rows measure the
+same call. The module has the crate's one new `unsafe` block, with its `SAFETY` comment.
+
+### 9.3 Flow-graph writes are counted wherever the graph changes
+
+The pre-measurement counted the placement path's inserts and removals: 107-110 a second. The build
+counts every insert and every removal that finds something, including a gang's, which is 120-125 a
+second, and owned changes move from "about 760" to 770-776 with nothing enforced. The bands in P1
+held either way.
+
+### 9.4 A flight ends closed or cancelled, and a departure is a close
+
+`flights_closed` counts a flight that completes or whose client departs, and a cancelled flight is
+counted under `cancels`, so a run with no departures has `opened == closed + cancels`, asserted. A
+cancelled request's continuation opens a new flight.
+
+### 9.5 Liveness is arithmetic, and `Machine` holds no lease
+
+`liveness_writes(nodes, seconds, renew)` multiplies nodes by renewals, and `--lease-renew` is a
+parameter of the command. The simulator has no node death by lease expiry until increment 4, and
+counting liveness as a `Machine` writer would charge it for a state the machine does not have.
+
+### 9.6 The `FaaS` denominator is 120 us, not 129
+
+§1.2 quotes a warm invocation at ~129 us. The command computes it from the constants it names, 40 us
+plus the mean of a uniform 0-160 us, which is 120 us; every ratio to it is 7% larger than the same
+cost against 129. The ordering and the bands are unchanged.
+
+### 9.7 What is not built
+
+- **Faults and everything they need:** `Fault`, `inject`, the outage and the retry, stream fate,
+  the restarted scheduler's sources, node agents' enforcement, the engine crash and node loss
+  (§4.6 to §4.12), and the four sections of `durability` they feed (§4.14, sections 4 to 11).
+- **Every decode a flight, and observations at completion** (§4.4, §4.5): the preconditions for any
+  fault to reach a fan-out agent or to be graded against a deployment's estimator lag.
+- **The FoundationDB commit rung** (`--features fdb`), which stays optional.
+- **`programs --fault`.** The logged tier is counted by `programs` as in Phase 7, and `durability`
+  reads that count; nothing yet crashes a program.
+
+---
+
+### 9.8 Increment 2: where it landed
+
+`fault.rs` holds the fault's types, the retry's timing and its counters. In `machine.rs`, `armed`
+(`--track-flights`) registers every decode: a fan-out's agents as one `GangFlight` that closes when
+its last agent ends, so a fault that aborts any aborts them all and retries the gang whole through
+`retry_gangs`; a refused fan-out's agents, which ran before the refusal, as orphans that a fault
+aborts and that expire at their end. `Machine::inject` takes a scheduler restart or an estimator
+reset. A restart under shared fate aborts every flight, gang and orphan and returns the engines'
+queues to the router; under held fate it aborts nothing. Both clear the flow graph, the landings,
+the tenant meters and the gang cancellations, reset the estimators unless kept, and put the router
+down for the outage: no queue service, no gang retry and no engine-side cancel, while engines run on.
+`Belief::unpin` releases a flight's pin on abort, and the belief's reads are filtered to what the
+scheduler has dispatched since the restart until a snapshot or never. `--observe completion` records a
+length when its decode ends and drops it if the decode is aborted. `drive_with` in `main.rs` injects
+the fault at a request, defers every arrival the outage covers and retries it as a burst or a
+backoff, and `ClassTally` keeps a `Detail` per request for the window.
+
+### 9.9 A refused fan-out's agents keep running, and a crash has to reach them
+
+A fan-out is refused when one of its agents is, after the agents before it have been dispatched. Those
+agents hold their pins and reservations until their decodes end, and the first version of the gang
+registry dropped them: after a shared restart four reservations were still held. They are orphans
+now, aborted by a fault and expired at their end, and the test that found them asserts that an
+aborted stream holds no reservation, no pinned block and no batch slot.
+
+### 9.10 The agents were 22% of the streams, and they move the figures they were predicted to
+
+The pre-measurement's restart reached 82-88 streams; the build reaches 102-112, 20-24 of them a
+gang's agents, and throws away 61-73 decode-seconds against 49-57. The held rows, which abort
+nothing, reproduce the pre-measurement to the digit (125.5 / 111.6 / 142.7 at a 1 s outage, 38,698 /
+39,050 / 38,043 at 15 s, and the belief and estimator rows), and so does the no-fault run.
+
+### 9.11 Backing off costs request-seconds, and the burst costs requests
+
+§1.6 predicted that spreading the retries would remove most of the burst's share at 15 s and change
+nothing at 1 s. Measured, a retry that waits one, two and four doubling intervals lands up to twice
+as late as the outage lasted, so every deferred request waits longer and the sum of service rises
+2-28%, while the admission the burst overloads refuses fewer (26-58% fewer unserved at 15 s). The
+price of a burst is paid in refusals and of a backoff in waiting; neither is free and a client's
+backoff is not the remedy §1.6 expected. The remedy it named, admitting retries at the restarted
+scheduler, is not built. Re-run with the driver's clock corrected (§9.27), the sum of service rises
+7-32% and the unserved fall 9-18%: most of the 26-58% was the first run's drift, which thinned the
+arrivals after a backoff's retries.
+
+### 9.12 What is not built in increment 2
+
+- **The reservation ledger's rebuild** (`--rebuild`) and node agents' enforcement (`--node-check`),
+  so the over-admission clause of P3 and the 0.6x and 0.5x rows of §1.7 are not reproduced.
+- **A subscriber that replays** (`--subscriber`): the belief is the exact view filtered to what the
+  scheduler dispatched, with a snapshot after a delay or never, as in the pre-measurement, and not
+  the engine's replay of its last 10,000 steps.
+- **Observations at completion are built and gated, and not yet graded:** the estimator rows of §1.7
+  (P4) need the sweep that suppresses observations for a window, which is increment 3's.
+- **The engine crash, node loss, the crossover and `programs --fault`** (§4.11, §4.12, §4.14).
+
+---
+
+### 9.13 Increment 3: where it landed
+
+`Restart` gains a ledger (`Now`, `After`, `Never`) and an estimator source (`Lost`, `Kept`,
+`Snapshot`). Under held fate and a ledger not rebuilt, the router's admission check and its load view
+read a shadow that holds only the claims committed since the restart, the flights then in the air
+are marked and are no cancel's victims, and the shadow ends at its deadline or when the last marked
+flight has ended. Each blind admission is checked against the real ledger, and counted as an
+over-admission if the node would have refused it. `--node-check` makes a dispatch the real ledger
+does not admit return to the router's queue, held back for one arrival, and covers a fan-out's
+agents when they are placed. `--snapshot-estimators` copies the length histograms, the observed
+means, the flow templates and the attained service every N seconds, counts the write and its bytes
+in the logged tier, and a restart restores the last copy.
+
+### 9.14 Over-admission is rare and the node check is cheap
+
+A blind ledger over-admitted nothing in the unit fixtures at any partition, because the router's
+queue backs up and waits for room before it has a stale claim to act on; the cases in the tests fill
+the real ledgers directly. In the `belief` cluster it appears only at 0.6x and 0.5x, as predicted.
+
+### 9.15 Refusals are counted once per request
+
+The first count of requests refused at a node counted every retry, one per arrival while a request
+waited for room: 3,206 against 54 requests at 0.6x. `refused_at_node` is now distinct requests and
+`refusal_attempts` the retries.
+
+### 9.16 A subscriber that replays is not built, and cannot matter at this length
+
+§4.9's `--subscriber` has `Cold` and `Snapshot`, as the pre-measurement had, and `Warm` as the bound.
+An engine's replay buffer is 10,000 steps, 70 s at the engine's 7 ms step, which holds a whole 60 s
+run, so a restart that asks for the buffer sees every event and is the warm view. The case that
+matters, a ring that has rolled (llm-d/llm-d-router#3124), needs a run of several minutes and a
+cold subscriber that anchors on the first batch it gets; it is not built.
+
+### 9.17 What is not built in increment 3
+
+- **Fan-out claims staged together** are checked by a node one at a time, which is where the
+  residual over-admissions come from.
+- **The cancel's own deficit** still reads the real ledger; the router's blind view does not reach
+  it.
+- **Active-active schedulers.** The shadow is one scheduler's blind view; two live schedulers
+  would each need their own, and are Phase 11's.
+- **The engine crash, node loss, the crossover and `programs --fault`** (§4.11, §4.12, §4.14).
+
+---
+
+### 9.18 Increment 4: where it landed
+
+`Fault::Engine` and `Fault::Node` in `fault.rs`; in `machine.rs`, `fail_node_streams` fails the
+flights, the gangs with any agent on the node and the orphans on it, and returns the node's engine
+queue to the router; `Hierarchy::crash_engine` drops the GPU and host-offload KV and the spill if
+asked, and `lose_node` drains everything and lists the durable cells. An engine crash puts the node
+out of the decode pool until its restart, and a node loss marks it lost until its declaration, when
+it leaves placement for good. A request placed on a lost node before then is parked (`Limbo`) and
+returned to the router at the declaration with its original arrival. `--copy-durable` records a copy
+when a cell is marked, charged its bytes, and a node loss counts the cells it took apart from those
+copied.
+
+### 9.19 A gang dies with any of its agents' nodes
+
+An engine crash aborts every gang with an agent on the node, all its agents, and retries it whole:
+the 34-42 streams a crash fails are the node's own streams and the siblings those gangs' other
+agents had on other nodes, which is why the figure is above a quarter of the 110 streams in flight.
+
+### 9.20 The lease parks single requests, and fan-outs and tools see the dead node at once
+
+Only single requests are parked. A fan-out's agents and a tool call skip a lost node from the moment
+of the loss, so the lease's cost to fan-outs is understated, and at 0.75x with a 40 s grace the
+parked quarter of the traffic is load the three live nodes do not carry: 5 / 21 / 16 fan-outs are
+refused against 28 / 44 / 42 with no fault, and 46-53 fewer requests are unserved.
+
+### 9.21 Suspicion is a delay, not a detector
+
+`NodeLoss::declare_ns` stands for the router's detection: 0 for acting on the first failed dispatch,
+2 s for a few silent steps (Phase 4's episodes), 10-40 s for a lease. No mechanism decides it, and
+under `--fleet` the planner does not yet re-place the lost node's replicas after the declaration.
+
+### 9.22 What is not built in increment 4
+
+- **Durable cells in a program.** The count and the copy are unit-tested; running `programs` with
+  a node loss is `programs --fault`.
+- **Re-placement under `--fleet`** after a declaration.
+- **The crossover section** (§4.14, section 11) and the sidecar's fail-open window.
+
+---
+
+### 9.23 Increment 5: where it landed
+
+`Fault::Degrade` switches the router to hash-only placement with no flow awareness and no peer fetch
+for a window and restores what it saved, aborting nothing: it is the sidecar's fail-open.
+`programs::Config` gains `fault` (an instant and a fault) and `copy_durable`, a program driver event
+injects the fault, and `Outcome` carries the fault's counters and the number of programs left
+holding a lost durable sandbox. `durability` gains `crossover` (the table of §1.11, built) and
+`durable` (section 12).
+
+### 9.24 A copy has to be sized when a cell is marked
+
+The first copy looked a cell's size up when it was marked, and a cell marked while it was not
+resident was not copied: with copying on, 6 of 8 durable cells were still lost. A mark now carries
+the cell's size, from the program's sandbox or the tool request's chain, and the unit test that
+found it asserts that with copying on a lost node loses none.
+
+### 9.25 The fail-open window costs a tenth of what the arithmetic said
+
+§1.11 priced the sidecar's failover as 15 s of Phase 6's `hash only` penalty at 500 req/s on eight
+nodes, 16-32% of service, which came to 340-850 request-seconds. At 250 req/s on four the ledger's
+own lead of scored over hash is 4-6% end to end, and the window's extra service is 12-53
+request-seconds. P9's conclusion moves with it (above).
+
+### 9.26 What is not built, and what the phase leaves open
+
+- **Re-placement under `--fleet`** after a declaration, and detectors for the declaration's delay.
+- **A replaying subscriber**, and a ring that has rolled (§9.16).
+- **Active-active schedulers**, and a scheduler per region: Phase 11's.
+- **The FoundationDB commit rung** (`--features fdb`), which stays optional.
+- **Fan-outs parked on a lease** (§9.20), so the lease's cost to fan-outs is understated.
+
+### 9.27 The review: the driver's clock ran on after a retry
+
+A review of the phase found that `drive_with` submitted each new arrival one interval after the
+machine's clock rather than at its own slot. A released retry moves that clock to its retry time, so
+every retry released late pushed the arrivals after it later: after a 15 s outage with backoff the
+trace ended at 63.3 s instead of 60.1 s, and the recovery saw less load than the trace offers. A
+burst moves the clock by at most one interval, once. The pre-measurement's driver did the same, which
+is why the held rows reproduced it to the digit (§9.10). With a fault planned, a new arrival is now
+submitted at its slot, and every restart arm ends at 60.08 s as the run without a fault does. A run
+with no outage cannot move, and `estimators`, `engine`, `node` and `durable` are identical between
+the two builds; `restart`, `routing` and `crossover` were run again.
+
+Only backoff moved beyond the noise. It costs 7-32% more than a burst rather than 2-28%, and leaves
+9-18% fewer requests unserved rather than 26-58%, so §9.11's trade holds but backoff buys less than
+it seemed to. Every other figure moved within its noise: a 1 s outage with the streams held costs
+126-139 request-seconds against 112-143, streams that die 63-75 at 0.1 s and 284-370 at 1 s
+against 62-75 and 284-383, and the crossover's hours at 1.0x of the grant are the same to a tenth
+except the held 0.1 s takeover's, 51-87 s against 43-74 s. The predictions keep their verdicts; P3,
+P5, P6 and P9 give the re-run beside the first.
+
+The review found three more things:
+
+- **`router held` counted twice.** It was counted after a shared restart had returned the aborted
+  streams and the engines' queues to the router, so it repeated `aborted`; it now counts what was
+  queued before the restart, which is none in every arm here.
+- **The snapshot's bytes were the histograms' alone,** though it restores the observed means, the
+  flow templates and the attained service as well (§9.13). It now counts all of them. In
+  `durability` the templates and the attained service are empty -- the first fill only with learned
+  hints, the second only under the PLAS order -- so the snapshot stays 32 KiB.
+- **Five fixes that move no published figure.** Unscored placement's flow shortcut skips an engine
+  inside its crash restart and a node declared lost; `warm_cell` avoids a lost node before it is
+  declared; a lost node's lease heap is cleared, so its leases do not expire as breaks; a retrieval's
+  lead is the leading run of resident blocks, not a binary search on a predicate that is not a
+  prefix; and the durable copy's rate is divided by the programs' nodes, not `durability --nodes`.
+  The run that sizes a partition's grant never carries a fault, and `durability`'s default sections
+  now include `engine`, `node`, `crossover` and `durable`.
+
+Two findings are left as they are: a `FullFlush` on Linux is `fsync` (§9.2), and `--batch` requests
+advance the counter that names fresh requests' blocks, which renames fresh traffic when both are on
+without changing its shape.
+
+---
+
+## 10. Verification, as run
+
+Increment 1.
+
+- **Byte-identity with every new bit off:** `residency` (twice, the second with `--engine-cache
+  --decode-kv`), `flows`, `placement`, `volatility`, `ownership`, `price`, `belief --sections gate`,
+  `influence --seeds 1`, `fleet --seeds 1`, `enforce --seeds 1`, `programs --sections gate,logged`
+  and `distributed --crossing native --engine-cache --decode-kv --admit perfect --repeat 1
+  --distances rack`, all at `--ops 3000 --seed 2`, produce output identical to the build before this
+  phase (`aeeb943`). `distributed` carries two lines of control-plane share that depend on live host
+  timing (`warm faas` and `warm service`) and differ between two runs of the pristine build, 0.34% and
+  0.27% on the first line; the rest of it is identical.
+- **The gate,** `durability` section 1: `--count-writes` against off at 1.0x and 0.75x of the grant
+  and on the published ledger run -- identical totals, service and stall, identical owned changes,
+  and KV events counted only when on.
+- **Tests,** 11 new, 272 in all: every KV event lands in exactly one slot by type and tier; the
+  owned changes exclude the inferred stream and the record; liveness is a write per node per renewal;
+  counting events changes no cost and each tier's stores less its removals is what it holds; every
+  reservation is released and every flight ends closed or cancelled; a machine that enforces nothing
+  writes no reservation, flight or queue entry; the flow graph counts each insert and each removal
+  that finds something; each commit appends its payload once per iteration; measuring leaves no file
+  behind and reports ordered percentiles; a missing directory is an error; percentiles read the
+  sorted latencies.
+- **The census** is 13. `cargo fmt --check` is clean, and `cargo clippy --all-targets` shows only the
+  three `assert_is_empty` warnings in lines this phase did not write (`cache.rs`, `fleet.rs`,
+  `stream.rs`).
+- **Reproducibility:** `durability --sections gate,count,logged,fleet` run twice is byte-identical;
+  the rung varies with the host, as the ladder does.
+
+Increment 2.
+
+- **Byte-identity with every new bit off:** the same thirteen commands, all identical to `aeeb943`.
+  `distributed` was identical on this run; its two timing-dependent lines are the same ones as above.
+- **The gate,** `durability` section 1, adds: `--track-flights` against off at 1.0x and 0.75x of the
+  grant (identical totals, served counts, service and stall); a fault scheduled past the trace's end
+  against no fault, both armed; and `--observe completion` where no claim reads a length (an
+  `--admit perfect` arm) against dispatch -- all identical.
+- **Tests,** 12 new, 284 in all: registering every decode as a flight changes no request; a shared
+  restart aborts every stream and gang, leaves no reservation, pinned block or batch slot, and every
+  request still closes once with every reservation released; a held restart aborts nothing and a
+  continuation keeps the tokens decoded; the router serves nothing while down and everything when it
+  is back; an aborted decode releases the belief's pin; an estimator reset sends every claim back to
+  `max_tokens`; a length is observed when its decode ends and never if it is aborted; a cold scheduler
+  does not know residency it did not dispatch and a warm one does; an unpinned belief hold stops
+  certifying its blocks and expires without a second release; a burst retries at the outage's end; a
+  backoff doubles from its base until it clears the outage; an outage is a scheduler's and an
+  estimator reset has none.
+- **The census** is 13; `cargo fmt --check` is clean; `cargo clippy --all-targets` shows only the
+  three `assert_is_empty` warnings.
+- **Reproducibility:** `durability --sections restart` is seed-deterministic like the other
+  sections, and takes about 80 s for three seeds at two partitions.
+
+Increment 3.
+
+- **Byte-identity with every new bit off:** the same thirteen commands identical to `aeeb943`, bar
+  `distributed`'s two timing-dependent lines on the run that differed (0.27% and 0.29% on the
+  first).
+- **The gate,** `durability` section 1, adds: `--node-check` and `--snapshot-estimators 10` with no
+  fault, against off, at 1.0x and 0.75x of the grant -- identical costs, with snapshots written.
+- **Tests,** 5 new, 289 in all: a blind ledger admits what the real one would refuse and a node check
+  refuses it, and a rebuilt ledger sees it; a refused dispatch returns to the router and every request
+  still closes once; the blind view ends when the pre-restart decodes have ended or at its deadline; a
+  snapshot is written on its cadence and a restart restores what it held, and a lost one sends every
+  claim back to `max_tokens`; taking snapshots changes no cost.
+- **The census** is 13; `cargo fmt --check` is clean; `cargo clippy --all-targets` shows only the
+  three `assert_is_empty` warnings.
+- **Runtime:** `routing` and `estimators` each take several minutes on this host, with five seeds at
+  the overloads and three elsewhere.
+
+Increment 4.
+
+- **Byte-identity with every new bit off:** the same thirteen commands identical to `aeeb943`, bar
+  `distributed`'s two timing-dependent lines on the run that differed (0.27% and 0.28% on the first).
+- **The gate,** `durability` section 1: `--node-check`, `--snapshot-estimators 10` and
+  `--copy-durable` together with no fault, against off, at 1.0x and 0.75x of the grant.
+- **Tests,** 5 new, 294 in all: an engine crash takes one node's streams and KV and its decoding
+  until it restarts, and its host work stays placed; a crash that loses the spill loses every tier and
+  one that keeps it loses two; a lost node parks what is placed on it until it is declared and then
+  leaves placement; a node declared at once is never parked on; losing a node counts its durable
+  cells and a copy made when they were marked saves them without calling a lost node a dropped cell.
+- **The census** is 13; `cargo fmt --check` is clean; `cargo clippy --all-targets` shows only the
+  three `assert_is_empty` warnings.
+
+Increment 5.
+
+- **Byte-identity with every new bit off:** the same thirteen commands identical to `aeeb943`, bar
+  `distributed`'s two timing-dependent lines on the run that differed.
+- **Tests,** 3 new, 297 in all: a degraded router places by hash for its window, restores its
+  placement and aborts nothing; a lost node takes the durable sandboxes it holds unless they were
+  copied, and counts the programs left with lost state; copying durable cells changes no program and
+  charges their bytes.
+- **The census** is 13; `cargo fmt --check` is clean; `cargo clippy --all-targets` shows only the
+  three `assert_is_empty` warnings.
+
+The review (§9.27).
+
+- **Re-run:** `restart`, `routing` and `crossover` on the corrected driver. `estimators`, `engine`,
+  `node` and `durable` are identical between the builds before and after the review, and so is
+  `programs` with every section.
+- **Byte-identity with every new bit off:** the same thirteen commands identical to `aeeb943`, bar
+  `distributed`'s timing-dependent lines, which two runs of `aeeb943` also disagree on (`warm faas`,
+  `warm service` and the two shortest hypotheticals).
+- **The gate,** `durability` section 1: every line identical.
+- **Tests,** 1 new, 298 in all: a snapshot counts the bytes of everything a restart restores.
+- **The census** is 13; `cargo fmt --check` is clean; `cargo clippy --all-targets` shows only the
+  three `assert_is_empty` warnings.
+

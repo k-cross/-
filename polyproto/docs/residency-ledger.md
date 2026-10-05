@@ -1565,6 +1565,67 @@ programs is 0.0% at 8 and 2 GiB, because no program contends with a second owned
 published trace at 2 GiB it is 6.1 / 7.6 / 41.4% for non-AI work, 7.8 / 6.4 / 37.9% for tool
 pipelines, 5.2 / 5.6 / 41.3% for agentic and 4.0 / 6.3 / 40.4% for multi-agent, and 0.0% at 8 GiB.
 
+### Durability: what each tier writes, and what a crash costs
+
+`phase-10.md`, implemented. `polyphonic durability` runs its sections on seeds 1-3 on the `belief`
+cluster (four nodes, 250 req/s, 10% fan-out, `--throughput 0.3`) with Phase 9's integrated arm --
+each class's own p90 claim, the class-ordered queue, the engine waiting by class, the cancel with
+continuation -- no control crossing charged, the partition at a stated share of the published grant,
+and a fault at 40% of the trace. A fault's cost is the request-seconds of service it adds to the
+same trace and seed with no fault; the window is 30 s of arrivals from the fault; five seeds at 0.6x
+and 0.5x, where any perturbation moves a run by -300 to +600 request-seconds and only counts and
+tails carry a signal.
+
+**The count.** Owned changes by their owner are 3.1 a request with nothing enforced and 5.0 under
+Phase 9's enforcement (770 and 1,200 a second, 190 and 300 a node; 5.2-5.5 at 0.6x and 0.5x), of
+which decisions are 1.23; the KV event stream is 51-77 events a request, and its removals from GPU
+and host offload 1,140-1,590 a second an engine, 9-13.5 KB/s of hashes. Liveness at a 10 s lease
+renewal is 0.4 writes a second on four nodes, 94-95% of the record's writes and 17 times the
+planner's on eight. At 10,000 nodes: 3.0 million owned changes a second (0.14 cores a node at
+FoundationDB's published cluster write rate), the logged tier 146,000-491,000 on the agent presets
+against its benchmark's 820,000, the record about 1,060. A durable append on this host is 1.6 us,
+with `fsync` 18 us and a full flush 4.0 ms; a commit per decision is 72 us on a protected drive
+within a rack, 0.8 ms across a zone and 1.5-2.5 ms at FoundationDB's published commit, 0.6-21 times
+a warm `FaaS` invocation of 120 us.
+
+**A scheduler restart.** Streams held below the scheduler: an outage of 0.1 s costs -0.5 to +6.9
+request-seconds, 1 s costs 126-139 (`λD²/2` = 125) and a 15 s lease 32,426-38,829, with 236-374
+requests unserved and a first-token p99 of 14.7-14.8 s; backing off instead of bursting costs 26-32%
+more at 15 s and leaves 9-18% fewer unserved. Streams that die with it reach 102-112 (20-24 a gang's
+agents), throw away 61-73 decode-seconds and cost 63-75 at a 0.1 s outage, 284-370 at 1 s with a
+restart and 233-276 with the client's continuation. Of the state a restart loses, the belief and the
+flow graph cost 10.0 / 0.6 / 3.9 request-seconds at 0.75x and 0.6 / -0.3 / -0.5 at 1.0x with
+3,700-5,600 reads of a resident block unknown, and the estimators cost nothing, observed at dispatch
+or when a decode ends (-0.5 to +9 at 0.75x; a first-token p99 of 63-69 ms at 0.6x with prefill
+against 63-66), and a snapshot 4 s old restores them to the digit (32 KiB every 10 s). A reservation
+ledger not rebuilt from node agents admits 131-203 requests blind and over-admits none at 1.0x and
+0.75x, 3-30% at 0.6x and 11-23% at 0.5x with a 1 s outage (10 / 27 / 9 / 25 / 5 of 154 / 161 / 140 /
+167 / 150 at 0.6x with prefill free); up to 118 sequences wait at an engine, against none, and the
+interactive first-token p99 rises on one or two of five seeds. Node agents that check their own
+partitions leave 0-4 over-admissions and no sequence waiting, and send 7-90 requests back to the
+router.
+
+**An engine crash and a node loss** (node 0 of four). An engine back after 2, 8 and 30 s costs 17.1
+/ 9.9 / 13.4, 45.8 / 39.8 / 45.0 and 156.4 / 139.9 / 114.8 request-seconds at 1.0x (3.6-5.0 for each
+second down) and 18.5 / 19.0 / 27.5, 59.8 / 24.9 / 49.5 and 217.6 / 246.0 / 112.5 at 0.75x; losing
+the spill as well changes nothing while it loses 7,971-11,187 KV blocks against 3,099-3,614;
+continuing the 34-42 streams it fails beats restarting them on two seeds of three. A node declared
+lost at once costs 196.6 / 201.9 / 179.1 at 1.0x (32-62 over an engine that never returns) and 885 /
+443 / 458 at 0.75x, refuses 23-28 more fan-outs at 1.0x and 75-98 more at 0.75x, and loses 96-115
+host blobs. A router that learns of it after 2 s pays 343-407 (a first-token p99 of 1.4-1.6 s),
+after 10 s 4,217-4,781, after 40 s 64,524-66,742 at 1.0x (a p99 of 39.4-39.6 s): the requests placed
+on it wait, 2,481-2,510 of them, a quarter of the window's arrivals.
+
+**Durable sandboxes and the crossover.** Losing a node half way through the long-running programs
+takes 18 / 18 / 20 durable cells and leaves one program each holding lost state, with turn latency
+moving 0.1-0.4%; a copy made when each cell is marked loses none, copying 6.0-6.2 GiB over the run,
+0.14-0.29 MiB/s a node, 0.012-0.024% of a zone link. A crash costs as much as the integrated path's
+saving over the sidecar (44-75 us a request, Phase 8) in: under 90 s with the streams held and a 0.1
+s takeover; 1.9-3.2 hours held at 1 s; 1.0-1.8 hours with streams dying at 0.1 s and 4.4-7.5 at 1 s
+with a restart; 2.9-4.9 weeks under a 15 s lease (1.1-8.9 hours and 3.4-5.8 weeks at 0.75x). The
+sidecar's own window, 15 s of hash-only routing with every stream intact, costs 30 / 53 / 38
+request-seconds at 1.0x and 21 / 12 / 41 at 0.75x.
+
 ## Method
 
 **On the fairness caveat.** Every comparison above between arms this repository wrote is a delta
@@ -1656,8 +1717,8 @@ the decision loop.
 
 [`owned-and-observed.md`](owned-and-observed.md) is the design this ledger is being corrected
 toward: what the orchestrator *owns*, *infers* and only *observes*, the data path, the workload
-taxonomy in [`taxo.md`](taxo.md) as a scheduler input, and the phase plan (§9 there). Phases 0-9
-are built, and their results are above. Phases 10 (durability) and 11 (regions) are design.
+taxonomy in [`taxo.md`](taxo.md) as a scheduler input, and the phase plan (§9 there). Phases 0-10
+are built, and their results are above. Phase 11 (regions) is design.
 
 ## Not built
 
@@ -1742,9 +1803,19 @@ a replica set is one neighbour's.
 | leases and drafts bind only where host DDR does | **leases bind at 8 GiB** -- 7% of a node's DDR pinned, 27-30% at 4 GiB; none broken; draft reclaim under 1% either way |
 | retention through a tool call (Continuum's TTL) | **null** -- +0.00% of turn latency; a call's rebuild is its sequence's preemption |
 | one suspend decision for KV and sandbox | **differs from two timers on 45.5% of idle gaps, frees no more** -- 62.8% against 64.5% of idle time; resumes cost under 0.15% of a turn |
-| the logged tier is orders of magnitude below the soft tier | **no** -- 20-66% of the soft tier's decisions on the agent presets; 1 in 790 for the record tier's planner |
+| the logged tier is orders of magnitude below the soft tier | **no** -- 20-66% of the soft tier's decisions on the agent presets; the record tier is 1,400-3,000 times below at four nodes, and its largest writer is liveness (17 times the planner's) |
 | prefix caching reuses retrieved chunks | **by order** -- 36% in a fixed order, 12% in relevance order; reuse by content 64% (counterfactual) |
 | a role's own quantile replaces the pooled one | **yes where claims bind** -- overruns 9-13% against 63% for reviewers; fan-out service -2.8% to +3.3% at 160 MiB |
 | the class is recoverable from observables | **partly** -- 60.6% at the first call, 85.7% at the last; the consumers move by under 15% |
 | coupling is confined to the patterns with flows | **locality yes, memory not on programs** -- 13-15% on pipelines, 4-7% on agentic and multi-agent, 0% elsewhere; memory coupling 0% on programs, 4-41% on the published trace at 2 GiB |
-
+| a restart's cost is its soft state | **no** -- its outage and its streams: `λD²/2` with the streams held (126-139 request-seconds at 1 s, 32,426-38,829 at a 15 s lease), 61-73 decode-seconds and 63-75 request-seconds more at a 0.1 s outage when they die with the scheduler; the belief, the flow graph and the estimators cost nothing a run can see |
+| a 15 s lease is a takeover for a scheduler on the request path | **no** -- 32,000-39,000 request-seconds a crash; node agents enforcing their own partitions let a standby take over without one |
+| spreading retries by a backoff beats a burst | **no** -- 7-32% more request-seconds for 9-18% fewer requests unserved |
+| a blind reservation ledger over-admits | **only where memory binds hardest** -- 3-30% of blind admissions at 0.6x and below, none at 1.0x and 0.75x; the engine's wait absorbs it and a node check removes all but 0-4 |
+| the estimators need a checkpoint | **no** -- lengths observed when a decode ends re-learn within a fraction of a second; a snapshot restores them to the digit at 32 KiB every 10 s |
+| an engine crash costs its KV | **no** -- its replica's restart, 3.6-5 request-seconds a second down at 1.0x, whether or not the spill survives |
+| a lost node is an engine crash that never returns | **plus 32-62 request-seconds** at 1.0x for its host work, its gangs (fan-outs refused 0 -> 23-28), and the lease: 4,200-4,800 request-seconds if the router waits 10 s and about 65,000 at 40 s |
+| durable sandboxes survive every fault | **all but the loss of their node** -- 18-20 cells lost in a long-running run, none with a copy made when each is marked, at 0.14-0.29 MiB/s a node |
+| write-through checkpoints | **ruled out** -- 0.6-21 times a warm `FaaS` invocation at a protected-drive or FoundationDB commit, 4 ms with this host's full flush |
+| the logged tier outgrows FoundationDB | **no** -- 146,000-491,000 writes a second at 10,000 nodes against 820,000 published |
+| the integrated path pays for its crashes | **while it crashes no more than about once a minute or two with its streams held and once an hour or two with them fate-shared**; a fail-open proxy's window costs 12-53 request-seconds |

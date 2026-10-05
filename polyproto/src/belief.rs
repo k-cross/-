@@ -210,6 +210,11 @@ impl Belief {
     }
 
     #[must_use]
+    pub fn pinned_blocks(&self) -> usize {
+        self.pinned.len()
+    }
+
+    #[must_use]
     pub fn believes_held(&self, id: &BlobId) -> bool {
         self.believes_gpu(id) || self.index.contains(Medium::Cpu, id)
     }
@@ -389,7 +394,7 @@ impl Belief {
         }
     }
 
-    fn pin(&mut self, ids: Vec<BlobId>, until: u64) {
+    fn pin(&mut self, ids: Vec<BlobId>, until: u64) -> u64 {
         self.certain.set(None);
         let seq = self.next_hold;
         self.next_hold += 1;
@@ -398,6 +403,22 @@ impl Belief {
         }
         self.held.insert(seq, ids);
         self.holds.push(Reverse((until, seq)));
+        seq
+    }
+
+    fn unpin(&mut self, seq: u64) {
+        let Some(ids) = self.held.remove(&seq) else {
+            return;
+        };
+        self.certain.set(None);
+        for id in ids {
+            if let Some(n) = self.pinned.get_mut(&id) {
+                *n -= 1;
+                if *n == 0 {
+                    self.pinned.remove(&id);
+                }
+            }
+        }
     }
 
     fn release(&mut self, now: u64) {
@@ -603,8 +624,12 @@ impl Observer {
         }
     }
 
-    pub fn pin(&mut self, d: usize, ids: Vec<BlobId>, until: u64) {
-        self.beliefs[d].pin(ids, until);
+    pub fn pin(&mut self, d: usize, ids: Vec<BlobId>, until: u64) -> u64 {
+        self.beliefs[d].pin(ids, until)
+    }
+
+    pub fn unpin(&mut self, d: usize, seq: u64) {
+        self.beliefs[d].unpin(seq);
     }
 
     pub fn release(&mut self, now: u64) {
@@ -1095,6 +1120,20 @@ mod tests {
         o.pump(26, &[10], &[0, 0]);
         o.dispatched(0, &[a], 26, 1.0);
         assert_eq!(o.survival(0, &a.0), 1.0);
+    }
+
+    #[test]
+    fn an_unpinned_hold_stops_certifying_its_blocks_and_expires_without_a_second_release() {
+        let mut o = Observer::new(1, Conditions::exact());
+        let b = block("held");
+        o.emit(0, vec![stored(&b, Medium::Gpu)], 0, 0);
+        let seq = o.pin(0, vec![b.0], 100);
+        assert_eq!(o.survival(0, &b.0), 1.0);
+        o.unpin(0, seq);
+        assert!(!o.beliefs[0].pinned.contains_key(&b.0));
+        o.unpin(0, seq);
+        o.release(200);
+        assert!(o.beliefs[0].held.is_empty() && o.beliefs[0].pinned.is_empty());
     }
 
     #[test]

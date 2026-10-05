@@ -1,4 +1,5 @@
 mod belief_cmd;
+mod durability_cmd;
 mod enforce_cmd;
 mod fleet_cmd;
 mod influence_cmd;
@@ -487,6 +488,58 @@ enum Cmd {
         #[arg(
             long,
             default_value = "gate,engine,queue,order,cancel,claims,restart,llmd,batch,departures,buffer"
+        )]
+        sections: String,
+    },
+
+    /// What each durability tier writes and what a crash costs: phase-10.md §4.14's sweeps.
+    /// Charges no control crossing, so every number bar the host's durable-append timings is
+    /// reproducible from the seed
+    Durability {
+        #[arg(long, default_value_t = 4)]
+        nodes: usize,
+        #[arg(long, default_value_t = 3)]
+        units_per_node: usize,
+        #[arg(long, default_value = "16GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        #[arg(long, default_value = "32GiB", value_parser = parse_bytes)]
+        dram: u64,
+        #[arg(long, default_value = "64GiB", value_parser = parse_bytes)]
+        nvme: u64,
+        #[arg(long, default_value_t = 15_000)]
+        ops: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, default_value_t = 250.0)]
+        rate: f64,
+        #[arg(long, default_value_t = 0.10)]
+        fanout: f64,
+        /// Seeds per cell
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..))]
+        seeds: u64,
+        /// Fraction of sessions that declare a throughput objective
+        #[arg(long, default_value_t = 0.3)]
+        throughput: f64,
+        /// Partitions of the published grant the enforced arm is counted at, comma-separated
+        #[arg(long, default_value = "0.75,1.0")]
+        scales: String,
+        /// Fleet size the count is multiplied to in the fleet section
+        #[arg(long, default_value_t = 10_000)]
+        fleet_nodes: u64,
+        /// Seconds between a node's lease renewals; Kubernetes renews every 10
+        #[arg(long, default_value_t = 10.0)]
+        lease_renew: f64,
+        /// Runs of the durable-append rung; the lowest median and p99 are kept
+        #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
+        reps: u64,
+        /// Directory the durable-append rung writes to; a tmpfs measures no flush
+        #[arg(long, default_value_os_t = std::env::temp_dir())]
+        dir: std::path::PathBuf,
+        /// Sections to run, comma-separated, printed in this order: gate, count, logged, restart,
+        /// routing, estimators, engine, node, crossover, durable, rung, fleet
+        #[arg(
+            long,
+            default_value = "gate,count,logged,restart,routing,estimators,engine,node,crossover,durable,rung,fleet"
         )]
         sections: String,
     },
@@ -1216,6 +1269,12 @@ enum EngineWaitArg {
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ObserveArg {
+    Dispatch,
+    Completion,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 enum QueueArg {
     Off,
     Fifo,
@@ -1298,6 +1357,30 @@ struct EnforceArgs {
     /// arrival; changes nothing
     #[arg(long)]
     stream_buffer: bool,
+    /// Instrument: count the KV events each engine emits, by type and tier, beside the owned
+    /// changes the machine always counts; changes nothing
+    #[arg(long)]
+    count_writes: bool,
+    /// Instrument: register every decode as a flight, a fan-out's agents as one gang, so that a
+    /// fault can reach it; changes nothing
+    #[arg(long)]
+    track_flights: bool,
+    /// When the router records an output length: as a decode is dispatched, or when it ends
+    #[arg(long, value_enum, default_value_t = ObserveArg::Dispatch)]
+    observe: ObserveArg,
+    /// Node agents' arm: a node refuses a dispatch its own ledger of claims does not admit, and
+    /// the request returns to the router's queue, so a router whose ledger is blind cannot
+    /// over-admit a node (acts only after a scheduler restart that leaves the ledger blind)
+    #[arg(long)]
+    node_check: bool,
+    /// Seconds between snapshots of the router's estimators, written to the logged tier; 0 takes
+    /// none
+    #[arg(long, default_value_t = 0.0)]
+    snapshot_estimators: f64,
+    /// Copy a durable cell off its node when it is marked, so that losing the node loses none of
+    /// them; charged its bytes
+    #[arg(long)]
+    copy_durable: bool,
     /// After each request, with this chance from a stream of its own, a throughput request with an
     /// unshared 8-block prompt and 200-600 output tokens
     #[arg(long, default_value_t = 0.0)]
@@ -1318,6 +1401,12 @@ impl EnforceArgs {
         disconnect: 0.0,
         leak: false,
         stream_buffer: false,
+        count_writes: false,
+        track_flights: false,
+        observe: ObserveArg::Dispatch,
+        node_check: false,
+        snapshot_estimators: 0.0,
+        copy_durable: false,
         batch: 0.0,
     };
 
@@ -1426,6 +1515,17 @@ impl EnforceArgs {
             leak: self.leak,
         }));
         mach.set_track_stream(self.stream_buffer);
+        mach.set_count_events(self.count_writes);
+        mach.set_armed(self.track_flights);
+        mach.set_node_check(self.node_check);
+        mach.set_copy_durable(self.copy_durable);
+        mach.set_snapshot_every(
+            (self.snapshot_estimators > 0.0).then_some((self.snapshot_estimators * 1e9) as u64),
+        );
+        mach.set_observe(match self.observe {
+            ObserveArg::Dispatch => polyphonic::fault::Observe::Dispatch,
+            ObserveArg::Completion => polyphonic::fault::Observe::Completion,
+        });
         mach.set_probe_engine(self.probe_engine);
         mach.set_engine_wait(match self.engine_wait {
             EngineWaitArg::Off => EngineWait::Off,
@@ -3102,6 +3202,46 @@ fn main() {
             ops,
             sections,
         }),
+        Cmd::Durability {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            rate,
+            fanout,
+            seeds,
+            throughput,
+            scales,
+            fleet_nodes,
+            lease_renew,
+            reps,
+            dir,
+            sections,
+        } => durability_cmd::run_all(&durability_cmd::Env {
+            nodes,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            ops,
+            seed,
+            rate,
+            fanout,
+            seeds,
+            throughput,
+            scales: scales
+                .split(',')
+                .map(|s| s.trim().parse().expect("a scale is a number"))
+                .collect(),
+            fleet_nodes,
+            lease_renew,
+            reps: reps as usize,
+            dir,
+            sections,
+        }),
         Cmd::Enforce {
             nodes,
             units_per_node,
@@ -3397,6 +3537,18 @@ struct ClassTally {
     base: u64,
     window: (f64, f64),
     departed: u64,
+    details: Vec<Detail>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Detail {
+    position: u64,
+    slo: usize,
+    decodes: bool,
+    class: usize,
+    served: bool,
+    service_ns: u64,
+    stall_ns: u64,
 }
 
 type ClassRow<'a> = (&'a str, ClassTally);
@@ -3716,6 +3868,7 @@ struct Scenario {
     fleet: FleetArgs,
     enforce: EnforceArgs,
     lag_ns: u64,
+    fault: Option<FaultPlan>,
 }
 
 fn oracle_of(sc: &Scenario, nodes: usize) -> Option<polyphonic::fleet::OraclePlan> {
@@ -3853,9 +4006,9 @@ fn distributed_run(
         if inf.oracle() {
             mach.set_foresight(Some(foresight));
         }
-        drive(&mut mach, sc.rate, &trace)
+        drive_with(&mut mach, sc.rate, &trace, sc.fault)
     } else {
-        drive(&mut mach, sc.rate, workload)
+        drive_with(&mut mach, sc.rate, workload, sc.fault)
     };
     t.window = sc.fleet.neighbour_window();
     ArmRun {
@@ -4088,6 +4241,7 @@ fn distributed(
         fleet,
         enforce,
         lag_ns: 0,
+        fault: None,
     };
 
     let mut warm_seen = [(0u64, 0u64); BlobKind::N];
@@ -4345,6 +4499,7 @@ fn code_review(
 }
 
 struct Shape {
+    deferred_ns: u64,
     class: usize,
     base_at: u64,
     tenant: u32,
@@ -4358,6 +4513,7 @@ struct Shape {
 impl Shape {
     fn of(req: &polyphonic::work::Request, base_at: u64) -> Self {
         Self {
+            deferred_ns: 0,
             class: req.kind_idx(),
             base_at,
             tenant: req.tenant.unwrap_or(u32::MAX),
@@ -4377,37 +4533,48 @@ fn tally(
     shape: &Shape,
     c: &polyphonic::cache::Cost,
 ) {
+    let service = c.service_ns() + shape.deferred_ns;
+    let stall = c.total_ns() + shape.deferred_ns;
+    t.details.push(Detail {
+        position: shape.base_at,
+        slo: shape.slo.idx(),
+        decodes: shape.decodes,
+        class: shape.class,
+        served: !c.pending,
+        service_ns: service,
+        stall_ns: stall,
+    });
     if c.pending {
         return;
     }
     let k = shape.class;
     t.tenant_samples
-        .push((shape.base_at, shape.tenant, c.service_ns()));
-    *total += c.total_ns();
-    t.stall[k] += c.total_ns();
-    t.service[k] += c.service_ns();
+        .push((shape.base_at, shape.tenant, service));
+    *total += stall;
+    t.stall[k] += stall;
+    t.service[k] += service;
     t.decide[k] += c.decide_ns;
     t.ops[k] += 1;
-    t.samples[k].push(c.service_ns());
-    t.phase[shape.phase].0 += c.service_ns();
+    t.samples[k].push(service);
+    t.phase[shape.phase].0 += service;
     t.phase[shape.phase].1 += 1;
     if k == BlobKind::KvBlock.idx() && shape.decodes {
-        t.slo_service[shape.slo.idx()].push(c.service_ns());
-        t.slo_stall[shape.slo.idx()].push(c.total_ns());
+        t.slo_service[shape.slo.idx()].push(service);
+        t.slo_stall[shape.slo.idx()].push(stall);
     }
     if k == BlobKind::KvBlock.idx() {
         if shape.stage {
-            t.stage.push(c.service_ns());
+            t.stage.push(service);
             t.produced[1] += shape.produced;
         } else {
-            t.chat.push(c.service_ns());
+            t.chat.push(service);
             t.produced[0] += shape.produced;
         }
     }
 
     if c.transfer_ns == 0 && c.recompute_ns == 0 {
         t.warm[k] += 1;
-        t.warm_ns[k] += c.service_ns();
+        t.warm_ns[k] += service;
     }
     t.regime[polyphonic::oracle::classify(c).idx()] += 1;
     *served += 1;
@@ -4430,37 +4597,143 @@ fn settle(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FaultPlan {
+    at_request: usize,
+    fault: polyphonic::fault::Fault,
+    retry: polyphonic::fault::Retry,
+}
+
 fn drive<R: std::borrow::Borrow<polyphonic::work::Request>>(
     mach: &mut polyphonic::machine::Machine,
     rate: f64,
     workload: impl IntoIterator<Item = R>,
 ) -> (ClassTally, u64, u64, u64) {
+    drive_with(mach, rate, workload, None)
+}
+
+fn submit_tallying(
+    mach: &mut polyphonic::machine::Machine,
+    req: &polyphonic::work::Request,
+    at_ns: Option<u64>,
+    shape: Shape,
+    acc: &mut Drive,
+) {
     use polyphonic::machine::Submitted;
+    let outcome = match at_ns {
+        Some(at) => mach.submit_at(at, req),
+        None => mach.submit(req),
+    };
+    match outcome {
+        Submitted::Closed(c) => tally(&mut acc.t, &mut acc.total, &mut acc.served, &shape, &c),
+        Submitted::Open(id) => {
+            acc.open.insert(id, shape);
+        }
+    }
+    settle(
+        mach,
+        &mut acc.open,
+        &mut acc.t,
+        &mut acc.total,
+        &mut acc.served,
+    );
+}
+
+#[derive(Default)]
+struct Drive {
+    t: ClassTally,
+    total: u64,
+    served: u64,
+    open: std::collections::HashMap<usize, Shape>,
+}
+
+fn drive_with<R: std::borrow::Borrow<polyphonic::work::Request>>(
+    mach: &mut polyphonic::machine::Machine,
+    rate: f64,
+    workload: impl IntoIterator<Item = R>,
+    plan: Option<FaultPlan>,
+) -> (ClassTally, u64, u64, u64) {
     mach.set_arrival_rate(rate);
-    let mut t = ClassTally::default();
-    let (mut total, mut served, mut offered) = (0u64, 0u64, 0u64);
-    let mut open = std::collections::HashMap::new();
+    let interval_ns = if rate > 0.0 { (1e9 / rate) as u64 } else { 0 };
+    let mut acc = Drive::default();
+    let mut offered = 0u64;
+    let mut outage_end = 0u64;
+    let mut waiting: Vec<(u64, polyphonic::work::Request, Shape)> = Vec::new();
     for (position, req) in workload.into_iter().enumerate() {
         let req = req.borrow();
         mach.set_position(position as u64);
         offered += 1;
-        let shape = Shape::of(req, t.base);
-        t.base += u64::from(!req.concurrent);
-        match mach.submit(req) {
-            Submitted::Closed(c) => tally(&mut t, &mut total, &mut served, &shape, &c),
-            Submitted::Open(id) => {
-                open.insert(id, shape);
+        let shape = Shape::of(req, acc.t.base);
+        acc.t.base += u64::from(!req.concurrent);
+        let mut at_ns = None;
+        if let Some(plan) = plan {
+            if position == plan.at_request {
+                mach.inject(plan.fault);
+                outage_end = mach.now_ns() + plan.fault.outage_ns();
             }
+            let nominal = mach.now_ns() + if req.concurrent { 0 } else { interval_ns };
+            if !req.concurrent && nominal < outage_end {
+                mach.advance_to(nominal);
+            }
+            release_waiting(mach, &mut waiting, nominal, &mut acc);
+            if nominal < outage_end {
+                let mut attempts = 0u64;
+                let at = polyphonic::fault::retry_at(plan.retry, nominal, outage_end, &mut || {
+                    attempts += 1;
+                    polyphonic::rng::Rng::hashed_unit(
+                        (position as u64) << 8 ^ RETRY_JITTER_KEY ^ attempts,
+                    )
+                });
+                waiting.push((
+                    at,
+                    req.clone(),
+                    Shape {
+                        deferred_ns: at - nominal,
+                        ..shape
+                    },
+                ));
+                settle(
+                    mach,
+                    &mut acc.open,
+                    &mut acc.t,
+                    &mut acc.total,
+                    &mut acc.served,
+                );
+                continue;
+            }
+            at_ns = Some(nominal);
         }
-        settle(mach, &mut open, &mut t, &mut total, &mut served);
+        submit_tallying(mach, req, at_ns, shape, &mut acc);
     }
+    release_waiting(mach, &mut waiting, u64::MAX, &mut acc);
     mach.finish();
-    settle(mach, &mut open, &mut t, &mut total, &mut served);
+    settle(
+        mach,
+        &mut acc.open,
+        &mut acc.t,
+        &mut acc.total,
+        &mut acc.served,
+    );
     assert!(
-        open.is_empty(),
+        acc.open.is_empty(),
         "every request is closed once the trace drains"
     );
-    (t, total, served, offered)
+    (acc.t, acc.total, acc.served, offered)
+}
+
+const RETRY_JITTER_KEY: u64 = 0x7e57_0a11;
+
+fn release_waiting(
+    mach: &mut polyphonic::machine::Machine,
+    waiting: &mut Vec<(u64, polyphonic::work::Request, Shape)>,
+    until_ns: u64,
+    acc: &mut Drive,
+) {
+    waiting.sort_by_key(|(at, _, _)| *at);
+    let due = waiting.partition_point(|(at, _, _)| *at <= until_ns);
+    for (at, req, shape) in waiting.drain(..due) {
+        submit_tallying(mach, &req, Some(at), shape, acc);
+    }
 }
 
 fn fanout_admission(topo: &polyphonic::topo::Topology, memory: NodeMemory, sc: &Scenario) {
@@ -5009,6 +5282,7 @@ fn price(a: &PriceArgs) {
             fleet: FleetArgs::OFF,
             enforce: EnforceArgs::OFF,
             lag_ns: 0,
+            fault: None,
         };
         let cell = |p3: Correct| -> String {
             let mut out = Vec::with_capacity(2);
