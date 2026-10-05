@@ -1757,7 +1757,7 @@ run, and what was measured; the current numbers are in the ledger.
 | [7](phase-7.md) | learned flows, speculative authority, sessions that suspend, the taxonomy (`--hint-grade`, `--learn-gate`, `polyphonic programs`) | done | closed-loop turns are 3.6-3.8x the open-loop trace's, and the same hints cut the flow stall by 0-5% rather than 47-63%; speculation is worth about 1% on coding tools; the logged tier writes 20-66% of the soft tier's decisions on agent presets |
 | [8](phase-8.md) | the data path as an arm | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
 | [9](phase-9.md) | enforcement: a queue at the router, cancellation on the path, and two-tier admission (`--engine-wait`, `--queue`, `--admit`, `--cancel`, `--victim`, `--disconnect`, `--batch`, `--stream-buffer`) | done | a cancel by declared class takes the interactive first-token p99 to 63-66 ms, a restart is 26-183% later than a continuation, and the stalled-stream buffer is under 2 MB a node |
-| 10 | durability: what each tier writes, and what a crash costs | planned | |
+| [10](phase-10.md) | durability: what each tier writes, and what a crash costs | planned | |
 | 11 | regions: a scheduler per region under global budgets | planned | |
 
 Built bits are off by default, and every result behind them is an A/B against the run without them.
@@ -1871,6 +1871,8 @@ under 1.8 MB a node. Several cells lie outside their stated bands and `phase-9.m
 the batch arms are graded on bands against a draw that is not the pre-measurement's.
 
 ### Phase 10 -- Durability: what each tier writes, and what a crash costs
+
+Implementation plan: [`phase-10.md`](phase-10.md), which states its predictions before the run.
 
 §1 makes two claims about durability that no run tests: the three tiers' write rates sit orders of
 magnitude apart, and soft state can be rebuilt rather than stored.
