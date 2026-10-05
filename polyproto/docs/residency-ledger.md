@@ -1492,6 +1492,79 @@ sequence-seconds of decode that an abort frees.
 the busiest node holds 3853-4638 tokens on the published workload and 7110-8876 with the batch
 class: 0.77-0.93 and 1.42-1.78 MB at 200 bytes a token, 0.009-0.021% of a node's DDR.
 
+### Programs: closed-loop agents, and what the open-loop trace overstated
+
+`polyphonic programs` (`phase-7.md`) submits agent programs step by step, each step when its
+predecessor completes, on the belief cluster's shape with no control crossing charged: 900 programs a
+run at 12 a second, compress 5, three seeds, every figure one value per seed. The published trace is
+open loop and these are not its replacement; every row above is still the trace's.
+
+**Causality.** The published trace submits a tool call 28 ms after its turn whatever the turn is
+doing: 100% of an agent turn's tool calls and fan-outs arrive before the turn ends, by a median of
+1.0-1.1 s, 18% of a session's consecutive turns overlap, and a `FaaS` call's inference arrives 28 ms
+after it. Released when their upstream finishes, none does. A closed-loop turn is 3.6-3.8x the open
+loop's (5.4-5.8 s against 1.5 s) and a session 1.9-2.0x (16.4-17.1 s against 8.1-8.7 s, the open
+loop keeping each session's think time). Every flow result above that depends on a
+downstream arriving before its upstream ends -- *announce*, *prefill-ahead*, the flow stall -- is an
+open-loop figure and is kept as measured.
+
+**Hints by grade.** Against prefill-ahead off, in published order, the flow downstream's stall falls
+63 / 64 / 62% with the declared downstream, 47% with the declared template only and 31 / 28 / 24%
+with a template learned per function (known for 74% of flows); gated at P(flow) 0.5 the learned
+figure is 23 / 19 / 14%. Released when the upstream finishes, the figures are 0.5 / 1.9 / 3.2%, 0.4 /
+3.4 / 5.4% and -0.1 / +2.9 / -0.0%, and at half the partition the template-only hint costs +4.6 /
++4.7 / +10.7%. Warm-ups before a tool on long-running agents are -0.03 to -0.04% of turn latency whether
+the name is predicted or read from the stream; a declared fixed pipeline's is -0.25 / -0.23 / -0.26%
+at 2 GiB of DDR a node.
+
+| | coding tools | research tools, open reads allowed |
+|---|---|---|
+| speculation at the measured top-1, turn latency | 27%: -0.5 / +1.6 / -1.0% | 28%: -3.2 / -3.4 / -3.7% |
+| speculation at habit 0.6 | 50%: -0.1 / -0.5 / -1.3% | |
+| a perfect predictor | -1.8 / +0.5 / -2.0% | -17.3 / -16.5 / -16.9% |
+| wasted / saved tool-seconds | 312 / 124 (27%), 219 / 219 (50%) | 4098 / 2033 |
+
+With executor slots, unpriced speculation shortens the queue other sessions' tools wait in by 15-19%
+at 2-4 slots a node and 1% at 6, because a hit takes its tool out of the queue, and moves turn
+latency by -1.1 to +2.6%; priced, it stays within 2.1% of none.
+
+**Leases, retention, the lifecycle.** A lease on a `SideEffecting` call's cell pins 7.0% of a node's
+DDR at its peak at 8 GiB and 27-30% at 4 GiB, with none broken and no durable cell lost; reclaiming
+drafts moves turn latency by +0.00% at 8 GiB and by under 1% either way below it. Every agentic run
+abandons 60-61 of 2700 programs when the router's admission refuses a call. Continuum's TTL
+emits 2.4-2.6 million marks a run and moves turn latency by +0.00% at 6, 12 and 18 sessions a second:
+the excess rebuild a call pays, 0.03-7 ms (8-9 ms at half the partition), is the sequence's own
+preemption, not an eviction between calls. The two timers (KV 300 s, sandbox 900 s, divided by the
+compression) disagree on 19.2% of 4671 turn boundaries; the joint decision differs from the pair on
+45.5% of them, frees 62.8% of idle time against the timers' 64.5%, and moves a turn by +0.07 / +0.13
+/ +0.06% at 8 GiB and +0.03 / +0.08 / +0.03% at 2 GiB.
+
+**The logged tier.** An intent and an outcome per `SideEffecting` call are 6.9 writes a second on the
+pipeline preset (40% of its soft decisions), 7.1 on the agentic (20%; 13.9 and 38% with MCP's
+defaults for edits) and 14.6 on the multi-agent (44%); the long-running preset writes 0.59 a second
+(66% of its 0.9 decisions); one-shot, extraction, conversational, retrieval and batch write nothing.
+The record tier's planner writes 0.046 a second.
+
+**Retrieval.** At k = 5 over 10,000 chunks a finite partition reuses 35.7 / 36.1 / 35.5% of the
+chunk tokens under prefix caching in a fixed order and 12.4 / 12.2 / 11.6% in relevance order (52.3%
+and 27.6% infinite); reuse by content under any parent finds 64.0 / 64.1 / 63.2% (96.2% infinite), a
+residency counterfactual that nets 54% after the 15% it recomputes. At 100,000 chunks: 32.1% and
+10.3%, and 55.7%.
+
+**Roles and class inference.** A pooled p90 claim of 242 tokens overruns on 63 / 65% of reviewers and
+23 / 24% of explorers; a role's own p90 on 8.5-13.3% of each, reserving 220 tokens an agent. Fan-out
+service moves by -0.1% at a 256 MiB partition a node and -2.8% (claims) / +3.3% (score) at 160 MiB,
+where the pooled claim completes 1193 of 1242 fan-outs and the role's 1181 of 1245. The class read
+from observables is right for 60.6% of requests at their first call, 85.7% at their last and 79.1%
+over every call.
+
+**The table.** Locality coupling by pattern, 8 GiB: one-shot, extraction, conversational, retrieval
+and batch 0.0%; tool pipeline 15.2 / 14.8 / 13.0%; agentic 4.1 / 4.1 / 3.8%; multi-agent 7.2 / 7.6 /
+6.9%; long-running 2.2 / 2.2 / 1.9%; the four together 8.1 / 9.3 / 7.7%. Memory coupling on the
+programs is 0.0% at 8 and 2 GiB, because no program contends with a second owned class; on the
+published trace at 2 GiB it is 6.1 / 7.6 / 41.4% for non-AI work, 7.8 / 6.4 / 37.9% for tool
+pipelines, 5.2 / 5.6 / 41.3% for agentic and 4.0 / 6.3 / 40.4% for multi-agent, and 0.0% at 8 GiB.
+
 ## Method
 
 **On the fairness caveat.** Every comparison above between arms this repository wrote is a delta
@@ -1583,9 +1656,8 @@ the decision loop.
 
 [`owned-and-observed.md`](owned-and-observed.md) is the design this ledger is being corrected
 toward: what the orchestrator *owns*, *infers* and only *observes*, the data path, the workload
-taxonomy in [`taxo.md`](taxo.md) as a scheduler input, and the phase plan (§9 there). Phases 0-6
-and 8 are built, and their results are above. Phase 7, learned flows and speculative authority,
-follows Phase 9's cancellation.
+taxonomy in [`taxo.md`](taxo.md) as a scheduler input, and the phase plan (§9 there). Phases 0-9
+are built, and their results are above. Phases 10 (durability) and 11 (regions) are design.
 
 ## Not built
 
@@ -1623,7 +1695,7 @@ a replica set is one neighbour's.
 | memory coupling | regime-bound — **0.0%** at the `distributed` defaults (nothing binds), **54–85%** at 4 GiB DDR/node; locality coupling 0.8–1.7% in both. **With the engine allocating KV, 0–26%** (0–2% on the scored arms): most of it was the ledger allocating the engine's offload |
 | clairvoyant eviction vs GDSF | budget-matched: wins hit rate (+22.8pp), loses on cost (+3.7%) — GDSF gives up the *cheap* hits, so cost-weighting is already doing the work |
 | unified control plane beats RPC-queried | rounding error in aggregate (+0.02 ms/request); 33.7% of a warm `FaaS` invocation against its chosen `exec_ns` |
-| announce / anticipatory prewarm | 11–18% faster tasks, net work slightly worse — **half to three-quarters of it was KV prewarm**, which the engine does not let the orchestrator write; 3–9% with the engine allocating. **All of the KV margin was prewarm, none retention**, and a prefill of the declared downstream dispatched with the hint buys 24–28% |
+| announce / anticipatory prewarm | 11–18% faster tasks, net work slightly worse — **half to three-quarters of it was KV prewarm**, which the engine does not let the orchestrator write; 3–9% with the engine allocating. **All of the KV margin was prewarm, none retention**, and a prefill of the declared downstream dispatched with the hint buys 24–28%. Open-loop figure: the trace submits the downstream before its upstream ends (*Programs*); the published number is kept. |
 | downstream-aware gate | coupling tier 1 — replicable by a hint API |
 | data path binds below ~1 ms, dissolves an order of magnitude above | holds — crossover 0.84–1.42 ms / 4.35–7.42 ms, measured tax not borrowed |
 | out-of-process hook caps scheduler fleet size | holds — ~20 nodes (`ext_proc`) vs ~1000 (`Wasm`), `d` measured not assumed |
@@ -1638,7 +1710,7 @@ a replica set is one neighbour's.
 | the gossip result is about engine telemetry | **retracted** -- it was about an informer cache over owned state in one regime; engine KV from the channel moves residency-greedy +21% at the published partition and -30% at half of it |
 | the score can stop reading the exact output length | **yes** -- the observed mean is within 0.13% and better; a quantile of it is not wanted |
 | retention directives buy back what the correction removed | **no** -- holding a declared flow's blocks is worth 0.0-0.1pp; an oracle emitter that knows every next use buys at most 1.4% of stall and 0.1% of service, with the sign changing across seeds; the bump half of `announce` carried -5% to +9% of its KV margin |
-| the engine lets the orchestrator prewarm | **yes, by dispatch** -- prefill-ahead buys 24-28% task latency on one node and cuts a flow downstream's stall by 64% at rack, 31% at zone and 7% at region, for 1.5-1.7x its saving in prefill work; only about half land where the downstream is placed |
+| the engine lets the orchestrator prewarm | **yes, by dispatch** -- prefill-ahead buys 24-28% task latency on one node and cuts a flow downstream's stall by 64% at rack, 31% at zone and 7% at region, for 1.5-1.7x its saving in prefill work; only about half land where the downstream is placed. Open-loop figure: the trace submits the downstream before its upstream ends (*Programs*); the published number is kept. |
 | an ignored directive can make the router's view wrong | **no** -- it changes no event, and an acknowledged belief is byte-identical to no directives; a belief that trusts its own requests is over-confident (0.975 against 1.000 realised) only where removals go undelivered |
 | divergence has separable causes | **yes** -- undelivered removals dominate; 1-8% of the no-recovery column is stranded optimistic entries; misses are zero at every sample |
 | a deadline on the ledger's bump | bounded state (no stale entries against 27-852) and 0.8-2.0 points of task latency with honest hints |
@@ -1663,4 +1735,16 @@ a replica set is one neighbour's.
 | a quantile claim needs a second cancel trigger at the engine | **no** -- the router's check alone keeps the interactive first-token p99 under 1 s on every seed; the engine trigger takes one seed from 691 to 64 ms and costs 1.3-2.4x at 0.6x with prefill |
 | a client that leaves is the cancel's first job | **holds at 20%** (1.7-3.2x on the interactive first-token p99 leaked against aborted), at 5% only with prefill free |
 | the stalled-stream buffer is a memory-arbitration event | **retracted for text** -- under 1.8 MB a node |
+| a closed loop is what the open-loop trace measured | **no** -- the trace submits 100% of tool calls and fan-outs before their turn ends, by about a second; a closed-loop turn is 3.6-3.8x as long, and *announce* and *prefill-ahead* are open-loop figures, kept as published |
+| prefill-ahead survives a causal arrival and an estimate | **an estimate keeps about half of the open-loop win (24-31% of the flow stall against 63%), and a causal arrival almost none** -- 0-5% released at the upstream's end |
+| a stream that names the tool warms what the model restores | **yes, and a predictor adds nothing** -- -0.03 to -0.04% of turn latency either way; a restore is 3 ms against a decode of a second |
+| speculating read-only tools | **small where tools are short** -- -1.3 to +1.6% on coding tools, -3.2 to -3.7% on research tools wasting twice what they save; a perfect predictor -17% on research; unpriced, it shortens others' tool waits, since a hit leaves the queue |
+| leases and drafts bind only where host DDR does | **leases bind at 8 GiB** -- 7% of a node's DDR pinned, 27-30% at 4 GiB; none broken; draft reclaim under 1% either way |
+| retention through a tool call (Continuum's TTL) | **null** -- +0.00% of turn latency; a call's rebuild is its sequence's preemption |
+| one suspend decision for KV and sandbox | **differs from two timers on 45.5% of idle gaps, frees no more** -- 62.8% against 64.5% of idle time; resumes cost under 0.15% of a turn |
+| the logged tier is orders of magnitude below the soft tier | **no** -- 20-66% of the soft tier's decisions on the agent presets; 1 in 790 for the record tier's planner |
+| prefix caching reuses retrieved chunks | **by order** -- 36% in a fixed order, 12% in relevance order; reuse by content 64% (counterfactual) |
+| a role's own quantile replaces the pooled one | **yes where claims bind** -- overruns 9-13% against 63% for reviewers; fan-out service -2.8% to +3.3% at 160 MiB |
+| the class is recoverable from observables | **partly** -- 60.6% at the first call, 85.7% at the last; the consumers move by under 15% |
+| coupling is confined to the patterns with flows | **locality yes, memory not on programs** -- 13-15% on pipelines, 4-7% on agentic and multi-agent, 0% elsewhere; memory coupling 0% on programs, 4-41% on the published trace at 2 GiB |
 

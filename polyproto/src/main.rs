@@ -2,6 +2,7 @@ mod belief_cmd;
 mod enforce_cmd;
 mod fleet_cmd;
 mod influence_cmd;
+mod programs_cmd;
 
 use clap::{Parser, Subcommand};
 use polyphonic::admit::Reserve;
@@ -490,6 +491,37 @@ enum Cmd {
         sections: String,
     },
 
+    /// Agent programs submitted step by step: phase-7.md §4.18's sweeps. Charges no control
+    /// crossing, so every number is reproducible from the seed
+    Programs {
+        /// Seeds per cell
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..))]
+        seeds: u64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Programs per run
+        #[arg(long, default_value_t = 900)]
+        programs: usize,
+        /// Programs arriving a second
+        #[arg(long, default_value_t = 12.0)]
+        rate: f64,
+        /// Tool and idle durations are divided by this: the simulator's call is about a fifth of
+        /// a production one
+        #[arg(long, default_value_t = 5.0)]
+        compress: f64,
+        /// Requests of the published trace in the sections that replay it
+        #[arg(long, default_value_t = 15_000)]
+        ops: u64,
+        /// Sections to run, comma-separated, printed in phase-7.md §4.18's order: gate, causal,
+        /// hints, speculation, leases, retention, lifecycle, logged, retrieval, roles, classify,
+        /// table
+        #[arg(
+            long,
+            default_value = "gate,causal,hints,speculation,leases,retention,lifecycle,logged,retrieval,roles,classify,table"
+        )]
+        sections: String,
+    },
+
     /// The price of the engine boundary: phase-3.md §4.11's sweeps, per class and at p99.
     /// Charges no control crossing, so every number is reproducible from the seed
     Price {
@@ -703,6 +735,13 @@ enum TargetArg {
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum HintGradeArg {
+    Declared,
+    Template,
+    Learned,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
 enum HalfArg {
     Both,
     Retain,
@@ -751,6 +790,14 @@ struct InfluenceArgs {
     /// Track reuse by origin; only `influence` reports it
     #[arg(long)]
     reuse: bool,
+    /// What a prefill-ahead is told: the declared downstream, its static template only, or a
+    /// template learned per function
+    #[arg(long, value_enum, default_value_t = HintGradeArg::Declared)]
+    hint_grade: HintGradeArg,
+    /// A learned template is sent only where the function's observed share of calls that flow is
+    /// at least this
+    #[arg(long, default_value_t = 0.0)]
+    learn_gate: f64,
 }
 
 impl InfluenceArgs {
@@ -764,6 +811,8 @@ impl InfluenceArgs {
         prefill_target: TargetArg::Argmin,
         clairvoyant_kv: false,
         reuse: false,
+        hint_grade: HintGradeArg::Declared,
+        learn_gate: 0.0,
     };
 
     fn directives(self) -> Option<polyphonic::machine::Directives> {
@@ -3036,6 +3085,23 @@ fn main() {
             seeds,
             sections,
         }),
+        Cmd::Programs {
+            seeds,
+            seed,
+            programs,
+            rate,
+            compress,
+            ops,
+            sections,
+        } => programs_cmd::run_all(&programs_cmd::Env {
+            seeds,
+            seed,
+            programs,
+            rate,
+            compress,
+            ops,
+            sections,
+        }),
         Cmd::Enforce {
             nodes,
             units_per_node,
@@ -3746,6 +3812,14 @@ fn distributed_run(
     sc.enforce.apply(&mut mach, sc.p3.admit);
     mach.set_directives(inf.directives());
     mach.set_prefill_ahead(inf.prefill_ahead);
+    mach.set_hint_grade(
+        match inf.hint_grade {
+            HintGradeArg::Declared => polyphonic::machine::HintGrade::Declared,
+            HintGradeArg::Template => polyphonic::machine::HintGrade::Template,
+            HintGradeArg::Learned => polyphonic::machine::HintGrade::Learned,
+        },
+        inf.learn_gate,
+    );
     mach.set_prefill_target(match inf.prefill_target {
         TargetArg::Argmin => polyphonic::machine::Target::Argmin,
         TargetArg::Deepest => polyphonic::machine::Target::Deepest,

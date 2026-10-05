@@ -6,6 +6,7 @@ use crate::engine::{EngineCache, Placed};
 use crate::flow::FlowHint;
 use crate::stream::{KvEvent, Mark, Medium};
 use crate::tier::{Tier, TierSpec};
+use crate::work::Pattern;
 
 const FREQ_CAP: u32 = 16;
 
@@ -181,6 +182,8 @@ struct Entry {
     resident_children: u32,
     priority: f64,
     epoch: u64,
+    leases: u32,
+    durable: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -240,6 +243,13 @@ pub struct TierPool {
 
     pub coupled: u64,
     pub coupled_decisions: u64,
+    pub coupled_by: [(u64, u64); Pattern::N],
+    pattern: usize,
+    pub evicted_bytes: u64,
+    pins_durable: bool,
+    durable_ids: HashSet<BlobId>,
+    leased_bytes: u64,
+    pub leased_peak: u64,
 }
 
 impl TierPool {
@@ -269,7 +279,78 @@ impl TierPool {
             retirements: BinaryHeap::new(),
             coupled: 0,
             coupled_decisions: 0,
+            coupled_by: [(0, 0); Pattern::N],
+            pattern: 0,
+            evicted_bytes: 0,
+            pins_durable: false,
+            durable_ids: HashSet::new(),
+            leased_bytes: 0,
+            leased_peak: 0,
         }
+    }
+
+    pub fn set_pattern(&mut self, pattern: Pattern) {
+        self.pattern = pattern.idx();
+    }
+
+    pub fn pin_durable(&mut self) {
+        self.pins_durable = true;
+    }
+
+    pub fn mark_durable(&mut self, id: BlobId) {
+        self.durable_ids.insert(id);
+        if let Some(e) = self.entries.get_mut(&id) {
+            e.durable = true;
+            if self.pins_durable {
+                self.epoch += 1;
+                e.epoch = self.epoch;
+            }
+        }
+    }
+
+    pub fn release_durable(&mut self, id: &BlobId) {
+        if !self.durable_ids.remove(id) {
+            return;
+        }
+        if let Some(e) = self.entries.get_mut(id) {
+            e.durable = false;
+            if self.pins_durable && e.leases == 0 {
+                self.reheap(*id);
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn is_durable(&self, id: &BlobId) -> bool {
+        self.durable_ids.contains(id)
+    }
+
+    #[must_use]
+    pub fn is_leased(&self, id: &BlobId) -> bool {
+        self.entries.get(id).is_some_and(|e| e.leases > 0)
+    }
+
+    pub fn set_lease(&mut self, id: BlobId, on: bool) -> bool {
+        let Some(e) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        let bytes = e.meta.bytes;
+        if on {
+            e.leases += 1;
+            if e.leases == 1 {
+                self.epoch += 1;
+                e.epoch = self.epoch;
+                self.leased_bytes += bytes;
+                self.leased_peak = self.leased_peak.max(self.leased_bytes);
+            }
+        } else if e.leases > 0 {
+            e.leases -= 1;
+            if e.leases == 0 {
+                self.leased_bytes = self.leased_bytes.saturating_sub(bytes);
+                self.reheap(id);
+            }
+        }
+        true
     }
 
     pub fn set_recovery(&mut self, spec: TierSpec) {
@@ -467,8 +548,10 @@ impl TierPool {
     }
 
     fn is_serving(&self, e: &Entry) -> bool {
-        e.meta.kind == BlobKind::ServiceHeap
-            && self.clock.saturating_sub(e.last_touch) < SERVING_WINDOW
+        e.leases > 0
+            || (self.pins_durable && e.durable)
+            || (e.meta.kind == BlobKind::ServiceHeap
+                && self.clock.saturating_sub(e.last_touch) < SERVING_WINDOW)
     }
 
     fn reheap(&mut self, id: BlobId) {
@@ -477,6 +560,9 @@ impl TierPool {
         };
         self.epoch += 1;
         e.epoch = self.epoch;
+        if e.leases > 0 || (self.pins_durable && e.durable) {
+            return;
+        }
         let (k, ranked) = (
             e.meta.kind.idx(),
             Ranked {
@@ -609,6 +695,7 @@ impl TierPool {
         let e = self.entries.remove(&r.id)?;
         self.used -= e.meta.bytes;
         self.by_kind[k] -= e.meta.bytes;
+        self.evicted_bytes += e.meta.bytes;
         self.inflation = r.priority;
         self.last_price = self.loss_per_byte(&e.meta) * self.regret_rate(k);
         self.evicted[k] += 1;
@@ -676,6 +763,9 @@ impl TierPool {
                 if c != k {
                     self.coupled += 1;
                 }
+                let by = &mut self.coupled_by[self.pattern];
+                by.1 += 1;
+                by.0 += u64::from(c != k);
             }
             if let Some((vid, v)) = self.take_victim(c) {
                 out.push((vid, v.meta));
@@ -700,6 +790,8 @@ impl TierPool {
                 resident_children: 0,
                 priority,
                 epoch: self.epoch,
+                leases: 0,
+                durable: self.durable_ids.contains(&id),
             },
         );
         self.reheap(id);
@@ -731,11 +823,15 @@ impl TierPool {
         self.evictable.iter_mut().for_each(BinaryHeap::clear);
         self.used = 0;
         self.by_kind = [0; BlobKind::N];
+        self.leased_bytes = 0;
         out
     }
 
     pub fn remove(&mut self, id: &BlobId) -> Option<BlobMeta> {
         let e = self.entries.remove(id)?;
+        if e.leases > 0 {
+            self.leased_bytes = self.leased_bytes.saturating_sub(e.meta.bytes);
+        }
         self.used -= e.meta.bytes;
         self.by_kind[e.meta.kind.idx()] -= e.meta.bytes;
         self.unlink_parent(e.meta.parent);
@@ -999,6 +1095,17 @@ pub struct Hierarchy {
     pub prefilled_blocks: u64,
     pub held_blocks: u64,
     seq_hits: u64,
+    leases: BinaryHeap<Reverse<(u64, BlobId, usize)>>,
+    pub leases_taken: u64,
+    pub lease_breaks: u64,
+    pub durable_lost: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CellState {
+    Hot,
+    Cold,
+    Gone,
 }
 
 #[derive(Clone, Copy, Default, Debug)]
@@ -1078,15 +1185,17 @@ impl Hierarchy {
                 events: None,
             }
         });
+        let mut cold = TierPool::new(
+            nvme,
+            policy,
+            false,
+            Quota::open(nvme_cap, mem.ddr_quota.band),
+        );
+        cold.pin_durable();
         Self {
             hbm,
             ddr,
-            nvme: TierPool::new(
-                nvme,
-                policy,
-                false,
-                Quota::open(nvme_cap, mem.ddr_quota.band),
-            ),
+            nvme: cold,
             split,
             can_decode: mem.can_decode,
             link: TierSpec::pcie(),
@@ -1111,6 +1220,10 @@ impl Hierarchy {
             prefilled_blocks: 0,
             held_blocks: 0,
             seq_hits: 0,
+            leases: BinaryHeap::new(),
+            leases_taken: 0,
+            lease_breaks: 0,
+            durable_lost: 0,
         }
     }
 
@@ -1669,7 +1782,90 @@ impl Hierarchy {
         if let Some(kv) = self.kv.as_mut() {
             kv.gpu.release(now_ns);
         }
+        while let Some(&Reverse((until, id, k))) = self.leases.peek() {
+            if until > now_ns {
+                break;
+            }
+            self.leases.pop();
+            if !self.home_mut(BlobKind::ALL[k]).set_lease(id, false) {
+                self.lease_breaks += 1;
+            }
+        }
         self.tick(now_ns);
+    }
+
+    pub fn set_pattern(&mut self, pattern: Pattern) {
+        self.hbm.set_pattern(pattern);
+        self.ddr.set_pattern(pattern);
+        self.nvme.set_pattern(pattern);
+    }
+
+    pub fn mark_durable(&mut self, id: BlobId) {
+        self.nvme.mark_durable(id);
+    }
+
+    pub fn release_durable(&mut self, id: &BlobId) {
+        self.nvme.release_durable(id);
+    }
+
+    pub fn lease(&mut self, id: BlobId, kind: BlobKind, until_ns: u64) -> bool {
+        if !self.home_mut(kind).set_lease(id, true) {
+            return false;
+        }
+        self.leases.push(Reverse((until_ns, id, kind.idx())));
+        self.leases_taken += 1;
+        true
+    }
+
+    #[must_use]
+    pub fn leased_peak(&self) -> u64 {
+        self.hbm.leased_peak + self.ddr.leased_peak
+    }
+
+    pub fn suspend_cell(&mut self, id: BlobId, kind: BlobKind) -> bool {
+        if self.home(kind).is_leased(&id) {
+            return false;
+        }
+        let Some(meta) = self.home_mut(kind).remove(&id) else {
+            return false;
+        };
+        self.spill(id, meta);
+        true
+    }
+
+    pub fn evict_first_cell(&mut self, id: BlobId, kind: BlobKind) {
+        self.home_mut(kind).evict_first(id);
+    }
+
+    #[must_use]
+    pub fn cell_state(&self, id: &BlobId, kind: BlobKind) -> CellState {
+        if self.is_hot(id, kind) {
+            CellState::Hot
+        } else if self.nvme.contains(id) {
+            CellState::Cold
+        } else {
+            CellState::Gone
+        }
+    }
+
+    #[must_use]
+    pub fn ddr_pressure(&self) -> (u64, u64) {
+        (self.ddr.evicted_bytes, self.ddr.used())
+    }
+
+    #[must_use]
+    pub fn ddr_price(&self) -> f64 {
+        self.ddr.marginal_price()
+    }
+
+    #[must_use]
+    pub fn kv_pressure(&self) -> Option<(u64, u64)> {
+        self.kv.as_ref().map(|kv| (kv.gpu.evictions, kv.gpu.used()))
+    }
+
+    #[must_use]
+    pub fn pattern_coupling(&self) -> [(u64, u64); Pattern::N] {
+        self.ddr.coupled_by
     }
 
     pub fn expire_marks(&mut self, now: u64) {
@@ -1781,7 +1977,11 @@ impl Hierarchy {
 
     fn spill(&mut self, id: BlobId, meta: BlobMeta) {
         let mut dropped = Vec::new();
-        let _ = self.nvme.offer(id, meta, &mut dropped);
+        if self.nvme.offer(id, meta, &mut dropped) == Admission::Pending
+            && self.nvme.is_durable(&id)
+        {
+            self.durable_lost += 1;
+        }
     }
 
     fn demote(&mut self, id: BlobId, meta: BlobMeta) {
@@ -2758,6 +2958,141 @@ mod tests {
     }
 
     #[test]
+    fn a_leased_entry_is_never_the_victim_and_is_a_candidate_again_once_released() {
+        let mut pool = pool_of(2);
+        let (a, b, c, d) = (blob("a"), blob("b"), blob("c"), blob("d"));
+        let mut out = Vec::new();
+        assert_eq!(pool.admit(a.0, a.1, &mut out), Admission::Admitted);
+        assert_eq!(pool.admit(b.0, b.1, &mut out), Admission::Admitted);
+        assert!(pool.set_lease(a.0, true));
+        assert!(pool.is_leased(&a.0));
+        assert_eq!(pool.admit(c.0, c.1, &mut out), Admission::Admitted);
+        assert_eq!(out.iter().map(|v| v.0).collect::<Vec<_>>(), vec![b.0]);
+        assert!(pool.set_lease(a.0, false));
+        out.clear();
+        pool.touch(c.0);
+        assert_eq!(pool.admit(d.0, d.1, &mut out), Admission::Admitted);
+        assert_eq!(out.iter().map(|v| v.0).collect::<Vec<_>>(), vec![a.0]);
+    }
+
+    #[test]
+    fn more_leases_than_the_pinned_scan_limit_do_not_refuse_an_evictable_pool() {
+        let leased = PINNED_SCAN_LIMIT as usize + 4;
+        let mut pool = pool_of(leased as u64 + 1);
+        let mut out = Vec::new();
+        let cells: Vec<_> = (0..=leased).map(|i| blob(&format!("cell {i}"))).collect();
+        for c in &cells {
+            assert_eq!(pool.admit(c.0, c.1, &mut out), Admission::Admitted);
+        }
+        for c in &cells[..leased] {
+            assert!(pool.set_lease(c.0, true));
+        }
+        let fresh = blob("fresh");
+        assert_eq!(pool.admit(fresh.0, fresh.1, &mut out), Admission::Admitted);
+        assert_eq!(
+            out.iter().map(|v| v.0).collect::<Vec<_>>(),
+            vec![cells[leased].0]
+        );
+    }
+
+    #[test]
+    fn a_lease_on_an_absent_entry_holds_nothing() {
+        let mut pool = pool_of(1);
+        assert!(!pool.set_lease(blob("ghost").0, true));
+    }
+
+    #[test]
+    fn a_durable_entry_is_refused_a_home_rather_than_evicted_from_the_cold_tier() {
+        let mut pool = pool_of(1);
+        pool.pin_durable();
+        let (a, b) = (blob("a"), blob("b"));
+        pool.mark_durable(a.0);
+        let mut out = Vec::new();
+        assert_eq!(pool.admit(a.0, a.1, &mut out), Admission::Admitted);
+        assert_eq!(pool.admit(b.0, b.1, &mut out), Admission::Pending);
+        assert!(out.is_empty());
+        assert!(pool.contains(&a.0));
+    }
+
+    #[test]
+    fn a_suspended_cell_goes_to_the_cold_tier_and_a_durable_one_is_never_lost() {
+        let mut h = hierarchy(true);
+        let cell = (
+            BlobId::leaf(b"cell"),
+            BlobMeta {
+                kind: BlobKind::Snapshot,
+                bytes: 32 << 20,
+                parent: None,
+                recompute_ns: 9_000_000,
+            },
+        );
+        let _ = h.access(&[cell]);
+        assert_eq!(h.cell_state(&cell.0, cell.1.kind), CellState::Hot);
+        h.mark_durable(cell.0);
+        assert!(h.suspend_cell(cell.0, cell.1.kind));
+        assert_eq!(h.cell_state(&cell.0, cell.1.kind), CellState::Cold);
+        assert_eq!(h.durable_lost, 0);
+        let back = h.access(&[cell]);
+        assert!(back.transfer_ns > 0 && back.recompute_ns == 0);
+        assert_eq!(h.cell_state(&cell.0, cell.1.kind), CellState::Hot);
+    }
+
+    #[test]
+    fn a_lease_pins_a_hot_cell_until_its_time_and_a_suspension_refuses_a_leased_one() {
+        let mut h = hierarchy(true);
+        let cell = (
+            BlobId::leaf(b"leased"),
+            BlobMeta {
+                kind: BlobKind::Snapshot,
+                bytes: 32 << 20,
+                parent: None,
+                recompute_ns: 9_000_000,
+            },
+        );
+        let _ = h.access(&[cell]);
+        assert!(h.lease(cell.0, cell.1.kind, 1_000));
+        assert!(!h.suspend_cell(cell.0, cell.1.kind));
+        h.release(500);
+        assert!(h.home(cell.1.kind).is_leased(&cell.0));
+        h.release(1_000);
+        assert!(!h.home(cell.1.kind).is_leased(&cell.0));
+        assert_eq!(h.lease_breaks, 0);
+        assert_eq!(h.leases_taken, 1);
+        assert!(h.leased_peak() >= 32 << 20);
+    }
+
+    #[test]
+    fn overlapping_leases_hold_a_cell_until_the_last_one_expires() {
+        let mut h = hierarchy(true);
+        let cell = (
+            BlobId::leaf(b"leased twice"),
+            BlobMeta {
+                kind: BlobKind::Snapshot,
+                bytes: 32 << 20,
+                parent: None,
+                recompute_ns: 9_000_000,
+            },
+        );
+        let _ = h.access(&[cell]);
+        assert!(h.lease(cell.0, cell.1.kind, 1_000));
+        assert!(h.lease(cell.0, cell.1.kind, 2_000));
+        h.release(1_000);
+        assert!(h.home(cell.1.kind).is_leased(&cell.0));
+        h.release(2_000);
+        assert!(!h.home(cell.1.kind).is_leased(&cell.0));
+    }
+
+    #[test]
+    fn a_released_durable_mark_no_longer_pins_the_cold_tier() {
+        let mut h = hierarchy(true);
+        let id = BlobId::leaf(b"finished program");
+        h.mark_durable(id);
+        assert!(h.nvme.is_durable(&id));
+        h.release_durable(&id);
+        assert!(!h.nvme.is_durable(&id));
+    }
+
+    #[test]
     fn a_deadline_withdraws_the_bump_and_an_unbounded_one_never_self_corrects() {
         let (a, b) = (blob("a").0, blob("b").0);
         assert_eq!(
@@ -2813,6 +3148,7 @@ mod tests {
         let downstream: Vec<_> = (0..4).map(|i| blob(&format!("s{i}"))).collect();
         let hint = FlowHint {
             task: 1,
+            template_len: downstream.len(),
             downstream: downstream.clone(),
             probability: 1.0,
             lead_ops: 6,

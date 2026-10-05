@@ -8,18 +8,23 @@ against estimates rather than oracles; the latency and goodput delta from specul
 the logged tier's write rate; and a table saying for which workload patterns a unified orchestrator
 can help at all.
 
-**Status: planned.** Nothing below is built. §2's predictions are stated before the run, per
-`owned-and-observed.md` §7, and like Phases 4 to 6 and 9 they lean on **pre-measurements**: numbers
-taken on an instrumented copy of `4dcdefb`, run outside the repository and not committed, with every
-hook off reproducing `influence`'s published prefill-ahead section to the digit, and with every
-split counter summing to the machine's own. Two read the existing model through instruments this
-phase builds (causality, coupling by origin); four emulate what it builds (a closed-loop driver for
-agent programs, a learned flow template, speculative tool calls, a call's misses by gap); three are
-arithmetic, one on a retrieval trace with no simulator under it and two on published distributions.
-Each is labelled with its grade (`owned-and-observed.md`, *On the numbers*), and §8 says how each
-was taken. They are reasons to predict, not results: §4.17 rebuilds each instrument in the
-repository, and a pre-measurement the build does not reproduce is reconciled before a prediction
-resting on it is graded.
+**Status: built and measured.** Programs, the event clock, the estimator and hints by grade,
+authority, speculation, leases and durable cells, the lifecycle, the logged tier's count, retrieval,
+roles and class inference are in `programs.rs` and `machine.rs` and driven by `polyphonic programs`,
+whose sections are §4.18's. Every bit is off by default and every result behind one is an A/B against
+the run without it, so the published numbers stay the ledger's. §2's predictions are stated before the
+run, per `owned-and-observed.md` §7, and like Phases 4 to 6 and 9 they lean on **pre-measurements**:
+numbers taken on an instrumented copy of `4dcdefb`, run outside the repository and not committed,
+with every hook off reproducing `influence`'s published prefill-ahead section to the digit, and with
+every split counter summing to the machine's own. Two read the existing model through instruments
+this phase builds (causality, coupling by origin); four emulate what it builds (a closed-loop driver
+for agent programs, a learned flow template, speculative tool calls, a call's misses by gap); three
+are arithmetic, one on a retrieval trace with no simulator under it and two on published
+distributions. Each is labelled with its grade (`owned-and-observed.md`, *On the numbers*), and §8
+says how each was taken. They are reasons to predict, not results: §4.17 rebuilt each instrument in
+the repository and §9 says which pre-measurement the build reproduced and which it did not. Each
+prediction in §2 is followed by its grade; §9 records what the build found and §10 how it was
+verified.
 
 Four things make this phase unlike Phase 9.
 
@@ -474,6 +479,18 @@ session's 2-2.6 times.
   trace was a fair proxy for a task's latency, and the first thing to check is the calls' duration
   against the 28 ms lead.
 
+**Measured: the trace clauses are right; the turn ratio is below the band and the session ratio at
+its edge.** On the build's own instrument an agent turn's tool call arrives before the turn finishes
+on 100 / 100 / 100% of flows, by a median of 1045 / 1071 / 1045 ms; a fan-out's dispatch likewise
+(964 / 1051 / 1010 ms); 51.8 / 49.8 / 47.7% of resumes arrive before their slowest agent; 18.2 /
+17.9 / 17.0% of consecutive turns overlap; and a `FaaS` call's inference arrives 27.9 ms after the
+call, 0.0% before it -- the pre-measurement's figures to the digit. A closed-loop turn is 3.81 /
+3.63 / 3.76 times the same scripts replayed open loop (5816 / 5364 / 5639 ms against 1526 / 1479 /
+1500), below the 4-5 predicted, and a session 1.97 / 1.92 / 2.02 times (17.1 / 16.5 / 16.4 s against
+8.7 / 8.6 / 8.1 s), at the band's lower edge. The open-loop turn is longer than the
+pre-measurement's 1.2 s and its session longer than 7.0-7.4 s, which accounts for both ratios. The
+*if wrong* branch (within 2x) did not fire for turns.
+
 **P2 -- Prefill-ahead keeps about half its open-loop win under an estimate, and nothing of it on a
 causal lead.**
 
@@ -492,6 +509,21 @@ points.
 - *If wrong* (a causal `FaaS` flow keeps more than 10%): prefill-ahead's value was never its lead
   but where it puts the template, and the landing target is the mechanism to keep.
 
+**Measured: right on the base trace, and the causal clause is right once the model charges for it.**
+Against prefill-ahead off, at the published partition the declared template without its call blocks
+cuts the flow downstream's stall by 46.8 / 47.4 / 46.7% (predicted 45-50%) and, at half the partition,
+40.3 / 37.0 / 38.6% (35-43%); a learned template cuts it by 31.2 / 28.0 / 23.6% and 23.4 / 17.5 /
+25.1% (22-34% and 18-27%), at 3.6 and 4.2 seconds of prefill work per second saved against the
+declared hint's 1.5; and a gate at P(flow) 0.5 gives 23.2 / 18.9 / 13.9%, not the template-only
+figure. The learned template exists for 74% of flows when their upstream arrives. On the causal
+replay -- each downstream released when its upstream finishes, 0.1 ms after a `FaaS` call -- the
+declared downstream cuts the flow stall by 0.5 / 1.9 / 3.2%, the template by 0.4 / 3.4 / 5.4% and the
+learned template by -0.1 / +2.9 / -0.0%: under 2% in 6 of 9 cells and at most 5.4% in the other three,
+so the band is slightly exceeded, and at half the partition the template-only hint is worse than none
+(+4.6 / +4.7 / +10.7%). §9.1 says why those figures needed a correction to the engine model. The
+pipeline clause (a step that outlasts the template's prefill) was not run: no preset has a fixed
+pipeline whose downstream names a shared template.
+
 **P3 -- The stream names the tool early enough to warm what the model restores, and a predictor adds
 little to it.**
 
@@ -508,6 +540,17 @@ sandbox.
 - *If wrong* (a predictor adds more than 2% beyond the stream): warm-ups sit on the critical path
   for longer than the decode leaves, and prediction is worth building for that time.
 
+**Measured: the first half holds, the second half was not run.** Warm-ups before a tool on
+long-running agents whose idle sandboxes are suspended by timers: predicted and stream-graded
+warm-ups are both -0.04 / -0.03 / -0.04% of turn latency against none, the stream grade at 2%, 30%
+and 80% of the decode alike, and the predictor adds nothing beyond the stream while warming more
+often (1574 warm-ups against 1448, the difference on calls that end their turn). The first tool
+after a suspension pays 2.93 ms of restore without a warm-up and 0.00 ms with one; the cell restores
+in about 3 ms against a decode of a second, so the name only has to arrive in the decode's last
+percent. The thinking-model clause, a 1 s resume that the remaining decode stops covering, needs a
+sandbox whose restore is about a second; a 32 MiB cell restores in 3-9 ms, so it stays arithmetic. A
+declared pipeline's warm-up moves turn latency by -0.25 / -0.23 / -0.26% at 2 GiB of DDR a node.
+
 **P4 -- Speculation is worth under 1.5% on coding and 3-7% on research at published accuracies.**
 
 On the agentic preset with Copilot-shaped read tools, speculating them at accuracy 0.28-0.39 moves
@@ -522,6 +565,19 @@ and the priced gate does not.
 - *If wrong* (coding gains over 3%): fast reads sit on the critical path more than Copilot's overlap
   figures say, and the overlap instrument is the first thing to read.
 
+**Measured: right on coding and on research, wrong on capacity.** On coding tools at 27% top-1
+speculation moves turn latency by -0.5 / +1.6 / -1.0% and wastes 312 tool-seconds for 124 saved; at
+50% (habit 0.6) -0.1 / -0.5 / -1.3%, wasting as much as it saves (219 against 219); a perfect
+predictor -1.8 / +0.5 / -2.0%. On research tools of 2-10 s with open-world reads allowed, 28% top-1
+gives -3.2 / -3.4 / -3.7%, wasting 4098 tool-seconds for 2033 saved (2.0x, the band's lower edge),
+and the perfect ceiling -17.3 / -16.5 / -16.9%, above the -11 to -15% band. With open-world reads
+refused, as §3 rule 4 requires, there are no runs and no gain. The capacity clause is wrong: with
+executor slots, toolspec's unpriced shape shortens the queue other sessions' tools wait in, because
+a hit takes its tool out of the queue: by 19%, 18% and 15% at 2, 3 and 4 slots a node (84%, 68% and
+60% busy with it, 78%, 65% and 55% without) and by 1% at 6. Turn latency moves by -1.1 to +1.3% at 2
+to 4 slots and +1.5 to +2.6% at 6, where the executors are idle and the waste is what remains; the
+priced gate stays within 2.1% of no speculation at every slot count.
+
 **P5 -- Leases and drafts bind only where host DDR does.**
 
 *Arithmetic on the emulation's tool mix; no pre-measurement.* A `SideEffecting` execution's lease
@@ -533,6 +589,15 @@ and no `SideEffecting` execution is ever preempted, by assertion.
   model; the lease is free and reclaiming drafts is a regime effect.
 - *If wrong* (leases pin more than 5%): long side-effecting executions hold memory others need, and
   the lease becomes a cost the scheduler should price before dispatch.
+
+**Measured: two clauses hold and the size clause is wrong.** A `SideEffecting` lease pins 7.0% of a
+node's DDR at its peak at 8 GiB and 27.3-29.7% at 4 GiB, not under 2%: every exec tool leases a 32
+MiB cell for its run and a dozen run at once. No lease broke and no durable cell was lost in any run
+(0 of 4332-8555 leases), and a draft's reclaim moves turn latency by +0.00 / -0.00 / +0.00% at 8
+GiB, -0.2 / -0.2 / +0.2% at 4 GiB and -1.0 / +0.3 / -0.5% at 2 GiB: under 1%, in both directions.
+Declared against pessimistic annotations differ at 4 GiB only (5810 / 5428 / 5622 against 5813 /
+5436 / 5597 ms). In every agentic run 60-61 of 2700 programs (2.2%) are abandoned when the router's
+admission refuses a call (§9.12), and 69-78 at 2 GiB.
 
 **P6 -- Retention through a tool call buys at most the rebuild a call misses.**
 
@@ -548,6 +613,16 @@ engine does not appear.
 - *If wrong* (the TTL gains more than 3% at the published partition): retention changes placement or
   order by more than the excess rebuild counts, and Phase 5's ceiling was measured on the wrong
   trace.
+
+**Measured: wrong in the direction of nothing.** Continuum's TTL, computed from the gap distribution,
+emits 2.4-2.6 million retain marks a run, honours 94-100% of them, and moves turn latency by +0.00% on
+every seed at every load, at the half partition and on the engine that waits. The excess rebuild a
+call pays beyond its new blocks is 0.07 / 0.03 / 0.05 ms at 6 sessions a second, 3.2 / 1.6 / 2.9 at 12,
+7.1 / 4.9 / 7.2 at 18 and 8.4 / 6.4 / 9.3 at half the partition, and it is a preemption of the
+sequence, not an eviction between calls: in-flight pins hold the partition and a mark cannot unpin
+them, which is Phase 5's finding on a closed-loop trace. On the engine that waits the excess is
+0.11 / 0.17 / 0.00 ms. The ordering half of Continuum's benefit was not built (§9.7), so the clause
+about the router's queue is not graded.
 
 **P7 -- One suspend decision for KV and sandbox differs from two timers on about a fifth of idle
 gaps.**
@@ -565,6 +640,15 @@ resumes.
 - *If wrong* (the joint decision frees more than 50% more): the timers' blind spot is larger than
   the idle distribution suggests, and the survival estimate is the mechanism worth publishing.
 
+**Measured: the disagreement is right and the freeing is not.** The two timers disagree on 19.2% of
+turn boundaries (predicted 15-25%; 4671 boundaries on three seeds), and the joint decision differs
+from the pair on 45.5%. It does not free more idle sandbox-seconds: timers free 64.5% and the joint
+decision 62.8%, against the 73% the lognormal arithmetic gave for the timeout and the 10-20 points
+more predicted. The joint hold price is dominated by the KV side, so it is the same at 8 and 2 GiB
+of DDR a node (§9.4). Resumes cost 36.8 ms (timers) and 30.1 ms (joint) per suspended boundary and
+move a turn by +0.09 / +0.10 / +0.08% and +0.07 / +0.13 / +0.06% at 8 GiB, and +0.09 / +0.09 /
++0.07% and +0.03 / +0.08 / +0.03% at 2 GiB: under 2% as predicted.
+
 **P8 -- The logged tier writes 20-60% of the soft tier's decisions on the agent presets.**
 
 An intent and an outcome per side-effecting call put the logged tier at 18-22% of the soft tier's
@@ -578,6 +662,15 @@ stays three or more orders of magnitude below the soft one.
   session rate, and Phase 10's count decides whether FoundationDB carries it.
 - *If wrong* (the logged tier under 5% of the soft one): side-effecting calls are rarer or batched
   where it counts, and the tiers do sit apart.
+
+**Measured: right.** An intent and an outcome per side-effecting call are 20% of the soft tier's
+decision rate on the agentic preset (7.12 writes against 36.3 decisions a second), 38% with MCP's
+defaults for edits (13.95), 40% on the pipeline and 44% on the multi-agent preset, whose agents'
+`SideEffecting` tools are logged the same way; the long-running preset writes 0.59 a second (66% of
+its 0.9 decisions), 0.27 of them intents and outcomes and 0.32 approval, suspend, resume and task
+records; one-shot, extraction, conversational, retrieval and batch write nothing. The record tier's
+planner, 0.046 writes a second, is 1 in 790 of the agentic soft tier: just under the three orders
+predicted.
 
 **P9 -- Retrieval reuse is set by chunk order under prefix caching, and position independence is
 worth more than any order.**
@@ -594,6 +687,17 @@ prefill.
 - *If wrong* (a finite partition costs more than 15 points): chunk working sets are wider than Zipf
   1.1 makes them, and the index's popularity skew is the constant to replace with a trace.
 
+**Measured: the order is right and the sizes are not.** Under prefix caching a finite partition
+reuses 35.7 / 36.1 / 35.5% of the chunk tokens in canonical order and 12.4 / 12.2 / 11.6% in
+relevance order at k = 5 over 10,000 chunks (52.3% and 27.6% with an infinite cache), 15-17 points
+below it where 15 were predicted, and about 36% and 12% against the predicted half and quarter.
+Position-independent reuse, counted as residency by content under any parent, finds 64.0 / 64.1 /
+63.2% (96.2% infinite): 32 points below it, against 75-95% predicted. Its net of the 15% recompute is
+54% against the canonical order's 36%, ahead by 18 points where a quarter to a third of the call's
+chunk prefill was predicted. At 100,000 chunks the figures are 32.1% and 10.3% (prefix) and 55.7%
+(position-independent). The position-independent arm is a residency counterfactual, not an executed
+arm (§9.6).
+
 **P10 -- With lengths by role, a role's own quantile replaces the pooled one.**
 
 *Arithmetic on Pythia's role shapes, no pre-measurement.* On the multi-agent preset, a pooled p90
@@ -608,6 +712,15 @@ means moves mean service by 1-5% against the pooled mean, where Phase 4 found no
 - *If wrong* (per-role means move service by under 0.5%): output length still matters only to
   admission, and the score's indifference to it is structural, not a property of the old trace.
 
+**Measured: the direction holds and the sizes are larger.** A pooled p90 claim of 242 tokens overruns
+on 63.3% of reviewers' sequences and 23.1% of explorers', 2.1% of engineers' and never on planners'
+or chroniclers', against the 40-50% and 15-20% predicted; a role's own p90 overruns on 8.5-12.6% of
+each (planner 0.0%) and reserves 220 tokens an agent, 9% fewer than the pooled claim where 10-25%
+fewer were predicted. Admission binds only at 160 MiB of KV partition a node, where the pooled claim
+completes 1193 of 1242 fan-outs and the role's own 1181 of 1245, with fan-out service -2.8%, and the
+score reading per-role means is +3.3% against the pooled mean (-0.0% at 256 MiB, where nothing binds):
+inside the 1-5% predicted at 160 MiB, with a sign the other seeds do not fix.
+
 **P11 -- The workload class is recoverable from observables, so its inference costs little.**
 
 *No pre-measurement.* A classifier over tool results in the history, chain growth per call, the gap
@@ -620,6 +733,15 @@ speculation gate, the claim's quantile -- the inferred arm lands within 1% of th
   must make.
 - *If wrong* (a consumer loses more than 3% to inference): presets overlap in what the router sees,
   and the class is worth declaring, as `slo` is.
+
+**Measured: wrong.** From observables alone the class is right for 60.6% of requests at their first
+call (conversational, pipeline and multi-agent are indistinguishable from a first agentic call: 0%),
+85.7% at their last call with their history, and 79.1% over every call, short of the 90% predicted.
+As consumers, speculation's gate is indifferent (+0.00% on every seed whether the class comes from
+the generator, from observables or is pooled, because every program that calls tools is in a class
+that may speculate), the claim's overrun share moves -2.2 / -5.3 / -4.9% and joint suspension's idle
+share +15.1 / -5.1 / -0.8% against the generator's class; pooled classes move them -12 to -14% and
++18.5 to +145%.
 
 **P12 -- The table: coupling is confined to the patterns with flows and to the decisions this phase
 adds.**
@@ -637,6 +759,20 @@ today.
   memory over time, and nowhere else, which is a result.
 - *If wrong* (a pattern with no flow couples): a decision the silo definition does not see is
   coupled, and the silos are drawn too narrowly to be honest.
+
+**Measured: the locality half holds, the memory half and the added decisions do not.** Locality
+coupling is 0.0% for one-shot, extraction, conversational, retrieval and batch programs (the
+retrieval preset has no flow in this model), 13.0-15.2% for the tool pipeline, 3.8-4.1% for agentic,
+6.9-7.6% for multi-agent and 1.9-2.2% for long-running programs, and 7.7-9.3% for the four together;
+pipelines are above the 2-7% band and long-running at its lower edge. Memory coupling is 0.0% for
+every pattern at 8 and at 2 GiB of DDR a node (0, and 11-3632 evictions): no program contends with a
+second owned class in host DDR, so the 5-20% predicted for long-running agents does not appear. On
+the published trace at 2 GiB it is 4.0-41.4% by pattern (§1.13's origins), by seed 6 / 8 / 41%: the
+services and function cells are what couple. The added decisions: joint suspension differs from the
+pair of timers on 45.5% of 4671 idle gaps (15-25% predicted), a speculative tool is placed away from
+its agent's node on 28.9% of 13,728 runs (under 10% predicted), and multi-agent admission completes
+1322 of 1324 fan-outs all-or-nothing against 1319 of 1320 per agent at a 160 MiB partition: no
+measurable difference there.
 
 ---
 
@@ -934,3 +1070,187 @@ fan-out, 15,000 requests -- unless they say otherwise.
 | *rag* | chunk reuse with no simulator | a Python trace of 50,000 queries drawing k distinct chunks by Zipf popularity over 10,000 or 100,000; a chunk reusable under prefix caching if every chunk before it in the query's order was seen before in that order, under position independence if it was seen anywhere; canonical order is by rank, relevance order a per-query permutation; infinite cache | §1.11's table |
 | *roles* | pooled against per-role claims | arithmetic on Pythia's per-role means and coefficients of variation, lognormal by role, the engineer role's mean (1,400) and CV (0.30) assumed; planner, explorer, engineer, reviewer and chronicler weighted 1 / 3.5 / 4.5 / 1 / 1, the midpoints of its coding workflow's regular expression, the chronicler's weight assumed | §1.12: pooled p90 overruns 46% of reviewers', 17% of explorers'; per-role reserves 17% fewer blocks |
 | *timers* | two silos' timers against one decision | arithmetic: a lognormal through Copilot's cross-turn container idle (median 243 s, P95 90 min, sigma 1.89) puts 21% of gaps between 5 and 15 minutes and lets a 15-minute timeout free 73% of idle sandbox-seconds; through the KV idle (median 172 s, P95 75 min, sigma 1.98), 19% | P7 |
+
+---
+
+## 9. What the build found
+
+Four increments, in the order the findings arrived, then a review of the build that changed nine
+things before the final sweep (§9.12).
+
+### 9.1 A downstream that arrives before its prefill ends was served as if it had finished
+
+The first causal replay of the published trace cut a `FaaS` flow's downstream stall by 60-70% with
+prefill-ahead although the downstream arrived 0.1 ms after its upstream. The engine places a
+prefill's blocks as resident the instant they are dispatched and charges the prefill as engine load
+only, so a request that follows it at once finds a finished prefill. The build records when each
+prefill finishes, its dispatch time plus its work (`prefill_ready`), and a downstream that lands on
+the node the prefill went to waits for the remainder; one that lands elsewhere waits for nothing. At
+the published lead (28 ms against a prefill of at most 11 ms) the wait is zero, so every published
+prefill-ahead number is unchanged and the gate holds; on the causal replay the gain is 0.5-5% where
+it had been 60-70% (P2).
+
+### 9.2 New fields
+
+`Request` gains `pattern`, `authority`, `root` and `tool`, `Agent` a `root`, `FlowHint` a
+`template_len`, and `RequestView` the root, the authority and the tool flag and nothing else (§3 rule
+3). Every constructor sets them to the old behaviour, and the gate is the evidence. `Pattern` tags
+the published trace: a turn that calls a tool is agentic, a fan-out and its resume multi-agent, a
+`FaaS` call with a flow a pipeline, a plain conversation conversational, and the remaining
+`FaaS` calls and services `Plain` (reported as non-AI).
+
+### 9.3 The event clock
+
+`Machine::submit_at` moves the clock to the later of now and the instant given and submits there;
+`advance_to` runs a tick's housekeeping at an instant. The trace replayed at its own arrival instants
+is the trace submitted in order, which is the first check line of `programs` and a unit test. A
+program's next step is submitted when its predecessor completes, so a step is as late as the router
+and the engines make it.
+
+### 9.4 The joint suspension is set by the KV side
+
+`Machine::host_hold_ns_per_s` is the DDR pool's price times the bytes times the fraction of the pool
+evicted a second; `kv_hold_ns_per_s` is the same for the engine's partition from its tail price.
+Rent-or-buy suspends at the first time `resume x hazard <= hold`, with the hazard read from the
+survival of the class's idle gaps over the next quarter of the elapsed time, and takes no decision on
+a class with fewer than 20 observed gaps. The idle share freed, the resume cost and the boundaries
+on which the joint decision differs are identical at 8 and at 2 GiB of DDR a node, so the hold price
+that decides them is the KV side's; DDR changes only the turn latency.
+
+### 9.5 A declared warm-up is worth a quarter of a percent
+
+A declared fixed pipeline's warm-up at its first call moves turn latency by -0.25 / -0.23 / -0.26%
+at 2 GiB of DDR a node. The first sweep put it at +4.4 / +16.7 / +6.8%: a tool waiting for its
+warm-up was submitted at the warm-up's end, which moved the machine's clock past other programs'
+steps still in the heap and served them late (§9.12).
+
+### 9.6 Retrieval chunks are content-keyed, and the position-independent arm is a counterfactual
+
+The first build keyed a chunk's blocks by its program, so no chunk was ever shared and every reuse
+figure was 0.0%. A chunk's blocks are now named by the chunk and the block, chained from whatever
+precedes them, so the same chunk after a different parent is a different block: prefix caching's
+rule. The position-independent figure counts a chunk's block resident if any of up to eight earlier
+incarnations of it, under other parents, is resident on the node, and charges nothing; it is a
+residency counterfactual and not an executed arm, because the ledger's chain walk assumes a prefix
+and has no way to run a call whose chunks are resident in a different order.
+
+### 9.7 What was planned and not built
+
+- **`distributed --programs`** (§4.18). The programs run through their own command, which is the only
+  driver; `distributed` takes `--hint-grade` and `--learn-gate` for the base trace.
+- **Per-bit command-line flags** (§3 rule 7). The bits are fields of `programs::Config`
+  (`hints`, `speculate`, `tool_slots`, `suspend`, `claim_key`, `class_mode`, `shape.roles` and the
+  rest) and each section sets them; there is no `--speculate` on the command line.
+- **`--speculate warm`.** The modes are `Off`, `Run` (priced), `Always` (toolspec's shape) and
+  `Oracle` (a ceiling); a warm-up is a hint's act (`--hints`), not a speculation.
+- **Continuum's out-of-order term.** The TTL arm has only the cache-miss benefit; the queue-position
+  half of its benefit needs a queue that keeps a program's place, and the router's queue does not
+  (P6's last clause).
+- **The `Pipeline` with a shared template downstream** (P2's last clause) and **a sandbox whose
+  restore is a second** (P3's second half).
+- **A tool on the base trace's executors.** `Tool` requests have slots; the fan-out agents' tools run
+  inside the machine as function calls with no slot, no authority and no lease, and are only logged.
+
+### 9.8 Host DDR rarely contends in these programs
+
+Memory coupling is 0.0% for every program preset at 8 and at 2 GiB of DDR a node, and the
+denominators say why: 0 DDR evictions at 8 GiB and 11-3632 at 2 GiB, all of one class. A sandbox cell
+evicts another sandbox cell; cross-class eviction needs a service heap or a function cell, which the
+base trace has and the presets do not (`Retrieve`'s index heaps are admitted once and pinned while
+serving). The published trace at 2 GiB couples 4-41% of its evictions by pattern.
+
+### 9.9 The estimator's accuracy is measured, not set
+
+`determinism` is the share of next tools drawn as a fixed function of the previous one. At 0.25 the
+estimator's measured top-1 is 27% on coding tools and 28% on research tools, and at 0.6 it is 50%.
+
+### 9.10 The open-loop replay keeps a session's think time
+
+The replay submits each step 28 ms after the previous one, except that the step after an idle period
+waits for the idle's duration, as the published trace spaces a session's turns by think time and not
+by completion. The first build dropped idle durations in the open loop, which put the open-loop
+session at 3.2-3.4 s and P1's session ratio at 5; with them kept the session is 8.1-8.7 s and the
+ratio 1.9-2.0, against the pre-measurement's 7.0-7.4 s.
+
+### 9.11 Leases pin more than predicted
+
+A lease pins a 32 MiB cell for an exec tool's run, and the peak is 7% of a node's DDR at 8 GiB and
+27-30% at 4 GiB (§2 P5). The cell's size is chosen (§1.14) and the share scales with it.
+
+### 9.12 A review of the build, and what it changed
+
+A code review of the build, and the re-run it prompted, found nine defects, each fixed before the
+sweep §2 grades. The first sweep's figures are replaced rather than kept beside the new ones, since
+no committed document published them; where a fix moved a figure, the old one is named once below.
+
+- **Leases blocked admission.** A leased cell stayed in its pool's eviction heap, and once more than
+  the pinned-scan limit of eight leased cells were the cheapest, a pool with evictable cells
+  beneath them refused a sandbox. Leased cells, and durable ones in a tier that pins them, now
+  leave the heap while held and rejoin it on release.
+- **A refused tool was served.** A tool or retrieval refused admission was counted as executed; any
+  refused step now ends its program, counted as abandoned. With the fix above no tool is refused;
+  every agentic run abandons 60-61 of 2700 programs when the router's admission refuses a call, as
+  it did in the first sweep, unreported.
+- **Prediction read the truth.** Predicted warm-ups and speculation acted only on calls a tool truly
+  follows, so neither paid for a guess on a call that ends its turn. Both now act on the estimate
+  alone, and a missed speculation is cancelled when its call completes. Coding speculation's waste
+  rose from 246 to 312 tool-seconds; research's from 1.5 to 2.0 times what it saves.
+- **The estimator's key crossed turns.** A turn's first call was keyed by the previous turn's last
+  tool, where the script draws it with none; the key is now reset at a turn's start, and top-1 at
+  habit 0.6 rose from 45% to 50%.
+- **An approval broke a flow.** A tool after an approval pause lost its link to the call that named
+  it; the step after a call is now the next one that is not an approval. Long-running programs'
+  locality coupling rose from 1.2-1.4% to 1.9-2.2%.
+- **The clock ran ahead.** A tool waiting for a warm-up was submitted at the warm-up's end, ahead of
+  events still in the heap (§9.5); it is now an event at that instant.
+- **The open loop dropped think time** (§9.10).
+- **Holds were not released or counted.** A durable mark outlived its program, and a second lease on
+  a leased cell was lost when the first expired; a finished or abandoned program releases its
+  mark, a lease is a count, and a missed speculation's executor slot is released no earlier than
+  it started.
+- **The end of a run lost steps.** Steps scheduled while the machine drained its engines at the end
+  of a run were never run; the driver drains until the heap and the engines are both empty.
+
+The table's joint-suspension line now runs at the lifecycle section's load, so the two read the same
+45.5%.
+
+---
+
+## 10. Verification, as run
+
+- **Byte-identity with every new bit off**: twelve commands, all at `--ops 3000 --seed 2` --
+  `residency` (twice, the second with `--engine-cache --decode-kv`), `flows`, `placement`,
+  `volatility`, `ownership`, `price`, `belief --sections gate`, `influence --seeds 1`, `fleet
+  --seeds 1`, `enforce --seeds 1`, and `distributed --crossing native --engine-cache --decode-kv
+  --admit perfect --repeat 1 --distances rack` -- with the gRPC, ring, warm-rate and measured lines
+  filtered out, produce output identical to the build before this phase. It was checked after the
+  plumbing (types, cache, machine) and again on the final build.
+- **The gate**, nine check lines in `programs` section 1: the trace replayed at its arrival instants
+  against in order; `tool_slots` of 10,000 against unbounded; `hints declared` on a preset with no
+  declared graph; `speculate run` on a preset with no tools; `suspend joint` with no idle gap;
+  `claim_key root` under a static claim; `roles` off on a preset with no fan-out; a prefill-ahead
+  replay twice; and the four silent presets writing nothing to the logged tier.
+- **Tests**, 30 new, 261 in all: a leased entry is never a victim until released; overlapping leases
+  hold a cell until the last expires; more leases than the pinned-scan limit do not refuse a pool
+  with evictable cells; a released durable mark no longer pins the cold tier; a lease on an
+  absent entry holds nothing; a durable entry is refused a home rather than evicted from the cold
+  tier; a suspended cell goes cold and comes back as a transfer; a lease pins until its time and a
+  suspension refuses a leased cell; a downstream that arrives before its prefill ends waits for the
+  rest of it; a tool waits for a slot only when slots are bounded; coupling by pattern sums to the
+  machine's counters; a resubmission at the trace instants is the trace in order; a script is drawn
+  from its own stream; authority follows MCP's annotations and an unannotated tool is
+  `SideEffecting`; every preset runs to completion and is counted under its pattern; a closed-loop
+  turn is longer than the same scripts open loop; side effects are logged before and after, leased
+  and durable; patterns with no side effect log nothing; the estimator ranks a habitual successor
+  first; rent-or-buy holds while a return is likely and suspends once it is not; the inference reads
+  only observables; speculation runs only read-only tools; a suspended cell is demoted and never
+  dropped once durable; the published trace runs a tool call during its turn; a causal replay
+  releases no downstream early; a learned template is known for most flows; an infinite cache reuses
+  more of a canonical order than a relevance order; an open loop keeps each idle step's duration; and
+  a predicted warm-up is weighed on every call, not only where a tool follows.
+- **The census** is 13. `cargo fmt --check` and `cargo clippy --all-targets` are clean apart from
+  the three `assert_is_empty` warnings in lines this phase did not write (`cache.rs`, `fleet.rs`,
+  `stream.rs`).
+- **The sweep**: `polyphonic programs`, every section, three seeds, on the final build, after the
+  review's fixes (§9.12) and with the gate re-run on that build; sections 1, 2, 7 and 8 were run a
+  second time with every row identical.

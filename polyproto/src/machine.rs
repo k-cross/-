@@ -2,7 +2,7 @@ use crate::admit::{Lengths, Reservations, Reserve};
 use crate::belief::{Cause, Conditions, Marks, Observer, SLO_QUANTILE, Scoring};
 use crate::blob::{BlobId, BlobKind, BlobMeta};
 use crate::boundary::Cost as Crossing;
-use crate::cache::{Cost, Hierarchy, NodeMemory, Policy};
+use crate::cache::{CellState, Cost, Hierarchy, NodeMemory, Policy};
 use crate::engine::{Batching, Engine, MAX_BATCH, MODEL_COUNT, Model, PrefillLoad};
 use crate::fleet::{Costs, Fleet, FleetView, PlannerKind, Role, moves_between, retarget};
 use crate::flow::FlowHint;
@@ -15,8 +15,8 @@ use crate::tele::Telemetry;
 use crate::tier::TierSpec;
 use crate::topo::Topology;
 use crate::work::{
-    Agent, Gang, Origin, Origins, Request, RequestView, Slo, ToolCall, WEIGHT_BYTES, WEIGHT_NS,
-    model_of,
+    Agent, Authority, Gang, Origin, Origins, Pattern, Request, RequestView, Slo, ToolCall,
+    WEIGHT_BYTES, WEIGHT_NS, model_of,
 };
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -224,6 +224,7 @@ pub struct Machine {
     prefill_ahead: bool,
     prefill_target: Target,
     landing: HashMap<u64, usize>,
+    prefill_ready: HashMap<u64, u64>,
     redispatched: Vec<HashSet<BlobId>>,
     origins: Option<Origins>,
     priced_models: bool,
@@ -272,6 +273,57 @@ pub struct Machine {
     track_stream: bool,
     pub stream: StreamStats,
     submitted: u64,
+    deciding: Pattern,
+    pub locality_by: [(u64, u64); Pattern::N],
+    tool_slots: Option<usize>,
+    slot_free: Vec<Vec<u64>>,
+    last_slot: Option<ToolSlot>,
+    claim_key: ClaimKey,
+    root_lengths: HashMap<u32, Lengths>,
+    root_observed: HashMap<u32, (u64, u64)>,
+    last_home: usize,
+    hint_grade: HintGrade,
+    learner: FlowLearner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ToolSlot {
+    pub node: usize,
+    pub slot: usize,
+    pub start_ns: u64,
+    pub end_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ClaimKey {
+    #[default]
+    Slo,
+    Root,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum HintGrade {
+    #[default]
+    Declared,
+    Template,
+    Learned,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LearnStats {
+    pub flows: u64,
+    pub known: u64,
+    pub fired: u64,
+    pub calls: u64,
+}
+
+#[derive(Debug, Default)]
+struct FlowLearner {
+    seen: HashMap<BlobId, (u64, u64)>,
+    task_fn: HashMap<u64, (BlobId, usize)>,
+    template: HashMap<BlobId, Vec<(BlobId, BlobMeta)>>,
+    gate: f64,
+    stats: LearnStats,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -603,6 +655,7 @@ impl Machine {
             prefill_ahead: false,
             prefill_target: Target::Argmin,
             landing: HashMap::new(),
+            prefill_ready: HashMap::new(),
             redispatched: vec![HashSet::new(); n_domains],
             origins: None,
             priced_models: false,
@@ -655,7 +708,254 @@ impl Machine {
                 sum_tokens: vec![0; n_domains],
             },
             submitted: 0,
+            deciding: Pattern::Plain,
+            locality_by: [(0, 0); Pattern::N],
+            tool_slots: None,
+            slot_free: vec![Vec::new(); n_domains],
+            last_slot: None,
+            claim_key: ClaimKey::Slo,
+            root_lengths: HashMap::new(),
+            root_observed: HashMap::new(),
+            last_home: 0,
+            hint_grade: HintGrade::Declared,
+            learner: FlowLearner::default(),
         }
+    }
+
+    pub fn set_hint_grade(&mut self, grade: HintGrade, gate: f64) {
+        self.hint_grade = grade;
+        self.learner.gate = gate;
+    }
+
+    #[must_use]
+    pub fn learn_stats(&self) -> LearnStats {
+        self.learner.stats
+    }
+
+    pub fn set_claim_key(&mut self, key: ClaimKey) {
+        self.claim_key = key;
+    }
+
+    pub fn set_tool_slots(&mut self, slots: Option<usize>) {
+        self.tool_slots = slots;
+        for free in &mut self.slot_free {
+            free.clear();
+            free.resize(slots.unwrap_or(0), 0);
+        }
+    }
+
+    fn tool_wait_ns(&self, d: usize) -> u64 {
+        if self.tool_slots.is_none() {
+            return 0;
+        }
+        let free = self.slot_free[d].iter().copied().min().unwrap_or(0);
+        free.saturating_sub(self.arrival_ns)
+    }
+
+    #[must_use]
+    pub fn tool_utilisation(&self) -> f64 {
+        let total: usize = self.slot_free.iter().map(Vec::len).sum();
+        if self.tool_slots.is_none() || total == 0 {
+            return 0.0;
+        }
+        let busy = self
+            .slot_free
+            .iter()
+            .flatten()
+            .filter(|&&f| f > self.arrival_ns)
+            .count();
+        busy as f64 / total as f64
+    }
+
+    #[must_use]
+    pub fn last_tool_slot(&self) -> Option<ToolSlot> {
+        self.last_slot
+    }
+
+    pub fn release_tool_slot(&mut self, slot: ToolSlot, at_ns: u64) {
+        let now = self.arrival_ns;
+        if let Some(cell) = self.slot_free[slot.node].get_mut(slot.slot)
+            && *cell == slot.end_ns
+        {
+            *cell = at_ns.max(now).max(slot.start_ns).min(slot.end_ns);
+        }
+    }
+
+    pub fn warm_cell(
+        &mut self,
+        task: Option<u64>,
+        fallback: usize,
+        cell: (BlobId, BlobMeta),
+        pattern: Pattern,
+    ) -> u64 {
+        if self
+            .active
+            .iter()
+            .any(|&d| self.domains[d].is_hot(&cell.0, cell.1.kind))
+        {
+            return 0;
+        }
+        let anchor = task
+            .and_then(|t| self.upstream.get(&t))
+            .and_then(|sources| sources.first())
+            .map(|&(d, _)| d);
+        let d = anchor.unwrap_or(fallback);
+        self.domains[d].set_pattern(pattern);
+        let c = self.domains[d].access(&[cell]);
+        c.recompute_ns + c.transfer_ns
+    }
+
+    pub fn drop_kv(&mut self, ids: &[BlobId]) -> usize {
+        self.domains
+            .iter_mut()
+            .map(|h| h.kv_drop_unpinned(ids))
+            .sum()
+    }
+
+    pub fn suspend_cell(&mut self, cell: (BlobId, BlobMeta)) -> bool {
+        let mut any = false;
+        for h in &mut self.domains {
+            any |= h.suspend_cell(cell.0, cell.1.kind);
+        }
+        any
+    }
+
+    pub fn mark_durable(&mut self, id: BlobId) {
+        for h in &mut self.domains {
+            h.mark_durable(id);
+        }
+    }
+
+    pub fn forget_flow(&mut self, task: u64) {
+        self.upstream.remove(&task);
+        self.landing.remove(&task);
+        self.prefill_ready.remove(&task);
+    }
+
+    pub fn release_durable(&mut self, id: &BlobId) {
+        for h in &mut self.domains {
+            h.release_durable(id);
+        }
+    }
+
+    pub fn evict_first_cell(&mut self, cell: (BlobId, BlobMeta)) {
+        for h in &mut self.domains {
+            h.evict_first_cell(cell.0, cell.1.kind);
+        }
+    }
+
+    #[must_use]
+    pub fn cell_state(&self, cell: &(BlobId, BlobMeta)) -> CellState {
+        let states = self
+            .domains
+            .iter()
+            .map(|h| h.cell_state(&cell.0, cell.1.kind));
+        let mut best = CellState::Gone;
+        for state in states {
+            match state {
+                CellState::Hot => return CellState::Hot,
+                CellState::Cold => best = CellState::Cold,
+                CellState::Gone => {}
+            }
+        }
+        best
+    }
+
+    #[must_use]
+    pub fn host_hold_ns_per_s(&self, bytes: u64) -> f64 {
+        let secs = self.arrival_ns as f64 / 1e9;
+        if secs <= 0.0 {
+            return 0.0;
+        }
+        let nodes = self.domains.len().max(1) as f64;
+        let total: f64 = self
+            .domains
+            .iter()
+            .map(|h| {
+                let (evicted, used) = h.ddr_pressure();
+                h.ddr_price() * bytes as f64 * (evicted as f64 / secs / used.max(1) as f64)
+            })
+            .sum();
+        total / nodes
+    }
+
+    #[must_use]
+    pub fn kv_hold_ns_per_s(&self, bytes: u64) -> f64 {
+        let secs = self.arrival_ns as f64 / 1e9;
+        if secs <= 0.0 {
+            return 0.0;
+        }
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for h in &self.domains {
+            if let (Some((evictions, used)), Some(price)) = (h.kv_pressure(), h.kv_tail_price()) {
+                let turnover = evictions as f64 * crate::work::KV_BLOCK_BYTES as f64
+                    / secs
+                    / used.max(1) as f64;
+                sum += price * bytes as f64 * turnover;
+                n += 1.0;
+            }
+        }
+        if n == 0.0 { 0.0 } else { sum / n }
+    }
+
+    #[must_use]
+    pub fn chain_resident(&self, chain: &[(BlobId, BlobMeta)]) -> (usize, usize) {
+        let mut lead = 0;
+        let mut any = 0;
+        for &d in &self.active {
+            let h = &self.domains[d];
+            lead = lead.max(chain.partition_point(|(id, m)| h.is_hot(id, m.kind)));
+            any = any.max(chain.iter().filter(|(id, m)| h.is_hot(id, m.kind)).count());
+        }
+        (lead, any)
+    }
+
+    #[must_use]
+    pub fn resident_union(&self, groups: &[Vec<BlobId>]) -> usize {
+        self.active
+            .iter()
+            .map(|&d| {
+                groups
+                    .iter()
+                    .filter(|g| {
+                        g.iter()
+                            .any(|id| self.domains[d].is_hot(id, BlobKind::KvBlock))
+                    })
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn leases(&self) -> (u64, u64, u64) {
+        self.domains
+            .iter()
+            .fold((0, 0, 0), |(taken, breaks, peak), h| {
+                (
+                    taken + h.leases_taken,
+                    breaks + h.lease_breaks,
+                    peak.max(h.leased_peak()),
+                )
+            })
+    }
+
+    #[must_use]
+    pub fn durable_lost(&self) -> u64 {
+        self.domains.iter().map(|h| h.durable_lost).sum()
+    }
+
+    #[must_use]
+    pub fn memory_by_pattern(&self) -> [(u64, u64); Pattern::N] {
+        let mut out = [(0, 0); Pattern::N];
+        for h in &self.domains {
+            for (o, c) in out.iter_mut().zip(h.pattern_coupling()) {
+                o.0 += c.0;
+                o.1 += c.1;
+            }
+        }
+        out
     }
 
     pub fn set_engine_wait(&mut self, wait: EngineWait) {
@@ -1434,12 +1734,18 @@ impl Machine {
         Reservations::default().admits_claim(capacity, req, (&blocks, extra), None)
     }
 
-    fn claim(&self, req: &Request) -> (Vec<(BlobId, BlobMeta)>, u64) {
-        let class = |slo: Slo| &self.lengths[slo.idx()];
-        let tokens = match self.claims {
-            Claim::Static | Claim::Gate(_) => {
-                return self.reserve.claim(req, self.tokens_per_block);
+    fn claim_tokens(&self, req: &Request) -> Option<u64> {
+        let class = |slo: Slo| {
+            if self.claim_key == ClaimKey::Root
+                && let Some(own) = self.root_lengths.get(&req.root)
+            {
+                own
+            } else {
+                &self.lengths[slo.idx()]
             }
+        };
+        match self.claims {
+            Claim::Static | Claim::Gate(_) => None,
             Claim::Quantile { q, pooled: false } => class(req.slo).quantile(q),
             Claim::Quantile { q, pooled: true } => {
                 self.lengths[0].pooled_quantile(&self.lengths[1], q)
@@ -1448,7 +1754,22 @@ impl Machine {
                 Slo::Interactive => class(Slo::Interactive).quantile(q),
                 Slo::Throughput => class(Slo::Throughput).mean(),
             },
-        };
+        }
+    }
+
+    #[must_use]
+    pub fn claimed_tokens(&self, req: &Request) -> Option<u64> {
+        match self.claims {
+            Claim::Static | Claim::Gate(_) => None,
+            _ => Some(self.claim_tokens(req).unwrap_or(req.max_tokens)),
+        }
+    }
+
+    fn claim(&self, req: &Request) -> (Vec<(BlobId, BlobMeta)>, u64) {
+        if matches!(self.claims, Claim::Static | Claim::Gate(_)) {
+            return self.reserve.claim(req, self.tokens_per_block);
+        }
+        let tokens = self.claim_tokens(req);
         let (blocks, _) = Reserve::Prompt.claim(req, self.tokens_per_block);
         let output = if req.tokens == 0 {
             0
@@ -1513,6 +1834,12 @@ impl Machine {
     fn seen_tokens(&self, req: &Request) -> u64 {
         if !self.observables || req.tokens == 0 {
             return req.tokens;
+        }
+        if self.claim_key == ClaimKey::Root
+            && let Some(&(sum, n)) = self.root_observed.get(&req.root)
+            && n > 0
+        {
+            return sum / n;
         }
         match self.observed[req.slo.idx()] {
             (sum, n) if n > 0 => sum / n,
@@ -1787,10 +2114,20 @@ impl Machine {
         }
     }
 
-    fn observe_landing(&mut self, req: &Request, home: usize) {
-        if let Some(target) = req.completes.and_then(|t| self.landing.remove(&t)) {
-            self.instruments.prefill.landings += 1;
-            self.instruments.prefill.landed += u64::from(target == home);
+    fn observe_landing(&mut self, req: &Request, home: usize) -> u64 {
+        let Some(task) = req.completes else {
+            return 0;
+        };
+        let Some(target) = self.landing.remove(&task) else {
+            return 0;
+        };
+        self.instruments.prefill.landings += 1;
+        self.instruments.prefill.landed += u64::from(target == home);
+        let ready = self.prefill_ready.remove(&task);
+        if target == home {
+            ready.map_or(0, |at| at.saturating_sub(self.arrival_ns))
+        } else {
+            0
         }
     }
 
@@ -1805,16 +2142,84 @@ impl Machine {
             let end = self.arrival_ns + cost.queue_ns + cost.exec_ns;
             self.tenant_flight.entry(t).or_default().push(Reverse(end));
         }
-        if self.prefill_ahead
-            && let Some(hint) = &req.hint
-        {
-            self.prefill_for(hint, home);
+        if self.prefill_ahead {
+            match self.hint_grade {
+                HintGrade::Declared => {
+                    if let Some(hint) = &req.hint {
+                        self.prefill_for(hint, home);
+                    }
+                }
+                HintGrade::Template => {
+                    if let Some(hint) = &req.hint {
+                        self.prefill_for(&hint.templated(), home);
+                    }
+                }
+                HintGrade::Learned => self.prefill_learned(req, home),
+            }
         }
         let flow_prompt = self.origins.as_ref().is_some_and(|o| {
             req.chain.first().and_then(|(id, _)| o.of(id)) == Some(Origin::FlowPrompt)
         });
         if flow_prompt && req.completes.is_some() {
             self.instruments.flow.record(cost.total_ns());
+        }
+    }
+
+    fn prefill_learned(&mut self, req: &Request, home: usize) {
+        let kv_first = |chain: &[(BlobId, BlobMeta)]| {
+            chain
+                .first()
+                .is_some_and(|(_, m)| m.kind == BlobKind::KvBlock)
+        };
+        let function = req
+            .chain
+            .first()
+            .filter(|(_, m)| m.kind == BlobKind::Snapshot && req.completes.is_none())
+            .map(|(id, _)| *id);
+        if let Some(f) = function {
+            let flows = req.hint.as_ref().is_some_and(|h| kv_first(&h.downstream));
+            let entry = self.learner.seen.entry(f).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += u64::from(flows);
+            let probability = entry.1 as f64 / entry.0 as f64;
+            if let Some(h) = &req.hint {
+                self.learner.task_fn.insert(h.task, (f, h.template_len));
+            }
+            let template = self.learner.template.get(&f).cloned();
+            self.learner.stats.calls += 1;
+            if flows {
+                self.learner.stats.flows += 1;
+                self.learner.stats.known += u64::from(template.is_some());
+            }
+            if let Some(template) = template
+                && probability >= self.learner.gate
+            {
+                let task = req
+                    .hint
+                    .as_ref()
+                    .map_or(u64::MAX - self.arrival_ns, |h| h.task);
+                let predicted = FlowHint {
+                    task,
+                    template_len: template.len(),
+                    downstream: template,
+                    probability,
+                    lead_ops: crate::work::FLOW_LEAD_OPS,
+                    payload_bytes: 0,
+                };
+                self.learner.stats.fired += 1;
+                self.prefill_for(&predicted, home);
+                if req.hint.is_none() {
+                    self.landing.remove(&task);
+                    self.prefill_ready.remove(&task);
+                }
+            }
+        }
+        if let Some(task) = req.completes
+            && kv_first(&req.chain)
+            && let Some((f, n)) = self.learner.task_fn.remove(&task)
+        {
+            let template: Vec<(BlobId, BlobMeta)> = req.chain.iter().take(n).copied().collect();
+            self.learner.template.entry(f).or_insert(template);
         }
     }
 
@@ -1836,6 +2241,9 @@ impl Machine {
             class: BlobKind::KvBlock.idx(),
             slo: Slo::Interactive,
             tenant: None,
+            root: 0,
+            authority: Authority::ReadOnly,
+            tool: false,
         };
         self.decode_pool()
             .into_iter()
@@ -1902,6 +2310,7 @@ impl Machine {
         stats.blocks += placed.len() as u64;
         stats.work_ns += work;
         self.landing.insert(hint.task, target);
+        self.prefill_ready.insert(hint.task, self.arrival_ns + work);
         self.observe_blocks(target, &placed);
         self.observe_emit(target);
     }
@@ -2552,6 +2961,8 @@ impl Machine {
         let engine = if decoding {
             (tele.projected_ns(self.arrival_ns, req.tokens, reserved) + self.loading_wait_ns(d))
                 as f64
+        } else if req.tool {
+            self.tool_wait_ns(d) as f64
         } else {
             0.0
         };
@@ -2631,6 +3042,9 @@ impl Machine {
             if silo_pick != top {
                 self.locality_coupled += 1;
             }
+            let by = &mut self.locality_by[self.deciding.idx()];
+            by.1 += 1;
+            by.0 += u64::from(silo_pick != top);
         }
 
         let full = if cost(top) < cost(affinity) {
@@ -3050,7 +3464,27 @@ impl Machine {
     }
 
     pub fn submit(&mut self, req: &Request) -> Submitted {
-        self.arrive(req.concurrent);
+        self.submit_with(req, req.concurrent)
+    }
+
+    pub fn submit_at(&mut self, at_ns: u64, req: &Request) -> Submitted {
+        self.arrival_ns = self.arrival_ns.max(at_ns);
+        self.submit_with(req, true)
+    }
+
+    pub fn advance_to(&mut self, at_ns: u64) {
+        self.arrival_ns = self.arrival_ns.max(at_ns);
+        self.arrive(true);
+    }
+
+    #[must_use]
+    pub fn now_ns(&self) -> u64 {
+        self.arrival_ns
+    }
+
+    fn submit_with(&mut self, req: &Request, concurrent: bool) -> Submitted {
+        self.arrive(concurrent);
+        self.last_slot = None;
         let seq = self.submitted;
         self.submitted += 1;
         if let Some(task) = req.completes
@@ -3201,6 +3635,7 @@ impl Machine {
     }
 
     fn place(&mut self, req: &Request, candidates: &[usize], arrival: Arrival) -> Submitted {
+        self.deciding = req.pattern;
         let decode_needed = Self::needs_decode(req);
         let decide_ns = self.decide(req.chain.len(), candidates.len());
         self.decide_ns += decide_ns;
@@ -3235,6 +3670,7 @@ impl Machine {
             }
         };
         let home = self.topo.units[self.unit_in(target)].home as usize;
+        self.last_home = home;
 
         let mut planned = None;
         if !self.meters_admit(home, req, &mut planned) {
@@ -3270,7 +3706,7 @@ impl Machine {
         let handoff = self.collect(home, &sources);
         let reached = self.reach(home, req, decode_needed);
 
-        self.observe_landing(req, home);
+        let landing_wait_ns = self.observe_landing(req, home);
         let pair = self.decide_pair(home, req, &mut planned);
         let hops = handoff + reached + arrival.abort_ns;
         let mut cost = match self.run_or_queue(home, req, pair, hops, decide_ns, arrival) {
@@ -3279,7 +3715,7 @@ impl Machine {
         };
         cost.decide_ns = decide_ns;
         cost.transfer_ns += hops;
-        cost.queue_ns += self.arrival_ns - arrival.at_ns;
+        cost.queue_ns += self.arrival_ns - arrival.at_ns + landing_wait_ns;
         self.after_dispatch(req, home, &cost);
         if let Some(pick) = pick {
             let class = BlobKind::ALL[req.kind_idx()];
@@ -3788,6 +4224,7 @@ impl Machine {
             t.set_requester(req.tenant);
         }
         self.domains[home].set_owner(req.tenant);
+        self.domains[home].set_pattern(req.pattern);
         let prefilled = pair.and_then(|(p, avoided)| self.prefill_on(p, req, avoided));
         let shared_before = self.shared_reads;
         let ran_with = self.truly_resident(home, req);
@@ -3834,10 +4271,7 @@ impl Machine {
             self.dispatches += 1;
             let (exec, queue) = self.execute(home, req);
             if req.tokens > 0 && !resubmitted {
-                let seen = &mut self.observed[req.slo.idx()];
-                seen.0 += req.tokens;
-                seen.1 += 1;
-                self.lengths[req.slo.idx()].record(req.tokens);
+                self.observe_length(req);
             }
             if req.tokens > 0 && self.queue == Queue::Plas && self.cancel == CancelMode::Off {
                 let end = self.arrival_ns + queue + exec;
@@ -3845,6 +4279,7 @@ impl Machine {
             }
             cost.exec_ns = exec;
             cost.queue_ns += queue;
+            self.lease_side_effects(home, req, queue + exec);
             self.domains[home].decode_output(&req.chain, &req.produces, chain_recompute, &mut cost);
             self.preempted[class] += u64::from(cost.preempted);
             let decoding = req.tokens > 0 && self.interval_ns > 0;
@@ -3889,7 +4324,62 @@ impl Machine {
         cost
     }
 
+    fn observe_length(&mut self, req: &Request) {
+        let seen = &mut self.observed[req.slo.idx()];
+        seen.0 += req.tokens;
+        seen.1 += 1;
+        self.lengths[req.slo.idx()].record(req.tokens);
+        if self.claim_key == ClaimKey::Root {
+            let by_root = self.root_observed.entry(req.root).or_insert((0, 0));
+            by_root.0 += req.tokens;
+            by_root.1 += 1;
+            self.root_lengths
+                .entry(req.root)
+                .or_default()
+                .record(req.tokens);
+        }
+    }
+
+    fn lease_side_effects(&mut self, home: usize, req: &Request, duration_ns: u64) {
+        if !req.tool || req.authority != Authority::SideEffecting {
+            return;
+        }
+        let until = self.arrival_ns + duration_ns;
+        for &(id, meta) in &req.chain {
+            self.domains[home].lease(id, meta.kind, until);
+            self.domains[home].mark_durable(id);
+        }
+    }
+
     fn execute(&mut self, d: usize, req: &Request) -> (u64, u64) {
+        if req.tool
+            && req.tokens == 0
+            && let Some(slots) = self.tool_slots
+        {
+            if self.slot_free[d].len() != slots {
+                self.slot_free[d].resize(slots, 0);
+            }
+            let now = self.arrival_ns;
+            let (slot, free) = self.slot_free[d]
+                .iter()
+                .copied()
+                .enumerate()
+                .min_by_key(|&(_, f)| f)
+                .unwrap_or((0, 0));
+            let wait = free.saturating_sub(now);
+            let start = now + wait;
+            let end = start + req.exec_ns;
+            if let Some(cell) = self.slot_free[d].get_mut(slot) {
+                *cell = end;
+            }
+            self.last_slot = Some(ToolSlot {
+                node: d,
+                slot,
+                start_ns: start,
+                end_ns: end,
+            });
+            return (req.exec_ns, wait);
+        }
         if req.tokens == 0 || self.interval_ns == 0 {
             return (req.exec_ns, 0);
         }
@@ -3902,7 +4392,29 @@ impl Machine {
         (step.exec_ns, step.queue_ns + wait)
     }
 
-    fn agent_request(agent: &Agent) -> Request {
+    #[must_use]
+    pub fn last_home(&self) -> usize {
+        self.last_home
+    }
+
+    #[must_use]
+    pub fn anchor_of(&self, task: u64) -> Option<usize> {
+        self.upstream
+            .get(&task)
+            .and_then(|sources| sources.first())
+            .map(|&(d, _)| d)
+    }
+
+    #[must_use]
+    pub fn warm_price(&self, task: Option<u64>, fallback: usize, cell: &(BlobId, BlobMeta)) -> f64 {
+        let d = task.and_then(|t| self.anchor_of(t)).unwrap_or(fallback);
+        let mut need = [0u64; BlobKind::N];
+        need[cell.1.kind.idx()] = cell.1.bytes;
+        self.domains[d].displacement(&need, &[0; BlobKind::N])
+    }
+
+    #[must_use]
+    pub fn agent_request(agent: &Agent) -> Request {
         Request {
             phase: 0,
             chain: agent.chain.clone(),
@@ -3919,6 +4431,10 @@ impl Machine {
             concurrent: false,
             tenant: agent.tenant,
             program: 0,
+            pattern: Pattern::MultiAgent,
+            authority: Authority::ReadOnly,
+            root: agent.root,
+            tool: false,
         }
     }
 
@@ -3939,10 +4455,15 @@ impl Machine {
             concurrent: false,
             tenant: None,
             program: 0,
+            pattern: Pattern::MultiAgent,
+            authority: Authority::ReadOnly,
+            root: 0,
+            tool: false,
         }
     }
 
     fn serve_gang(&mut self, req: &Request, gang: &Gang) -> Cost {
+        self.deciding = Pattern::MultiAgent;
         let n = gang.agents.len().max(1);
         for a in &gang.agents {
             self.record_demand(model_of(&a.requires), a.tokens);
@@ -5777,6 +6298,10 @@ mod tests {
             concurrent: false,
             tenant: None,
             program: 0,
+            pattern: crate::work::Pattern::Plain,
+            authority: crate::work::Authority::ReadOnly,
+            root: 0,
+            tool: false,
         };
         assert!(mach.domains[d].evict_unrecorded(&victim));
         let believed = mach.plan(d, &req.view(0), View::Belief);
@@ -5861,6 +6386,10 @@ mod tests {
             concurrent: false,
             tenant: None,
             program: 0,
+            pattern: crate::work::Pattern::Plain,
+            authority: crate::work::Authority::ReadOnly,
+            root: 0,
+            tool: false,
         };
         let mut mach = gate_machine(Control::Unified, false);
         assert_eq!(mach.view_of(&request(50)).tokens, 50);
@@ -6084,6 +6613,171 @@ mod tests {
             |m: &Machine| m.instruments.flow.stall_ns as f64 / m.instruments.flow.n.max(1) as f64;
         assert!(plain.instruments.flow.n > 0 && ahead.instruments.flow.n > 0);
         assert!(per_flow(&ahead) < per_flow(&plain));
+    }
+
+    fn bare_request() -> Request {
+        Request {
+            phase: 0,
+            chain: Vec::new(),
+            requires: Vec::new(),
+            hint: None,
+            completes: None,
+            exec_ns: 0,
+            tokens: 0,
+            gang: None,
+            produces: Vec::new(),
+            max_tokens: 0,
+            slo: Slo::Interactive,
+            retention: crate::work::Retention::default(),
+            concurrent: true,
+            tenant: None,
+            program: 0,
+            pattern: Pattern::Plain,
+            authority: Authority::ReadOnly,
+            root: 0,
+            tool: false,
+        }
+    }
+
+    fn flow_pair(downstream_blocks: u64) -> (Request, Request) {
+        let upstream_cell = (
+            BlobId::leaf(b"fn:wait"),
+            BlobMeta {
+                kind: BlobKind::Snapshot,
+                bytes: 1 << 20,
+                parent: None,
+                recompute_ns: 1_000,
+            },
+        );
+        let mut parent = crate::blob::ROOT;
+        let downstream: Vec<(BlobId, BlobMeta)> = (0..downstream_blocks)
+            .map(|d| {
+                let block = crate::programs::kv_block(parent, &format!("wait:{d}"));
+                parent = block.0;
+                block
+            })
+            .collect();
+        let mut up = bare_request();
+        up.chain = vec![upstream_cell];
+        up.requires = Vec::new();
+        up.tokens = 0;
+        up.exec_ns = 1_000;
+        up.pattern = Pattern::Pipeline;
+        up.hint = Some(FlowHint {
+            task: 7,
+            template_len: downstream.len(),
+            downstream: downstream.clone(),
+            probability: 1.0,
+            lead_ops: 6,
+            payload_bytes: 0,
+        });
+        let mut down = bare_request();
+        down.chain = downstream;
+        down.completes = Some(7);
+        (up, down)
+    }
+
+    fn landing_run(downstream_blocks: u64, arrives_ns: u64) -> (u64, u64) {
+        let mut mach = gate_machine(Control::Unified, false);
+        mach.set_prefill_ahead(true);
+        let (up, down) = flow_pair(downstream_blocks);
+        let Submitted::Closed(_) = mach.submit_at(1_000_000, &up) else {
+            panic!("closed");
+        };
+        let Submitted::Closed(cost) = mach.submit_at(1_000_000 + arrives_ns, &down) else {
+            panic!("closed");
+        };
+        (cost.queue_ns, mach.instruments.prefill.work_ns)
+    }
+
+    #[test]
+    fn a_downstream_that_arrives_before_its_prefill_ends_waits_for_the_rest_of_it() {
+        let work = landing_run(10, u64::MAX / 4).1;
+        assert!(work > 0);
+        let (early, _) = landing_run(10, work / 4);
+        let (late, _) = landing_run(10, 2 * work);
+        assert_eq!(late, 0);
+        assert!(early > 0 && early <= work, "{early} of {work}");
+        let (instant, _) = landing_run(10, 1_000);
+        assert!(instant > early);
+    }
+
+    #[test]
+    fn a_tool_waits_for_an_executor_slot_and_only_when_slots_are_bounded() {
+        let tool_request = |at: u64| {
+            let mut req = bare_request();
+            req.chain = vec![(
+                BlobId::leaf(format!("sbx:{at}").as_bytes()),
+                BlobMeta {
+                    kind: BlobKind::Snapshot,
+                    bytes: 1 << 20,
+                    parent: None,
+                    recompute_ns: 1_000,
+                },
+            )];
+            req.requires = Vec::new();
+            req.tokens = 0;
+            req.exec_ns = 50_000_000;
+            req.tool = true;
+            req
+        };
+        let waits = |slots: Option<usize>| -> Vec<u64> {
+            let mut mach = gate_machine(Control::Unified, false);
+            mach.set_tool_slots(slots);
+            (0..16)
+                .map(|i| {
+                    let req = tool_request(i);
+                    let Submitted::Closed(cost) = mach.submit_at(1_000_000 + i * 1_000, &req)
+                    else {
+                        panic!("closed");
+                    };
+                    cost.queue_ns
+                })
+                .collect()
+        };
+        assert!(waits(None).iter().all(|&w| w == 0));
+        assert!(waits(Some(1000)).iter().all(|&w| w == 0));
+        assert!(waits(Some(1)).iter().any(|&w| w > 0));
+    }
+
+    #[test]
+    fn coupling_by_pattern_sums_to_the_machines_own_counters() {
+        let mut mach = gate_machine(Control::Unified, false);
+        mach.set_regret(true);
+        for req in &decode_trace(3, 1_500) {
+            mach.serve_request(req);
+        }
+        let (coupled, decisions) = mach
+            .locality_by
+            .iter()
+            .fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        assert_eq!(decisions, mach.locality_coupled_decisions);
+        assert_eq!(coupled, mach.locality_coupled);
+        let memory: u64 = mach.memory_by_pattern().iter().map(|c| c.1).sum();
+        let (_, evictions) = mach.memory_coupled();
+        assert_eq!(memory, evictions);
+    }
+
+    #[test]
+    fn a_resubmission_at_the_trace_instants_is_the_trace_submitted_in_order() {
+        let trace = decode_trace(3, 800);
+        let mut plain = gate_machine(Control::Unified, false);
+        let mut timed = gate_machine(Control::Unified, false);
+        let interval = (1e9 / 250.0) as u64;
+        let mut slot = 0;
+        for req in &trace {
+            let a = plain.serve_request(req);
+            let at = if req.concurrent {
+                slot * interval
+            } else {
+                slot += 1;
+                slot * interval
+            };
+            let Submitted::Closed(b) = timed.submit_at(at, req) else {
+                panic!("closed");
+            };
+            assert_eq!(format!("{a:?}"), format!("{b:?}"));
+        }
     }
 
     #[test]

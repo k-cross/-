@@ -13,6 +13,7 @@ pub mod machine;
 pub mod oracle;
 pub mod own;
 pub mod plat;
+pub mod programs;
 pub mod rng;
 pub mod span;
 pub mod store;

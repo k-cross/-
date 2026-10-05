@@ -12,14 +12,15 @@ not about who wrote it; the HTTP itself is a linked library's (§2.6). **Cede th
 path** -- and the second is only defensible because of the first, since routing and cancellation
 are what is left to decide with once allocation is gone.
 
-**Status.** Phases 0-6, 8 and 9 are built and measured; Phases 7, 10 and 11 are design (§9). Current
+**Status.** Phases 0-9 are built and measured; Phases 10 and 11 are design (§9). Current
 results are in [`residency-ledger.md`](residency-ledger.md); each phase's plan, predictions and
 outcomes are in its own `phase-N.md`. The corrected architecture runs behind bits that are off by
 default -- `--engine-cache` (Phase 3), `--belief` (Phase 4), `--directives`, `--prefill-ahead` and
 `--retain` (Phase 5), `--model-batches`, `--prefill-time`, `--model-keyed` and `--fleet`
 (Phase 6), and `--engine-wait`, `--queue`, `--admit quantile | tiered | gate`, `--cancel`,
-`--victim`, `--disconnect`, `--leak`, `--batch` and `--stream-buffer` (Phase 9) -- so a published
-number is the ledger's unless it is marked otherwise.
+`--victim`, `--disconnect`, `--leak`, `--batch` and `--stream-buffer` (Phase 9), and `--hint-grade`
+and `--learn-gate` for the base trace and `polyphonic programs` for closed-loop agent programs
+(Phase 7) -- so a published number is the ledger's unless it is marked otherwise.
 
 **On the numbers.** Four grades of evidence, kept apart:
 
@@ -130,7 +131,14 @@ makes liveness **owned**, not observed: "is this replica still serving" is a cor
 by the second test above, and two schedulers must never hand out one node's capacity. Utilisation
 and power stay observed.
 
-The rates in the table are asserted, not measured. Counting owned-state changes per tier per
+The logged tier's rate is now counted (Phase 7): an intent and an outcome per `SideEffecting` call
+are 20% of the soft tier's decision rate on the agentic preset (7.1 writes a second against 36.3
+decisions), 38% with MCP's defaults for edits, 40-44% on the pipeline and multi-agent presets, and
+the long-running preset writes 0.59 a second, 0.27 of intents and outcomes and 0.32 of approval, suspend,
+resume and task records, against 0.9 decisions; the five
+presets with no side effect write nothing. That is within a factor of five of the soft tier, not
+orders of magnitude below it; the record tier's one writer so far is 1 in 790 of the agentic soft
+tier. The other rates in the table are asserted, not measured. Counting owned-state changes per tier per
 simulated second -- mostly from counters the runs already keep, `decisions` and `dispatches` among
 them -- is what would check that the tiers sit orders of magnitude apart; Phase 10 does that, and
 tests the failure model above by injecting each crash.
@@ -149,16 +157,16 @@ tests the failure model above by injecting each crash.
 | retention directives it issued | **owned** | soft | `Entry.retain_until` on the ledger (`--retain`); on the engine a mark on a dispatch, believed once the stream acknowledges it (§3.3) |
 | placement decisions, flow graph | **owned** | soft | `upstream`, `tool_anchor`, `origin` |
 | partition sizes, model placement | **owned** | record | `Fleet` under `--fleet`: a replica per node, its role, and the partition its weights leave, changed by the planner about once in 20 s on the rotating mix (§9, Phase 6) |
-| side-effect intents, suspended sessions, approval pauses | **owned** | logged | **missing** -- §4 |
+| side-effect intents, suspended sessions, approval pauses | **owned** | logged | **counted, not stored** (Phase 7): `programs::LogCause` counts the writes by cause; the log's store is §8's and the simulator has none |
 | tenant identity and per-tenant quota | **owned** | record | identity declared on `Request`, and the router's two per-tenant meters built (§3.8); the per-tenant axis on `Quota` is **missing** |
 | node liveness and membership | **owned** | record | **missing** -- a lease in the record |
 | shadow price per pool | **inferred** | soft | `TierPool::marginal_price` |
 | regret rate per class | **inferred** | soft | `TierPool::regret_rate`, from a ghost list |
-| per-tool re-arrival gap | **inferred** | soft | **missing** -- `sched_lm`'s `ToolGapIndex` |
-| P(turn calls a tool), which tool, payload | **inferred** | soft | **declared, not inferred** -- `FlowHint.probability` is `1.0` |
+| per-tool re-arrival gap | **inferred** | soft | built for programs (Phase 7): the tool-transition estimator and the idle-gap survival the lifecycle reads; not on the base trace |
+| P(turn calls a tool), which tool, payload | **inferred** | soft | a hint carries a grade (Phase 7, `--hint-grade`): declared, template, or learned per function, whose probability is the observed rate; the published defaults still declare at `1.0` |
 | output length of a decode | **inferred** | soft | the observed mean under `--observables`; the exact length by default |
 | peer residency | **inferred** | soft | the event-stream belief under `--belief`; otherwise `Gossip`, a stale *exact* set |
-| workload class | **inferred** | soft | **missing** -- §4 |
+| workload class | **inferred** | soft | built for programs (Phase 7): read from observables, right for 60.6% of requests at their first call and 85.7% at their last |
 | realised TTFT / ITL, batch occupancy | **observed** | -- | modelled internally |
 | engine prefix-cache hit rate | **observed** | -- | the engine's under `--engine-cache`; conflated with owned residency by default |
 | node utilisation, power | **observed** | -- | absent |
@@ -172,8 +180,9 @@ behind bits. The score read the exact output length; under `--observables` it re
 mean, which costs nothing on this workload (§3.2). `Control::Gossip` handed over a stale but
 **exact** engine residency set, which telemetry cannot produce (below); under `--belief` the
 engine's KV comes from its event stream instead. The third is open and load-bearing:
-`FlowHint.probability` is hardcoded `1.0`, so every cross-workload flow result rests on the
-scheduler being *told* the future with certainty (§3.2, Phase 7).
+`FlowHint.probability` is `1.0` in the published runs, so every published cross-workload flow result
+rests on the scheduler being *told* the future with certainty (§3.2); Phase 7 prices what is left
+when it is not.
 
 ### The correction: the orchestrator does not allocate the KV cache
 
@@ -790,6 +799,18 @@ survives when the hint is an estimate?** Against a perfect declaration, announce
 latency on the ledger and 3.2-9.0% with the engine allocating (§1). Against an EWMA with real
 variance it buys less, and the amount it loses is the honest value of the mechanism.
 
+**Measured (Phase 7).** Hints have three grades: the declared downstream, the declared template
+only (the leading blocks the flow shares), and a template learned per function. On the published
+trace in its published order, prefill-ahead cuts the flow downstream's stall by 63% with the
+declared downstream, 47% with the template only and 24-31% with a learned template (which exists
+for 74% of flows when their upstream arrives); at half the partition 40-49%, 37-40% and 17-25%.
+Those are open-loop figures: the trace submits a downstream 28 ms after its upstream whether or not
+the upstream has finished, and 100% of an agent turn's tool calls arrive before the turn ends.
+Released when the upstream finishes, the same hints cut the stall by 0-5%, and the learned template
+by nothing (-0.1 / +2.9 / -0.0%). The published prefill-ahead and announce figures stay on record
+as open-loop figures. The name of a tool arriving in the stream warms its sandbox as well as
+prediction does, since a restore takes about 3 ms against a decode of a second.
+
 **Lengths.** For the score, the observed running mean of completed output lengths is enough: under
 `--observables` it lands within 0.13% of the exact length on this workload, and no estimator can do
 better here, because output length is independent of everything the router can see (Phase 4). A
@@ -1175,10 +1196,10 @@ an engine input: the scheduler needs a handful of fields it can act on, not a pa
 
 | dimension | scheduler field | status |
 |---|---|---|
-| Control flow | `flow: None \| Declared \| Predicted(dist) \| Fanout(n)` | 3 of 4 built; **Predicted** is §3.2 |
-| Knowledge grounding | which blob classes, and their sharing shape | KV / snapshot / weights built; **RAG missing** |
-| State and time horizon | `retention: evict_first \| until(deadline) \| durable` | **built** for the first two (Phase 5): `evict_first` declared over one-shot scopes, `until(deadline)` from a hint's lead, both consumed by §3.3; `durable` is missing |
-| Authority to act | `authority: ReadOnly \| DraftOnly \| SideEffecting` + `pause_tolerance` | **missing**; drives speculation, sets which preemption primitive applies (§2.3) and which requests need a durable write (§1) |
+| Control flow | `flow: None \| Declared \| Predicted(dist) \| Fanout(n)` | 4 of 4 built; **Predicted** is a learned template (§3.2, Phase 7) |
+| Knowledge grounding | which blob classes, and their sharing shape | KV / snapshot / weights / **retrieved chunks** built (Phase 7) |
+| State and time horizon | `retention: evict_first \| until(deadline) \| durable` | **built** for the first two (Phase 5): `evict_first` declared over one-shot scopes, `until(deadline)` from a hint's lead, both consumed by §3.3; `durable` is **built** for sandboxes (Phase 7): a cell that is demoted and never dropped |
+| Authority to act | `authority: ReadOnly \| DraftOnly \| SideEffecting` + `pause_tolerance` | **built** (Phase 7): derived from MCP's `ToolAnnotations` defaults, pessimistically, so an unannotated tool is `SideEffecting`; drives speculation, the lease and the log write. `pause_tolerance` is not built as a field |
 | *no dimension -- see below* | `slo: Interactive \| Throughput` | **declared** (Phase 4, `--throughput`); read by the scoring quantile (§3.7), by admission and the router queue (Phase 9). `Deadline(t)` waits for something to consume it |
 
 **The fifth field has no dimension behind it.** §1's admission and §3.7's score both need to know
@@ -1204,16 +1225,20 @@ case -- is definitionally the one that cannot be declared and must be predicted.
 declared hints felt natural: they are the *fixed*-pipeline case, and the prototype has been testing
 the easy half of the dimension.
 
-**RAG-grounded is genuinely missing.** Retrieved chunks are shared across *sessions* with Zipf
+**RAG-grounded was missing, and is built (Phase 7).** Retrieved chunks are shared across *sessions* with Zipf
 popularity, not chain-structured like a KV prefix, so they evict differently from anything modelled
 and contend with KV for the same pool. `sched_lm` models this (`--rag-docs`, `--rag-zipf`);
-polyproto has no equivalent. It is the cheapest high-value addition, and the one grounding mode
-that changes the ledger's contention shape.
+polyproto has no equivalent. It was the cheapest high-value addition, and the one grounding mode
+that changes the ledger's contention shape. Under prefix caching a finite partition reuses 36% of the
+chunk tokens a call retrieves when the chunks arrive in a fixed order and 12% when they arrive in
+relevance order (k = 5, 10,000 chunks), against 52% and 28% with an infinite cache; reuse
+independent of position finds 64% (96% infinite) and nets 54% after recomputing about 15%. The
+position-independent figure is a residency counterfactual, not an executed arm.
 
-**Durable memory breaks an invariant.** Every class in the ledger is evictable at a priced cost.
+**Durable memory breaks an invariant, and the invariant holds (Phase 7).** Every class in the ledger is evictable at a priced cost.
 Durable state must never be *lost*, only demoted -- a correctness constraint, not a cost tradeoff.
-That exists today only as `ServiceHeap`'s serving pin, and generalising it means a class of state
-whose eviction is forbidden rather than expensive.
+Before Phase 7 that existed only as `ServiceHeap`'s serving pin; a durable cell is now pinned to
+the cold tier and demoted, never dropped, and no durable cell was lost in any run.
 
 ### Authority drives speculation, preemption, and idempotency
 
@@ -1237,6 +1262,18 @@ preempt or checkpoint:
 4. **Human-approved** (unbounded pauses) -> demote the whole execution context out of HBM and host
    DDR into cold storage until the approval callback arrives.
 
+**Measured (Phase 7).** Speculating read tools moves turn latency by -1.0 to +1.6% on coding tools
+at 27% top-1 accuracy, -0.1 to -1.3% at 50% and -3.2 to -3.7% on research tools of 2-10 s
+(open-world reads allowed, wasting twice what they save), against -17% for a perfect predictor.
+Unpriced, it shortens the queue other sessions' tools wait in, since a hit takes its tool out of the
+queue; priced, it stays within 2% of none. A lease pins 7% of a node's DDR at its peak at 8 GiB and
+27-30% at 4 GiB, and reclaiming drafts moves turn latency by under 1% in either direction. Retention
+through a tool call with Continuum's TTL moves turn latency by 0.00%: the excess rebuild a call pays
+(0.03-9 ms) is a preemption of the sequence, which a mark cannot undo. The two timers disagree on
+19% of turn boundaries; one suspend decision for the KV and the sandbox differs from the pair on
+45.5% of them, frees 63% of idle time to the timers' 65%, and costs under 0.15% of turn latency at 8
+and at 2 GiB.
+
 ### Generator-side truth, scheduler-side inference
 
 **The taxonomy exists twice, and telemetry is the only bridge.** The workload generator uses the
@@ -1248,10 +1285,25 @@ measurable -- what `class_aware` plus `ToolGapIndex` do in `sched_lm`. `RequestV
 keeps the truth out of the score, which is what turns `taxo.md` into the experiment's independent
 variable. The same split applies to tenancy (§3.8).
 
+**Measured (Phase 7).** From observables a request's class is right for 60.6% of requests at their
+first call, 85.7% at their last with its history and 79.1% over every call; conversational, pipeline
+and multi-agent requests look like agentic ones at their first call. The consumers hardly care:
+speculation's gate is unchanged, a claim by inferred class overruns 2-5% less than by the true
+class, and joint suspension frees 15% more, -5% and -1% idle time on three seeds. A role's own p90
+claim overruns on 9-13% of its agents against a pooled claim's 63% for reviewers, and changes fan-out
+service by -2.8% to +3.3% at the one partition where claims bind.
+
 ### Per-pattern coupling is the falsifier
 
 Run coupled % per taxonomy cell on both axes. The output is a two-column table saying, for each
 pattern, whether a unified orchestrator can help at all.
+
+Phase 7 built it. Locality coupling on the programs is 0% for one-shot, extraction, conversational,
+retrieval and batch programs, 13-15% for tool pipelines, 4% for agentic, 7% for multi-agent and 2%
+for long-running ones; memory coupling is 0% for every pattern, because no program contends with a
+second class in host DDR. On the published trace at 2 GiB it is 4-41% by pattern, driven by the
+services and function cells. The table is smaller than the expected shape below: coupling lives on
+flows, and the host-memory half of the claim for long-running agents did not appear.
 
 Expected shape, stated in advance so it can be wrong: batch inference and one-shot generation show
 near-zero coupling on both axes (independent requests, nothing to co-decide); multi-agent and
@@ -1318,11 +1370,11 @@ whoever fills it.
 
 **Proposed, and the reason to do §3 and §4.**
 
-8. **Learned cross-class retention.** "This agent returns to this tool in ~800 ms, confidence 0.7"
+8. **Learned cross-class retention (Phase 7: measured, and small).** "This agent returns to this tool in ~800 ms, confidence 0.7"
    driving a FaaS warm-cell retention decision priced against what holding it displaces. A silo can
    receive that as a hint; it cannot weigh it. Phase 5 bounds what it could be worth through a
    directive on this workload: an emitter that knows every next use buys at most 1.4% of stall.
-9. **Authority-driven speculative scheduling.** Pre-executing `ReadOnly` tool calls concurrently
+9. **Authority-driven speculative scheduling (Phase 7: measured, and small where tools are short).** Pre-executing `ReadOnly` tool calls concurrently
    with decode, and scheduling `DraftOnly` work into burstable capacity with zero-compensation
    preemption -- reclaimed by eviction where the orchestrator still owns the pool and by
    cancellation where the engine does (§4). Both require knowing the authority class, which is a
@@ -1358,7 +1410,9 @@ while the placement follows the mix -- a placement that is late by 30 s costs 11
 one that is on time. Once the orchestrator stops pretending it allocates KV
 blocks, what remains is a system solving three problems existing stacks fail at: joint dataflow
 placement across network boundaries, macro capacity and gang coordination, and authority-aware
-speculative execution. Phase 3 showed the first two survive the correction; Phase 7 tests the third.
+speculative execution. Phase 3 showed the first two survive the correction; Phase 7 tested the third: speculation is worth
+about 1% on coding tools and 3-4% on research tools at published accuracies, and a perfect predictor
+bounds it at 17%.
 
 ---
 
@@ -1636,8 +1690,9 @@ simulate-first method, one level down.
 **The logged tier is FoundationDB too** -- a second cluster, appending with versionstamps, so one
 technology spans two failure domains; AX chose Redis for the same tier. It stays FoundationDB until
 evidence says otherwise, and the evidence that would is Phase 10's per-tier count showing
-FoundationDB cannot carry the rate -- which it can only show once Phase 7 gives the logged tier its
-writers. A purpose-built log is the one place building below the layer could pay, and
+FoundationDB cannot carry the rate. Phase 7 gave the logged tier its writers and counted them: 7 to
+15 writes a simulated second on a program mix whose soft tier makes 6 to 36 decisions, which is the
+rate Phase 10 must carry at fleet scale. A purpose-built log is the one place building below the layer could pay, and
 that count is what would justify it. The simulator models no store at all, so no result here
 depends on the choice.
 
@@ -1699,7 +1754,7 @@ run, and what was measured; the current numbers are in the ledger.
 | [4](phase-4.md) | belief, not truth: lossy telemetry and `P(resident)` (`--belief`) | done | within 0.16% of the exact view at 20% batch loss with no recovery |
 | [5](phase-5.md) | influence: retention directives, prefill-ahead, divergence by cause (`--directives`, `--prefill-ahead`, `--retain`) | done | an oracle's retention directives buy at most 1.4% of stall; a prefill of a declared downstream buys 24-28% of task latency where `announce` bought 10-18% |
 | [6](phase-6.md) | macro authority: weight placement, partitions, disaggregated prefill/decode, tenancy (`--model-batches`, `--prefill-time`, `--model-keyed`, `--fleet`, `--planner`, `--pairing`, `--neighbour`) | done | one model per node is within 0.3% of the pooled engine and a late placement is the whole price (30 s start +77-82%); a pair wins 1.6-2.6% at one prefiller in eight and loses past it; a router quota beats sharing against a neighbour |
-| [7](phase-7.md) | learned flows, speculative authority, sessions that suspend, the taxonomy | planned | |
+| [7](phase-7.md) | learned flows, speculative authority, sessions that suspend, the taxonomy (`--hint-grade`, `--learn-gate`, `polyphonic programs`) | done | closed-loop turns are 3.6-3.8x the open-loop trace's, and the same hints cut the flow stall by 0-5% rather than 47-63%; speculation is worth about 1% on coding tools; the logged tier writes 20-66% of the soft tier's decisions on agent presets |
 | [8](phase-8.md) | the data path as an arm | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
 | [9](phase-9.md) | enforcement: a queue at the router, cancellation on the path, and two-tier admission (`--engine-wait`, `--queue`, `--admit`, `--cancel`, `--victim`, `--disconnect`, `--batch`, `--stream-buffer`) | done | a cancel by declared class takes the interactive first-token p99 to 63-66 ms, a restart is 26-183% later than a continuation, and the stalled-stream buffer is under 2 MB a node |
 | 10 | durability: what each tier writes, and what a crash costs | planned | |
@@ -1756,7 +1811,9 @@ rotating mix.
 
 ### Phase 7 -- Learned flows, speculative authority, and the taxonomy
 
-Implementation plan: [`phase-7.md`](phase-7.md), which states its predictions before the run.
+Plan, predictions and outcomes: [`phase-7.md`](phase-7.md). **Status:** built and measured, behind
+`--hint-grade` and `--learn-gate` for the base trace and `polyphonic programs` for the rest; every
+bit is off by default and the byte-identity gate holds on the twelve-command set.
 
 Predicted flows replacing declared ones (§3.2), a tool-gap estimator, taxonomy presets, the RAG
 class, durable retention, and authority-driven speculative scheduling (`ReadOnly` pre-execution,
@@ -1767,7 +1824,7 @@ class, durable retention, and authority-driven speculative scheduling (`ReadOnly
 approval -- needs a session lifecycle the workload does not have: active, idle, suspended to cold
 storage, resumed. It is also the only writer of the logged tier (§1): `SideEffecting` intents,
 suspended-session records and approval pauses, so Phase 7 extends Phase 10's count with them, and
-§8's choice of store for the logged tier can only be tested once it has.
+§8's choice of store for the logged tier can now be tested against that count.
 
 - **Deliverable:** what the coupling-tier-1 win is worth against estimates rather than oracles; the
   latency and goodput delta from speculative scheduling; the logged tier's write rate; and a table

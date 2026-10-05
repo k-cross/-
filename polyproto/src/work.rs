@@ -123,6 +123,7 @@ struct Queued {
     fanout: Option<Fanout>,
     slo: Slo,
     tenant: Option<u32>,
+    pattern: Pattern,
 }
 
 #[derive(Clone, Debug)]
@@ -169,6 +170,84 @@ impl Slo {
         match self {
             Self::Interactive => 0,
             Self::Throughput => 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Pattern {
+    #[default]
+    Plain,
+    OneShot,
+    Extraction,
+    Conversational,
+    Rag,
+    Pipeline,
+    Agentic,
+    LongRunning,
+    MultiAgent,
+    Batch,
+}
+
+impl Pattern {
+    pub const N: usize = 10;
+    pub const ALL: [Self; Self::N] = [
+        Self::Plain,
+        Self::OneShot,
+        Self::Extraction,
+        Self::Conversational,
+        Self::Rag,
+        Self::Pipeline,
+        Self::Agentic,
+        Self::LongRunning,
+        Self::MultiAgent,
+        Self::Batch,
+    ];
+
+    #[must_use]
+    pub fn idx(self) -> usize {
+        self as usize
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Plain => "non-AI",
+            Self::OneShot => "one-shot",
+            Self::Extraction => "extraction",
+            Self::Conversational => "conversational",
+            Self::Rag => "fixed-pipeline RAG",
+            Self::Pipeline => "tool pipeline",
+            Self::Agentic => "agentic",
+            Self::LongRunning => "long-running agent",
+            Self::MultiAgent => "multi-agent",
+            Self::Batch => "batch",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Authority {
+    #[default]
+    ReadOnly,
+    DraftOnly,
+    SideEffecting,
+}
+
+impl Authority {
+    pub const N: usize = 3;
+
+    #[must_use]
+    pub fn idx(self) -> usize {
+        self as usize
+    }
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "ReadOnly",
+            Self::DraftOnly => "DraftOnly",
+            Self::SideEffecting => "SideEffecting",
         }
     }
 }
@@ -273,6 +352,7 @@ pub struct Agent {
     pub slo: Slo,
     pub retention: Retention,
     pub tenant: Option<u32>,
+    pub root: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -303,6 +383,10 @@ pub struct Request {
     pub concurrent: bool,
     pub tenant: Option<u32>,
     pub program: u64,
+    pub pattern: Pattern,
+    pub authority: Authority,
+    pub root: u32,
+    pub tool: bool,
 }
 
 #[must_use]
@@ -326,6 +410,9 @@ pub struct RequestView<'a> {
     pub class: usize,
     pub slo: Slo,
     pub tenant: Option<u32>,
+    pub root: u32,
+    pub authority: Authority,
+    pub tool: bool,
 }
 
 impl Request {
@@ -339,6 +426,9 @@ impl Request {
             class: self.kind_idx(),
             slo: self.slo,
             tenant: self.tenant,
+            root: self.root,
+            authority: self.authority,
+            tool: self.tool,
         }
     }
 
@@ -785,6 +875,7 @@ impl Workload {
                     evict_first_from: Some(parent.len()),
                 },
                 tenant: Some(tenant as u32),
+                root: 0,
             });
         }
         let mut resume = parent.clone();
@@ -1132,9 +1223,17 @@ impl Workload {
             concurrent: true,
             tenant: Some(tenant),
             program,
+            pattern: match kind {
+                Unshared::Fresh { .. } => Pattern::Extraction,
+                Unshared::Batch => Pattern::Batch,
+            },
+            authority: Authority::ReadOnly,
+            root: 0,
+            tool: false,
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn next_base(&mut self) -> Option<Request> {
         let phase = self.phase();
 
@@ -1156,6 +1255,7 @@ impl Workload {
                     None,
                     q.slo,
                     f.tenant,
+                    Pattern::MultiAgent,
                 );
                 return Some(Request {
                     phase,
@@ -1173,6 +1273,10 @@ impl Workload {
                     concurrent: false,
                     tenant: None,
                     program: PROGRAM_TASK | q.task,
+                    pattern: Pattern::MultiAgent,
+                    authority: Authority::ReadOnly,
+                    root: 0,
+                    tool: false,
                 });
             }
             let tail = q.chain.last().map_or(ROOT, |(id, _)| *id);
@@ -1201,6 +1305,10 @@ impl Workload {
                 concurrent: false,
                 tenant: q.tenant,
                 program: PROGRAM_TASK | q.task,
+                pattern: q.pattern,
+                authority: Authority::ReadOnly,
+                root: 0,
+                tool: false,
             });
         }
         let mix = self.mix();
@@ -1228,6 +1336,10 @@ impl Workload {
             concurrent: false,
             tenant: None,
             program: 0,
+            pattern: Pattern::Plain,
+            authority: Authority::ReadOnly,
+            root: 0,
+            tool: false,
         })
     }
 }
@@ -1240,6 +1352,7 @@ impl Workload {
         exec_ns: u64,
         tokens: u64,
         payload: u64,
+        pattern: Pattern,
     ) -> FlowHint {
         self.enqueue_after(
             FLOW_LEAD_OPS,
@@ -1251,6 +1364,7 @@ impl Workload {
             None,
             Slo::Interactive,
             None,
+            pattern,
         )
     }
 
@@ -1266,6 +1380,7 @@ impl Workload {
         fanout: Option<Fanout>,
         slo: Slo,
         tenant: Option<u32>,
+        pattern: Pattern,
     ) -> FlowHint {
         self.next_task += 1;
         let task = self.next_task;
@@ -1284,10 +1399,12 @@ impl Workload {
                 fanout,
                 slo,
                 tenant,
+                pattern,
             },
         );
         FlowHint {
             task,
+            template_len: chain.len(),
             downstream: chain,
             probability: 1.0,
             lead_ops: lead,
@@ -1308,7 +1425,9 @@ impl Workload {
         );
         self.grow(turn, produces.len() as u64);
         let requires = self.model_shards(tenant);
+        let mut pattern = Pattern::Conversational;
         let hint = if self.fanout_fraction > 0.0 && self.rng.chance(self.fanout_fraction) {
+            pattern = Pattern::MultiAgent;
             let task = self.next_task + 1;
             let plan = self.fanout(&chain, tenant, task, slo);
             let hint = self.enqueue_after(
@@ -1321,6 +1440,7 @@ impl Workload {
                 Some(plan),
                 slo,
                 None,
+                Pattern::MultiAgent,
             );
             debug_assert_eq!(hint.task, task);
             Some(hint)
@@ -1329,7 +1449,8 @@ impl Workload {
             let tool = self.faas_for(f);
             let exec = self.faas_exec();
             let payload = self.tool_payload_bytes;
-            Some(self.enqueue(tool, Vec::new(), exec, 0, payload))
+            pattern = Pattern::Agentic;
+            Some(self.enqueue(tool, Vec::new(), exec, 0, payload, Pattern::Agentic))
         } else {
             None
         };
@@ -1349,6 +1470,10 @@ impl Workload {
             concurrent: false,
             tenant: Some(tenant as u32),
             program: turn.session,
+            pattern,
+            authority: Authority::ReadOnly,
+            root: 0,
+            tool: false,
         }
     }
 
@@ -1361,17 +1486,22 @@ impl Workload {
         };
         let chain = self.faas_for(f);
         let exec_ns = self.faas_exec();
+        let mut flows = false;
         let hint = if self.rng.chance(FLOW_FRACTION) {
+            flows = true;
             let downstream = self.flow_chain(f);
             let requires = Self::shards_of(self.flow_model(f));
             let tokens = self.tokens();
-            Some(self.enqueue(
+            let mut hint = self.enqueue(
                 downstream,
                 requires,
                 tokens * DECODE_NS_PER_TOKEN,
                 tokens,
                 self.flow_payload_bytes,
-            ))
+                Pattern::Pipeline,
+            );
+            hint.template_len = FLOW_PROMPT_BLOCKS as usize;
+            Some(hint)
         } else {
             None
         };
@@ -1391,6 +1521,14 @@ impl Workload {
             concurrent: false,
             tenant: None,
             program: 0,
+            pattern: if flows {
+                Pattern::Pipeline
+            } else {
+                Pattern::Plain
+            },
+            authority: Authority::ReadOnly,
+            root: 0,
+            tool: false,
         }
     }
 }

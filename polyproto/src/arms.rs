@@ -422,9 +422,11 @@ pub fn run_with(
             let function = phantoms.zipf(crate::work::FLOW_FUNCTIONS, 1.5);
             let call = crate::work::FLOW_CALLS + phantoms.below(crate::work::FLOW_CALLS);
             phantom_task -= 1;
+            let downstream = crate::work::flow_downstream(function, call);
             h.announce(&FlowHint {
                 task: phantom_task,
-                downstream: crate::work::flow_downstream(function, call),
+                template_len: downstream.len(),
+                downstream,
                 probability: 1.0,
                 lead_ops: crate::work::FLOW_LEAD_OPS,
                 payload_bytes: 0,
