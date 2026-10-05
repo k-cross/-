@@ -1699,7 +1699,7 @@ run, and what was measured; the current numbers are in the ledger.
 | [4](phase-4.md) | belief, not truth: lossy telemetry and `P(resident)` (`--belief`) | done | within 0.16% of the exact view at 20% batch loss with no recovery |
 | [5](phase-5.md) | influence: retention directives, prefill-ahead, divergence by cause (`--directives`, `--prefill-ahead`, `--retain`) | done | an oracle's retention directives buy at most 1.4% of stall; a prefill of a declared downstream buys 24-28% of task latency where `announce` bought 10-18% |
 | [6](phase-6.md) | macro authority: weight placement, partitions, disaggregated prefill/decode, tenancy (`--model-batches`, `--prefill-time`, `--model-keyed`, `--fleet`, `--planner`, `--pairing`, `--neighbour`) | done | one model per node is within 0.3% of the pooled engine and a late placement is the whole price (30 s start +77-82%); a pair wins 1.6-2.6% at one prefiller in eight and loses past it; a router quota beats sharing against a neighbour |
-| 7 | learned flows, speculative authority, sessions that suspend, the taxonomy | planned | |
+| [7](phase-7.md) | learned flows, speculative authority, sessions that suspend, the taxonomy | planned | |
 | [8](phase-8.md) | the data path as an arm | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
 | [9](phase-9.md) | enforcement: a queue at the router, cancellation on the path, and two-tier admission (`--engine-wait`, `--queue`, `--admit`, `--cancel`, `--victim`, `--disconnect`, `--batch`, `--stream-buffer`) | done | a cancel by declared class takes the interactive first-token p99 to 63-66 ms, a restart is 26-183% later than a continuation, and the stalled-stream buffer is under 2 MB a node |
 | 10 | durability: what each tier writes, and what a crash costs | planned | |
@@ -1755,6 +1755,8 @@ rotating mix.
   results stay the ledger's, read as a fleet of one model.
 
 ### Phase 7 -- Learned flows, speculative authority, and the taxonomy
+
+Implementation plan: [`phase-7.md`](phase-7.md), which states its predictions before the run.
 
 Predicted flows replacing declared ones (§3.2), a tool-gap estimator, taxonomy presets, the RAG
 class, durable retention, and authority-driven speculative scheduling (`ReadOnly` pre-execution,
