@@ -1,9 +1,8 @@
-use crate::slideshow::FontAssets;
-use crate::slideshow::SlideState;
 use crate::slideshow::animation::SlamEntrance;
 use crate::slideshow::splatter::{
     CardCorner, spawn_corner_ink_splatter, spawn_ink_blotch, spawn_ui_ink_blotch,
 };
+use crate::slideshow::{FontAssets, SlideController, SlideState, character};
 
 use crate::theme::colors::*;
 use crate::theme::geometry::*;
@@ -12,7 +11,144 @@ use crate::theme::typography::*;
 use bevy::prelude::*;
 use bevy::state::state_scoped::DespawnOnExit;
 
-pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
+pub const SELECTED_ROTATION_DEG: f32 = -70.0;
+pub const SELECTED_ROTATION_RAD: f32 = SELECTED_ROTATION_DEG * std::f32::consts::PI / 180.0;
+
+#[derive(Resource, Default)]
+pub struct IntroSelection {
+    pub current: usize,
+}
+
+#[derive(Component)]
+pub struct IntroMenuCard {
+    pub index: usize,
+    pub rest_tilt: f32,
+    pub is_climax: bool,
+    pub current_angle: f32,
+    pub target_angle: f32,
+}
+
+#[derive(Component, Clone, Copy)]
+pub enum IntroCardElement {
+    Icon(usize),
+    Num(usize),
+    Title(usize),
+    Sub(usize),
+}
+
+pub struct MenuCardData {
+    pub indent: f32,
+    pub num: &'static str,
+    pub title: &'static str,
+    pub sub: &'static str,
+    pub unselected_bg: Color,
+    pub unselected_border: BorderColor,
+    pub unselected_fg: Color,
+    pub corner: CardCorner,
+    pub splat_color: Color,
+    pub is_climax: bool,
+    pub target_state: SlideState,
+}
+
+pub const MENU_CARDS: [MenuCardData; 5] = [
+    MenuCardData {
+        indent: 0.0,
+        num: "01",
+        title: "ON THE ROAD TO LOCK FREEDOM",
+        sub: "[CURRENT ROUTE]",
+        unselected_bg: P5_BLACK,
+        unselected_border: BorderColor {
+            left: P5_RED,
+            top: P5_BORDER,
+            right: P5_BORDER,
+            bottom: P5_BORDER,
+        },
+        unselected_fg: P5_WHITE,
+        corner: CardCorner::TopLeft,
+        splat_color: P5_RED,
+        is_climax: false,
+        target_state: SlideState::Intro,
+    },
+    MenuCardData {
+        indent: 26.0,
+        num: "02",
+        title: "SYNCHRONOUS WITH ATOMICS",
+        sub: "[THE SIZE RACE]",
+        unselected_bg: P5_BLACK,
+        unselected_border: BorderColor {
+            left: P5_RED,
+            top: P5_RED,
+            right: P5_RED,
+            bottom: P5_RED,
+        },
+        unselected_fg: P5_WHITE,
+        corner: CardCorner::TopRight,
+        splat_color: P5_RED,
+        is_climax: false,
+        target_state: SlideState::MutexBottleneck,
+    },
+    MenuCardData {
+        indent: 52.0,
+        num: "03",
+        title: "MEMORY SEQUENCING & ABA",
+        sub: "[TURN-STAMP RESOLUTION]",
+        unselected_bg: P5_OFF_BLACK,
+        unselected_border: BorderColor {
+            left: P5_BORDER,
+            top: P5_BORDER,
+            right: P5_BORDER,
+            bottom: P5_BORDER,
+        },
+        unselected_fg: P5_OFF_WHITE,
+        corner: CardCorner::BottomLeft,
+        splat_color: P5_DARK_RED,
+        is_climax: false,
+        target_state: SlideState::BoolRep,
+    },
+    MenuCardData {
+        indent: 78.0,
+        num: "04",
+        title: "HARDWARE CACHE CONTENTION",
+        sub: "[APPLE SILICON 128B]",
+        unselected_bg: P5_CHARCOAL,
+        unselected_border: BorderColor {
+            left: P5_BORDER,
+            top: P5_BORDER,
+            right: P5_BORDER,
+            bottom: P5_BORDER,
+        },
+        unselected_fg: P5_LIGHT_GREY,
+        corner: CardCorner::TopLeft,
+        splat_color: P5_RED,
+        is_climax: false,
+        target_state: SlideState::CacheContention,
+    },
+    MenuCardData {
+        indent: 104.0,
+        num: "05",
+        title: "BRANCHLESS & TAIL LATENCY",
+        sub: "[CLIMAX ROUTE ★]",
+        unselected_bg: P5_GOLD,
+        unselected_border: BorderColor {
+            left: P5_BLACK,
+            top: P5_BLACK,
+            right: P5_BLACK,
+            bottom: P5_BLACK,
+        },
+        unselected_fg: P5_BLACK,
+        corner: CardCorner::BottomLeft,
+        splat_color: P5_BLACK,
+        is_climax: true,
+        target_state: SlideState::BranchlessIndex,
+    },
+];
+
+pub fn spawn_intro_slide(
+    mut commands: Commands,
+    font_assets: Res<FontAssets>,
+    mut selection: ResMut<IntroSelection>,
+) {
+    selection.current = 0;
     // Slide-scoped high-visibility crimson ink blotch in world space
     let title_blotch = spawn_ink_blotch(
         &mut commands,
@@ -475,102 +611,206 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                 },
                 SlamEntrance::new(Vec2::new(-140.0, -80.0), 0.15, 0.28),
             )).with_children(|menu| {
-                // Menu Cards: (indent, num, title, sub, bg, border_color, fg, corner, splat_col, active, is_climax)
-                let menu_cards = [
-                    // Card 01: Active White card with Crimson Corner Splatter
-                    (0.0, "01", "ON THE ROAD TO LOCK FREEDOM", "[CURRENT ROUTE]", P5_WHITE, BorderColor::all(P5_BLACK), P5_BLACK, CardCorner::TopLeft, P5_RED, true, false),
-                    // Card 02: Black card with Crimson Corner Splatter on Top-Right
-                    (26.0, "02", "SYNCHRONOUS WITH ATOMICS", "[THE SIZE RACE]", P5_BLACK, BorderColor::all(P5_RED), P5_WHITE, CardCorner::TopRight, P5_RED, false, false),
-                    // Card 03: Off-Black card with Dark Crimson Corner Splatter on Bottom-Left
-                    (52.0, "03", "MEMORY SEQUENCING & ABA", "[TURN-STAMP RESOLUTION]", P5_OFF_BLACK, BorderColor::all(P5_BORDER), P5_OFF_WHITE, CardCorner::BottomLeft, P5_DARK_RED, false, false),
-                    // Card 04: Charcoal card with Red Corner Splatter on Top-Left
-                    (78.0, "04", "HARDWARE CACHE CONTENTION", "[APPLE SILICON 128B]", P5_CHARCOAL, BorderColor::all(P5_BORDER), P5_LIGHT_GREY, CardCorner::TopLeft, P5_RED, false, false),
-                    // Card 05: Climax Amber-Gold card with Black Corner Splatter (Iwai Shop SELL card style!)
-                    (104.0, "05", "BRANCHLESS & TAIL LATENCY", "[CLIMAX ROUTE ★]", P5_GOLD, BorderColor::all(P5_BLACK), P5_BLACK, CardCorner::BottomLeft, P5_BLACK, false, true),
-                ];
-
-                for (indent, num, title, sub, bg, border_color, fg, corner, splat_color, active, is_climax) in menu_cards {
-                    let tilt = if active { -0.04 } else if is_climax { 0.03 } else { -0.02 };
-                    let pad_v = if active { 7.0 } else { 5.5 };
+                for (i, card_data) in MENU_CARDS.iter().enumerate() {
+                    let is_selected = i == 0;
+                    let rest_tilt = if is_selected {
+                        -0.04
+                    } else if card_data.is_climax {
+                        0.03
+                    } else {
+                        -0.02
+                    };
+                    let bg = if is_selected {
+                        if card_data.is_climax {
+                            P5_GOLD
+                        } else {
+                            P5_WHITE
+                        }
+                    } else {
+                        card_data.unselected_bg
+                    };
+                    let border_color = if is_selected {
+                        if card_data.is_climax {
+                            BorderColor::all(P5_RED)
+                        } else {
+                            BorderColor::all(P5_BLACK)
+                        }
+                    } else {
+                        card_data.unselected_border
+                    };
+                    let border = if is_selected {
+                        UiRect {
+                            left: Val::Px(5.0),
+                            top: Val::Px(1.5),
+                            right: Val::Px(4.0),
+                            bottom: Val::Px(4.0),
+                        }
+                    } else {
+                        UiRect {
+                            left: Val::Px(2.5),
+                            top: Val::Px(1.5),
+                            right: Val::Px(2.5),
+                            bottom: Val::Px(2.5),
+                        }
+                    };
 
                     menu.spawn((
                         Node {
                             position_type: PositionType::Relative,
-                            margin: UiRect::left(Val::Px(indent)),
+                            margin: UiRect::left(Val::Px(card_data.indent)),
                             width: Val::Px(510.0),
-                            padding: UiRect::axes(Val::Px(16.0), Val::Px(pad_v)),
+                            height: Val::Px(38.0),
+                            padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)),
                             flex_direction: FlexDirection::Row,
                             align_items: AlignItems::Center,
                             justify_content: JustifyContent::SpaceBetween,
-                            border: UiRect {
-                                left: Val::Px(if active { 5.0 } else { 2.5 }),
-                                top: Val::Px(1.5),
-                                right: Val::Px(if active { 4.0 } else { 2.5 }),
-                                bottom: Val::Px(if active { 4.0 } else { 2.5 }),
-                            },
+                            border,
                             border_radius: BorderRadius::all(Val::Px(8.0)),
                             ..default()
                         },
                         BackgroundColor(bg),
                         border_color,
-                        UiTransform::from_rotation(Rot2::radians(tilt)),
-                    )).with_children(|card| {
-                        // Stamped Corner Ink Splatter on every card (P5 Shop Style)!
-                        spawn_corner_ink_splatter(card, corner, splat_color, if active || is_climax { 30.0 } else { 22.0 });
-
-                        // Left Side: Dagger / Star + Number + Title
-                        card.spawn((
-                            Node {
-                                flex_direction: FlexDirection::Row,
-                                align_items: AlignItems::Center,
-                                column_gap: Val::Px(10.0),
-                                ..default()
-                            },
-                        )).with_children(|left| {
-                            if active {
-                                left.spawn((
-                                    Text::new("▶"),
-                                    TextFont::from_font_size(14.0).with_font(font_assets.symbols.clone()),
-                                    TextColor(P5_RED),
-                                ));
-                            } else if is_climax {
-                                left.spawn((
-                                    Text::new("★"),
-                                    TextFont::from_font_size(14.0).with_font(font_assets.symbols.clone()),
-                                    TextColor(P5_BLACK),
-                                ));
+                        UiTransform::from_rotation(Rot2::radians(rest_tilt)),
+                        ZIndex(if is_selected { 10 } else { 0 }),
+                        IntroMenuCard {
+                            index: i,
+                            rest_tilt,
+                            is_climax: card_data.is_climax,
+                            current_angle: rest_tilt,
+                            target_angle: if is_selected {
+                                SELECTED_ROTATION_RAD
                             } else {
-                                left.spawn((
-                                    Text::new("•"),
-                                    TextFont::from_font_size(12.0).with_font(font_assets.symbols.clone()),
-                                    TextColor(P5_MUTED),
-                                ));
-                            }
+                                rest_tilt
+                            },
+                        },
+                    ))
+                    .with_children(|card| {
+                        spawn_corner_ink_splatter(
+                            card,
+                            card_data.corner,
+                            card_data.splat_color,
+                            if is_selected || card_data.is_climax {
+                                30.0
+                            } else {
+                                22.0
+                            },
+                        );
 
-                            // Route Number Tag
+                        card.spawn((Node {
+                            flex_direction: FlexDirection::Row,
+                            align_items: AlignItems::Center,
+                            column_gap: Val::Px(10.0),
+                            ..default()
+                        },))
+                        .with_children(|left| {
+                            let icon_text = if is_selected {
+                                "▶"
+                            } else if card_data.is_climax {
+                                "★"
+                            } else {
+                                "•"
+                            };
+                            let icon_color = if is_selected {
+                                P5_RED
+                            } else if card_data.is_climax {
+                                P5_BLACK
+                            } else {
+                                P5_MUTED
+                            };
                             left.spawn((
-                                Text::new(num),
-                                TextFont::from_font_size(13.0).with_font(font_assets.display.clone()),
-                                TextColor(if active { P5_RED } else if is_climax { P5_BLACK } else { P5_MUTED }),
+                                Text::new(icon_text),
+                                TextFont::from_font_size(if is_selected || card_data.is_climax {
+                                    14.0
+                                } else {
+                                    12.0
+                                })
+                                .with_font(font_assets.symbols.clone()),
+                                TextColor(icon_color),
+                                IntroCardElement::Icon(i),
                             ));
 
-                            // Title Text
+                            let num_color = if is_selected {
+                                P5_RED
+                            } else if card_data.is_climax {
+                                P5_BLACK
+                            } else {
+                                P5_MUTED
+                            };
                             left.spawn((
-                                Text::new(title),
-                                TextFont::from_font_size(if active || is_climax { 14.0 } else { 12.5 })
-                                    .with_font(if active || is_climax { font_assets.display.clone() } else { font_assets.sans.clone() }),
-                                TextColor(fg),
+                                Text::new(card_data.num),
+                                TextFont::from_font_size(13.0)
+                                    .with_font(font_assets.display.clone()),
+                                TextColor(num_color),
+                                IntroCardElement::Num(i),
+                            ));
+
+                            let title_color = if is_selected || card_data.is_climax {
+                                P5_BLACK
+                            } else {
+                                card_data.unselected_fg
+                            };
+                            let title_font = if is_selected || card_data.is_climax {
+                                font_assets.display.clone()
+                            } else {
+                                font_assets.sans.clone()
+                            };
+                            let title_size = if is_selected || card_data.is_climax {
+                                14.0
+                            } else {
+                                12.5
+                            };
+                            left.spawn((
+                                Text::new(card_data.title),
+                                TextFont::from_font_size(title_size).with_font(title_font),
+                                TextColor(title_color),
+                                IntroCardElement::Title(i),
                             ));
                         });
 
-                        // Right Side: Context Badge
+                        let sub_color = if is_selected || card_data.is_climax {
+                            P5_DARK_RED
+                        } else {
+                            P5_MUTED
+                        };
                         card.spawn((
-                            Text::new(sub),
-                            TextFont::from_font_size(10.5).with_font(font_assets.sans_heavy.clone()),
-                            TextColor(if active || is_climax { P5_DARK_RED } else { P5_MUTED }),
+                            Text::new(card_data.sub),
+                            TextFont::from_font_size(10.5)
+                                .with_font(font_assets.sans_heavy.clone()),
+                            TextColor(sub_color),
+                            IntroCardElement::Sub(i),
                         ));
                     });
                 }
+
+                menu.spawn((Node {
+                    flex_direction: FlexDirection::Row,
+                    align_items: AlignItems::Center,
+                    column_gap: Val::Px(8.0),
+                    margin: UiRect::axes(Val::Px(12.0), Val::Px(4.0)),
+                    ..default()
+                },))
+                .with_children(|hint| {
+                    hint.spawn((
+                        Text::new("★"),
+                        TextFont::from_font_size(11.0).with_font(font_assets.symbols.clone()),
+                        TextColor(P5_RED),
+                    ));
+                    hint.spawn((
+                        Text::new("[↑ / ↓] SELECT INFILTRATION ROUTE"),
+                        TextFont::from_font_size(10.5).with_font(font_assets.sans_heavy.clone()),
+                        TextColor(P5_MUTED),
+                    ));
+                    hint.spawn((
+                        Text::new("|"),
+                        TextFont::from_font_size(10.5).with_font(font_assets.sans.clone()),
+                        TextColor(P5_BORDER),
+                    ));
+                    hint.spawn((
+                        Text::new("[ENTER] INFILTRATE"),
+                        TextFont::from_font_size(10.5).with_font(font_assets.sans_heavy.clone()),
+                        TextColor(P5_OFF_WHITE),
+                    ));
+                });
             });
         });
 
@@ -758,4 +998,172 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
             });
         });
     });
+}
+
+pub fn handle_intro_menu_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut selection: ResMut<IntroSelection>,
+    mut controller: ResMut<SlideController>,
+    mut next_state: ResMut<NextState<SlideState>>,
+    mut commands: Commands,
+    character_roots: Query<&mut character::PhantomThiefRoot>,
+) {
+    if keys.just_pressed(KeyCode::ArrowDown) || keys.just_pressed(KeyCode::KeyJ) {
+        selection.current = (selection.current + 1) % 5;
+    }
+    if keys.just_pressed(KeyCode::ArrowUp) || keys.just_pressed(KeyCode::KeyK) {
+        selection.current = (selection.current + 4) % 5;
+    }
+    if keys.just_pressed(KeyCode::Enter) {
+        let target_state = MENU_CARDS[selection.current].target_state;
+        let (final_state, final_idx) = if target_state == SlideState::Intro {
+            (SlideState::MutexBottleneck, 1)
+        } else {
+            let idx = SlideState::ORDER
+                .iter()
+                .position(|&s| s == target_state)
+                .unwrap_or(0);
+            (target_state, idx)
+        };
+
+        controller.current_index = final_idx;
+        next_state.set(final_state);
+        crate::slideshow::animation::spawn_screen_slash(&mut commands);
+        crate::slideshow::character::trigger_character_slash(character_roots);
+    }
+}
+
+pub fn update_intro_menu_visuals(
+    selection: Res<IntroSelection>,
+    font_assets: Res<FontAssets>,
+    mut card_query: Query<(
+        &mut IntroMenuCard,
+        &mut BackgroundColor,
+        &mut BorderColor,
+        &mut Node,
+        &mut ZIndex,
+    )>,
+    mut text_query: Query<(&IntroCardElement, &mut Text, &mut TextColor, &mut TextFont)>,
+) {
+    let sel = selection.current;
+
+    for (mut card, mut bg, mut border_color, mut node, mut z_index) in &mut card_query {
+        let is_selected = card.index == sel;
+        let data = &MENU_CARDS[card.index];
+
+        if is_selected {
+            card.target_angle = SELECTED_ROTATION_RAD;
+            *z_index = ZIndex(10);
+            *bg = if card.is_climax {
+                BackgroundColor(P5_GOLD)
+            } else {
+                BackgroundColor(P5_WHITE)
+            };
+            *border_color = if card.is_climax {
+                BorderColor::all(P5_RED)
+            } else {
+                BorderColor::all(P5_BLACK)
+            };
+            node.border = UiRect {
+                left: Val::Px(5.0),
+                top: Val::Px(1.5),
+                right: Val::Px(4.0),
+                bottom: Val::Px(4.0),
+            };
+        } else {
+            card.target_angle = card.rest_tilt;
+            *z_index = ZIndex(0);
+            *bg = BackgroundColor(data.unselected_bg);
+            *border_color = data.unselected_border;
+            node.border = UiRect {
+                left: Val::Px(2.5),
+                top: Val::Px(1.5),
+                right: Val::Px(2.5),
+                bottom: Val::Px(2.5),
+            };
+        }
+    }
+
+    for (element, mut text, mut color, mut font) in &mut text_query {
+        match *element {
+            IntroCardElement::Icon(idx) => {
+                let is_selected = idx == sel;
+                let is_climax = MENU_CARDS[idx].is_climax;
+                if is_selected {
+                    **text = "▶".to_string();
+                    *color = TextColor(P5_RED);
+                    *font = TextFont::from_font_size(14.0).with_font(font_assets.symbols.clone());
+                } else if is_climax {
+                    **text = "★".to_string();
+                    *color = TextColor(P5_BLACK);
+                    *font = TextFont::from_font_size(14.0).with_font(font_assets.symbols.clone());
+                } else {
+                    **text = "•".to_string();
+                    *color = TextColor(P5_MUTED);
+                    *font = TextFont::from_font_size(12.0).with_font(font_assets.symbols.clone());
+                }
+            }
+            IntroCardElement::Num(idx) => {
+                let is_selected = idx == sel;
+                let is_climax = MENU_CARDS[idx].is_climax;
+                if is_selected {
+                    *color = TextColor(P5_RED);
+                } else if is_climax {
+                    *color = TextColor(P5_BLACK);
+                } else {
+                    *color = TextColor(P5_MUTED);
+                }
+            }
+            IntroCardElement::Title(idx) => {
+                let is_selected = idx == sel;
+                let is_climax = MENU_CARDS[idx].is_climax;
+                let data = &MENU_CARDS[idx];
+                if is_selected || is_climax {
+                    *color = TextColor(P5_BLACK);
+                    *font = TextFont::from_font_size(14.0).with_font(font_assets.display.clone());
+                } else {
+                    *color = TextColor(data.unselected_fg);
+                    *font = TextFont::from_font_size(12.5).with_font(font_assets.sans.clone());
+                }
+            }
+            IntroCardElement::Sub(idx) => {
+                let is_selected = idx == sel;
+                let is_climax = MENU_CARDS[idx].is_climax;
+                if is_selected || is_climax {
+                    *color = TextColor(P5_DARK_RED);
+                } else {
+                    *color = TextColor(P5_MUTED);
+                }
+            }
+        }
+    }
+}
+
+pub fn animate_intro_menu_cards(
+    time: Res<Time>,
+    mut query: Query<(&mut UiTransform, &mut IntroMenuCard)>,
+) {
+    let dt = time.delta_secs();
+    const W: f32 = 510.0;
+    const H: f32 = 38.0;
+    const SPEED: f32 = 18.0;
+
+    for (mut ui_transform, mut card) in &mut query {
+        let diff = card.target_angle - card.current_angle;
+        if diff.abs() > 0.0005 {
+            card.current_angle += diff * (1.0 - (-SPEED * dt).exp());
+        } else {
+            card.current_angle = card.target_angle;
+        }
+
+        let angle = card.current_angle;
+        let cos_a = angle.cos();
+        let sin_a = angle.sin();
+
+        let delta_x = (W / 2.0) * (cos_a - 1.0) - (H / 2.0) * sin_a;
+        let delta_y = (W / 2.0) * sin_a + (H / 2.0) * (cos_a - 1.0);
+
+        ui_transform.translation = Val2::px(delta_x, delta_y);
+        ui_transform.rotation = Rot2::radians(angle);
+    }
 }

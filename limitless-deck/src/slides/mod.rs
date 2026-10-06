@@ -9,7 +9,18 @@ pub struct SlidesPlugin;
 
 impl Plugin for SlidesPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(OnEnter(SlideState::Intro), intro::spawn_intro_slide)
+        app.init_resource::<intro::IntroSelection>()
+            .add_systems(OnEnter(SlideState::Intro), intro::spawn_intro_slide)
+            .add_systems(
+                Update,
+                (
+                    intro::handle_intro_menu_input,
+                    intro::update_intro_menu_visuals
+                        .run_if(resource_changed::<intro::IntroSelection>),
+                    intro::animate_intro_menu_cards,
+                )
+                    .run_if(in_state(SlideState::Intro)),
+            )
             .add_systems(
                 OnEnter(SlideState::MutexBottleneck),
                 auto_slides::spawn_sync_atomics_slide,

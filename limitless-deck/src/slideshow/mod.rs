@@ -121,16 +121,18 @@ fn handle_slide_input(
     mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     mut controller: ResMut<SlideController>,
+    current_state: Res<State<SlideState>>,
     mut next_state: ResMut<NextState<SlideState>>,
     mut windows: Query<&mut Window, With<bevy::window::PrimaryWindow>>,
     character_roots: Query<&mut character::PhantomThiefRoot>,
 ) {
     let mut changed = false;
+    let is_intro = *current_state.get() == SlideState::Intro;
 
     // Next slide actions
     if (keys.just_pressed(KeyCode::ArrowRight)
         || keys.just_pressed(KeyCode::Space)
-        || keys.just_pressed(KeyCode::Enter)
+        || (!is_intro && keys.just_pressed(KeyCode::Enter))
         || keys.just_pressed(KeyCode::PageDown))
         && controller.total_slides > 0
     {
