@@ -467,6 +467,31 @@ impl Costs {
     }
 
     #[must_use]
+    pub fn best_region_counts(&self, demand: &[f64], nodes: usize, cap: usize) -> Vec<usize> {
+        let mut counts = vec![usize::from(cap > 0); demand.len()];
+        let mut left = nodes.saturating_sub(counts.iter().sum::<usize>());
+        let gain = |r: usize, n: usize| {
+            self.cost_rate(0, demand[r], n) - self.cost_rate(0, demand[r], n + 1)
+        };
+        while left > 0 {
+            let Some(best) = (0..demand.len())
+                .filter(|&r| counts[r] < cap)
+                .max_by(|&a, &b| {
+                    gain(a, counts[a])
+                        .total_cmp(&gain(b, counts[b]))
+                        .then(counts[b].cmp(&counts[a]))
+                        .then(b.cmp(&a))
+                })
+            else {
+                break;
+            };
+            counts[best] += 1;
+            left -= 1;
+        }
+        counts
+    }
+
+    #[must_use]
     pub fn best_counts(&self, demand: &[f64; MODEL_COUNT], nodes: usize) -> [usize; MODEL_COUNT] {
         self.best_counts_among(demand, nodes, [true; MODEL_COUNT])
     }
@@ -891,6 +916,30 @@ mod tests {
         assert_eq!(
             c.best_counts_among(&demand, 8, [true; MODEL_COUNT])[1..],
             [1, 1, 1]
+        );
+    }
+
+    #[test]
+    fn nodes_follow_a_regions_demand_and_every_region_keeps_one() {
+        let c = costs();
+        let counts = c.best_region_counts(&[6_000.0, 3_000.0, 500.0], 12, 6);
+        assert_eq!(counts.iter().sum::<usize>(), 12);
+        assert!(counts.iter().all(|&n| (1..=6).contains(&n)));
+        assert!(counts[0] > counts[1] && counts[1] > counts[2]);
+        assert_eq!(c.best_region_counts(&[1_000.0; 3], 12, 6), vec![4, 4, 4]);
+        assert_eq!(
+            c.best_region_counts(&[9_000.0, 0.0, 0.0], 12, 6),
+            vec![6, 3, 3]
+        );
+    }
+
+    #[test]
+    fn a_cap_binds_and_a_short_fleet_gives_each_region_what_there_is() {
+        let c = costs();
+        assert_eq!(c.best_region_counts(&[9_000.0, 10.0], 8, 5), vec![5, 3]);
+        assert_eq!(
+            c.best_region_counts(&[1_000.0, 1_000.0, 1_000.0], 2, 4),
+            vec![1, 1, 1]
         );
     }
 }

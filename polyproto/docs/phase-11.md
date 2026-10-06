@@ -8,19 +8,27 @@ under budgets give up, and how much rebalancing recovers. It predicts the price 
 one place it could bind: an agent and its model host in different regions, where the origin round
 trip is 61 ms and no placement moves it.
 
-**Status: planned.** Nothing below is built. §2's predictions are stated before the run, per
-`owned-and-observed.md` §7, and like Phases 4 to 7, 9 and 10 they lean on **pre-measurements**:
-numbers taken on an instrumented copy of `7f16fef`, run outside the repository and not committed,
-with every hook off reproducing `belief`, `residency`, `enforce`, `fleet` and `durability` byte for
-byte on the sections §8 names. Nine emulate what this phase builds -- clients in regions with their
-round trip in the score (*even*, *diag*), the published class phases against a flat mix (*phases*),
-the regional knee (*knee*), spill (*spill*), a global routing table (*table*), node budgets that
-follow demand (*budget*), models placed by region (*models*) and the active-active schedulers Phase
-10 deferred (*shards*) -- and three are arithmetic, one on the generator's own demand (*tenants*)
-and two on published figures (*path*, *records*). Each is labelled with its grade
-(`owned-and-observed.md`, *On the numbers*), and §8 says how each was taken. They are reasons to
-predict, not results: §4.13 rebuilds each instrument in the repository, and a pre-measurement the
-build does not reproduce is reconciled before a prediction resting on it is graded.
+**Status: increments 1 to 4 built.** Regions in the topology, clients in regions, the round trip in
+the score and regional schedulers (§4.1 to §4.5), summaries, own forwards, overflow and the forced
+forward (§4.6 and §4.7), then the routing table, node budgets and models placed by region (§4.8 to
+§4.10), then tenants' shares and residency, active-active schedulers and the arithmetic (§4.11,
+§4.12 and §4.14), are in `topo.rs`, `work.rs`, `fleet.rs`, `machine.rs` and `regions_cmd.rs`, driven
+by `polyphonic regions`, whose sections are `gate`, `even`, `burst`, `day`, `table`, `budget`,
+`models`, `tenants`, `shards` and `arithmetic`; `--regions` on `distributed` and `code-review` is
+the one work item not built, and §9 records what the four increments and a review of them found.
+§2's predictions are stated before the run, per `owned-and-observed.md` §7, and like Phases 4 to 7,
+9 and 10 they lean on **pre-measurements**: numbers taken on an instrumented copy of `7f16fef`, run
+outside the repository and not committed, with every hook off reproducing `belief`, `residency`,
+`enforce`, `fleet` and `durability` byte for byte on the sections §8 names. Nine emulate what this
+phase builds -- clients in regions with their round trip in the score (*even*, *diag*), the
+published class phases against a flat mix (*phases*), the regional knee (*knee*), spill (*spill*), a
+global routing table (*table*), node budgets that follow demand (*budget*), models placed by region
+(*models*) and the active-active schedulers Phase 10 deferred (*shards*) -- and three are
+arithmetic, one on the generator's own demand (*tenants*) and two on published figures (*path*,
+*records*). Each is labelled with its grade (`owned-and-observed.md`, *On the numbers*), and §8 says
+how each was taken. They are reasons to predict, not results: §4.13 rebuilds each instrument in the
+repository, and a pre-measurement the build does not reproduce is reconciled before a prediction
+resting on it is graded.
 
 Four things make this phase unlike the others.
 
@@ -564,6 +572,11 @@ excepted (P5).
 - *If wrong* (regional schedulers within 10% on the burst at 250): a region's headroom absorbs its
   peak at the published load, and spill matters only near the knee.
 
+**Measured (increments 2 and 3): P3 holds.** At 250 req/s a region the 2.25x burst costs regional
+schedulers +71.7 to +82.1% and the day at amplitude 0.75 +16.6 to +23.3%; at 325, +222.6 to +249.6%
+and +160.9 to +174.2%. Every cross-region rule built lands within 5.6% of equal demand at 250 and
+4.3% at 325 on 30 ms round trips, the table near the knee excepted, and within 6.8% on Azure's.
+
 **P4 -- A price on a stale summary herds; counting one's own forwards removes it; a region-mean
 price halves what remains, and a threshold is right only at its load.**
 
@@ -580,6 +593,17 @@ view lands at +0.5 to +1.5%. A threshold of 0.7 costs under 0.2% at equal demand
   not self-inflicted, and a receiving region must grant an allowance -- Doorman's lease, for
   capacity rather than for a tenant.
 
+**Measured (increment 2): P4 holds, with two rows below its band.** On a 1 s summary the node price
+serves 15.8-19.1% of client-facing requests away at equal demand at 250 and 25.1-26.7% at 325
+(18-32% predicted) and costs +2.0 to +2.4% there, below the band's +2.5, and +2.7 to +3.5% under a
+peak; with own forwards +1.0 to +2.2% at 250 and +1.2 to +2.1% at 325 (+1 to +2.5% and +1 to +3%
+predicted). The region mean with own forwards costs +0.6 to +0.7% at equal demand and +1.2 to +1.7%
+under a peak at 250, +1.0 to +2.1% at 325, and +3.1 to +3.5% on Azure's day (+3 to +4.5%). The exact
+view lands at +0.8 to +1.8% at 30 ms, above the predicted +0.5 to +1.5% on the day at both loads,
+and +3.2 to +3.5% on Azure's. Threshold 0.7 costs 0.0% at equal demand at 250 and +1.2 to +1.4% at
+325; threshold 0.5 the reverse, +1.4% and 0.0 to +0.2%, and on the day at 325 +3.8 to +4.0% where +5
+to +8% was predicted (§9.6).
+
 **P5 -- The table costs nothing at equal demand, misses what is shorter than its epoch, and
 under-forwards near the knee.**
 
@@ -593,6 +617,12 @@ epoch costs more than the 1 s one, and is not graded.
   beneath it, and Phase 6's mean-value cost model is not a capacity model near the knee.
 - *If wrong* (the table within 3% of the spill on the day at 325): the mean-value model suffices on
   the provisioning clock, and the spill is needed only for bursts.
+
+**Measured (increment 3): P5 holds.** At equal demand the table is within +0.1% of regional
+schedulers at both loads and both epochs, serving 0.2-0.8% of client-facing requests away. At 250
+req/s a region it costs +2.0 to +2.4% on the burst at a 1 s epoch and +9.3 to +19.0% at 5 s, and
++2.3 to +3.7% on the day; at 325, +39.2 to +51.8% on the burst at 1 s and +17.6 to +20.8% on the
+day. Over the region-mean overflow it lands within 0.3 points of the overflow alone.
 
 **P6 -- Budgets that follow the day recover it, and lateness is their price.**
 
@@ -608,6 +638,15 @@ moves by rent-or-buy lands between on time and 10 s late.
 - *If wrong* (the rent-or-buy planner worse than 10 s late): its accrual lags a day's ramp, and a
   forecast from the day before is the arm worth building.
 
+**Measured (increment 3; regenerated after the review, §9.23): P6's costs hold and its rent-or-buy
+clause fails.** On a 240 s day with an 8 s load, budgets moved on time cost +1.0 to +1.7% at 250
+req/s a region and +1.5 to +4.7% at 325 (+3.2 to +5.1% under the threshold spill, §9.13), where
+fixed budgets cost +3.1 to +3.2% at amplitude 0.5 and +67 to +80% at 0.75 at 250, and 2.8 to 3.1 and
+7.3 to 7.5 times the service at 325. Ten seconds late costs +0.4 to +0.5 and +0.9 to +1.2 points
+more at 250 and +2.8 to +4.2 and +29 to +41 points more at 325; thirty seconds late is worse than
+fixed budgets at 250. The rent-or-buy planner lands not between on time and 10 s late but between 10
+s late and 30 s late, and level with 10 s late in one cell of four (§9.13).
+
 **P7 -- A model in another region costs its round trip; every model in every region costs a knee.**
 
 With four models at 55 / 25 / 12 / 8% on three regions of four nodes, one replica of every model in
@@ -621,6 +660,14 @@ engine; concentrated region by region, they forward 10-20% and cost +1 to +2.5% 
 - *If wrong* (forwarding for a missing model costs more than 5%): sessions forwarded for their model
   lose their prefix every turn, and a region needs a replica of every model its sessions use.
 
+**Measured (increment 3): P7 holds.** One replica of every model in every region is +268.7 to
++298.9% (3.7 to 4.0 times the service) with 48-49% of decodes arriving at a full batch. The fleet's
+counts spread across regions serve 3.4% of client-facing requests in another region for a model
+theirs lacks, and the forced forwards (which include flow downstreams and resumes) number 5.0-5.1%
+of the client-facing requests; they cost +0.7% over regional schedulers on the published engine.
+Concentrated region by region, they serve 14.3-14.6% away (forced 21%) and cost +1.4 to +1.5 points
+more than spread.
+
 **P8 -- A tenant's regional share is a lease.**
 
 *Arithmetic on the generator's day:* a static split of a tenant's quota by its mean share refuses
@@ -633,6 +680,15 @@ and a refreshed lease under 1%.
   tenant's global quota and region set.
 - *If wrong* (a refreshed lease refuses more than 2%): the lease's refresh lags the peak's ramp and
   the share needs the table's epoch, not Doorman's.
+
+**Measured (increment 4; regenerated after the review, §9.23): P8's mechanism holds and its figures
+are not reproduced.** The arithmetic reproduces to the digit (§9.21). Built, on a meter of generated
+tokens (§9.17), the day adds 2.2 to 2.6 points of refused requests to a static split with 10% of
+headroom and 1.4 to 1.7 with 50%, at 250 and 325 req/s; to a lease refreshed every 0.1 or 0.5 s it
+adds -0.2 to +0.3, and to one refreshed every 2 s +0.3 to +0.8. The absolute figures P8 states (a
+static split refusing 10-25%, a lease under 1%) are for a meter on prefill work, which these runs do
+not price; here every split has a floor from each tenant's own bursts, 2.2 to 3.0% of requests at
+10% of headroom and 0.5 to 0.9% at 50% at equal demand (§9.18).
 
 **P9 -- Active-active schedulers in a region are free at the engine's step and herd on seconds-old
 reports.**
@@ -648,6 +704,12 @@ report age (not pre-measured: the published arm admits nothing to over-admit).
   dispatched since the last step, and active-active schedulers need a shared view, which is the
   stateful mode llm-d's RFC proposes.
 
+**Measured (increment 4): P9 holds at 250 req/s a region and not at 325.** The pre-measurement
+reproduces in all but one cell by 0.1 point. With reports every 25 ms two and four schedulers are
+within +0.1% of one at both loads; at 1 s four cost +1.6 to +1.9% at 250 and +11.7 to +13.4% at 325,
+and at 5 s +27.6 to +30.2% and +69.9 to +73.7%, half the decodes at a full batch at 250. Two
+schedulers stay within +0.6% at every age and load. Node agents' checks are not built (§9.22).
+
 **P10 -- A scheduler on the request path cannot be global, and a WAN partition is an outage for one
 that is.**
 
@@ -660,6 +722,11 @@ request-seconds to it (`λD²/2`), against what it could not forward for a regio
   forced, not chosen.
 - *If wrong:* not applicable; this is arithmetic, and is checked only against the built round trip.
 
+**Measured (increment 4): P10 holds.** On the built round trips a global scheduler adds a mean of
+40.0 ms a request at 30 ms one way and 82.0, 105.3 or 131.3 ms on Azure's triangle as it sits in
+East US, West Europe or Japan East: 534-910 and 1,094-2,987 times the sidecar tax, 4.0% and
+8.2-13.1% of a one-second turn, and 450,000 request-seconds lost to a 60 s partition at 250 req/s.
+
 **P11 -- The global record writes under once a second at 10,000 nodes.**
 
 *Arithmetic:* the table's six fractions an epoch, budget moves of 0.1-0.2 a second, quota changes on
@@ -670,6 +737,12 @@ whose liveness writes 1,000 a second.
   second region, carries the global record with room; the regions' records carry the rate.
 - *If wrong* (above 10 a second): something on the request clock -- a tenant's lease refreshed
   through the record -- has been written durably, and belongs in the soft tier.
+
+**Measured (increment 4): P11 holds.** Liveness is 333 writes a second a region at 10,000 nodes in
+three regions. The global record writes the table's six fractions every 300 s (0.020 a second) and
+the clairvoyant budget's 14 and 18 node moves a day at amplitude 0.5 and 0.75, which at 10,000 nodes
+is 0.14 and 0.17 a second: 0.16 and 0.19 a second in all, 1,700 to 2,200 times fewer than one
+region's liveness.
 
 ---
 
@@ -968,3 +1041,581 @@ Gateway](https://cloud.google.com/blog/products/containers-kubernetes/gpu-and-tp
 design](https://github.com/youtube/doorman/blob/master/doc/design.md); Stojkovic et al.,
 [DynamoLLM](https://arxiv.org/abs/2408.00741) (HPCA '25); and
 [llm-d-router#1593](https://github.com/llm-d/llm-d-router/issues/1593) (2026-06-11).
+
+---
+
+## 9. What the build found
+
+Increment 1, in the order the findings arrived.
+
+### 9.1 Where it landed
+
+`Topology::regions` builds regions of nodes with a distance within a region and a matrix of one-way
+latencies between them; with one region it is `Topology::cluster`, which a test asserts link by
+link. `Request` gains its client's region and `Request::client_facing`, true for what a client sent:
+not a flow downstream or resume (`completes`), a tool call or a fan-out. The generator's
+`with_regions` takes a `RegionDemand` (even, a skew, a day) and draws a region from a stream of its
+own; a session occupies one region's slots, so its turns stay there, and with one region the trace
+is the published one, asserted. `Machine` holds `Regions` -- the node-to-region map, the matrix, the
+mode (`Global` or `Regional`), whether the round trip is priced, and the instruments -- a scope per
+request, and the client's region. The round trip is a term of `Terms::full`, charged by `reach` when
+the request runs, and the instruments live in `RegionStats`.
+
+### 9.2 The build reproduces the pre-measurement to the digit
+
+`polyphonic regions --sections even` on seeds 1-3 gives regional schedulers 459.5 / 454.7 / 461.4 ms
+(§1.1), the global argmin with no round trip in its score +7.1 / +7.2 / +7.1% with 66.3-66.7% of
+client-facing requests served away and a warm `FaaS` call at 40.4-40.7 ms, and with the round trip
+priced +4.4 / +4.6 / +4.3% with 36.9-40.1% away (§1.3). P1 and P2's first halves stand as predicted
+for the 30 ms case; the Azure-triangle rows are not yet built into the command.
+
+### 9.3 A queued request enters its own region
+
+The emulation set the scope when a request arrived and left it set for whatever the router queue
+served next, which no pre-measurement noticed because none ran a queue. The router queue now enters
+each waiting request's region before it decides, and restores the caller's scope after. Where a
+request waits at the router, the region that served it is not recorded (`served_in` is empty), so
+the served-away share counts only requests placed at once; every figure so far runs without a queue.
+
+### 9.4 What increment 1 did not build
+
+Everything from §4.6 on, which §9.5 to §9.9 cover for increment 2, §9.10 to §9.15 for increment 3,
+and §9.16 lists for what is left.
+
+### 9.5 Increment 2: where it landed
+
+`Regions` gains an `overflow` rule (`Off`, `Node`, `RegionMean`, `Threshold`), a summary period, and
+whether a sender counts its own forwards. The plan calls the rule *spill*; the type is `Overflow`,
+because `fault::Spill` already names whether an engine crash keeps its `NVMe`. A summary is a
+snapshot of every node's decodes in flight taken every `summary_ns` (zero is the exact view); a
+sender's own forwards are the decodes it sent to another region that have not ended, which it knows
+because it relays them, and the correction is those in flight now less those in flight at the
+snapshot, per node of the receiving region. `enter_region` makes the decision for a request -- home,
+or the region the rule picks -- and the router queue calls it again for each request when it leaves
+the queue. A request whose model its chosen region lacks goes to the nearest region that has it
+(`forced`); without a fleet no request is forced.
+
+### 9.6 The build reproduces the pre-measurement, except where the emulation let work cross for free
+
+At equal demand and 250 req/s a region the build gives regional schedulers 459.5 / 454.7 / 461.4 ms
+and the exact-view node price +0.8%, the region-mean price on a 1 s summary with own forwards +0.6
+to +0.7%, threshold 0.7 0.0%, the global argmin +4.3 to +4.6%, and under the 0.75 burst and the 0.75
+day regional schedulers +71.7 to +82.1% and +16.6 to +23.3% -- §1.6's figures. Three families of
+rows differ, all in the direction of less overflow: the node price on a 1 s summary is +2.0 to +2.4%
+at equal demand where §1.6 has +3.3 to +3.4%, threshold 0.5 +1.4% where it had +1.8%, and at 325
+req/s threshold 0.5 on the day is +3.8 to +4.0% where it had +6.3 to +6.9%.
+
+The cause is in the emulation. Its node price and its threshold applied to every request that
+decodes, not only to what a client sent, so a flow downstream or a fan-out's resume could move to
+another region and pay no round trip, since the round trip is charged to client-facing requests only
+(rule 5). §4.7 forwards client-facing requests that decode, and the build does. Nothing else
+differs: the region-mean rows, which were always for client-facing requests, reproduce, and the
+conclusions do not move -- the exact view is the bound, the summary's herding is removed by the
+sender's own forwards, and the threshold's right value moves with the load -- but §1.6's node-price
+and threshold-0.5 rows were optimistic by a point or two of overflow, and the threshold's failure at
+325 req/s on the day is smaller than §1.6 said (+3.8 to +4.0% against 0.7's +2.5 to +2.8%).
+
+### 9.7 What the build measured
+
+Mean service against regional schedulers at equal demand on the same seed and load, the range over
+seeds 1-3, three regions of four nodes, `polyphonic regions` (`--rate`, `--rtt`), 60 s. The burst is
+region 0 taking 75% of arrivals from 30% to 60% of the run, the day amplitude 0.75.
+
+| 250 req/s a region | equal demand | burst | day |
+|---|---|---|---|
+| regional, no cross-region rule | 0 | +71.7 to +82.1% | +16.6 to +23.3% |
+| global argmin, round trip priced | +4.3 to +4.6% | +4.2 to +4.7% | +4.0 to +5.6% |
+| node price, an exact view | +0.8% | +1.3 to +1.5% | +1.5 to +1.7% |
+| node price, 1 s summary | +2.0 to +2.4% | +2.7 to +2.9% | +3.3 to +3.5% |
+| the same with own forwards | +1.0 to +1.1% | +1.5 to +1.7% | +1.6 to +1.8% |
+| the same, 5 s summary | +1.3 to +1.5% | +2.0 to +2.2% | +2.0 to +2.2% |
+| region mean, 1 s summary, own forwards | +0.6 to +0.7% | +1.2 to +1.4% | +1.4 to +1.7% |
+| region mean, 5 s summary, own forwards | +1.0 to +1.1% | +1.8 to +2.0% | +1.8 to +2.0% |
+| threshold 0.5, 1 s summary | +1.4% | +2.0 to +2.1% | +2.5 to +2.9% |
+| threshold 0.7, 1 s summary | 0.0% | +1.2 to +1.6% | +2.8 to +3.4% |
+
+| 325 req/s a region | equal demand | burst | day |
+|---|---|---|---|
+| regional, no cross-region rule | 0 | +222.6 to +249.6% | +160.9 to +174.2% |
+| global argmin, round trip priced | +4.1 to +4.3% | +4.0 to +4.3% | +4.2 to +4.3% |
+| node price, an exact view | +1.0 to +1.1% | +1.5 to +1.7% | +1.7 to +1.8% |
+| node price, 1 s summary | +3.1 to +3.2% | +3.3 to +3.6% | +3.8% |
+| the same with own forwards | +1.2 to +1.3% | +1.8 to +1.9% | +2.0 to +2.1% |
+| region mean, 1 s summary, own forwards | +1.0 to +1.2% | +1.7 to +1.8% | +1.9 to +2.1% |
+| threshold 0.5, 1 s summary | 0.0 to +0.2% | +1.6 to +2.2% | +3.8 to +4.0% |
+| threshold 0.7, 1 s summary | +1.2 to +1.4% | +1.8 to +2.0% | +2.5 to +2.8% |
+
+On Azure's round trips at 250 req/s: the global argmin priced +11.2 to +12.2% at equal demand and
++9.5 to +12.3% on the day; the exact-view node price +0.8%, +2.0 to +2.1% and +3.2 to +3.5%; the
+region-mean price +0.6 to +0.7%, +1.9 to +2.0% and +3.1 to +3.5%; threshold 0.5 +3.0 to +3.4%, +4.4
+to +4.7% and +6.0 to +6.8%. A forwarded request pays more there and fewer are worth forwarding: 3%
+of requests leave at equal demand against 6% at 30 ms. Every cell served every request. The rows
+with own forwards were re-run after the defect of §9.11 and are the figures here; before it they
+were 0.0 to 0.3 points different.
+
+### 9.8 A queued request is re-decided when it leaves the router's queue
+
+A request that waits at the router may wait long enough for the summary to have moved, so the
+overflow decision is made again when it leaves, and its client's region is what `reach` charges.
+`reach` asserts that the client region it holds is the placed request's own and that the request is
+one a client sent; with the router-queue fix disabled the test for it fails on that assertion, which
+the served-away count alone did not catch, because it compares against the same stale region.
+
+### 9.9 A summary counts once, and a single region has nothing to forward to
+
+With one region every overflow rule, summary and own-forwards setting changes nothing, which the
+command's gate checks to the bit. The summary is refreshed on arrivals, so a sparse trace's summary
+is as old as its last arrival and not as old as its period: a property of the clock the simulator
+keeps, which a deployment's timer does not share.
+
+### 9.10 Increment 3: where it landed
+
+The table is a `RoutingTable` on `Regions`: each epoch the global tier reads the decode tokens each
+region's clients sent over the last epoch, moves demand from region to region in steps of 0.5% of
+the total while the token time `Costs::cost_rate` charges the receiving region's nodes, plus the
+round trip of the requests moved, is below what it saves at the sender, and publishes each region's
+fractions. A client-facing request is sent by a hash of its session and the epoch, so a session's
+turns stay together for an epoch; a request the table leaves home meets the overflow rule, so the
+two compose and `--table` alone is the table without a spill beneath it.
+
+`Budgets` hold which node slots run, when each becomes ready, and one of three rules. `Static` is
+the nodes that run. `Planned` applies a list of allocations at instants, which the command fills
+from the generator's own shares, so it is the clairvoyant arm and its lateness is a parameter.
+`Follow` is Phase 6's rent-or-buy lifted to regions: every epoch it reads the demand each region's
+clients sent, allocates the fleet's nodes by `Costs::best_region_counts` (the planner's separable
+convex cost, one node at a time to the region whose token time falls most), accrues what the
+allocation in place costs over the best, and moves when the accrued loss covers the move: the token
+time lost while the released nodes are gone and the acquired ones load, and the KV the released
+nodes held. A released node is the one with the least KV worth keeping; it is drained as a lost node
+is, and an acquired one is cold and serves after its load. Nothing places on a node that is not
+running or still loading (`available`).
+
+Models by region are the command's: the fleet's counts over the whole fleet (`best_counts`, [6, 3,
+2, 1] for twelve nodes), laid across regions round-robin or region by region, each node a replica of
+one model with the partition its weights leave, a batch per model priced; a request for a model its
+region lacks takes the forced forward of §9.5.
+
+### 9.11 A fan-out's agents were counted as forwarded clients
+
+Increment 2 built the agents' probe requests with region 0, and a probe looks like a client's
+request (no `completes`, not a tool call, not a gang), so an agent served outside region 0 was
+recorded as a request forwarded from region 0 and added to the own-forwards correction of every
+region it was served in. `serve_gang` now gives each probe its gang's region, and a forward is
+recorded only for the request the scope was entered for. The own-forwards rows moved by 0.0 to 0.3
+points and §9.7 is regenerated; the test that found it asserts that with no overflow rule and a
+trace full of fan-outs nothing is ever forwarded, and fails on the earlier build.
+
+### 9.12 The table
+
+Mean service against regional schedulers at equal demand on the same seed, the range over seeds 1-3,
+60 s; the burst is region 0 taking 75% of arrivals from 30% to 60% of the run and the day has
+amplitude 0.75. It reproduces §1.7 to the digit.
+
+| 250 req/s a region | equal demand | burst | day |
+|---|---|---|---|
+| regional | 0 | +71.7 to +82.1% | +16.6 to +23.3% |
+| table, 1 s epoch | +0.1% | +2.0 to +2.4% | +2.3 to +2.8% |
+| table, 5 s epoch | 0.0% | +9.3 to +19.0% | +3.2 to +3.7% |
+| table, 1 s epoch + region mean | +0.8% | +1.3 to +1.5% | +1.7 to +1.9% |
+| table, 5 s epoch + region mean | +0.6 to +0.7% | +1.3 to +1.5% | +1.7 to +2.0% |
+
+| 325 req/s a region | equal demand | burst | day |
+|---|---|---|---|
+| regional | 0 | +222.6 to +249.6% | +160.9 to +174.2% |
+| table, 1 s epoch | 0.0 to +0.1% | +39.2 to +51.8% | +17.6 to +20.8% |
+| table, 5 s epoch | 0.0% | +70.3 to +89.7% | +35.2 to +44.8% |
+| table, 1 s epoch + region mean | +1.1 to +1.2% | +1.7 to +2.0% | +2.1 to +2.3% |
+| table, 5 s epoch + region mean | +1.1 to +1.2% | +1.8 to +1.9% | +2.1 to +2.3% |
+
+### 9.13 The budgets, and what rent-or-buy costs
+
+A 240 s day over twelve running nodes on six slots a region, mean service against regional
+schedulers at equal demand over 240 s on four nodes a region (about 457 / 455 / 454 ms at 250 req/s
+and 484 / 483 / 482 at 325), the range over seeds. *On time*, *10 s late* and *30 s late* are the
+clairvoyant allocation with an 8 s load; *30 s load* is on time with a 30 s load; *rent-or-buy* is
+the planner of §9.10 with an 8 s load and a 5 s epoch. Increment 3's build reproduced §1.8's
+clairvoyant columns to the digit; the KV grant the review corrected (§9.23) moves the rows below by
+at most 0.4 points a seed, except the threshold's at 325 req/s, by up to 6.0 (the 30 s load at
+amplitude 0.75, a cell whose seeds already spanned 17 points).
+
+| 250 req/s, amplitude 0.5 | static | on time | 10 s late | 30 s late | 30 s load | rent-or-buy |
+|---|---|---|---|---|---|---|
+| regional | +3.1 to +3.2% | +1.0% | +1.4 to +1.5% | +6.1 to +11.2% | +3.9 to +5.6% | +1.8 to +3.0% |
+| threshold 0.7 | +1.9 to +2.1% | +1.0 to +1.1% | +1.3 to +1.4% | +2.4 to +2.5% | +3.4 to +3.5% | +1.4 to +1.7% |
+| table 5 s | +1.5% | +1.0 to +1.1% | +1.3 to +1.4% | +2.2 to +2.3% | +3.4 to +3.6% | +1.4 to +1.6% |
+
+| 250 req/s, amplitude 0.75 | static | on time | 10 s late | 30 s late | 30 s load | rent-or-buy |
+|---|---|---|---|---|---|---|
+| regional | +67.2 to +79.6% | +1.6 to +1.7% | +2.6 to +2.8% | +91.8 to +107.2% | +15.8 to +23.5% | +4.0 to +10.4% |
+| threshold 0.7 | +3.2 to +3.4% | +1.5 to +1.6% | +2.2% | +3.6 to +3.9% | +5.3 to +5.5% | +2.3 to +2.4% |
+| table 5 s | +2.7 to +2.8% | +1.5 to +1.6% | +2.1 to +2.2% | +5.6 to +7.4% | +6.2 to +8.2% | +2.2 to +3.2% |
+
+| 325 req/s, amplitude 0.5 | static | on time | 10 s late | 30 s late | 30 s load | rent-or-buy |
+|---|---|---|---|---|---|---|
+| regional | +181.9 to +207.1% | +1.5% | +4.3 to +5.7% | +153.7 to +160.6% | +50.9 to +55.9% | +9.6 to +12.8% |
+| threshold 0.7 | +2.0 to +2.1% | +3.2 to +3.7% | +3.1 to +3.4% | +3.8 to +4.1% | +11.4 to +12.7% | +3.3 to +3.6% |
+| table 5 s | +3.6 to +10.8% | +1.4 to +1.5% | +2.3 to +2.7% | +13.2 to +15.0% | +16.7 to +20.4% | +3.1 to +3.6% |
+
+| 325 req/s, amplitude 0.75 | static | on time | 10 s late | 30 s late | 30 s load | rent-or-buy |
+|---|---|---|---|---|---|---|
+| regional | +625.3 to +645.7% | +2.8 to +4.7% | +31.8 to +45.3% | +533.7 to +566.5% | +271.8 to +314.0% | +16.3 to +39.6% |
+| threshold 0.7 | +2.6 to +2.9% | +4.3 to +5.1% | +4.9 to +5.1% | +9.2 to +10.4% | +45.6 to +60.1% | +5.8 to +6.2% |
+| table 5 s | +57.1 to +65.0% | +2.5 to +2.7% | +6.0 to +7.3% | +99.4 to +109.6% | +117.9 to +144.7% | +5.0 to +9.2% |
+
+Four findings, three of them §1.8's and one new.
+
+- **Rent-or-buy is neither on time nor free.** It recovers the day -- +1.8 to +3.0% where fixed
+  budgets cost +3.1 at amplitude 0.5, and +4.0 to +10.4% where they cost +67 to +80% at 0.75 -- and
+  it lands between 10 s late and 30 s late in three cells of four and level with 10 s late at 325
+  req/s and amplitude 0.75. Its lateness is the epoch plus the accrual: it waits until the loss it
+  has suffered covers the move, which is its rule, and a day's ramp is too steep for that to be
+  quick. P6 predicted it would land between on time and 10 s late, and it does not.
+- **A spill beneath the budget absorbs the planner's lateness.** Seed by seed, with the threshold or
+  the table over it, rent-or-buy is within 1.3 points of 10 s late in every cell bar one seed of the
+  table at 325 req/s and amplitude 0.75 (+1.9, the other two seeds below 10 s late); without one it
+  is 0.4 to 8.1 points behind in the three cells where it lands between: the request clock covers
+  what the provisioning clock misses.
+- **A threshold misfires on budgets near the knee** (325 req/s, amplitude 0.5): +3.2 to +3.7% on
+  time against +2.0 to +2.1% on a static budget, and +4.3 to +5.1% against +2.6 to +2.9% at 0.75, as
+  §1.8 found.
+- **The table needs the budget near the knee.** On a static budget at 325 and amplitude 0.75 it
+  costs +57.1 to +65.0%, and on time +2.5 to +2.7%.
+
+### 9.14 Models by region
+
+Mean service against regional schedulers at equal demand on the published engine (§1.1), 250 req/s a
+region, four models at 55 / 25 / 12 / 8% of demand; the fleet's counts for twelve nodes are [6, 3,
+2, 1]. It reproduces §1.9 to the digit.
+
+| placement | regional | global argmin | threshold 0.7 | served away; forced forwards |
+|---|---|---|---|---|
+| every model in every region | +268.7 to +298.9% | +270.9 to +297.2% | +268.7 to +298.9% | none |
+| the fleet's counts, spread | +0.7% | +3.2 to +3.3% | +0.7% | 3.4%; 5.0-5.1% of client-facing requests |
+| the fleet's counts, concentrated | +2.1 to +2.2% | +4.2 to +4.3% | +2.1 to +2.2% | 14.3-14.6%; 21.2-21.4% of client-facing requests |
+
+A forward for a missing model is not an overflow: the threshold never moves a request there, so its
+column is the regional one, and the table and the budget are what would move a replica.
+
+### 9.15 What differs from the emulation, and what is new
+
+The table, the clairvoyant budget and the models are the emulation's to the digit. The allocation
+the clairvoyant budget applies is the emulation's -- one node at a time to the region with the
+largest share per node -- while `follow` allocates by the cost model, so the two differ in the
+allocator as well as in what they know; the numbers do not show it, the rent-or-buy planner's
+lateness being much larger than an allocator's difference. `follow` is new to the build. The
+emulation's table called its spill rule the same way (`TableSpill`); here the two are a table and an
+overflow rule that compose.
+
+### 9.16 Increment 4: where it landed
+
+**Active-active schedulers.** `Machine::set_shards(k, report_ns)` gives a region's requests to one
+of `k` schedulers by a hash of the program, or of the request's number when it has none, so a
+session's turns stay with one. A scheduler holds the end of every decode it dispatched, per node,
+and reads the others' counts: exactly (`report_ns` of 0), or as of the last report, refreshed every
+`report_ns`. Its view of a node's load is its own flights plus its peers', capped at the batch size
+as an engine's own report is, and it is the last place a belief looks: an engine's header or a
+shadow ledger, where one exists, wins. With one scheduler there is no view and the run is the
+published one; the gate runs two schedulers with exact reports in one region.
+
+**Tenants' shares.** `TenantShares` holds, per tenant, a token bucket in each region refilled at the
+tenant's quota times the region's share, two seconds deep. A client-facing request is refused when
+its region's bucket cannot cover its tokens. The share is fixed at an even split, or a lease: at
+each refresh, the first a lease after the first request, the global tier reads the tokens each
+region's clients offered since the last one, sets each region's share to its fraction of them with a
+floor of 2%, and halves what it remembers. One share a region serves every tenant: the generator
+draws a request's tenant independently of its region, so each tenant's regional shares are the
+regions'. Refused requests are unserved and counted apart from the router's.
+
+**Residency.** `Machine::set_residency(share)` restricts that share of tenants, chosen by a hash of
+the tenant. A restricted tenant's request is confined: the table and the overflow rule do not move
+it, the forced forward for a missing model does not take it, and a decode pool that is empty in its
+region is not widened to every node, so a request whose model its region lacks goes unplaced and is
+counted as such rather than leaving.
+
+**The command.** `tenants` runs the shares at 10% and 50% of headroom over a quota set from the
+tenant's own tokens in the trace, on equal demand and the day at amplitude 0.75, with the lease
+refreshed every 0.1, 0.5 and 2 s, then residency at 0, 25, 50, 75 and 100% under the region-mean
+overflow on the 0.75 burst. `shards` runs two and four schedulers at five report ages. `arithmetic`
+prints the three arithmetic sections. The sections' arms are fixed in the command rather than flags:
+`--share`, `--residency`, `--schedulers` and `--report` of §4.11 and §4.12 are fields of the arms'
+configuration, set by each section.
+
+### 9.17 The tenants' meter is on generated tokens
+
+§4.11 says a tenant's share is of its prefill quota. A prefill meter exists on `Machine`
+(`set_tenant_quota`), and it needs the prefill priced (`set_prefill_time`), which the region runs do
+not do and which would change every baseline in this phase's sections. The shares meter a request's
+generated tokens instead, which every request carries. The quota is the tenant's mean token rate
+over the run, scaled by its headroom. Two things follow. A tenant's requests are bursty on a
+two-second bucket, so a static split refuses a floor of its demand even at equal demand, and P8's
+figures for prefill work are not comparable to these. And the refused requests are not served, so a
+mean service against regional schedulers at equal demand falls with them (-6.5% for a static split
+at equal demand at 250 req/s) and the rows below report refusals, which are what a lease changes,
+rather than service.
+
+### 9.18 The tenants
+
+Requests refused, as a share of all requests, the range over seeds 1-3, 60 s, at 250 and 325 req/s a
+region; the day has amplitude 0.75. Regenerated after the review corrected the lease (§9.23).
+
+| 250 req/s, headroom | 10% equal demand | 10% the day | 50% equal demand | 50% the day |
+|---|---|---|---|---|
+| static split | 2.5-2.6% | 4.8-5.0% | 0.6-0.7% | 2.2-2.3% |
+| lease, every 0.1 s | 2.9-3.0% | 2.8-3.0% | 0.9% | 0.9-1.1% |
+| lease, every 0.5 s | 2.6-2.7% | 2.7-2.9% | 0.7% | 0.8-1.0% |
+| lease, every 2 s | 2.5-2.6% | 3.2-3.3% | 0.6-0.7% | 1.2-1.3% |
+
+| 325 req/s, headroom | 10% equal demand | 10% the day | 50% equal demand | 50% the day |
+|---|---|---|---|---|
+| static split | 2.2% | 4.5-4.8% | 0.5% | 1.9-2.2% |
+| lease, every 0.1 s | 2.5-2.6% | 2.4-2.6% | 0.6-0.7% | 0.7-0.8% |
+| lease, every 0.5 s | 2.3% | 2.2-2.4% | 0.5-0.6% | 0.5-0.6% |
+| lease, every 2 s | 2.2-2.3% | 2.7-3.0% | 0.5% | 0.9-1.0% |
+
+- **A lease removes what the day adds.** Seed by seed, the day adds 2.2 to 2.6 points of refusals to
+  a static split at 10% of headroom and 1.4 to 1.7 at 50%; to a lease refreshed every 0.1 or 0.5 s
+  it adds -0.2 to +0.3, inside the seeds' spread.
+- **A fast refresh chases noise and a slow one lags.** At equal demand a lease refreshed every 0.1 s
+  refuses 0.1 to 0.4 points more than a static split, and one refreshed every 0.5 or 2 s is within
+  0.1 of it; on the day the 2 s lease refuses 0.3 to 0.8 points more than at equal demand. Only the
+  0.5 s refresh is within 0.1 of the static split at equal demand and within 0.3 of itself on the
+  day.
+- **Both failures are the compression's.** The run compresses a day 1,440 times and its arrivals not
+  at all, so a refresh every 0.1, 0.5 and 2 s of the run sees 0.1, 0.5 and 2 s of arrivals and 2.4,
+  12 and 48 minutes of the day's movement. Doorman's 16 s refresh sees 160 times the arrivals of the
+  0.1 s arm and a ninth of its movement -- a region's share moves at most 0.04 points in it (§9.21)
+  -- so neither the noise nor the lag measured here should reach a real lease.
+- **Serving what a static split refuses costs a region that cannot spill.** Mean service with the
+  refused requests served is +106.3 to +121.6% at 325 req/s and 10% of headroom for a lease and
+  +13.4 to +15.2% for a static split that shed them, regional schedulers having nowhere to put a
+  peak: the lease is the budget, and the overflow of §9.7 is what absorbs the peak it admits.
+- **P8's "if wrong" clause, on its letter, trips and on its reason does not.** A lease refuses more
+  than 2% on the day at 10% of headroom (2.2 to 3.3%), but a static split refuses 2.2 to 2.6% there
+  at equal demand: what the lease refuses is the floor every split has, not lag at the peak's ramp.
+
+### 9.19 Residency
+
+Mean service against regional schedulers at equal demand, the 0.75 burst, region-mean overflow on a
+1 s summary with the sender's own forwards, the range over seeds 1-3; a restricted tenant never
+leaves its region. The share of client-facing requests served away is 12.3 / 11.8 / 11.6% with no
+tenant restricted at 250 req/s, 15.9 / 15.7 / 16.6% at 325.
+
+| tenants restricted | 250 req/s | served away | 325 req/s | served away |
+|---|---|---|---|---|
+| none, regional schedulers only | +71.7 to +82.1% | 0% | +222.6 to +249.6% | 0% |
+| 0% | +1.2 to +1.4% | 11.6-12.3% | +1.7 to +1.8% | 15.7-16.6% |
+| 25% | +2.1 to +3.6% | 6.7-7.1% | +34.0 to +39.8% | 9.7-9.9% |
+| 50% | +3.5 to +13.4% | 5.8-6.1% | +55.5 to +67.5% | 8.1-8.4% |
+| 75% | +21.6 to +33.6% | 3.5-3.8% | +121.2 to +128.2% | 4.5-5.1% |
+| 100% | +71.7 to +82.1% | 0% | +222.6 to +249.6% | 0% |
+
+- **Residency is a graded cost, not a switch.** At 250 req/s a quarter of the tenants staying home
+  costs 2.1 to 3.6%, half 3.5 to 13.4%, three quarters 21.6 to 33.6%, and all of them is the
+  regional collapse. At 325 even a quarter costs +34.0 to +39.8%, because the hot region has no
+  headroom for the demand that cannot leave.
+
+### 9.20 Active-active schedulers
+
+Mean service against one scheduler a region at equal demand, the range over seeds 1-3 (the 250 req/s
+column reproduces §1.11 in all but one cell: four schedulers at 1 s, seed 1, +1.6 here against
++1.7).
+
+| reports every | two schedulers, 250 | four, 250 | two, 325 | four, 325 |
+|---|---|---|---|---|
+| continuous (exact) | identical | identical | identical | identical |
+| 25 ms | +0.0% | +0.0% | +0.0 to +0.1% | +0.1% |
+| 250 ms | +0.0 to +0.1% | +0.2 to +0.3% | +0.0 to +0.1% | +0.3 to +0.5% |
+| 1 s | +0.2% | +1.6 to +1.9% | +0.1 to +0.3% | +11.7 to +13.4% |
+| 5 s | +0.2 to +0.6% | +27.6 to +30.2%; 51-53% of decodes at a full batch | +0.0 to +0.1% | +69.9 to +73.7% |
+
+- **At the engine's step a region's scheduler scales out for nothing.** P9's if-wrong threshold,
+  four schedulers more than 1% slower at 25 ms, is not approached at either load.
+- **Herding grows with the schedulers and with the load.** Four schedulers on reports a second old
+  cost +11.7 to +13.4% at 325 where P9 gave +1 to +3% at 250: the herding P9 names, each choosing
+  the node that looked idle, costs more with less headroom. Two schedulers do not herd at either
+  load.
+- **The exact view is the single scheduler's.** With continuous reports two and four schedulers
+  place every request as one does, asserted by a test on the total service time of a trace; it fails
+  if the view is left uncapped at the batch size, which an engine's own report is.
+
+### 9.21 The arithmetic
+
+The three arithmetic sections print what P8, P10 and P11 state, from the build's own round trips,
+generator and plan. `tenants` reproduces §1.10's 15.6 and 23.5% and 5.2 and 12.4%, adds that 50% of
+headroom refuses 0.3 and 4.2%, and that a region's share moves by at most 0.023 and 0.037 points in
+16 s of a real day, 0.088 and 0.137 in 60 s and 0.439 and 0.686 in 300 s. `path` reproduces P10's 40
+ms and 82-132 ms. `records` reproduces §1.12's 14-18 node moves a day, taking them from the
+clairvoyant plan of §9.13 and scaling the twelve nodes to 10,000.
+
+### 9.22 What is not built
+
+- `--regions` on `distributed` and `code-review`, which would give their published topologies
+  clients. Those commands' output is byte-identical to the build before this phase, and the question
+  the published figures raise -- what a request reaches and leaves for free -- is answered by the
+  `even` section (§9.2).
+- Node agents' checks for active-active schedulers (§4.12, `--node-check`), which P9's last clause
+  concerns and which the published arm gives nothing to over-admit.
+- The per-scheduler `views` and per-tenant `lease` instruments of §4.13: the build counts refusals
+  in all, not by tenant, and does not print a scheduler's view against the engine's.
+- A tenant's region set larger than one: residency is a restriction to the client's own region.
+- A forecast-driven budget planner, which §7 leaves out; P6's *if wrong* branch is that this is the
+  arm worth building.
+- A figure for P3 on a router queue or an engine that waits: every cross-region run is unenforced,
+  as the pre-measurements were.
+
+
+### 9.23 What a review found
+
+A review of the phase's commit found two defects that move published numbers, six that move none,
+and five it left open. Every section was rerun with the fixes and compared with the outputs this
+section records.
+
+- **A lease refreshed on its first request.** `TenantShares` started with its next refresh at zero,
+  so the first metered request refreshed the lease from that one sample: with three regions the
+  sender's region took 96% of every tenant's share and the other two 2% each until the next refresh.
+  The longer the lease, the longer that split held: at equal demand the 2 s lease refused 0.5 to 0.6
+  points more than a static split and the 0.5 s lease 0.2 to 0.3 more, and both now refuse within
+  0.1 of it; only the 0.1 s lease's excess, 0.1 to 0.4, remains. The first refresh now comes a lease
+  after the first request, a test fails without it, and §9.18 and P8's note are regenerated.
+  Increment 4's finding that a lease is not free at equal demand was mostly this defect.
+- **The KV grant was sampled over nodes that were not running.** `arrive` averaged the KV held over
+  every slot that can decode, so with four nodes running on six slots a region the mean each cell's
+  engine grant is sized from was a third too small. The emulation sampled the same way, which is why
+  increment 3 reproduced §1.8 to the digit, and §1.8's budget figures carry it too. Sampled over
+  running nodes, §9.13 moves by at most 0.4 points a seed, except the threshold's rows at 325 req/s,
+  by up to 6.0; with only this fix reverted the build reproduces increment 3's budget section to the
+  digit, so it is the whole of the change. §9.13 and P6's note are regenerated.
+
+Moving no published number -- even, burst and day at both loads and on Azure's triangle, the table,
+models, residency and shards reproduce to the digit with every fix, and the budgets with every fix
+but the grant's:
+
+- A gang retried at a later arrival was placed under the scope, client region and shard left by the
+  request before it, and an engine-queue start charged its decode to the previous request's shard
+  and client region.
+- A request that needs no decode, from a region whose only node is drained, was refused rather than
+  served elsewhere as a decode is.
+- Residency was ignored under the global argmin.
+- With no summary, a sender kept a record of every forward for the whole run; and `forwarded_delta`
+  spread a sender's forwards over every slot of a region rather than its running nodes, which no
+  published arm reaches, since none counts its own forwards under a budget.
+- The gate's shards row ran one scheduler, which builds no view, so it checked nothing; it now runs
+  two with exact reports.
+- `durability`'s help had moved onto `regions`, and the tenants and shards sections printed the
+  models section's number.
+
+Left open:
+
+- **A summary's quote reads a remote engine's live state.** When a remote node's summarised load is
+  at or above the batch size, its quote includes the exact time until that engine's earliest decode
+  ends, which no summary carries (rule 3). A variant whose summary quotes never read it reproduces
+  even, burst and day at both loads and on Azure's triangle, the table and residency to the digit:
+  no published number rests on it. It would matter where a region's nodes are summarised full, and
+  what a summary should carry for a full node is a modelling decision.
+- **A cancelled decode stays counted.** Its flight in a scheduler's view and its forward stay until
+  their original end, and a resubmitted decode is counted twice in the demand the table and budgets
+  read. No section cancels.
+- **A request that opens is tallied without its serving region.** A request that waits at the
+  router's or an engine's queue, or runs as a tracked flight, closes with no region and is never
+  counted as served away. No section queues, cancels or arms a fault, so every request in them
+  closes when it is submitted.
+- **The table moves a new set of sessions every epoch.** Its hash includes the epoch, so at steady
+  fractions a different set of sessions leaves home each epoch and rebuilds its KV; a key without
+  the epoch would move only the change in fractions. The emulation did the same, and §1.7 and §9.12
+  are measured with it.
+- **The command's p99 is a different quantile** from the other commands' (`round((n - 1) q)` against
+  `floor(n q)`), so its p99s are not comparable with theirs to the last digit.
+
+---
+
+## 10. Verification, as run
+
+Increment 1.
+
+- **Byte-identity with every new bit off:** `belief --sections gate`, `residency`, `flows`,
+  `placement`, `volatility`, `ownership`, `price`, `influence --seeds 1`, `fleet --seeds 1`,
+  `enforce --seeds 1`, `programs --sections gate,logged` and `durability --seeds 1 --sections
+  gate,count`, all at `--ops 3000 --seed 2`, produce output identical to the build before this phase
+  (`7f16fef`). `distributed --crossing native --engine-cache --decode-kv --admit perfect --repeat 1
+  --distances rack` is identical bar the host-measured lines, which two runs of the pristine build
+  also disagree on.
+- **The gate,** `regions` section 1: one region with `Global` priced, `Global` unpriced and
+  `Regional` against no regions -- service, p99, turn mean and stall identical to the bit.
+- **Tests,** increment 1 added 10, 308 in all: a link costs the distance of the regions it joins and
+  one region is the cluster; one region is the published trace, requests name their client's region
+  by the shares, a follow-up belongs to its producer's region and a session stays in one; a regional
+  scheduler serves every client-facing request in its region, the global argmin charges the round
+  trip once per request served away, one region with every bit on changes no request, and a region
+  with no node falls back to every node.
+- **The census** is 13. `cargo fmt --check` is clean; `cargo clippy --all-targets` shows only the
+  three `assert_is_empty` warnings.
+
+Increment 2.
+
+- **Byte-identity with every new bit off:** the same twelve commands identical to `7f16fef`, and
+  `distributed` identical bar its host-measured lines.
+- **The gate,** `regions` section 1, adds `Overflow::Node`, `RegionMean` and `Threshold` with a 1 s
+  summary and own forwards, one region, against no regions: identical to the bit.
+- **Tests,** 7 new, 315 in all: a region that cannot serve its demand forwards it and the whole run
+  is faster, under the node price and the region mean; overflow forwards only what a client sent and
+  a decode needs, never a `FaaS` call or a service request; a threshold forwards only above its
+  utilisation; a sender counts what it forwarded since the summary it holds and a blind one counts
+  nothing; a summary is a snapshot on its clock; a request for a model its region lacks goes to the
+  nearest region with one, and every decode lands on a replica serving its model; and a request that
+  waits at the router is served in its own region (mutation-checked: it fails with the fix removed).
+- **The census** is 13. `cargo fmt --check` is clean; `cargo clippy --all-targets` shows only the
+  three `assert_is_empty` warnings.
+
+Increment 3.
+
+- **Byte-identity with every new bit off:** the same twelve commands identical to `7f16fef`, and
+  `distributed` identical bar its host-measured lines.
+- **The gate,** `regions` section 1, adds a table over a region-mean overflow and the rent-or-buy
+  budget with one region against no regions: identical to the bit.
+- **Tests,** 9 new, 324 in all: a fan-out's agents are never counted as forwarded clients (fails on
+  increment 2's build); nodes follow a region's demand and every region keeps one, and a cap binds
+  and a short fleet gives each region what there is; routing demand keeps a balanced fleet home and
+  moves a hot region's excess; a table moves almost nothing at equal demand and forwards a hot
+  region's demand by session with rows that sum to one; a node that is not running takes no work; a
+  planned move releases a node and the new one serves only after its load; and budgets that follow
+  demand move nodes to the hot region and not when demand is even.
+- **The census** is 13. `cargo fmt --check` is clean; `cargo clippy --all-targets` shows only the
+  three `assert_is_empty` warnings.
+- **Reproduction:** `polyphonic regions --sections table` and `models` reproduce the
+  pre-measurements to the digit; `budget` reproduces the clairvoyant columns to the digit.
+
+Increment 4.
+
+- **Byte-identity with every new bit off:** the same twelve commands identical to `7f16fef`, and
+  `distributed` identical bar its host-measured lines.
+- **The gate,** `regions` section 1, adds one scheduler with reports five seconds old, every tenant
+  restricted under the region-mean overflow, and leased tenant shares of a quota never reached, one
+  region against no regions: identical to the bit.
+- **Tests,** 8 new, 332 in all: schedulers that see each other's decodes exactly change no request;
+  reports seconds old herd, four more than two, and 25 ms ones less; a lease follows the day and a
+  static split refuses at the peaks; a lease moves a region's share toward its demand; full
+  residency makes every overflow rule and the table regional; a share of tenants stays home and the
+  rest may leave; a confined request whose model its region lacks goes unplaced and never leaves;
+  and a restricted tenant's request is never served outside its client's region, per request
+  (mutation-checked: it fails with the restriction removed).
+- **The census** is 13. `cargo fmt --check` is clean; `cargo clippy --all-targets` shows only the
+  three `assert_is_empty` warnings.
+- **Reproduction:** `polyphonic regions --sections shards` and `arithmetic` reproduce §8's *shards*,
+  *path*, *records* and *tenants* to the digit but one cell; `tenants` is new to the build (§9.17).
+
+After the review.
+
+- **Byte-identity with every new bit off:** the same twelve commands identical to `7f16fef`, and
+  `distributed` identical bar its host-measured lines.
+- **The gate,** `regions` section 1: its shards row now runs two schedulers with exact reports,
+  which builds the view the one-scheduler row never did; every row identical to the bit.
+- **Tests,** 1 new and 1 strengthened, 333 in all: a lease moves no share until it has seen a lease
+  of demand, and a region whose only node is drained sends every request elsewhere, not only
+  decodes; both fail with their fixes reverted.
+- **The census** is 13. `cargo fmt --check` is clean; `cargo clippy --all-targets` shows only the
+  three `assert_is_empty` warnings.
+- **Reproduction:** every section rerun against the outputs §9 records. Even, burst and day at 250
+  and 325 req/s and on Azure's triangle, the table at both loads, models, residency and shards are
+  identical to the digit; the budgets and the tenants' lease rows are regenerated (§9.13, §9.18);
+  and a variant whose summary quotes never read a remote engine is identical on every section that
+  prices a summary (§9.23).

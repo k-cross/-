@@ -1922,6 +1922,7 @@ impl<'a> Driver<'a> {
             authority: Authority::ReadOnly,
             root: claim_root,
             tool: false,
+            region: 0,
         }
     }
 
@@ -2239,6 +2240,7 @@ impl<'a> Driver<'a> {
             authority,
             root: 0,
             tool: true,
+            region: 0,
         }
     }
 
@@ -2494,6 +2496,7 @@ impl<'a> Driver<'a> {
             authority: Authority::ReadOnly,
             root: 0,
             tool: false,
+            region: 0,
         };
         let extra = Extra::Retrieve { chunks };
         match self.mach.submit_at(due, &req) {
@@ -2609,6 +2612,7 @@ impl<'a> Driver<'a> {
             authority: Authority::ReadOnly,
             root: 0,
             tool: false,
+            region: 0,
         };
         self.progs[p].pending_task = Some(resume_task);
         let extra = Extra::Fanout {

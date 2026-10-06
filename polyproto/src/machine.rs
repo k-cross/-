@@ -95,6 +95,274 @@ pub enum DataPath {
     SidecarPluggable,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegionMode {
+    Global,
+    Regional,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Overflow {
+    Off,
+    Node,
+    RegionMean,
+    Threshold { utilisation: f64 },
+}
+
+#[derive(Clone, Debug)]
+pub struct Shards {
+    k: usize,
+    report_ns: u64,
+    flights: Vec<Vec<Vec<u64>>>,
+    reported: Vec<Vec<usize>>,
+    next_report_ns: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct TenantShares {
+    quotas: HashMap<u32, f64>,
+    depth_s: f64,
+    lease_ns: Option<u64>,
+    shares: Vec<f64>,
+    observed: Vec<f64>,
+    next_refresh_ns: u64,
+    buckets: HashMap<(u32, usize), (f64, u64)>,
+    pub offered: u64,
+    pub refused: u64,
+    pub refreshes: u64,
+}
+
+impl TenantShares {
+    #[must_use]
+    pub fn new(
+        quotas: HashMap<u32, f64>,
+        regions: usize,
+        depth_s: f64,
+        lease_ns: Option<u64>,
+    ) -> Self {
+        Self {
+            quotas,
+            depth_s,
+            lease_ns,
+            shares: vec![1.0 / regions as f64; regions],
+            observed: vec![0.0; regions],
+            next_refresh_ns: 0,
+            buckets: HashMap::new(),
+            offered: 0,
+            refused: 0,
+            refreshes: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn shares(&self) -> &[f64] {
+        &self.shares
+    }
+
+    fn refresh(&mut self, now: u64, lease_ns: u64) {
+        self.next_refresh_ns = now + lease_ns;
+        let total: f64 = self.observed.iter().sum();
+        if total > 0.0 {
+            let floored: Vec<f64> = self
+                .observed
+                .iter()
+                .map(|o| (o / total).max(LEASE_FLOOR))
+                .collect();
+            let sum: f64 = floored.iter().sum();
+            self.shares = floored.iter().map(|f| f / sum).collect();
+        }
+        self.observed.iter_mut().for_each(|o| *o *= LEASE_DECAY);
+        self.refreshes += 1;
+    }
+
+    fn admit(&mut self, tenant: u32, region: usize, tokens: u64, now: u64) -> bool {
+        let Some(&quota) = self.quotas.get(&tenant) else {
+            return true;
+        };
+        self.offered += 1;
+        if let Some(lease_ns) = self.lease_ns {
+            self.observed[region] += tokens as f64;
+            if self.next_refresh_ns == 0 {
+                self.next_refresh_ns = now + lease_ns;
+            } else if now >= self.next_refresh_ns {
+                self.refresh(now, lease_ns);
+            }
+        }
+        let tokens = tokens as f64;
+        let rate = quota * self.shares[region];
+        let cap = (rate * self.depth_s).max(tokens);
+        let (level, last) = self.buckets.entry((tenant, region)).or_insert((cap, now));
+        *level = (*level + rate * now.saturating_sub(*last) as f64 / 1e9).min(cap);
+        *last = now;
+        if *level < tokens {
+            self.refused += 1;
+            return false;
+        }
+        *level -= tokens;
+        true
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TableStats {
+    pub recomputes: u64,
+    pub changes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RoutingTable {
+    epoch_ns: u64,
+    fractions: Vec<Vec<f64>>,
+    tokens: Vec<u64>,
+    requests: Vec<u64>,
+    next_ns: u64,
+    epoch: u64,
+}
+
+#[derive(Clone, Debug)]
+pub enum BudgetRule {
+    Static,
+    Planned(Vec<(u64, Vec<usize>)>),
+    Follow { interval_ns: u64 },
+}
+
+#[derive(Clone, Debug)]
+pub struct Budgets {
+    rule: BudgetRule,
+    load_ns: u64,
+    provisioned: Vec<bool>,
+    ready_at: Vec<u64>,
+    next_follow_ns: u64,
+    accrued_ns: f64,
+    tokens: Vec<u64>,
+    pub moves: u64,
+    pub loading_ns: u64,
+}
+
+impl Budgets {
+    #[must_use]
+    pub fn new(
+        rule: BudgetRule,
+        regions: usize,
+        slots: usize,
+        running: usize,
+        load_ns: u64,
+    ) -> Self {
+        Self {
+            rule,
+            load_ns,
+            provisioned: (0..regions * slots).map(|d| d % slots < running).collect(),
+            ready_at: vec![0; regions * slots],
+            next_follow_ns: 0,
+            accrued_ns: 0.0,
+            tokens: vec![0; regions],
+            moves: 0,
+            loading_ns: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn running(&self, node: usize) -> bool {
+        self.provisioned[node]
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RegionStats {
+    pub facing: [u64; BlobKind::N],
+    pub away: [u64; BlobKind::N],
+    pub reach_ns: u64,
+    pub reach_hops: u64,
+    pub dispatched: Vec<u64>,
+    pub spilled: u64,
+    pub forced: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Regions {
+    of: Vec<usize>,
+    one_way_ns: Vec<Vec<u64>>,
+    pub mode: RegionMode,
+    pub price_reach: bool,
+    pub client_bytes: u64,
+    pub overflow: Overflow,
+    pub summary_ns: u64,
+    pub own_forwards: bool,
+    table: Option<RoutingTable>,
+    pub table_stats: TableStats,
+    summary: Vec<usize>,
+    next_summary_ns: u64,
+    forwards: Vec<Vec<Vec<u64>>>,
+    at_summary: Vec<Vec<usize>>,
+    pub stats: RegionStats,
+}
+
+impl Regions {
+    #[must_use]
+    pub fn new(per_region: usize, one_way_ns: Vec<Vec<u64>>, mode: RegionMode) -> Self {
+        let count = one_way_ns.len();
+        let nodes = count * per_region;
+        Self {
+            of: (0..nodes).map(|d| d / per_region).collect(),
+            one_way_ns,
+            mode,
+            price_reach: true,
+            client_bytes: CLIENT_BYTES,
+            overflow: Overflow::Off,
+            summary_ns: 0,
+            own_forwards: false,
+            table: None,
+            table_stats: TableStats::default(),
+            summary: vec![0; nodes],
+            next_summary_ns: 0,
+            forwards: vec![vec![Vec::new(); count]; count],
+            at_summary: vec![vec![0; count]; count],
+            stats: RegionStats {
+                dispatched: vec![0; nodes],
+                ..RegionStats::default()
+            },
+        }
+    }
+
+    pub fn set_table(&mut self, epoch_ns: Option<u64>) {
+        let count = self.count();
+        self.table = epoch_ns.map(|epoch_ns| RoutingTable {
+            epoch_ns,
+            fractions: (0..count)
+                .map(|a| (0..count).map(|b| f64::from(u8::from(a == b))).collect())
+                .collect(),
+            tokens: vec![0; count],
+            requests: vec![0; count],
+            next_ns: 0,
+            epoch: 0,
+        });
+    }
+
+    #[must_use]
+    pub fn table_fractions(&self) -> Option<&[Vec<f64>]> {
+        self.table.as_ref().map(|t| t.fractions.as_slice())
+    }
+
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.one_way_ns.len()
+    }
+
+    #[must_use]
+    pub fn region_of(&self, node: usize) -> usize {
+        self.of[node]
+    }
+
+    #[must_use]
+    pub fn round_trip_ns(&self, a: usize, b: usize) -> u64 {
+        if a == b {
+            return 0;
+        }
+        2 * self.one_way_ns[a][b]
+            + (self.client_bytes as f64 * crate::topo::Distance::Region.ns_per_byte()) as u64
+    }
+}
+
 #[derive(Debug)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Machine {
@@ -316,6 +584,15 @@ pub struct Machine {
     lost_durable: Vec<BlobId>,
     degraded: Option<Degraded>,
     pub fault_stats: FaultStats,
+    regions: Option<Regions>,
+    scope: Option<usize>,
+    client_region: Option<usize>,
+    budgets: Option<Budgets>,
+    shards: Option<Shards>,
+    shard: usize,
+    tenant_shares: Option<TenantShares>,
+    residency: f64,
+    confined: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -880,6 +1157,490 @@ impl Machine {
             lost_durable: Vec::new(),
             degraded: None,
             fault_stats: FaultStats::default(),
+            regions: None,
+            scope: None,
+            client_region: None,
+            budgets: None,
+            shards: None,
+            shard: 0,
+            tenant_shares: None,
+            residency: 0.0,
+            confined: false,
+        }
+    }
+
+    pub fn set_shards(&mut self, schedulers: usize, report_ns: u64) {
+        let nodes = self.domains.len();
+        self.shards = (schedulers > 1).then(|| Shards {
+            k: schedulers,
+            report_ns,
+            flights: vec![vec![Vec::new(); nodes]; schedulers],
+            reported: vec![vec![0; nodes]; schedulers],
+            next_report_ns: 0,
+        });
+    }
+
+    pub fn set_tenant_shares(&mut self, shares: Option<TenantShares>) {
+        self.tenant_shares = shares;
+    }
+
+    #[must_use]
+    pub fn tenant_shares(&self) -> Option<&TenantShares> {
+        self.tenant_shares.as_ref()
+    }
+
+    pub fn set_residency(&mut self, share: f64) {
+        self.residency = share;
+    }
+
+    fn restricted(&self, tenant: u32) -> bool {
+        self.residency > 0.0
+            && ((seq_hint(u64::from(tenant) ^ RESIDENCY_KEY) >> 11) as f64 / (1u64 << 53) as f64)
+                < self.residency
+    }
+
+    fn assign_shard(&mut self, req: &Request) {
+        if let Some(k) = self.shards.as_ref().map(|sh| sh.k) {
+            let key = if req.program == 0 {
+                self.submitted
+            } else {
+                req.program
+            };
+            self.shard = (seq_hint(key) % k as u64) as usize;
+        }
+    }
+
+    fn shard_view(&self, d: usize) -> Option<usize> {
+        let sh = self.shards.as_ref()?;
+        let now = self.arrival_ns;
+        let own = sh.flights[self.shard][d]
+            .iter()
+            .filter(|&&end| end > now)
+            .count();
+        let others: usize = (0..sh.k)
+            .filter(|&o| o != self.shard)
+            .map(|o| {
+                if sh.report_ns == 0 {
+                    sh.flights[o][d].iter().filter(|&&end| end > now).count()
+                } else {
+                    sh.reported[o][d]
+                }
+            })
+            .sum();
+        Some((own + others).min(MAX_BATCH))
+    }
+
+    fn refresh_shards(&mut self, now: u64) {
+        let Some(sh) = self.shards.as_mut() else {
+            return;
+        };
+        for per in &mut sh.flights {
+            for ends in per.iter_mut() {
+                ends.retain(|&e| e > now);
+            }
+        }
+        if sh.report_ns == 0 || now < sh.next_report_ns {
+            return;
+        }
+        for (reported, flights) in sh.reported.iter_mut().zip(&sh.flights) {
+            for (slot, ends) in reported.iter_mut().zip(flights) {
+                *slot = ends.len();
+            }
+        }
+        sh.next_report_ns = now + sh.report_ns;
+    }
+
+    pub fn set_budgets(&mut self, budgets: Option<Budgets>) {
+        self.budgets = budgets;
+    }
+
+    #[must_use]
+    pub fn budgets(&self) -> Option<&Budgets> {
+        self.budgets.as_ref()
+    }
+
+    fn available(&self, d: usize) -> bool {
+        self.budgets
+            .as_ref()
+            .is_none_or(|b| b.provisioned[d] && b.ready_at[d] <= self.arrival_ns)
+    }
+
+    pub fn set_regions(&mut self, regions: Option<Regions>) {
+        self.regions = regions;
+    }
+
+    #[must_use]
+    pub fn regions(&self) -> Option<&Regions> {
+        self.regions.as_ref()
+    }
+
+    #[must_use]
+    pub fn served_region(&self) -> Option<usize> {
+        self.regions.as_ref().map(|r| r.region_of(self.last_home))
+    }
+
+    fn enter_region(&mut self, req: &Request) {
+        self.scope = None;
+        self.client_region = None;
+        self.confined = false;
+        let Some((mode, overflow)) = self.regions.as_ref().map(|r| (r.mode, r.overflow)) else {
+            return;
+        };
+        let home = usize::from(req.region);
+        if req.client_facing() {
+            self.client_region = Some(home);
+        }
+        self.confined = req.tenant.is_some_and(|t| self.restricted(t));
+        if mode == RegionMode::Global {
+            self.scope = self.confined.then_some(home);
+            return;
+        }
+        let decoding = Self::needs_decode(req);
+        let mut target = home;
+        if decoding && self.client_region.is_some() && !self.confined {
+            target = self.table_target(req, home);
+            if target == home && overflow != Overflow::Off {
+                target = self.overflow_target(req, home, overflow);
+            }
+        }
+        self.scope = Some(target);
+        if let Some(r) = self.regions.as_mut() {
+            r.stats.spilled += u64::from(target != home);
+        }
+        if decoding && req.gang.is_none() && !self.confined {
+            self.forward_for_model(req);
+        }
+    }
+
+    fn table_target(&self, req: &Request, home: usize) -> usize {
+        let Some(table) = self.regions.as_ref().and_then(|r| r.table.as_ref()) else {
+            return home;
+        };
+        let key = seq_hint(req.program ^ (table.epoch << 40) ^ TABLE_KEY);
+        let u = (key >> 11) as f64 / (1u64 << 53) as f64;
+        let mut acc = 0.0;
+        for (region, fraction) in table.fractions[home].iter().enumerate() {
+            acc += fraction;
+            if u < acc {
+                return region;
+            }
+        }
+        home
+    }
+
+    fn recompute_table(&mut self, now: u64) {
+        let Some((epoch_ns, count, next_ns)) = self
+            .regions
+            .as_ref()
+            .and_then(|r| r.table.as_ref().map(|t| (t.epoch_ns, r.count(), t.next_ns)))
+        else {
+            return;
+        };
+        if now < next_ns {
+            return;
+        }
+        let nodes: Vec<usize> = (0..count).map(|r| self.region_nodes(r).len()).collect();
+        let Some(r) = self.regions.as_mut() else {
+            return;
+        };
+        let round_trips: Vec<Vec<f64>> = (0..count)
+            .map(|a| (0..count).map(|b| r.round_trip_ns(a, b) as f64).collect())
+            .collect();
+        let Some(table) = r.table.as_mut() else {
+            return;
+        };
+        let first = table.next_ns == 0;
+        table.next_ns = now + epoch_ns;
+        let tokens = std::mem::replace(&mut table.tokens, vec![0; count]);
+        let requests = std::mem::replace(&mut table.requests, vec![0; count]);
+        if first {
+            return;
+        }
+        let seconds = epoch_ns as f64 / 1e9;
+        let demand: Vec<f64> = tokens.iter().map(|&t| t as f64 / seconds).collect();
+        let per_request: Vec<f64> = tokens
+            .iter()
+            .zip(&requests)
+            .map(|(&t, &n)| {
+                if n == 0 {
+                    TABLE_TOKENS_DEFAULT
+                } else {
+                    t as f64 / n as f64
+                }
+            })
+            .collect();
+        let costs = crate::fleet::Costs::published(epoch_ns.max(1_000_000_000));
+        let fractions = route_demand(&costs, &demand, &per_request, &nodes, &round_trips);
+        let changed = r.table.as_ref().is_some_and(|t| t.fractions != fractions);
+        r.table_stats.changes += u64::from(changed);
+        r.table_stats.recomputes += 1;
+        if let Some(table) = r.table.as_mut() {
+            table.fractions = fractions;
+            table.epoch += 1;
+        }
+    }
+
+    fn forward_for_model(&mut self, req: &Request) {
+        let Some(home) = self.scope else {
+            return;
+        };
+        let all = self.decode_pool_all();
+        if !self.eligible(self.scoped(&all), req).is_empty() {
+            return;
+        }
+        let Some(r) = &self.regions else {
+            return;
+        };
+        let mut others: Vec<usize> = (0..r.count()).filter(|&s| s != home).collect();
+        others.sort_by_key(|&s| r.one_way_ns[home][s]);
+        for s in others {
+            self.scope = Some(s);
+            if !self.eligible(self.scoped(&all), req).is_empty() {
+                if let Some(r) = self.regions.as_mut() {
+                    r.stats.forced += 1;
+                }
+                return;
+            }
+        }
+        self.scope = Some(home);
+    }
+
+    fn refresh_summary(&mut self, now: u64) {
+        let Some(r) = self.regions.as_mut() else {
+            return;
+        };
+        if r.summary_ns == 0 || now < r.next_summary_ns {
+            return;
+        }
+        for (d, slot) in r.summary.iter_mut().enumerate() {
+            *slot = self.engines[d].load(now);
+        }
+        for (a, row) in r.forwards.iter_mut().enumerate() {
+            for (b, ends) in row.iter_mut().enumerate() {
+                ends.retain(|&e| e > now);
+                r.at_summary[a][b] = ends.len();
+            }
+        }
+        r.next_summary_ns = now + r.summary_ns;
+    }
+
+    fn summarised_load(&self, d: usize) -> usize {
+        match &self.regions {
+            Some(r) if r.summary_ns > 0 => r.summary[d],
+            _ => self.engines[d].load(self.arrival_ns),
+        }
+    }
+
+    fn forwarded_delta(&self, from: usize, to: usize) -> f64 {
+        let Some(r) = &self.regions else {
+            return 0.0;
+        };
+        if !r.own_forwards || r.summary_ns == 0 {
+            return 0.0;
+        }
+        let live = r.forwards[from][to]
+            .iter()
+            .filter(|&&e| e > self.arrival_ns)
+            .count();
+        let nodes = self.region_nodes(to).len().max(1);
+        (live as f64 - r.at_summary[from][to] as f64) / nodes as f64
+    }
+
+    fn region_nodes(&self, region: usize) -> Vec<usize> {
+        self.regions.as_ref().map_or_else(Vec::new, |r| {
+            (0..r.of.len())
+                .filter(|&d| r.of[d] == region && self.domains[d].can_decode() && self.available(d))
+                .collect()
+        })
+    }
+
+    fn region_utilisation(&self, region: usize, live: bool) -> f64 {
+        let nodes = self.region_nodes(region);
+        if nodes.is_empty() {
+            return 1.0;
+        }
+        let load: usize = nodes
+            .iter()
+            .map(|&d| {
+                if live {
+                    self.engines[d].load(self.arrival_ns)
+                } else {
+                    self.summarised_load(d)
+                }
+            })
+            .sum();
+        load as f64 / (nodes.len() * MAX_BATCH) as f64
+    }
+
+    fn engine_quote_ns(&self, d: usize, req: &Request, load: usize) -> f64 {
+        if req.tokens == 0 || self.interval_ns == 0 {
+            return 0.0;
+        }
+        (self.engines[d].projected_live(self.arrival_ns, req.tokens, load)
+            + self.engines[d].congestion_live(req.tokens, load)) as f64
+    }
+
+    fn remote_quote_ns(&self, d: usize, req: &Request, flow: &[(usize, u64)], from: usize) -> f64 {
+        let delta = self.forwarded_delta(from, self.region_of(d));
+        let load = (self.summarised_load(d) as f64 + delta).round().max(0.0) as usize;
+        let rebuild: u64 = req.chain.iter().map(|(_, m)| m.recompute_ns).sum();
+        let unit = self.unit_in(d);
+        let handoff: f64 = flow
+            .iter()
+            .filter(|(src, _)| *src != d)
+            .map(|&(src, payload)| self.topo.fetch_ns(unit, src, payload) as f64)
+            .sum();
+        self.engine_quote_ns(d, req, load) + rebuild as f64 + handoff
+    }
+
+    fn region_mean_quote_ns(&self, region: usize, req: &Request, live: bool, from: usize) -> f64 {
+        let nodes: Vec<usize> = self
+            .eligible(self.decode_pool_all(), req)
+            .into_iter()
+            .filter(|&d| self.region_of(d) == region)
+            .collect();
+        if nodes.is_empty() {
+            return f64::MAX;
+        }
+        let delta = if live {
+            0.0
+        } else {
+            self.forwarded_delta(from, region)
+        };
+        let sum: f64 = nodes
+            .iter()
+            .map(|&d| {
+                let base = if live {
+                    self.engines[d].load(self.arrival_ns)
+                } else {
+                    self.summarised_load(d)
+                };
+                self.engine_quote_ns(d, req, (base as f64 + delta).round().max(0.0) as usize)
+            })
+            .sum();
+        sum / nodes.len() as f64
+    }
+
+    fn overflow_target(&mut self, req: &Request, home: usize, overflow: Overflow) -> usize {
+        match overflow {
+            Overflow::Off => home,
+            Overflow::Threshold { utilisation } => self.threshold_target(home, utilisation),
+            Overflow::Node => self.node_price_target(req, home),
+            Overflow::RegionMean => self.region_mean_target(req, home),
+        }
+    }
+
+    fn threshold_target(&self, home: usize, utilisation: f64) -> usize {
+        if self.region_utilisation(home, true) <= utilisation {
+            return home;
+        }
+        let Some(r) = &self.regions else {
+            return home;
+        };
+        let mut others: Vec<usize> = (0..r.count()).filter(|&s| s != home).collect();
+        others.sort_by_key(|&s| r.one_way_ns[home][s]);
+        others
+            .into_iter()
+            .find(|&s| {
+                let delta = self.forwarded_delta(home, s) / MAX_BATCH as f64;
+                self.region_utilisation(s, false) + delta < utilisation
+            })
+            .unwrap_or(home)
+    }
+
+    fn node_price_target(&mut self, req: &Request, home: usize) -> usize {
+        let flow: Vec<(usize, u64)> = req
+            .completes
+            .filter(|_| self.flow_aware)
+            .and_then(|t| self.upstream.get(&t).cloned())
+            .unwrap_or_default();
+        let in_region = |m: &Self, region: usize| -> Vec<usize> {
+            m.eligible(m.decode_pool_all(), req)
+                .into_iter()
+                .filter(|&d| m.region_of(d) == region)
+                .collect()
+        };
+        let saved = self.scope;
+        self.scope = Some(home);
+        let view = self.view_of(req);
+        let local = in_region(self, home)
+            .into_iter()
+            .map(|d| self.placement_terms(d, &view, &flow, View::Belief).full())
+            .fold(f64::MAX, f64::min);
+        self.scope = saved;
+        let Some(r) = &self.regions else {
+            return home;
+        };
+        let mut best = (home, local);
+        for s in (0..r.count()).filter(|&s| s != home) {
+            let reach = if r.price_reach {
+                r.round_trip_ns(home, s) as f64
+            } else {
+                0.0
+            };
+            let remote = in_region(self, s)
+                .into_iter()
+                .map(|d| self.remote_quote_ns(d, req, &flow, home))
+                .fold(f64::MAX, f64::min)
+                + reach;
+            if remote < best.1 {
+                best = (s, remote);
+            }
+        }
+        best.0
+    }
+
+    fn region_mean_target(&mut self, req: &Request, home: usize) -> usize {
+        let saved = self.scope;
+        self.scope = Some(home);
+        let view = self.view_of(req);
+        let acquire = self
+            .eligible(self.decode_pool_all(), req)
+            .into_iter()
+            .filter(|&d| self.region_of(d) == home)
+            .map(|d| self.plan(d, &view, View::Belief).ns as f64)
+            .fold(f64::MAX, f64::min);
+        self.scope = saved;
+        let local = self.region_mean_quote_ns(home, req, true, home) + acquire;
+        let rebuild: f64 = req.chain.iter().map(|(_, m)| m.recompute_ns as f64).sum();
+        let Some(r) = &self.regions else {
+            return home;
+        };
+        let mut best = (home, local);
+        for s in (0..r.count()).filter(|&s| s != home) {
+            let remote = self.region_mean_quote_ns(s, req, false, home)
+                + rebuild
+                + r.round_trip_ns(home, s) as f64;
+            if remote < best.1 {
+                best = (s, remote);
+            }
+        }
+        best.0
+    }
+
+    fn region_of(&self, node: usize) -> usize {
+        self.regions.as_ref().map_or(0, |r| r.region_of(node))
+    }
+
+    fn scoped(&self, pool: &[usize]) -> Vec<usize> {
+        self.scoped_to(pool, self.scope)
+    }
+
+    fn scoped_to(&self, pool: &[usize], scope: Option<usize>) -> Vec<usize> {
+        pool.iter()
+            .copied()
+            .filter(|&d| self.available(d))
+            .filter(|&d| match (scope, &self.regions) {
+                (Some(region), Some(r)) => r.region_of(d) == region,
+                _ => true,
+            })
+            .collect()
+    }
+
+    fn reach_term(&self, d: usize) -> f64 {
+        match (&self.regions, self.client_region) {
+            (Some(r), Some(c)) if r.price_reach => r.round_trip_ns(c, r.region_of(d)) as f64,
+            _ => 0.0,
         }
     }
 
@@ -1417,6 +2178,10 @@ impl Machine {
             let Some(gang) = retry.req.gang.as_ref() else {
                 continue;
             };
+            if self.regions.is_some() || self.shards.is_some() {
+                self.assign_shard(&retry.req);
+                self.enter_region(&retry.req);
+            }
             let mut cost = self.serve_gang(&retry.req, gang);
             cost.queue_ns += self.arrival_ns.saturating_sub(retry.arrival_ns);
             if let Submitted::Closed(done) = self.settle_gang(
@@ -1888,6 +2653,17 @@ impl Machine {
             if flight.len() >= self.tenant_slots {
                 return false;
             }
+        }
+        if req.client_facing()
+            && let Some(shares) = self.tenant_shares.as_mut()
+            && !shares.admit(
+                tenant,
+                self.regions.as_ref().map_or(0, |r| r.region_of(home)),
+                req.tokens,
+                now,
+            )
+        {
+            return false;
         }
         if self.tenant_prefill_ns_per_s > 0.0 && self.priced_prefill {
             let work = self.home_plan(home, req, planned).rebuild_ns as f64;
@@ -3416,26 +4192,53 @@ impl Machine {
     }
 
     fn decode_pool_len(&self) -> usize {
-        let n = self.active.iter().filter(|&&d| self.decodes_now(d)).count();
-        if n == 0 { self.active.len() } else { n }
+        self.decode_pool().len()
     }
 
     fn decode_pool(&self) -> Vec<usize> {
+        let all = self.decode_pool_all();
+        let scoped = self.scoped(&all);
+        if scoped.is_empty() && !self.confined {
+            all
+        } else {
+            scoped
+        }
+    }
+
+    fn serving_pool(&self) -> Vec<usize> {
+        let scoped = self.scoped(&self.active);
+        if scoped.is_empty() && !self.confined {
+            self.scoped_to(&self.active, None)
+        } else {
+            scoped
+        }
+    }
+
+    fn decode_pool_all(&self) -> Vec<usize> {
         let pool: Vec<usize> = self
             .active
             .iter()
             .copied()
             .filter(|&d| self.decodes_now(d))
             .collect();
-        if pool.is_empty() {
+        if !pool.is_empty() {
+            return pool;
+        }
+        let up: Vec<usize> = self
+            .active
+            .iter()
+            .copied()
+            .filter(|&d| self.available(d))
+            .collect();
+        if up.is_empty() {
             self.active.clone()
         } else {
-            pool
+            up
         }
     }
 
     fn decodes_now(&self, d: usize) -> bool {
-        self.domains[d].can_decode() && self.decode_out[d] <= self.arrival_ns
+        self.domains[d].can_decode() && self.decode_out[d] <= self.arrival_ns && self.available(d)
     }
 
     fn needs_decode(req: &Request) -> bool {
@@ -3787,7 +4590,8 @@ impl Machine {
         let tele = match view {
             View::Belief => self.telemetry(d).with_load(
                 self.shadow_load(d)
-                    .or_else(|| self.observed_by(d).and_then(|o| o.reported_load(d))),
+                    .or_else(|| self.observed_by(d).and_then(|o| o.reported_load(d)))
+                    .or_else(|| self.shard_view(d)),
             ),
             View::Truth => self.telemetry_in(d, view),
         };
@@ -3836,6 +4640,7 @@ impl Machine {
             engine,
             congestion,
             prefill,
+            reach: self.reach_term(d),
             need: plan.need,
         }
     }
@@ -4274,8 +5079,15 @@ impl Machine {
         if !concurrent {
             self.arrival_ns += self.interval_ns;
         }
+        self.scope = None;
+        self.client_region = None;
+        self.confined = false;
         let now = self.arrival_ns;
         self.fault_tick(now);
+        self.refresh_summary(now);
+        self.refresh_shards(now);
+        self.recompute_table(now);
+        self.apply_budgets(now);
         self.drain_lengths();
         self.drain_event_counts();
         for (h, r) in self.domains.iter_mut().zip(&mut self.reserved) {
@@ -4292,7 +5104,7 @@ impl Machine {
             .active
             .iter()
             .copied()
-            .filter(|&d| self.domains[d].can_decode())
+            .filter(|&d| self.domains[d].can_decode() && self.available(d))
             .collect();
         let n = engines.len().max(1) as u64;
         if !self.finishing {
@@ -4339,6 +5151,8 @@ impl Machine {
     fn submit_with(&mut self, req: &Request, concurrent: bool) -> Submitted {
         self.arrive(concurrent);
         self.last_slot = None;
+        self.assign_shard(req);
+        self.enter_region(req);
         let seq = self.submitted;
         self.submitted += 1;
         if let Some(task) = req.completes
@@ -4358,7 +5172,7 @@ impl Machine {
         let candidates = if decode_needed {
             self.eligible(self.decode_pool(), req)
         } else {
-            self.active.clone()
+            self.serving_pool()
         };
         if candidates.is_empty() {
             if let Some(fleet) = self.fleet.as_mut() {
@@ -4438,6 +5252,12 @@ impl Machine {
     }
 
     fn serve_router_queue(&mut self) {
+        let entered = (self.scope, self.client_region, self.confined, self.shard);
+        self.serve_router_queue_in_regions();
+        (self.scope, self.client_region, self.confined, self.shard) = entered;
+    }
+
+    fn serve_router_queue_in_regions(&mut self) {
         if self.is_down() {
             return;
         }
@@ -4448,6 +5268,11 @@ impl Machine {
             .filter(|&i| self.router_queue[i].not_before <= now)
             .min_by_key(|&i| self.queue_key(&self.router_queue[i]))
         {
+            if self.regions.is_some() || self.shards.is_some() {
+                let waiting = self.router_queue[head].req.clone();
+                self.assign_shard(&waiting);
+                self.enter_region(&waiting);
+            }
             let req = &self.router_queue[head].req;
             let candidates = self.eligible(self.decode_pool(), req);
             let mut room = self.admitting(&candidates, req);
@@ -5047,6 +5872,15 @@ impl Machine {
         let slo = waiting.req.slo.idx();
         self.engine_waits.waited[slo] += 1;
         self.engine_waits.waited_ns[slo] += self.arrival_ns - waiting.queued_ns;
+        if self.regions.is_some() || self.shards.is_some() {
+            self.assign_shard(&waiting.req);
+            self.client_region = self.regions.as_ref().and(
+                waiting
+                    .req
+                    .client_facing()
+                    .then_some(usize::from(waiting.req.region)),
+            );
+        }
         let mut cost = self.dispatch(home, &waiting.req, None, self.resubmitted(Some(waiting.id)));
         cost.decide_ns = waiting.decide_ns;
         cost.transfer_ns += waiting.pre_ns;
@@ -5064,6 +5898,24 @@ impl Machine {
     }
 
     fn reach(&mut self, home: usize, req: &Request, decode_needed: bool) -> u64 {
+        if let (Some(client), Some(r)) = (self.client_region, self.regions.as_mut()) {
+            assert!(
+                req.client_facing() && client == usize::from(req.region),
+                "a request is placed in its own client's region"
+            );
+            let class = req.kind_idx();
+            let here = r.region_of(home);
+            r.stats.facing[class] += 1;
+            r.stats.dispatched[home] += 1;
+            if client == here {
+                return 0;
+            }
+            let hop = r.round_trip_ns(client, here);
+            r.stats.away[class] += 1;
+            r.stats.reach_ns += hop;
+            r.stats.reach_hops += 1;
+            return hop;
+        }
         let Some((origin, payload)) = self.origin else {
             return 0;
         };
@@ -5182,6 +6034,7 @@ impl Machine {
             cost.dispatch_ns += self.dispatch.ns(DISPATCH_BYTES);
             self.dispatches += 1;
             let (exec, queue) = self.execute(home, req);
+            self.note_decode(home, req, queue + exec);
             if req.tokens > 0 && !resubmitted {
                 self.note_length(home, req, queue + exec);
             }
@@ -5228,6 +6081,177 @@ impl Machine {
             self.observe_touched(home, req);
         }
         cost
+    }
+
+    fn note_decode(&mut self, home: usize, req: &Request, held_ns: u64) {
+        if req.tokens == 0 {
+            return;
+        }
+        let from = usize::from(req.region);
+        if let Some(sh) = self.shards.as_mut() {
+            sh.flights[self.shard][home].push(self.arrival_ns + held_ns);
+        }
+        if let Some(b) = self.budgets.as_mut() {
+            b.tokens[from] += req.tokens;
+        }
+        let Some(r) = self.regions.as_mut() else {
+            return;
+        };
+        if let Some(t) = r.table.as_mut() {
+            t.tokens[from] += req.tokens;
+            t.requests[from] += 1;
+        }
+        let here = r.region_of(home);
+        if r.summary_ns > 0 && from != here && self.client_region == Some(from) {
+            r.forwards[from][here].push(self.arrival_ns + held_ns);
+        }
+    }
+
+    fn running_counts(&self) -> Vec<usize> {
+        let (Some(r), Some(b)) = (self.regions.as_ref(), self.budgets.as_ref()) else {
+            return Vec::new();
+        };
+        let mut counts = vec![0; r.count()];
+        for (d, up) in b.provisioned.iter().enumerate() {
+            counts[r.region_of(d)] += usize::from(*up);
+        }
+        counts
+    }
+
+    fn apply_budgets(&mut self, now: u64) {
+        let interval_ns = match self.budgets.as_ref().map(|b| &b.rule) {
+            None | Some(BudgetRule::Static) => return,
+            Some(BudgetRule::Planned(_)) => None,
+            Some(BudgetRule::Follow { interval_ns }) => Some(*interval_ns),
+        };
+        match interval_ns {
+            None => self.apply_plan(now),
+            Some(interval_ns) => self.follow_demand(now, interval_ns),
+        }
+    }
+
+    fn apply_plan(&mut self, now: u64) {
+        loop {
+            let due = match self.budgets.as_mut().map(|b| &mut b.rule) {
+                Some(BudgetRule::Planned(plan))
+                    if plan.first().is_some_and(|(at, _)| *at <= now) =>
+                {
+                    plan.remove(0).1
+                }
+                _ => return,
+            };
+            self.set_node_counts(&due, now);
+        }
+    }
+
+    fn follow_demand(&mut self, now: u64, interval_ns: u64) {
+        let Some(b) = self.budgets.as_mut() else {
+            return;
+        };
+        if now < b.next_follow_ns {
+            return;
+        }
+        let first = b.next_follow_ns == 0;
+        b.next_follow_ns = (now / interval_ns + 1) * interval_ns;
+        let regions = b.tokens.len();
+        let tokens = std::mem::replace(&mut b.tokens, vec![0; regions]);
+        if first {
+            return;
+        }
+        if let Some(target) = self.follow_target(&tokens, interval_ns) {
+            self.set_node_counts(&target, now);
+        }
+    }
+
+    fn follow_target(&mut self, tokens: &[u64], interval_ns: u64) -> Option<Vec<usize>> {
+        let current = self.running_counts();
+        let slots = self
+            .regions
+            .as_ref()?
+            .of
+            .iter()
+            .filter(|&&x| x == 0)
+            .count();
+        let seconds = interval_ns as f64 / 1e9;
+        let demand: Vec<f64> = tokens.iter().map(|&t| t as f64 / seconds).collect();
+        let costs = crate::fleet::Costs::published(interval_ns);
+        let best = costs.best_region_counts(&demand, current.iter().sum(), slots);
+        if best == current {
+            self.budgets.as_mut()?.accrued_ns = 0.0;
+            return None;
+        }
+        let rate = |counts: &[usize]| -> f64 {
+            demand
+                .iter()
+                .zip(counts)
+                .map(|(&d, &n)| costs.cost_rate(0, d, n))
+                .sum()
+        };
+        let loss = (rate(&current) - rate(&best)).max(0.0) * seconds;
+        let interim: Vec<usize> = current.iter().zip(&best).map(|(&c, &b)| c.min(b)).collect();
+        let extra = (rate(&interim) - rate(&current)).max(0.0);
+        let rebuild: f64 = self
+            .release_order(&current, &best)
+            .iter()
+            .map(|&d| self.keep_cost_ns(d))
+            .sum();
+        let b = self.budgets.as_mut()?;
+        let cost = extra * b.load_ns as f64 / 1e9 + rebuild;
+        b.accrued_ns += loss;
+        if b.accrued_ns < cost {
+            return None;
+        }
+        b.accrued_ns = 0.0;
+        Some(best)
+    }
+
+    fn release_order(&self, current: &[usize], target: &[usize]) -> Vec<usize> {
+        let (Some(r), Some(b)) = (self.regions.as_ref(), self.budgets.as_ref()) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (region, (&have, &want)) in current.iter().zip(target).enumerate() {
+            let mut held: Vec<usize> = (0..r.of.len())
+                .filter(|&d| r.of[d] == region && b.provisioned[d])
+                .collect();
+            held.sort_by(|&x, &y| {
+                self.keep_cost_ns(x)
+                    .total_cmp(&self.keep_cost_ns(y))
+                    .then(y.cmp(&x))
+            });
+            out.extend(held.into_iter().take(have.saturating_sub(want)));
+        }
+        out
+    }
+
+    fn set_node_counts(&mut self, target: &[usize], now: u64) {
+        let current = self.running_counts();
+        let released = self.release_order(&current, target);
+        let Some(of) = self.regions.as_ref().map(|r| r.of.clone()) else {
+            return;
+        };
+        let Some(b) = self.budgets.as_mut() else {
+            return;
+        };
+        for &d in &released {
+            b.provisioned[d] = false;
+        }
+        for (region, (&have, &want)) in current.iter().zip(target).enumerate() {
+            let free: Vec<usize> = (0..of.len())
+                .filter(|&d| of[d] == region && !b.provisioned[d])
+                .take(want.saturating_sub(have))
+                .collect();
+            for d in free {
+                b.provisioned[d] = true;
+                b.ready_at[d] = now + b.load_ns;
+                b.moves += 1;
+                b.loading_ns += b.load_ns;
+            }
+        }
+        for d in released {
+            let _ = self.domains[d].lose_node();
+            self.forget_engine(d);
+        }
     }
 
     fn record_length(&mut self, slo: usize, tokens: u64, root: u32) {
@@ -5340,6 +6364,7 @@ impl Machine {
             authority: Authority::ReadOnly,
             root: agent.root,
             tool: false,
+            region: 0,
         }
     }
 
@@ -5364,6 +6389,7 @@ impl Machine {
             authority: Authority::ReadOnly,
             root: 0,
             tool: false,
+            region: 0,
         }
     }
 
@@ -5395,7 +6421,14 @@ impl Machine {
             Vec::new()
         };
 
-        let probes: Vec<Request> = gang.agents.iter().map(Self::agent_request).collect();
+        let probes: Vec<Request> = gang
+            .agents
+            .iter()
+            .map(|agent| Request {
+                region: req.region,
+                ..Self::agent_request(agent)
+            })
+            .collect();
         let Some(assign) = self.stage_agents(gang, &probes, &flow, &dispatch) else {
             self.fanouts_refused += 1;
             cost.pending = true;
@@ -5522,6 +6555,9 @@ impl Machine {
     fn place_agent(&mut self, probe: &Request, flow: &[(usize, u64)]) -> Option<(usize, Need)> {
         let seen = self.view_of(probe);
         let mut eligible = self.eligible(self.decode_pool(), probe);
+        if eligible.is_empty() && self.scope.is_some() && !self.confined {
+            eligible = self.eligible(self.decode_pool_all(), probe);
+        }
         eligible.retain(|&d| self.lost[d].is_none());
         if eligible.is_empty()
             && let Some(fleet) = self.fleet.as_mut()
@@ -5632,11 +6668,20 @@ impl Machine {
     fn run_tool(&mut self, caller: usize, tool: &ToolCall) -> Cost {
         let probe = Self::tool_request(tool);
         let flow = [(caller, tool.payload_bytes), (caller, tool.payload_bytes)];
+        let caller_region = self
+            .regions
+            .as_ref()
+            .filter(|r| r.mode == RegionMode::Regional)
+            .map(|r| r.region_of(caller));
         let candidates: Vec<usize> = self
             .active
             .iter()
             .copied()
-            .filter(|&d| self.lost[d].is_none())
+            .filter(|&d| self.lost[d].is_none() && self.available(d))
+            .filter(|&d| {
+                caller_region
+                    .is_none_or(|c| self.regions.as_ref().is_some_and(|r| r.region_of(d) == c))
+            })
             .collect();
 
         let scored = if self.placement == Placement::Scored || !self.flow_aware {
@@ -5707,6 +6752,7 @@ struct Terms {
     engine: f64,
     congestion: f64,
     prefill: f64,
+    reach: f64,
 
     need: Need,
 }
@@ -5744,7 +6790,7 @@ impl Terms {
         self.placed() + self.engine
     }
     fn full(&self) -> f64 {
-        self.loaded() + self.congestion + self.prefill
+        self.loaded() + self.congestion + self.prefill + self.reach
     }
 }
 
@@ -5786,6 +6832,81 @@ const QUERY_BYTES_PER_BLOB: u64 = 40;
 pub const HOOK_BYTES: u64 = 64;
 
 pub const DISPATCH_BYTES: u64 = 1024;
+
+pub const CLIENT_BYTES: u64 = 16 * 1024;
+
+const TABLE_KEY: u64 = 0x7ab1e;
+
+const RESIDENCY_KEY: u64 = 0x5e51_de4c;
+
+const LEASE_FLOOR: f64 = 0.02;
+
+const LEASE_DECAY: f64 = 0.5;
+
+fn seq_hint(x: u64) -> u64 {
+    let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+const TABLE_TOKENS_DEFAULT: f64 = 124.0;
+
+const TABLE_STEP: f64 = 0.005;
+
+fn route_demand(
+    costs: &crate::fleet::Costs,
+    demand: &[f64],
+    per_request: &[f64],
+    nodes: &[usize],
+    round_trips: &[Vec<f64>],
+) -> Vec<Vec<f64>> {
+    let count = demand.len();
+    let mut moved: Vec<Vec<f64>> = (0..count)
+        .map(|a| {
+            (0..count)
+                .map(|b| if a == b { demand[a] } else { 0.0 })
+                .collect()
+        })
+        .collect();
+    let served = |m: &[Vec<f64>], to: usize| -> f64 { (0..count).map(|a| m[a][to]).sum() };
+    let step = (demand.iter().sum::<f64>() * TABLE_STEP).max(1.0);
+    loop {
+        let mut best: Option<(usize, usize, f64)> = None;
+        for a in (0..count).filter(|&a| moved[a][a] >= step) {
+            for b in (0..count).filter(|&b| b != a) {
+                let (from, to) = (served(&moved, a), served(&moved, b));
+                let saved =
+                    costs.cost_rate(0, from, nodes[a]) - costs.cost_rate(0, from - step, nodes[a]);
+                let added =
+                    costs.cost_rate(0, to + step, nodes[b]) - costs.cost_rate(0, to, nodes[b]);
+                let trip = step / per_request[a] * round_trips[a][b];
+                let delta = added + trip - saved;
+                if delta < best.map_or(-1e-6, |(_, _, d)| d) {
+                    best = Some((a, b, delta));
+                }
+            }
+        }
+        let Some((a, b, _)) = best else {
+            break;
+        };
+        moved[a][a] -= step;
+        moved[a][b] += step;
+    }
+    (0..count)
+        .map(|a| {
+            (0..count)
+                .map(|b| {
+                    if demand[a] > 0.0 {
+                        moved[a][b] / demand[a]
+                    } else {
+                        f64::from(u8::from(a == b))
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -7225,6 +8346,7 @@ mod tests {
             authority: crate::work::Authority::ReadOnly,
             root: 0,
             tool: false,
+            region: 0,
         };
         assert!(mach.domains[d].evict_unrecorded(&victim));
         let believed = mach.plan(d, &req.view(0), View::Belief);
@@ -7313,6 +8435,7 @@ mod tests {
             authority: crate::work::Authority::ReadOnly,
             root: 0,
             tool: false,
+            region: 0,
         };
         let mut mach = gate_machine(Control::Unified, false);
         assert_eq!(mach.view_of(&request(50)).tokens, 50);
@@ -7559,6 +8682,7 @@ mod tests {
             authority: Authority::ReadOnly,
             root: 0,
             tool: false,
+            region: 0,
         }
     }
 
@@ -9170,5 +10294,664 @@ mod tests {
         );
         costs.extend(drain_rest(&mut mach, &trace, 800));
         assert_eq!(costs.len(), trace.len());
+    }
+
+    fn region_trace(regions: usize, ops: u64) -> Vec<Request> {
+        Workload::with_fanout(2, ops, 0.0, 0.1)
+            .with_regions(Some(crate::work::RegionDemand {
+                count: regions,
+                shape: crate::work::RegionShape::Even,
+            }))
+            .collect()
+    }
+
+    fn regional_machine(per_region: usize, regions: usize, mode: Option<RegionMode>) -> Machine {
+        let bands = [0u8; BlobKind::N];
+        let mem = NodeMemory {
+            hbm: 0,
+            ddr: 64 << 30,
+            nvme: 0,
+            hbm_quota: Quota::open(0, bands),
+            ddr_quota: Quota::open(64 << 30, bands),
+            can_decode: true,
+            kv: None,
+        };
+        let one_way: Vec<Vec<u64>> = (0..regions)
+            .map(|a| {
+                (0..regions)
+                    .map(|b| if a == b { 0 } else { 30_000_000 })
+                    .collect()
+            })
+            .collect();
+        let topo = Topology::regions(
+            per_region,
+            1,
+            mem.ddr,
+            Distance::Rack,
+            &one_way,
+            Crossing::default(),
+        );
+        let mut m = Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored);
+        m.set_flow_aware(true);
+        m.set_state_transfer(true);
+        m.set_fanout_atomic(true);
+        m.set_regions(mode.map(|mode| Regions::new(per_region, one_way, mode)));
+        m
+    }
+
+    fn serve_all(m: &mut Machine, trace: &[Request]) -> u64 {
+        trace
+            .iter()
+            .map(|req| match m.submit(req) {
+                Submitted::Closed(c) => c.service_ns(),
+                Submitted::Open(_) => 0,
+            })
+            .sum()
+    }
+
+    fn away(m: &Machine) -> u64 {
+        m.regions().map_or(0, |r| r.stats.away.iter().sum())
+    }
+
+    fn facing(m: &Machine) -> u64 {
+        m.regions().map_or(0, |r| r.stats.facing.iter().sum())
+    }
+
+    #[test]
+    fn a_regional_scheduler_serves_every_client_facing_request_in_its_clients_region() {
+        let trace = region_trace(3, 3_000);
+        let mut m = regional_machine(2, 3, Some(RegionMode::Regional));
+        serve_all(&mut m, &trace);
+        assert!(facing(&m) > 1_000);
+        assert_eq!(away(&m), 0);
+        let stats = &m.regions().expect("regions are on").stats;
+        for region in 0..3 {
+            let placed: u64 = (region * 2..region * 2 + 2)
+                .map(|d| stats.dispatched[d])
+                .sum();
+            assert!(placed > 200, "region {region} placed {placed}");
+        }
+    }
+
+    #[test]
+    fn the_global_argmin_charges_the_round_trip_once_for_each_request_it_serves_away() {
+        let trace = region_trace(3, 3_000);
+        let mut unpriced = regional_machine(2, 3, Some(RegionMode::Global));
+        unpriced
+            .regions
+            .as_mut()
+            .expect("regions are on")
+            .price_reach = false;
+        let mut priced = regional_machine(2, 3, Some(RegionMode::Global));
+        serve_all(&mut unpriced, &trace);
+        serve_all(&mut priced, &trace);
+        let stats = &unpriced.regions().expect("regions are on").stats;
+        assert!(stats.reach_hops > 0 && stats.reach_hops == away(&unpriced));
+        let hop = unpriced
+            .regions()
+            .expect("regions are on")
+            .round_trip_ns(0, 1);
+        assert_eq!(stats.reach_ns, stats.reach_hops * hop);
+        assert!(
+            away(&priced) < away(&unpriced),
+            "{} {}",
+            away(&priced),
+            away(&unpriced)
+        );
+    }
+
+    #[test]
+    fn one_region_with_every_region_bit_on_changes_no_request() {
+        let trace: Vec<Request> = Workload::with_fanout(2, 2_000, 0.0, 0.1).collect();
+        let mut off = regional_machine(4, 1, None);
+        let reference = serve_all(&mut off, &trace);
+        for mode in [RegionMode::Global, RegionMode::Regional] {
+            let mut on = regional_machine(4, 1, Some(mode));
+            assert_eq!(serve_all(&mut on, &trace), reference);
+            assert_eq!(away(&on), 0);
+            assert_eq!(on.decisions, off.decisions);
+        }
+    }
+
+    #[test]
+    fn a_region_with_no_node_for_a_request_falls_back_to_every_node() {
+        let trace = region_trace(2, 500);
+        let mut m = regional_machine(1, 2, Some(RegionMode::Regional));
+        m.drain(1);
+        let unplaced = trace
+            .iter()
+            .filter(|req| matches!(m.submit(req), Submitted::Closed(c) if c.pending))
+            .count();
+        assert_eq!(unplaced, 0);
+        assert!(facing(&m) > 100);
+        assert!(
+            trace
+                .iter()
+                .any(|r| r.region == 1 && !Machine::needs_decode(r))
+        );
+    }
+
+    #[test]
+    fn a_lease_moves_no_share_until_it_has_seen_a_lease_of_demand() {
+        let mut shares =
+            TenantShares::new(HashMap::from([(1, 1_000.0)]), 3, 2.0, Some(500_000_000));
+        assert!(shares.admit(1, 0, 100, 1_000));
+        assert_eq!(shares.shares(), &[1.0 / 3.0; 3]);
+        assert!(shares.admit(1, 1, 100, 600_000_000));
+        assert_eq!(shares.refreshes, 1);
+        assert!((shares.shares()[0] - shares.shares()[1]).abs() < 1e-9);
+        assert!(shares.shares()[2] < shares.shares()[0]);
+    }
+
+    fn hot_trace(share: f64, ops: u64) -> Vec<Request> {
+        Workload::with_fanout(2, ops, 0.0, 0.0)
+            .with_regions(Some(crate::work::RegionDemand {
+                count: 2,
+                shape: crate::work::RegionShape::Skew {
+                    region: 0,
+                    share,
+                    from: 0.0,
+                    to: 1.0,
+                },
+            }))
+            .collect()
+    }
+
+    fn hot_machine(overflow: Overflow, summary_ns: u64, own_forwards: bool) -> Machine {
+        hot_machine_at(1_500.0, overflow, summary_ns, own_forwards)
+    }
+
+    fn hot_machine_at(
+        rate: f64,
+        overflow: Overflow,
+        summary_ns: u64,
+        own_forwards: bool,
+    ) -> Machine {
+        let mut m = regional_machine(2, 2, Some(RegionMode::Regional));
+        m.set_arrival_rate(rate);
+        let regions = m.regions.as_mut().expect("regions are on");
+        regions.overflow = overflow;
+        regions.summary_ns = summary_ns;
+        regions.own_forwards = own_forwards;
+        m
+    }
+
+    #[test]
+    fn a_region_that_cannot_serve_its_demand_forwards_it_and_the_whole_run_is_faster() {
+        let trace = hot_trace(0.9, 4_000);
+        let mut alone = hot_machine(Overflow::Off, 0, false);
+        let alone_ns = serve_all(&mut alone, &trace);
+        assert_eq!(away(&alone), 0);
+        for overflow in [Overflow::Node, Overflow::RegionMean] {
+            let mut m = hot_machine(overflow, 0, false);
+            let ns = serve_all(&mut m, &trace);
+            assert!(away(&m) > 100, "{overflow:?} forwarded {}", away(&m));
+            assert!(ns < alone_ns, "{overflow:?}: {ns} against {alone_ns}");
+        }
+    }
+
+    #[test]
+    fn overflow_forwards_only_what_a_client_sent_and_a_decode_needs() {
+        let trace = hot_trace(0.9, 4_000);
+        let mut m = hot_machine(Overflow::Node, 0, false);
+        serve_all(&mut m, &trace);
+        let stats = &m.regions().expect("regions are on").stats;
+        assert_eq!(stats.away[BlobKind::Snapshot.idx()], 0);
+        assert_eq!(stats.away[BlobKind::ServiceHeap.idx()], 0);
+        assert!(stats.away[BlobKind::KvBlock.idx()] > 0);
+    }
+
+    #[test]
+    fn a_threshold_forwards_only_above_its_utilisation() {
+        let trace = hot_trace(0.9, 4_000);
+        let at = |utilisation| hot_machine_at(600.0, Overflow::Threshold { utilisation }, 0, false);
+        let mut never = at(2.0);
+        serve_all(&mut never, &trace);
+        assert_eq!(away(&never), 0);
+        let mut low = at(0.6);
+        serve_all(&mut low, &trace);
+        assert!(away(&low) > 100, "{}", away(&low));
+    }
+
+    #[test]
+    fn a_sender_counts_what_it_forwarded_since_the_summary_it_holds() {
+        let trace = hot_trace(0.9, 4_000);
+        let mut m = hot_machine(Overflow::RegionMean, 5_000_000_000, true);
+        serve_all(&mut m, &trace);
+        let regions = m.regions.as_ref().expect("regions are on");
+        assert_ne!(regions.forwards[0][1].len(), 0);
+        assert!(m.forwarded_delta(0, 1) > 0.0);
+        assert!(m.forwarded_delta(0, 1) > m.forwarded_delta(1, 0));
+        let mut blind = hot_machine(Overflow::RegionMean, 5_000_000_000, false);
+        serve_all(&mut blind, &trace);
+        assert!(blind.forwarded_delta(0, 1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn a_summary_is_a_snapshot_taken_on_its_clock() {
+        let mut m = hot_machine(Overflow::Node, 1_000_000_000, false);
+        serve_all(&mut m, &hot_trace(0.9, 3_000));
+        let regions = m.regions.as_ref().expect("regions are on");
+        assert!(regions.next_summary_ns > 0);
+        assert!(regions.summary.iter().any(|&n| n > 0));
+        assert!(regions.next_summary_ns <= m.now_ns() + regions.summary_ns);
+    }
+
+    fn regional_fleet(placement: &[Option<Model>]) -> Machine {
+        let bands = [0u8; BlobKind::N];
+        let node = |_: usize| NodeMemory {
+            hbm: 4 << 30,
+            ddr: 8 << 30,
+            nvme: 64 << 30,
+            hbm_quota: Quota::open(4 << 30, bands),
+            ddr_quota: Quota::open(8 << 30, bands),
+            can_decode: true,
+            kv: Some(crate::cache::EngineKv {
+                partition: 3 << 30,
+                offload: 1 << 30,
+                spill: 8 << 30,
+                clairvoyant: false,
+            }),
+        };
+        let one_way = vec![vec![0, 30_000_000], vec![30_000_000, 0]];
+        let topo = Topology::regions(2, 1, 8 << 30, Distance::Rack, &one_way, Crossing::default());
+        let mut m = Machine::new(topo, node, Policy::Gdsf, Placement::Scored);
+        m.set_flow_aware(true);
+        m.set_state_transfer(true);
+        m.set_model_batches(Batching::PerModel, true);
+        m.set_fleet(
+            crate::fleet::Fleet::new(crate::fleet::Catalogue::published(8_000_000_000), placement),
+            None,
+        );
+        m.set_regions(Some(Regions::new(2, one_way, RegionMode::Regional)));
+        m
+    }
+
+    #[test]
+    fn a_request_for_a_model_its_region_lacks_is_forwarded_to_the_nearest_region_with_one() {
+        let trace: Vec<Request> = Workload::with_fanout(2, 1_500, 1.0, 0.1)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_model_keyed(true)
+            .with_regions(Some(crate::work::RegionDemand {
+                count: 2,
+                shape: crate::work::RegionShape::Even,
+            }))
+            .collect();
+        let placement = [Some(0), Some(1), Some(2), Some(3)];
+        let mut m = regional_fleet(&placement);
+        m.set_arrival_rate(250.0);
+        served_costs(&mut m, &trace);
+        let stats = &m.regions().expect("regions are on").stats;
+        assert!(stats.forced > 100, "{}", stats.forced);
+        assert!(away(&m) > 0);
+        let fleet = m.fleet().expect("a fleet");
+        assert_eq!(fleet.stats.unplaced, 0);
+        for (d, row) in fleet.stats.served.iter().enumerate() {
+            for (model, n) in row.iter().enumerate() {
+                if Some(model as Model) != placement[d] {
+                    assert_eq!(*n, 0, "node {d} decoded model {model}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_request_that_waits_at_the_router_is_served_in_its_own_region() {
+        let bands = [0u8; BlobKind::N];
+        let mem = NodeMemory {
+            hbm: 4 << 30,
+            ddr: 8 << 30,
+            nvme: 64 << 30,
+            hbm_quota: Quota::open(4 << 30, bands),
+            ddr_quota: Quota::open(8 << 30, bands),
+            can_decode: true,
+            kv: Some(crate::cache::EngineKv {
+                partition: TIGHT,
+                offload: 1 << 30,
+                spill: 8 << 30,
+                clairvoyant: false,
+            }),
+        };
+        let one_way = vec![vec![0, 30_000_000], vec![30_000_000, 0]];
+        let topo = Topology::regions(2, 1, mem.ddr, Distance::Rack, &one_way, Crossing::default());
+        let mut m = Machine::new(topo, |_| mem, Policy::Gdsf, Placement::Scored);
+        m.set_hold_decodes(true);
+        m.set_arrival_rate(250.0);
+        m.set_admission(Reserve::Perfect, crate::work::TOKENS_PER_KV_BLOCK);
+        m.set_queue(Queue::Fifo);
+        m.set_regions(Some(Regions::new(2, one_way, RegionMode::Regional)));
+        let trace: Vec<Request> = Workload::with_fanout(9, 3_000, 1.0, 0.0)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_throughput(0.3)
+            .with_regions(Some(crate::work::RegionDemand {
+                count: 2,
+                shape: crate::work::RegionShape::Even,
+            }))
+            .collect();
+        let (costs, opened) = submit_all(&mut m, &trace);
+        assert!(
+            opened > 0,
+            "an overcommitted partition must queue something"
+        );
+        assert_eq!(costs.len(), trace.len());
+        assert!(facing(&m) > 1_000);
+        assert_eq!(away(&m), 0);
+    }
+
+    #[test]
+    fn a_fan_outs_agents_are_never_counted_as_forwarded_clients() {
+        let trace: Vec<Request> = Workload::with_fanout(2, 3_000, 0.0, 0.3)
+            .with_regions(Some(crate::work::RegionDemand {
+                count: 2,
+                shape: crate::work::RegionShape::Even,
+            }))
+            .collect();
+        assert!(trace.iter().any(|r| r.gang.is_some()));
+        let mut m = hot_machine_at(1_500.0, Overflow::Off, 1_000_000_000, true);
+        serve_all(&mut m, &trace);
+        let regions = m.regions.as_ref().expect("regions are on");
+        assert_eq!(away(&m), 0);
+        assert!(regions.forwards.iter().flatten().all(Vec::is_empty));
+    }
+
+    fn table_machine(epoch_ns: u64) -> Machine {
+        let mut m = hot_machine_at(600.0, Overflow::Off, 0, false);
+        m.regions
+            .as_mut()
+            .expect("regions are on")
+            .set_table(Some(epoch_ns));
+        m
+    }
+
+    #[test]
+    fn a_table_moves_almost_nothing_when_no_region_is_worse_than_another() {
+        let trace = region_trace(2, 4_000);
+        let mut m = table_machine(1_000_000_000);
+        m.set_arrival_rate(400.0);
+        serve_all(&mut m, &trace);
+        let regions = m.regions().expect("regions are on");
+        assert!(regions.table_stats.recomputes > 2);
+        assert!(away(&m) * 50 < facing(&m), "{} of {}", away(&m), facing(&m));
+        for (a, row) in regions
+            .table_fractions()
+            .expect("a table")
+            .iter()
+            .enumerate()
+        {
+            assert!(row[a] > 0.8, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn a_table_forwards_a_hot_regions_demand_by_session_and_each_row_sums_to_one() {
+        let trace = hot_trace(0.9, 4_000);
+        let mut m = table_machine(1_000_000_000);
+        serve_all(&mut m, &trace);
+        let regions = m.regions().expect("regions are on");
+        let table = regions.table_fractions().expect("a table");
+        assert!(table[0][1] > 0.1, "{table:?}");
+        for row in table {
+            assert!((row.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        }
+        assert!(away(&m) > 100);
+        assert!(regions.table_stats.changes > 0);
+    }
+
+    #[test]
+    fn routing_demand_keeps_a_balanced_fleet_home_and_moves_a_hot_regions_excess() {
+        let costs = crate::fleet::Costs::published(1_000_000_000);
+        let trips = vec![vec![0.0, 6e7], vec![6e7, 0.0]];
+        let even = route_demand(&costs, &[2_000.0, 2_000.0], &[124.0; 2], &[4, 4], &trips);
+        assert_eq!(even, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let hot = route_demand(&costs, &[40_000.0, 1_000.0], &[124.0; 2], &[4, 4], &trips);
+        assert!(hot[0][1] > 0.2 && hot[1][1] > 0.99, "{hot:?}");
+    }
+
+    fn budget_machine(rule: BudgetRule, running: usize, load_ns: u64) -> Machine {
+        let mut m = regional_machine(3, 2, Some(RegionMode::Regional));
+        m.set_arrival_rate(600.0);
+        m.set_budgets(Some(Budgets::new(rule, 2, 3, running, load_ns)));
+        m
+    }
+
+    #[test]
+    fn a_node_that_is_not_running_takes_no_work() {
+        let mut m = budget_machine(BudgetRule::Static, 2, 0);
+        serve_all(&mut m, &region_trace(2, 3_000));
+        let placed = &m.regions().expect("regions are on").stats.dispatched;
+        assert_eq!(placed[2], 0);
+        assert_eq!(placed[5], 0);
+        assert!(placed[0] > 100 && placed[1] > 100 && placed[3] > 100 && placed[4] > 100);
+        assert_eq!(m.running_counts(), vec![2, 2]);
+    }
+
+    #[test]
+    fn a_planned_move_releases_a_node_and_the_new_one_serves_only_after_its_load() {
+        let plan = BudgetRule::Planned(vec![(1_000_000_000, vec![3, 1])]);
+        let mut m = budget_machine(plan, 2, 500_000_000);
+        m.advance_to(900_000_000);
+        assert_eq!(m.running_counts(), vec![2, 2]);
+        m.advance_to(1_100_000_000);
+        assert_eq!(m.running_counts(), vec![3, 1]);
+        assert!(!m.available(2), "the acquired node is still loading");
+        assert!(
+            !m.available(4) && !m.available(5),
+            "the released node and the idle slot are out"
+        );
+        m.advance_to(1_600_000_000);
+        assert!(m.available(2));
+        let budgets = m.budgets().expect("budgets are on");
+        assert_eq!(budgets.moves, 1);
+        assert_eq!(budgets.loading_ns, 500_000_000);
+    }
+
+    #[test]
+    fn budgets_that_follow_demand_move_nodes_to_the_hot_region_and_not_when_demand_is_even() {
+        let follow = || BudgetRule::Follow {
+            interval_ns: 1_000_000_000,
+        };
+        let mut hot = budget_machine(follow(), 2, 100_000_000);
+        serve_all(&mut hot, &hot_trace(0.9, 4_000));
+        let counts = hot.running_counts();
+        assert_eq!(counts.iter().sum::<usize>(), 4);
+        assert!(counts[0] > counts[1], "{counts:?}");
+        assert!(hot.budgets().expect("budgets are on").moves > 0);
+        let mut even = budget_machine(follow(), 2, 100_000_000);
+        serve_all(&mut even, &region_trace(2, 4_000));
+        assert_eq!(even.budgets().expect("budgets are on").moves, 0);
+        assert_eq!(even.running_counts(), vec![2, 2]);
+    }
+
+    fn sharded(k: usize, report_ns: u64) -> Machine {
+        let mut m = regional_machine(4, 1, Some(RegionMode::Regional));
+        m.set_arrival_rate(500.0);
+        m.set_shards(k, report_ns);
+        m
+    }
+
+    #[test]
+    fn schedulers_that_see_each_others_decodes_exactly_change_no_request() {
+        let trace = region_trace(1, 4_000);
+        let one = serve_all(&mut sharded(1, 0), &trace);
+        for k in [2, 4] {
+            assert_eq!(serve_all(&mut sharded(k, 0), &trace), one, "{k} schedulers");
+        }
+    }
+
+    #[test]
+    fn schedulers_that_report_seconds_late_herd_and_more_schedulers_herd_more() {
+        let trace = region_trace(1, 6_000);
+        let one = serve_all(&mut sharded(1, 0), &trace);
+        let two = serve_all(&mut sharded(2, 5_000_000_000), &trace);
+        let four = serve_all(&mut sharded(4, 5_000_000_000), &trace);
+        assert!(four > one && four >= two, "{one} {two} {four}");
+        let fast = serve_all(&mut sharded(4, 25_000_000), &trace);
+        assert!(fast < four);
+    }
+
+    fn day_trace(ops: u64) -> Vec<Request> {
+        Workload::with_fanout(2, ops, 0.0, 0.1)
+            .with_regions(Some(crate::work::RegionDemand {
+                count: 2,
+                shape: crate::work::RegionShape::Sun {
+                    amplitude: 0.75,
+                    peaks: vec![0.75, 0.25],
+                    days: 1.0,
+                },
+            }))
+            .collect()
+    }
+
+    fn tenant_quotas(trace: &[Request], seconds: f64, headroom: f64) -> HashMap<u32, f64> {
+        let mut quotas: HashMap<u32, f64> = HashMap::new();
+        for r in trace.iter().filter(|r| r.client_facing() && r.tokens > 0) {
+            if let Some(t) = r.tenant {
+                *quotas.entry(t).or_insert(0.0) += r.tokens as f64 / seconds;
+            }
+        }
+        for quota in quotas.values_mut() {
+            *quota *= 1.0 + headroom;
+        }
+        quotas
+    }
+
+    fn shared_tenants(trace: &[Request], headroom: f64, lease_ns: Option<u64>) -> Machine {
+        let mut m = regional_machine(2, 2, Some(RegionMode::Regional));
+        m.set_arrival_rate(400.0);
+        let quotas = tenant_quotas(trace, trace.len() as f64 / 400.0, headroom);
+        m.set_tenant_shares(Some(TenantShares::new(quotas, 2, 2.0, lease_ns)));
+        m
+    }
+
+    #[test]
+    fn a_leased_share_follows_the_day_and_a_static_split_refuses_at_the_peaks() {
+        let day = day_trace(8_000);
+        let even = region_trace(2, 8_000);
+        let refused = |trace: &[Request], headroom, lease| {
+            let mut m = shared_tenants(trace, headroom, lease);
+            serve_all(&mut m, trace);
+            let t = m.tenant_shares().expect("shares are on");
+            (t.refused, t.offered, t.refreshes)
+        };
+        let (generous, offered, _) = refused(&day, 20.0, None);
+        assert!(offered > 1_000);
+        assert_eq!(generous, 0);
+        let lease = Some(500_000_000);
+        let (fixed_day, _, _) = refused(&day, 0.1, None);
+        let (fixed_even, _, _) = refused(&even, 0.1, None);
+        let (leased_day, _, refreshes) = refused(&day, 0.1, lease);
+        let (leased_even, _, _) = refused(&even, 0.1, lease);
+        assert!(refreshes > 5);
+        let by_the_day = |day: u64, even: u64| day.saturating_sub(even);
+        assert!(
+            by_the_day(fixed_day, fixed_even) > 2 * by_the_day(leased_day, leased_even).max(1),
+            "static {fixed_day} against {fixed_even}, leased {leased_day} against {leased_even}"
+        );
+    }
+
+    #[test]
+    fn a_lease_moves_a_regions_share_toward_its_demand() {
+        let trace = hot_trace(0.9, 6_000);
+        let mut m = shared_tenants(&trace, 1.0, Some(500_000_000));
+        serve_all(&mut m, &trace);
+        let shares = m.tenant_shares().expect("shares are on").shares();
+        assert!(
+            shares[0] > 0.7 && (shares.iter().sum::<f64>() - 1.0).abs() < 1e-9,
+            "{shares:?}"
+        );
+    }
+
+    fn confined_machine(residency: f64, overflow: Overflow) -> Machine {
+        let mut m = hot_machine(overflow, 0, false);
+        m.set_residency(residency);
+        m
+    }
+
+    #[test]
+    fn full_residency_makes_every_overflow_rule_regional() {
+        let trace = hot_trace(0.9, 4_000);
+        let regional = serve_all(&mut hot_machine(Overflow::Off, 0, false), &trace);
+        for overflow in [Overflow::Node, Overflow::RegionMean] {
+            let mut m = confined_machine(1.0, overflow);
+            assert_eq!(serve_all(&mut m, &trace), regional);
+            assert_eq!(away(&m), 0);
+        }
+        let mut table = confined_machine(1.0, Overflow::Off);
+        table
+            .regions
+            .as_mut()
+            .expect("regions are on")
+            .set_table(Some(1_000_000_000));
+        assert_eq!(serve_all(&mut table, &trace), regional);
+        assert_eq!(away(&table), 0);
+    }
+
+    #[test]
+    fn residency_keeps_a_share_of_tenants_home_and_the_rest_may_leave() {
+        let trace = hot_trace(0.9, 4_000);
+        let open = {
+            let mut m = confined_machine(0.0, Overflow::Node);
+            serve_all(&mut m, &trace);
+            away(&m)
+        };
+        let half = {
+            let mut m = confined_machine(0.5, Overflow::Node);
+            serve_all(&mut m, &trace);
+            away(&m)
+        };
+        assert!(half > 0 && half < open, "{half} {open}");
+        let tenants: Vec<u32> = (0..24).collect();
+        let m = confined_machine(0.5, Overflow::Off);
+        let kept = tenants.iter().filter(|&&t| m.restricted(t)).count();
+        assert!((6..=18).contains(&kept), "{kept}");
+    }
+
+    #[test]
+    fn a_confined_request_whose_model_is_not_in_its_region_goes_unplaced_and_never_leaves() {
+        let trace: Vec<Request> = Workload::with_fanout(2, 1_500, 1.0, 0.0)
+            .with_decode_kv(crate::work::TOKENS_PER_KV_BLOCK)
+            .with_model_keyed(true)
+            .with_regions(Some(crate::work::RegionDemand {
+                count: 2,
+                shape: crate::work::RegionShape::Even,
+            }))
+            .collect();
+        let placement = [Some(0), Some(1), Some(2), Some(3)];
+        let mut m = regional_fleet(&placement);
+        m.set_arrival_rate(250.0);
+        m.set_residency(1.0);
+        served_costs(&mut m, &trace);
+        let confined = m.regions().expect("regions are on").stats.forced;
+        assert_eq!(away(&m), 0);
+        let unplaced = m.fleet().expect("a fleet").stats.unplaced;
+        assert!(unplaced > 100, "{unplaced}");
+        let mut open = regional_fleet(&placement);
+        open.set_arrival_rate(250.0);
+        served_costs(&mut open, &trace);
+        let forced = open.regions().expect("regions are on").stats.forced;
+        assert!(confined * 3 < forced, "{confined} against {forced}");
+    }
+
+    #[test]
+    fn a_restricted_tenants_request_is_never_served_outside_its_clients_region() {
+        let trace = hot_trace(0.9, 4_000);
+        let mut m = confined_machine(0.5, Overflow::Node);
+        let (mut kept, mut left) = (0, 0);
+        for req in &trace {
+            let Submitted::Closed(_) = m.submit(req) else {
+                continue;
+            };
+            let (Some(tenant), true) = (req.tenant, req.client_facing() && req.tokens > 0) else {
+                continue;
+            };
+            let served = m.served_region();
+            if m.restricted(tenant) {
+                assert_eq!(served, Some(usize::from(req.region)));
+                kept += 1;
+            } else if served != Some(usize::from(req.region)) {
+                left += 1;
+            }
+        }
+        assert!(kept > 100 && left > 0, "{kept} {left}");
     }
 }

@@ -4,6 +4,7 @@ mod enforce_cmd;
 mod fleet_cmd;
 mod influence_cmd;
 mod programs_cmd;
+mod regions_cmd;
 
 use clap::{Parser, Subcommand};
 use polyphonic::admit::Reserve;
@@ -488,6 +489,57 @@ enum Cmd {
         #[arg(
             long,
             default_value = "gate,engine,queue,order,cancel,claims,restart,llmd,batch,departures,buffer"
+        )]
+        sections: String,
+    },
+
+    /// Regional schedulers against the global argmin, with clients in regions: phase-11.md §4.14.
+    /// Charges no control crossing, so every number is reproducible from the seed
+    Regions {
+        /// Regions
+        #[arg(long, default_value_t = 3)]
+        regions: usize,
+        /// Nodes running in a region
+        #[arg(long, default_value_t = 4)]
+        per_region: usize,
+        /// Node slots a region, at least --per-region; the budget section adds two
+        #[arg(long, default_value_t = 0)]
+        slots: usize,
+        #[arg(long, default_value_t = 3)]
+        units_per_node: usize,
+        /// Accelerator HBM a node
+        #[arg(long, default_value = "4GiB", value_parser = parse_bytes)]
+        hbm: u64,
+        #[arg(long, default_value = "8GiB", value_parser = parse_bytes)]
+        dram: u64,
+        #[arg(long, default_value = "16GiB", value_parser = parse_bytes)]
+        nvme: u64,
+        /// Arrival rate a region, requests a second
+        #[arg(long, default_value_t = 250.0)]
+        rate: f64,
+        /// Seconds of arrivals
+        #[arg(long, default_value_t = 60.0)]
+        seconds: f64,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Seeds per cell
+        #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u64).range(1..))]
+        seeds: u64,
+        #[arg(long, default_value_t = 0.10)]
+        fanout: f64,
+        /// One-way latencies between regions: uniform (30 ms), near, far, or azure (three regions)
+        #[arg(long, default_value = "uniform")]
+        rtt: String,
+        /// Class-mix volatility; 0 holds the mix flat so the regions' shares are the only time structure
+        #[arg(long, default_value_t = 0.0)]
+        volatility: f64,
+        /// Model the KV a decode writes, held with its prompt until the decode ends
+        #[arg(long)]
+        decode_kv: bool,
+        /// Sections to run, comma-separated, printed in this order: gate, even, burst, day, table, budget, models, tenants, shards, arithmetic
+        #[arg(
+            long,
+            default_value = "gate,even,burst,day,table,budget,models,tenants,shards,arithmetic"
         )]
         sections: String,
     },
@@ -3202,6 +3254,41 @@ fn main() {
             ops,
             sections,
         }),
+        Cmd::Regions {
+            regions,
+            per_region,
+            slots,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            rate,
+            seconds,
+            seed,
+            seeds,
+            fanout,
+            rtt,
+            volatility,
+            decode_kv,
+            sections,
+        } => regions_cmd::run_all(&regions_cmd::Env {
+            regions,
+            per_region,
+            slots,
+            units_per_node,
+            hbm,
+            dram,
+            nvme,
+            rate,
+            seconds,
+            seed,
+            seeds,
+            fanout,
+            rtt,
+            volatility,
+            decode_kv,
+            sections,
+        }),
         Cmd::Durability {
             nodes,
             units_per_node,
@@ -3549,6 +3636,9 @@ struct Detail {
     served: bool,
     service_ns: u64,
     stall_ns: u64,
+    region: u8,
+    served_in: Option<usize>,
+    facing: bool,
 }
 
 type ClassRow<'a> = (&'a str, ClassTally);
@@ -4499,6 +4589,9 @@ fn code_review(
 }
 
 struct Shape {
+    region: u8,
+    served_in: Option<usize>,
+    facing: bool,
     deferred_ns: u64,
     class: usize,
     base_at: u64,
@@ -4513,6 +4606,9 @@ struct Shape {
 impl Shape {
     fn of(req: &polyphonic::work::Request, base_at: u64) -> Self {
         Self {
+            region: req.region,
+            served_in: None,
+            facing: req.client_facing(),
             deferred_ns: 0,
             class: req.kind_idx(),
             base_at,
@@ -4543,6 +4639,9 @@ fn tally(
         served: !c.pending,
         service_ns: service,
         stall_ns: stall,
+        region: shape.region,
+        served_in: shape.served_in,
+        facing: shape.facing,
     });
     if c.pending {
         return;
@@ -4625,7 +4724,13 @@ fn submit_tallying(
         None => mach.submit(req),
     };
     match outcome {
-        Submitted::Closed(c) => tally(&mut acc.t, &mut acc.total, &mut acc.served, &shape, &c),
+        Submitted::Closed(c) => {
+            let shape = Shape {
+                served_in: mach.served_region().filter(|_| !c.pending),
+                ..shape
+            };
+            tally(&mut acc.t, &mut acc.total, &mut acc.served, &shape, &c);
+        }
         Submitted::Open(id) => {
             acc.open.insert(id, shape);
         }

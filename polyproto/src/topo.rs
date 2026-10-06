@@ -277,6 +277,66 @@ impl std::str::FromStr for Distance {
 
 impl Topology {
     #[must_use]
+    pub fn regions(
+        per_region: usize,
+        units_per_node: usize,
+        dram_per_node: u64,
+        within: Distance,
+        one_way_ns: &[Vec<u64>],
+        crossing: crate::boundary::Cost,
+    ) -> Self {
+        let nodes = one_way_ns.len() * per_region;
+        assert!(nodes * units_per_node <= 256, "unit ids are a byte");
+        let region_of = |n: usize| n / per_region;
+        let mut units = Vec::new();
+        let mut domains = Vec::new();
+        for n in 0..nodes {
+            domains.push(MemoryDomain {
+                id: n as u8,
+                kind: if within.coherent() {
+                    DomainKind::Dram
+                } else {
+                    DomainKind::Remote
+                },
+                capacity: dram_per_node,
+            });
+            for i in 0..units_per_node {
+                units.push(ComputeUnit {
+                    id: (n * units_per_node + i) as u8,
+                    kind: UnitKind::Performance,
+                    cluster: n as u8,
+                    home: n as u8,
+                });
+            }
+        }
+        let mut links = Vec::with_capacity(units.len() * domains.len());
+        for u in &units {
+            for dom in &domains {
+                let (from, to) = (
+                    region_of(usize::from(u.home)),
+                    region_of(usize::from(dom.id)),
+                );
+                links.push(if u.home == dom.id {
+                    Link::local(1.0 / 28.0)
+                } else if from == to {
+                    Link {
+                        latency_ns: within.one_way_ns() + crossing.fixed_ns as u64,
+                        ns_per_byte: within.ns_per_byte() + crossing.ns_per_byte,
+                        coherent: within.coherent(),
+                    }
+                } else {
+                    Link {
+                        latency_ns: one_way_ns[from][to] + crossing.fixed_ns as u64,
+                        ns_per_byte: Distance::Region.ns_per_byte() + crossing.ns_per_byte,
+                        coherent: false,
+                    }
+                });
+            }
+        }
+        Self::new(units, domains, links)
+    }
+
+    #[must_use]
     pub fn cluster(
         nodes: usize,
         units_per_node: usize,
@@ -320,5 +380,41 @@ impl Topology {
             }
         }
         Self::new(units, domains, links)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::boundary::Cost;
+
+    fn latency(topo: &Topology, from: usize, to: usize) -> u64 {
+        topo.link(from, to).latency_ns
+    }
+
+    #[test]
+    fn a_link_costs_the_distance_of_the_regions_it_joins() {
+        let wan = vec![vec![0, 30_000_000], vec![30_000_000, 0]];
+        let topo = Topology::regions(2, 1, 1 << 30, Distance::Rack, &wan, Cost::default());
+        assert_eq!(latency(&topo, 0, 0), 0);
+        assert_eq!(latency(&topo, 0, 1), Distance::Rack.one_way_ns());
+        assert_eq!(latency(&topo, 0, 2), 30_000_000);
+        assert_eq!(latency(&topo, 3, 1), 30_000_000);
+        assert!(!topo.link(0, 2).coherent);
+    }
+
+    #[test]
+    fn one_region_is_the_cluster_at_that_distance() {
+        let regions = Topology::regions(4, 2, 1 << 30, Distance::Rack, &[vec![0]], Cost::default());
+        let cluster = Topology::cluster(4, 2, 1 << 30, Distance::Rack, Cost::default());
+        assert_eq!(regions.units.len(), cluster.units.len());
+        for u in 0..regions.units.len() {
+            for d in 0..regions.domains.len() {
+                let (a, b) = (regions.link(u, d), cluster.link(u, d));
+                assert_eq!(a.latency_ns, b.latency_ns);
+                assert!((a.ns_per_byte - b.ns_per_byte).abs() < f64::EPSILON);
+                assert_eq!(a.coherent, b.coherent);
+            }
+        }
     }
 }

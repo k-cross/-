@@ -352,6 +352,7 @@ mod tests {
             authority: crate::work::Authority::ReadOnly,
             root: 0,
             tool: false,
+            region: 0,
         };
         assert!(r.admits_claim(25, &req, (&req.chain, 5), None));
         assert!(!r.admits_claim(24, &req, (&req.chain, 5), None));
@@ -421,6 +422,7 @@ mod tests {
             authority: crate::work::Authority::ReadOnly,
             root: 0,
             tool: false,
+            region: 0,
         };
         assert_eq!(r.deficit_claim(100, &req, (&req.chain, 0)), 0);
         assert_eq!(r.deficit_claim(15, &req, (&req.chain, 0)), 5);

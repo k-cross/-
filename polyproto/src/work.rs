@@ -73,6 +73,73 @@ const MIX_SEED: u64 = 0x4D49_585F_5345_4544;
 const FRESH_SEED: u64 = 0x4652_4553_485F_5345;
 const NEIGHBOUR_SEED: u64 = 0x4E45_4947_4842_5352;
 const BATCH_SEED: u64 = 0x4241_5443_485F_5345;
+const REGION_SEED: u64 = 0x5245_4749_4F4E_5345;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum RegionShape {
+    Even,
+    Sun {
+        amplitude: f64,
+        peaks: Vec<f64>,
+        days: f64,
+    },
+    Skew {
+        region: usize,
+        share: f64,
+        from: f64,
+        to: f64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionDemand {
+    pub count: usize,
+    pub shape: RegionShape,
+}
+
+impl RegionDemand {
+    #[must_use]
+    pub fn shares(&self, f: f64) -> Vec<f64> {
+        let n = self.count.max(1);
+        let even = || vec![1.0 / n as f64; n];
+        match &self.shape {
+            RegionShape::Even => even(),
+            RegionShape::Sun {
+                amplitude,
+                peaks,
+                days,
+            } => {
+                let w: Vec<f64> = (0..n)
+                    .map(|r| {
+                        let peak = peaks.get(r).copied().unwrap_or(0.0);
+                        1.0 + amplitude * (std::f64::consts::TAU * (f * days - peak)).cos()
+                    })
+                    .collect();
+                let sum: f64 = w.iter().sum();
+                w.into_iter().map(|x| x / sum).collect()
+            }
+            RegionShape::Skew {
+                region,
+                share,
+                from,
+                to,
+            } => {
+                if f < *from || f >= *to || n < 2 {
+                    return even();
+                }
+                (0..n)
+                    .map(|r| {
+                        if r == *region {
+                            *share
+                        } else {
+                            (1.0 - share) / (n - 1) as f64
+                        }
+                    })
+                    .collect()
+            }
+        }
+    }
+}
 pub const BATCH_TENANT: u32 = 4_000;
 pub const BATCH_BLOCKS: u64 = 8;
 const BATCH_TOKENS_MIN: u64 = 200;
@@ -110,6 +177,7 @@ struct Turn {
     slot: usize,
     session: u64,
     index: u32,
+    region: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -124,6 +192,7 @@ struct Queued {
     slo: Slo,
     tenant: Option<u32>,
     pattern: Pattern,
+    region: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -387,6 +456,7 @@ pub struct Request {
     pub authority: Authority,
     pub root: u32,
     pub tool: bool,
+    pub region: u8,
 }
 
 #[must_use]
@@ -430,6 +500,11 @@ impl Request {
             authority: self.authority,
             tool: self.tool,
         }
+    }
+
+    #[must_use]
+    pub fn client_facing(&self) -> bool {
+        self.completes.is_none() && !self.tool && self.gang.is_none()
     }
 
     #[must_use]
@@ -497,6 +572,9 @@ pub struct Workload {
     shared_prefix: bool,
     batch_fraction: f64,
     batch_rng: Rng,
+    regions: Option<RegionDemand>,
+    region_rng: Rng,
+    current_region: u8,
 }
 
 fn kv(origins: Option<&Origins>, parent: BlobId, tag: &[u8], origin: Origin) -> (BlobId, BlobMeta) {
@@ -609,6 +687,9 @@ impl Workload {
             shared_prefix: false,
             batch_fraction: 0.0,
             batch_rng: Rng::new(seed ^ BATCH_SEED),
+            regions: None,
+            region_rng: Rng::new(seed ^ REGION_SEED),
+            current_region: 0,
         };
         for _ in 0..SESSIONS {
             let s = w.fresh_session();
@@ -746,6 +827,32 @@ impl Workload {
     pub fn with_model_keyed(mut self, on: bool) -> Self {
         self.model_keyed = on;
         self
+    }
+
+    #[must_use]
+    pub fn with_regions(mut self, demand: Option<RegionDemand>) -> Self {
+        self.regions = demand.filter(|d| d.count > 1);
+        self
+    }
+
+    fn region_count(&self) -> usize {
+        self.regions.as_ref().map_or(1, |d| d.count)
+    }
+
+    fn draw_region(&mut self) -> u8 {
+        let Some(demand) = &self.regions else {
+            return 0;
+        };
+        let shares = demand.shares(self.issued as f64 / self.ops.max(1) as f64);
+        let u = self.region_rng.unit();
+        let mut acc = 0.0;
+        for (r, p) in shares.iter().enumerate() {
+            acc += p;
+            if u < acc {
+                return r as u8;
+            }
+        }
+        (shares.len() - 1) as u8
     }
 
     #[must_use]
@@ -1043,11 +1150,15 @@ impl Workload {
     }
 
     fn agent_turn(&mut self) -> (Chain, usize, Turn) {
+        let regions = self.region_count() as u64;
+        let region = u64::from(self.draw_region());
         let slot = if self.mix.is_some() {
             let per_model = (SESSIONS / MODEL_COUNT) as u64;
-            (self.drawn_model() * per_model + self.rng.zipf(per_model, 1.3)) as usize
+            let model = self.drawn_model();
+            (model * per_model + self.rng.zipf(per_model / regions, 1.3) * regions + region)
+                as usize
         } else {
-            self.rng.zipf(self.sessions.len() as u64, 1.3) as usize
+            (self.rng.zipf(self.sessions.len() as u64 / regions, 1.3) * regions + region) as usize
         };
         let s = self.sessions[slot].clone();
         let mut chain = self.tenant_prefix[s.tenant].clone();
@@ -1078,6 +1189,7 @@ impl Workload {
             slot,
             session: s.id,
             index: s.turns,
+            region: region as u8,
         };
         (chain, s.tenant, turn)
     }
@@ -1162,6 +1274,7 @@ impl Iterator for Workload {
 
 impl Workload {
     fn unshared_request(&mut self, phase: usize, kind: Unshared) -> Request {
+        let region = self.draw_region();
         self.fresh_n += 1;
         let n = self.fresh_n;
         let (tag, blocks, tokens_min, tokens_span) = match kind {
@@ -1230,6 +1343,7 @@ impl Workload {
             authority: Authority::ReadOnly,
             root: 0,
             tool: false,
+            region,
         }
     }
 
@@ -1243,6 +1357,7 @@ impl Workload {
             if ready {
                 self.issued += 1;
             }
+            self.current_region = q.region;
             if let Some(f) = q.fanout {
                 let payload = RESULT_PAYLOAD_BYTES * f.gang.agents.len() as u64;
                 let hint = self.enqueue_after(
@@ -1277,6 +1392,7 @@ impl Workload {
                     authority: Authority::ReadOnly,
                     root: 0,
                     tool: false,
+                    region: q.region,
                 });
             }
             let tail = q.chain.last().map_or(ROOT, |(id, _)| *id);
@@ -1309,6 +1425,7 @@ impl Workload {
                 authority: Authority::ReadOnly,
                 root: 0,
                 tool: false,
+                region: q.region,
             });
         }
         let mix = self.mix();
@@ -1320,6 +1437,7 @@ impl Workload {
         if roll < mix.faas {
             return Some(self.faas_request(phase));
         }
+        let region = self.draw_region();
         Some(Request {
             phase,
             chain: self.service(),
@@ -1340,6 +1458,7 @@ impl Workload {
             authority: Authority::ReadOnly,
             root: 0,
             tool: false,
+            region,
         })
     }
 }
@@ -1400,6 +1519,7 @@ impl Workload {
                 slo,
                 tenant,
                 pattern,
+                region: self.current_region,
             },
         );
         FlowHint {
@@ -1414,6 +1534,7 @@ impl Workload {
 
     fn inference_request(&mut self, phase: usize) -> Request {
         let (chain, tenant, turn) = self.agent_turn();
+        self.current_region = turn.region;
         let slo = self.slo_of(turn.session);
         let tokens = self.tokens();
         let tail = chain.last().map_or(ROOT, |(id, _)| *id);
@@ -1474,10 +1595,13 @@ impl Workload {
             authority: Authority::ReadOnly,
             root: 0,
             tool: false,
+            region: turn.region,
         }
     }
 
     fn faas_request(&mut self, phase: usize) -> Request {
+        let region = self.draw_region();
+        self.current_region = region;
         let f = if self.mix.is_some() {
             let model = self.drawn_model();
             self.rng.zipf(FUNCTIONS / MODELS, 1.5) * MODELS + model
@@ -1529,6 +1653,7 @@ impl Workload {
             authority: Authority::ReadOnly,
             root: 0,
             tool: false,
+            region,
         }
     }
 }
@@ -2020,5 +2145,84 @@ mod tests {
         );
         assert!(wide.0 >= 2_000 - 50 && wide.1 <= 8_000 + 50, "{wide:?}");
         assert!(wide.1 - wide.0 > 5_500);
+    }
+
+    #[test]
+    fn one_region_is_the_published_trace() {
+        let plain = format!("{:?}", trace(None));
+        let one = Workload::with_fanout(2, 3_000, 1.0, 0.15)
+            .with_decode_kv(TOKENS_PER_KV_BLOCK)
+            .with_regions(Some(RegionDemand {
+                count: 1,
+                shape: RegionShape::Even,
+            }));
+        assert_eq!(plain, format!("{:?}", one.collect::<Vec<_>>()));
+    }
+
+    #[test]
+    fn requests_name_their_clients_region_by_the_regions_shares() {
+        let regions = |shape: RegionShape| -> Vec<Request> {
+            Workload::with_fanout(2, 6_000, 0.0, 0.1)
+                .with_regions(Some(RegionDemand { count: 3, shape }))
+                .collect()
+        };
+        let share = |trace: &[Request], region: u8| {
+            trace.iter().filter(|r| r.region == region).count() as f64 / trace.len() as f64
+        };
+        let even = regions(RegionShape::Even);
+        assert!(even.iter().all(|r| r.region < 3));
+        for r in 0..3 {
+            assert!(
+                (share(&even, r) - 1.0 / 3.0).abs() < 0.05,
+                "{}",
+                share(&even, r)
+            );
+        }
+        let skewed = regions(RegionShape::Skew {
+            region: 0,
+            share: 0.8,
+            from: 0.0,
+            to: 1.0,
+        });
+        assert!(share(&skewed, 0) > 0.7);
+    }
+
+    #[test]
+    fn a_followup_belongs_to_the_region_of_what_produced_it() {
+        let trace: Vec<Request> = Workload::with_fanout(2, 4_000, 0.0, 0.2)
+            .with_regions(Some(RegionDemand {
+                count: 3,
+                shape: RegionShape::Even,
+            }))
+            .collect();
+        let mut by_task: HashMap<u64, u8> = HashMap::new();
+        for r in &trace {
+            if let Some(h) = &r.hint {
+                by_task.insert(h.task, r.region);
+            }
+        }
+        let followups: Vec<&Request> = trace.iter().filter(|r| r.completes.is_some()).collect();
+        assert!(followups.len() > 100);
+        for r in followups {
+            assert_eq!(by_task.get(&r.completes.unwrap_or(0)), Some(&r.region));
+        }
+    }
+
+    #[test]
+    fn a_session_stays_in_one_region() {
+        let trace: Vec<Request> = Workload::with_fanout(2, 6_000, 0.0, 0.0)
+            .with_regions(Some(RegionDemand {
+                count: 3,
+                shape: RegionShape::Even,
+            }))
+            .collect();
+        let mut seen: HashMap<u64, u8> = HashMap::new();
+        for r in trace
+            .iter()
+            .filter(|r| r.tokens > 0 && r.completes.is_none())
+        {
+            assert_eq!(*seen.entry(r.program).or_insert(r.region), r.region);
+        }
+        assert!(seen.len() > 50);
     }
 }
