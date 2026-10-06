@@ -1810,7 +1810,7 @@ run, and what was measured; the current numbers are in the ledger.
 | [8](phase-8.md) | the data path as an arm | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
 | [9](phase-9.md) | enforcement: a queue at the router, cancellation on the path, and two-tier admission (`--engine-wait`, `--queue`, `--admit`, `--cancel`, `--victim`, `--disconnect`, `--batch`, `--stream-buffer`) | done | a cancel by declared class takes the interactive first-token p99 to 63-66 ms, a restart is 26-183% later than a continuation, and the stalled-stream buffer is under 2 MB a node |
 | [10](phase-10.md) | durability: what each tier writes, and what a crash costs (`--count-writes`, `--track-flights`, `--observe`, `--node-check`, `--snapshot-estimators`, `--copy-durable`, `polyphonic durability`) | done | a restart costs its outage (112-143 request-seconds at 1 s, 32,000-39,000 at a 15 s lease) and the streams that die with it; the soft state it loses costs nothing a run can see; the record's largest writer is liveness; a router that waits 40 s for a lease pays about 65,000 request-seconds |
-| 11 | regions: a scheduler per region under global budgets | planned | |
+| [11](phase-11.md) | regions: a scheduler per region under global budgets | planned | |
 
 Built bits are off by default, and every result behind them is an A/B against the run without them.
 Phase numbers are stable once cited, so phases added later take new numbers and *Ordering* sets the
@@ -1959,6 +1959,8 @@ three), and that the sidecar's failover costs 300-900 request-seconds (it costs 
 replicas under `--fleet`, fan-outs parked on a lease, and active-active schedulers (Phase 11).
 
 ### Phase 11 -- Regions: a scheduler per region under global budgets
+
+Implementation plan: [`phase-11.md`](phase-11.md), which states its predictions before the run.
 
 §8's shape puts a routing tier in each region, admitting within a budget the global tier sets on
 the provisioning clock. Every region-distance result so far is one scheduler taking a global
