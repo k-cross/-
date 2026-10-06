@@ -46,7 +46,6 @@ pub mod colors {
 
     // --- CODE STYLING (Strictly Reds, Whites, Blacks & Greys) ---
     pub const CODE_BG: Color = Color::srgb(0.035, 0.035, 0.047);
-    pub const CODE_HEADER_BG: Color = Color::srgb(0.10, 0.10, 0.13);
     pub const CODE_KEYWORD: Color = Color::srgb(0.95, 0.12, 0.20); // Punchy P5 crimson
     pub const CODE_TYPE: Color = Color::srgb(1.0, 1.0, 1.0); // Pure stark white
     pub const CODE_FUNCTION: Color = Color::srgb(0.88, 0.88, 0.92); // Light silver
@@ -78,154 +77,16 @@ pub mod geometry {
     /// Subtle tilt for smaller tags (~ -1.5 degrees)
     pub const TILT_SUBTLE: f32 = -0.026;
 
-    /// Strong accent tilt (~ -6.0 degrees)
-    pub const TILT_STRONG: f32 = -0.105;
-
-    /// Descending tilt for P5 menu card staircases (~ -2.6 degrees)
-    pub const TILT_CARD: f32 = -0.045;
-
-    /// Horizontal indentation step for descending card staircase (px)
-    pub const CASCADE_STAIR_STEP: f32 = 28.0;
-
-    pub fn rot_card() -> Transform {
-        Transform::from_rotation(Quat::from_rotation_z(TILT_CARD))
+    pub fn rot_primary() -> UiTransform {
+        UiTransform::from_rotation(Rot2::radians(TILT_PRIMARY))
     }
 
-    pub fn rot_primary() -> Transform {
-        Transform::from_rotation(Quat::from_rotation_z(TILT_PRIMARY))
+    pub fn rot_counter() -> UiTransform {
+        UiTransform::from_rotation(Rot2::radians(TILT_COUNTER))
     }
 
-    pub fn rot_counter() -> Transform {
-        Transform::from_rotation(Quat::from_rotation_z(TILT_COUNTER))
-    }
-
-    pub fn rot_subtle() -> Transform {
-        Transform::from_rotation(Quat::from_rotation_z(TILT_SUBTLE))
-    }
-
-    pub fn rot_strong() -> Transform {
-        Transform::from_rotation(Quat::from_rotation_z(TILT_STRONG))
-    }
-}
-
-/// Per-letter magazine cutout / ransom-note typography construction constants.
-/// Each letter sits on an individually clipped scrap with conflicting sizes,
-/// contrasting backgrounds, asymmetric borders, and distinct tilt angles.
-#[allow(dead_code)]
-pub mod cutout {
-    use bevy::prelude::*;
-
-    // --- Font size range for cutout letter scraps ---
-    /// Minimum cutout letter font size (px)
-    pub const FONT_SIZE_MIN: f32 = 28.0;
-    /// Maximum cutout letter font size (px)
-    pub const FONT_SIZE_MAX: f32 = 52.0;
-
-    // --- Tilt angle range (radians) for letter scraps ---
-    /// Maximum counter-clockwise tilt for letter scraps (~-12.6°)
-    pub const TILT_MIN: f32 = -0.22;
-    /// Maximum clockwise tilt for letter scraps (~+8.0°)
-    pub const TILT_MAX: f32 = 0.14;
-
-    // --- Scrap padding ranges (px) ---
-    pub const PAD_H_MIN: f32 = 8.0;
-    pub const PAD_H_MAX: f32 = 13.0;
-    pub const PAD_V_MIN: f32 = 4.0;
-    pub const PAD_V_MAX: f32 = 6.0;
-
-    /// Standard inter-letter gap margin (px)
-    pub const SCRAP_MARGIN: f32 = 1.5;
-
-    // --- Torn masking tape word-gap scrap dimensions ---
-    /// Tape scrap width (px) — used between words
-    pub const TAPE_WIDTH: f32 = 20.0;
-    /// Tape scrap height (px)
-    pub const TAPE_HEIGHT: f32 = 12.0;
-    /// Smaller tape variant width (px)
-    pub const TAPE_WIDTH_SM: f32 = 18.0;
-    /// Smaller tape variant height (px)
-    pub const TAPE_HEIGHT_SM: f32 = 10.0;
-    /// Standard tape side margin (px)
-    pub const TAPE_MARGIN: f32 = 8.0;
-    /// Smaller tape variant side margin (px)
-    pub const TAPE_MARGIN_SM: f32 = 6.0;
-
-    // --- Border thickness presets ---
-    /// Thin hairline border (px)
-    pub const BORDER_THIN: f32 = 1.5;
-    /// Standard border (px)
-    pub const BORDER_STD: f32 = 2.0;
-    /// Medium-thick accent border (px)
-    pub const BORDER_THICK: f32 = 2.5;
-    /// Heavy punk accent border (px)
-    pub const BORDER_HEAVY: f32 = 5.0;
-
-    /// Asymmetric drop-shadow border: thin top-left, thick bottom-right.
-    /// Used on cutout scraps to create a stamped-on depth effect.
-    pub fn drop_shadow_br(thin: f32, thick: f32) -> UiRect {
-        UiRect {
-            left: Val::Px(thin),
-            top: Val::Px(thin),
-            right: Val::Px(thick),
-            bottom: Val::Px(thick),
-        }
-    }
-
-    /// Asymmetric drop-shadow border: thick left, thin elsewhere.
-    /// Used on sidebar accent tags and classification ribbons.
-    pub fn drop_shadow_bl(thick: f32, thin: f32) -> UiRect {
-        UiRect {
-            left: Val::Px(thick),
-            top: Val::Px(thin),
-            right: Val::Px(thin),
-            bottom: Val::Px(thin),
-        }
-    }
-
-    // --- Scrap shape presets using BorderRadius ---
-    /// Torn paper scrap with severed top-right corner
-    pub fn scrap_torn_tr() -> BorderRadius {
-        BorderRadius {
-            top_left: Val::Px(1.0),
-            top_right: Val::Px(14.0),
-            bottom_right: Val::Px(3.0),
-            bottom_left: Val::Px(1.0),
-        }
-    }
-
-    /// Rounded pill / zine badge scrap
-    pub fn scrap_rounded() -> BorderRadius {
-        BorderRadius::all(Val::Px(8.0))
-    }
-
-    /// Asymmetric diagonal clipped corner scrap
-    pub fn scrap_diagonal_cut() -> BorderRadius {
-        BorderRadius {
-            top_left: Val::Px(16.0),
-            top_right: Val::Px(1.0),
-            bottom_right: Val::Px(16.0),
-            bottom_left: Val::Px(1.0),
-        }
-    }
-
-    /// Opposite diagonal clipped scrap
-    pub fn scrap_diagonal_alt() -> BorderRadius {
-        BorderRadius {
-            top_left: Val::Px(1.0),
-            top_right: Val::Px(14.0),
-            bottom_right: Val::Px(1.0),
-            bottom_left: Val::Px(14.0),
-        }
-    }
-
-    /// Circular stamp / wax seal shaped scrap
-    pub fn scrap_circular() -> BorderRadius {
-        BorderRadius::MAX
-    }
-
-    /// Sharp sheared rectangular newspaper scrap
-    pub fn scrap_sharp() -> BorderRadius {
-        BorderRadius::ZERO
+    pub fn rot_subtle() -> UiTransform {
+        UiTransform::from_rotation(Rot2::radians(TILT_SUBTLE))
     }
 }
 
@@ -234,11 +95,6 @@ pub mod cutout {
 /// radiating satellite droplets.
 #[allow(dead_code)]
 pub mod ink {
-    // --- Named radius presets for ink blotches ---
-    /// Small ink spray accent (px)
-    pub const RADIUS_SM: f32 = 36.0;
-    /// Medium ink stain (px)
-    pub const RADIUS_MD: f32 = 55.0;
     /// Large ink pool (px)
     pub const RADIUS_LG: f32 = 85.0;
     /// Extra-large ink pool anchoring major title areas (px)
@@ -262,29 +118,6 @@ pub mod ink {
     pub const NUCLEUS_B_OFFSET: (f32, f32) = (0.15, -0.1);
     /// Nucleus C offset multipliers (relative to radius)
     pub const NUCLEUS_C_OFFSET: (f32, f32) = (-0.2, 0.15);
-
-    // --- Satellite droplet conventions ---
-    /// Total number of radiating satellite droplets per blotch
-    pub const DROPLET_COUNT: usize = 10;
-
-    /// Droplet size ratio for nearest satellite (relative to radius)
-    pub const DROPLET_RATIO_NEAR: f32 = 0.35;
-    /// Droplet size ratio for farthest satellite (relative to radius)
-    pub const DROPLET_RATIO_FAR: f32 = 0.12;
-
-    // --- Spray reach multipliers (distance from center, relative to radius) ---
-    /// Nearest forward spray distance multiplier
-    pub const SPRAY_NEAR: f32 = 1.2;
-    /// Farthest forward spray distance multiplier
-    pub const SPRAY_FAR: f32 = 2.9;
-    /// Backsplash near distance multiplier
-    pub const BACKSPLASH_NEAR: f32 = 0.9;
-    /// Backsplash far distance multiplier
-    pub const BACKSPLASH_FAR: f32 = 1.3;
-    /// Lateral spray near distance multiplier
-    pub const LATERAL_NEAR: f32 = 1.1;
-    /// Lateral spray far distance multiplier
-    pub const LATERAL_FAR: f32 = 2.0;
 
     /// Z-layer for satellite droplets (above nucleus)
     pub const DROPLET_Z: f32 = 0.3;
@@ -361,14 +194,6 @@ pub mod captivity {
     pub const FRACTURE_OFFSET_X: f32 = 12.0;
     /// Fracture line rotation (radians)
     pub const FRACTURE_ANGLE: f32 = 0.3;
-
-    // --- Razor accent line widths ---
-    /// Primary crimson slash accent width (px)
-    pub const RAZOR_ACCENT_WIDTH: f32 = 7.0;
-    /// Secondary crimson hairline width (px)
-    pub const RAZOR_HAIRLINE_WIDTH: f32 = 2.5;
-    /// Torn-edge tape line width (px)
-    pub const TORN_TAPE_WIDTH: f32 = 3.5;
 }
 
 /// Kinetic motion engine timing constants: slam entrances, punk jitter,
@@ -382,26 +207,6 @@ pub mod motion {
     pub const SLAM_INITIAL_SCALE: f32 = 0.4;
     /// ease_out_back overshoot coefficient (snappy spring bounce)
     pub const SLAM_OVERSHOOT: f32 = 1.70158;
-
-    // --- PunkJitter (erratic living micro-jitter & breathing) ---
-    /// Base oscillation frequency (Hz) — cranked up for aggressive punk energy
-    pub const JITTER_FREQUENCY: f32 = 12.0;
-    /// Interval between erratic sharp twitches (seconds) — fires twice as often
-    pub const JITTER_TWITCH_INTERVAL: f32 = 0.25;
-    /// Minimum twitch timer reset floor (seconds)
-    pub const JITTER_TWITCH_MIN: f32 = 0.15;
-    /// Random twitch timer range added to min (seconds) — total range 0.15–0.45s
-    pub const JITTER_TWITCH_RANGE: f32 = 0.3;
-    /// Twitch decay rate (per-second exponential falloff) — snappier snap-back
-    pub const JITTER_TWITCH_DECAY: f32 = 12.0;
-    /// Micro-pulse scale ceiling (1.0 + this value) — more visible breathing
-    pub const JITTER_PULSE_SCALE: f32 = 0.035;
-
-    // --- BobbingCursor (animated menu dagger/arrow) ---
-    /// Bobbing oscillation speed
-    pub const BOBBING_SPEED: f32 = 8.0;
-    /// Bobbing travel distance (px)
-    pub const BOBBING_DISTANCE: f32 = 5.0;
 
     // --- ScreenSlashBlade (razor diagonal screen wipe) ---
     /// Duration for the heavy black cut blade (seconds)
@@ -425,8 +230,6 @@ pub mod typography {
     // --- Heading sizes ---
     /// Extra-large slide title (px)
     pub const FONT_HEADING_XL: f32 = 36.0;
-    /// Large section header (px)
-    pub const FONT_HEADING_LG: f32 = 30.0;
 
     // --- Body sizes ---
     /// Primary body text / subtitle cards (px)

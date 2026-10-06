@@ -1,68 +1,16 @@
 use crate::slideshow::FontAssets;
 use crate::slideshow::SlideState;
-use crate::slideshow::animation::{BobbingCursor, PunkJitter, SlamEntrance};
+use crate::slideshow::animation::SlamEntrance;
 use crate::slideshow::splatter::{
     CardCorner, spawn_corner_ink_splatter, spawn_ink_blotch, spawn_ui_ink_blotch,
 };
+
 use crate::theme::colors::*;
-use crate::theme::cutout;
 use crate::theme::geometry::*;
 use crate::theme::starburst;
 use crate::theme::typography::*;
 use bevy::prelude::*;
 use bevy::state::state_scoped::DespawnOnExit;
-
-#[allow(dead_code)]
-pub struct CutoutLetter {
-    pub ch: &'static str,
-    pub font: Option<Handle<Font>>,
-    pub font_size: f32,
-    pub bg: Color,
-    pub fg: Color,
-    pub border: UiRect,
-    pub border_color: BorderColor,
-    pub border_radius: BorderRadius,
-    pub offset_y: f32,
-    pub tilt: f32,
-    pub pad_h: f32,
-    pub pad_v: f32,
-    pub slam_offset: Vec2,
-    pub slam_rot: f32,
-    pub delay: f32,
-}
-
-#[allow(dead_code)]
-pub fn spawn_cutout_letter(builder: &mut ChildSpawnerCommands, letter: CutoutLetter) {
-    let mut text_font = TextFont::from_font_size(letter.font_size);
-    if let Some(font) = letter.font {
-        text_font = text_font.with_font(font);
-    }
-    builder
-        .spawn((
-            Node {
-                padding: UiRect::axes(Val::Px(letter.pad_h), Val::Px(letter.pad_v)),
-                border: letter.border,
-                border_radius: letter.border_radius,
-                margin: UiRect {
-                    left: Val::Px(cutout::SCRAP_MARGIN),
-                    right: Val::Px(cutout::SCRAP_MARGIN),
-                    top: Val::Px(letter.offset_y.max(0.0)),
-                    bottom: Val::Px((-letter.offset_y).max(0.0)),
-                },
-                ..default()
-            },
-            BackgroundColor(letter.bg),
-            letter.border_color,
-            Transform::from_rotation(Quat::from_rotation_z(letter.tilt)),
-            Visibility::default(),
-            InheritedVisibility::default(),
-            SlamEntrance::new(letter.slam_offset, letter.slam_rot, letter.delay),
-            PunkJitter::new(letter.tilt, 0.055),
-        ))
-        .with_children(|scrap| {
-            scrap.spawn((Text::new(letter.ch), text_font, TextColor(letter.fg)));
-        });
-}
 
 pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     // Slide-scoped high-visibility crimson ink blotch in world space
@@ -108,9 +56,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
             align_items: AlignItems::Center,
             ..default()
         },
-        Transform::default(),
-        Visibility::default(),
-        InheritedVisibility::default(),
         DespawnOnExit(SlideState::Intro),
     )).with_children(|slide| {
         // ==============================================================
@@ -139,9 +84,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                 max_width: Val::Px(700.0),
                 ..default()
             },
-            Transform::default(),
-            Visibility::default(),
-            InheritedVisibility::default(),
         )).with_children(|col| {
             // ==============================================================
             // Top Row: JAGGED COMIC STARBURST "HOLD UP!" + Classification Tag
@@ -153,9 +95,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                     column_gap: Val::Px(12.0),
                     ..default()
                 },
-                Transform::default(),
-                Visibility::default(),
-                InheritedVisibility::default(),
             )).with_children(|top_action| {
                 // "HOLD UP!" Multi-Point Comic Action Starburst
                 top_action.spawn((
@@ -172,11 +111,8 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         right: P5_RED,
                         bottom: P5_RED,
                     },
-                    Transform::from_rotation(Quat::from_rotation_z(starburst::STARBURST_TILT)), // +5.7 deg
-                    Visibility::default(),
-                    InheritedVisibility::default(),
+                    UiTransform::from_rotation(Rot2::radians(starburst::STARBURST_TILT)),
                     SlamEntrance::new(Vec2::new(-250.0, 120.0), -0.3, 0.0),
-                    PunkJitter::new(starburst::STARBURST_TILT, 0.015),
                 )).with_children(|hold_up| {
                     // Jagged explosive comic spikes behind text
                     hold_up.spawn((
@@ -189,7 +125,7 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         },
                     ));
                     hold_up.spawn((
-                        Text::new("HOLD UP!"),
+                        Text::new("KENNY CROSS!"),
                         TextFont::from_font_size(FONT_BODY_ICON).with_font(font_assets.display.clone()),
                         TextColor(P5_BLACK),
                     ));
@@ -224,8 +160,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         bottom: P5_BORDER,
                     },
                     rot_subtle(),
-                    Visibility::default(),
-                    InheritedVisibility::default(),
                     SlamEntrance::new(Vec2::new(-200.0, 80.0), 0.2, 0.04),
                 )).with_children(|tag| {
                     tag.spawn((
@@ -247,9 +181,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                     margin: UiRect::axes(Val::Px(0.0), Val::Px(4.0)),
                     ..default()
                 },
-                Transform::default(),
-                Visibility::default(),
-                InheritedVisibility::default(),
             )).with_children(|title_box| {
                 // ----------------------------------------------------------
                 // BANNER 1: "ON THE R★AD" (Chunky 3D Comic Block with Prismatic Wedges)
@@ -277,11 +208,8 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         right: P5_RED,
                         bottom: P5_RED,
                     },
-                    Transform::from_rotation(Quat::from_rotation_z(-0.045)),
-                    Visibility::default(),
-                    InheritedVisibility::default(),
+                    UiTransform::from_rotation(Rot2::radians(-0.045)),
                     SlamEntrance::new(Vec2::new(-300.0, 150.0), -0.35, 0.0),
-                    PunkJitter::new(-0.045, 0.025),
                 )).with_children(|b1| {
                     // Left Prismatic Neon Cyan Wedge (Reference 1 ITEM wedge)
                     b1.spawn((
@@ -295,7 +223,7 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                             ..default()
                         },
                         BackgroundColor(P5_CYAN),
-                        Transform::from_rotation(Quat::from_rotation_z(0.2)),
+                        UiTransform::from_rotation(Rot2::radians(0.2)),
                     ));
 
                     // Stamped Corner Ink Splatter on the Title Banner!
@@ -365,7 +293,7 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                             ..default()
                         },
                         BackgroundColor(P5_MAGENTA),
-                        Transform::from_rotation(Quat::from_rotation_z(-0.25)),
+                        UiTransform::from_rotation(Rot2::radians(-0.25)),
                     ));
                 });
 
@@ -396,11 +324,8 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         right: P5_BLACK,
                         bottom: P5_BLACK,
                     },
-                    Transform::from_rotation(Quat::from_rotation_z(0.035)),
-                    Visibility::default(),
-                    InheritedVisibility::default(),
+                    UiTransform::from_rotation(Rot2::radians(0.035)),
                     SlamEntrance::new(Vec2::new(-240.0, 80.0), 0.25, 0.12),
-                    PunkJitter::new(0.035, 0.02),
                 )).with_children(|b2| {
                     // Stamped Corner Ink Splatter on Bottom-Right!
                     spawn_corner_ink_splatter(b2, CardCorner::BottomRight, P5_BLACK, 36.0);
@@ -483,9 +408,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                     margin: UiRect::axes(Val::Px(0.0), Val::Px(2.0)),
                     ..default()
                 },
-                Transform::default(),
-                Visibility::default(),
-                InheritedVisibility::default(),
                 SlamEntrance::new(Vec2::new(-150.0, 0.0), 0.1, 0.24),
             )).with_children(|divider| {
                 divider.spawn((
@@ -531,8 +453,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                     bottom: P5_BORDER,
                 },
                 rot_counter(),
-                Visibility::default(),
-                InheritedVisibility::default(),
                 SlamEntrance::new(Vec2::new(-160.0, -40.0), -0.2, 0.26),
             )).with_children(|sub| {
                 sub.spawn((
@@ -553,9 +473,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                     margin: UiRect::top(Val::Px(6.0)),
                     ..default()
                 },
-                Transform::default(),
-                Visibility::default(),
-                InheritedVisibility::default(),
                 SlamEntrance::new(Vec2::new(-140.0, -80.0), 0.15, 0.28),
             )).with_children(|menu| {
                 // Menu Cards: (indent, num, title, sub, bg, border_color, fg, corner, splat_col, active, is_climax)
@@ -596,10 +513,7 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         },
                         BackgroundColor(bg),
                         border_color,
-                        Transform::from_rotation(Quat::from_rotation_z(tilt)),
-                        Visibility::default(),
-                        InheritedVisibility::default(),
-                        PunkJitter::new(tilt, if active { 0.025 } else { 0.01 }),
+                        UiTransform::from_rotation(Rot2::radians(tilt)),
                     )).with_children(|card| {
                         // Stamped Corner Ink Splatter on every card (P5 Shop Style)!
                         spawn_corner_ink_splatter(card, corner, splat_color, if active || is_climax { 30.0 } else { 22.0 });
@@ -618,7 +532,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                                     Text::new("▶"),
                                     TextFont::from_font_size(14.0).with_font(font_assets.symbols.clone()),
                                     TextColor(P5_RED),
-                                    BobbingCursor::default(),
                                 ));
                             } else if is_climax {
                                 left.spawn((
@@ -684,11 +597,8 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                 right: P5_RED,
                 bottom: P5_RED,
             },
-            Transform::from_rotation(Quat::from_rotation_z(-0.065)), // -3.7 deg
-            Visibility::default(),
-            InheritedVisibility::default(),
+            UiTransform::from_rotation(Rot2::radians(-0.065)),
             SlamEntrance::new(Vec2::new(380.0, 100.0), 0.25, 0.16),
-            PunkJitter::new(-0.065, 0.012),
         )).with_children(|card| {
             // Calling Card Header Tape: Prison zebra motif & Confidentiality tag
             card.spawn((
@@ -708,9 +618,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                 },
                 BackgroundColor(P5_CHARCOAL),
                 BorderColor::all(P5_RED),
-                Transform::default(),
-                Visibility::default(),
-                InheritedVisibility::default(),
             )).with_children(|header| {
                 header.spawn((
                     Node {
@@ -719,9 +626,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         column_gap: Val::Px(6.0),
                         ..default()
                     },
-                    Transform::default(),
-                    Visibility::default(),
-                    InheritedVisibility::default(),
                 )).with_children(|h_left| {
                     h_left.spawn((
                         Text::new("★"),
@@ -749,9 +653,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                     row_gap: Val::Px(10.0),
                     ..default()
                 },
-                Transform::default(),
-                Visibility::default(),
-                InheritedVisibility::default(),
             )).with_children(|body| {
                 // Target: Captivity
                 body.spawn((
@@ -763,8 +664,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         ..default()
                     },
                     BorderColor::all(P5_BORDER),
-                    Visibility::default(),
-                    InheritedVisibility::default(),
                 )).with_children(|target| {
                     target.spawn((
                         Text::new("TO: SIR MUTEX OF THE KERNEL"),
@@ -797,8 +696,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         right: P5_BORDER,
                         bottom: P5_BORDER,
                     },
-                    Visibility::default(),
-                    InheritedVisibility::default(),
                 )).with_children(|letter| {
                     letter.spawn((
                         Text::new("A great sinner of thread captivity. You have locked CPU cores and forced execution into agonizing sleep states for far too long.\n\nTonight, we shall break the chains of blocking synchronization, conquer false sharing, and expose the road to true lock freedom."),
@@ -814,8 +711,6 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         justify_content: JustifyContent::FlexEnd,
                         ..default()
                     },
-                    Visibility::default(),
-                    InheritedVisibility::default(),
                 )).with_children(|sign| {
                     sign.spawn((
                         Text::new("— The Phantom Thieves of Locks"),
@@ -842,10 +737,7 @@ pub fn spawn_intro_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
                         right: P5_RED,
                         bottom: P5_RED,
                     },
-                    Transform::from_rotation(Quat::from_rotation_z(starburst::SEAL_TILT)), // +6.9 deg
-                    Visibility::default(),
-                    InheritedVisibility::default(),
-                    PunkJitter::new(starburst::SEAL_TILT, 0.02),
+                    UiTransform::from_rotation(Rot2::radians(starburst::SEAL_TILT)),
                 )).with_children(|stamp| {
                     stamp.spawn((
                         Text::new("★"),

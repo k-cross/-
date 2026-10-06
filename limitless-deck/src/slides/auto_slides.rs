@@ -1,6 +1,6 @@
 use crate::slideshow::FontAssets;
 use crate::slideshow::SlideState;
-use crate::slideshow::animation::{PunkJitter, SlamEntrance};
+use crate::slideshow::animation::SlamEntrance;
 use crate::slideshow::code_view::{TokenKind, spawn_styled_code_block};
 use crate::slideshow::diagrams::*;
 use crate::theme::colors::*;
@@ -63,7 +63,6 @@ pub fn spawn_callout_card(
             },
             BackgroundColor(P5_BLACK),
             border_color,
-            PunkJitter::new(0.0, 0.012),
         ))
         .with_children(|c| {
             c.spawn(Node {
@@ -118,9 +117,6 @@ pub fn spawn_slide_frame(
                 align_items: AlignItems::FlexStart,
                 ..default()
             },
-            Transform::default(),
-            Visibility::default(),
-            InheritedVisibility::default(),
             DespawnOnExit(state),
         ))
         .with_children(|slide| {
@@ -133,9 +129,6 @@ pub fn spawn_slide_frame(
                         row_gap: Val::Px(6.0),
                         ..default()
                     },
-                    Transform::default(),
-                    Visibility::default(),
-                    InheritedVisibility::default(),
                     SlamEntrance::new(Vec2::new(-240.0, 100.0), -0.2, 0.0),
                 ))
                 .with_children(|header| {
@@ -150,7 +143,6 @@ pub fn spawn_slide_frame(
                             BackgroundColor(P5_RED),
                             BorderColor::all(P5_WHITE),
                             rot_counter(),
-                            PunkJitter::new(-0.038, 0.015),
                         ))
                         .with_children(|tag_node| {
                             tag_node.spawn((
@@ -217,19 +209,14 @@ pub fn spawn_slide_scaffold(
 ) {
     spawn_slide_frame(commands, font_assets, state, tag, title, |slide, fonts| {
         slide
-            .spawn((
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::SpaceBetween,
-                    align_items: AlignItems::Center,
-                    column_gap: Val::Px(24.0),
-                    ..default()
-                },
-                Transform::default(),
-                Visibility::default(),
-                InheritedVisibility::default(),
-            ))
+            .spawn((Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::Center,
+                column_gap: Val::Px(24.0),
+                ..default()
+            },))
             .with_children(|row| {
                 // Left: Code or Terminal container wrapper (Scrollable!)
                 row.spawn((

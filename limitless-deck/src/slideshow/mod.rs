@@ -110,9 +110,8 @@ impl Plugin for SlideshowPlugin {
                     handle_slide_input,
                     update_ui_scale_on_fullscreen,
                     hud::update_hud.run_if(resource_changed::<SlideController>),
-                    hud::animate_hud,
-                    code_view::scroll_code_blocks,
-                    code_view::blink_alert_lines,
+                    code_view::scroll_code_blocks
+                        .run_if(any_with_component::<code_view::CodeBlockScroll>),
                 ),
             );
     }
@@ -123,7 +122,7 @@ fn handle_slide_input(
     keys: Res<ButtonInput<KeyCode>>,
     mut controller: ResMut<SlideController>,
     mut next_state: ResMut<NextState<SlideState>>,
-    mut windows: Query<&mut Window>,
+    mut windows: Query<&mut Window, With<bevy::window::PrimaryWindow>>,
     character_roots: Query<&mut character::PhantomThiefRoot>,
 ) {
     let mut changed = false;
@@ -175,7 +174,10 @@ fn handle_slide_input(
 /// text and boxes appear proportionally larger on higher-resolution displays.
 /// The design resolution is 1280×720; in fullscreen the UI scales up to
 /// maintain visual prominence across the larger viewport.
-fn update_ui_scale_on_fullscreen(windows: Query<&Window>, mut ui_scale: ResMut<UiScale>) {
+fn update_ui_scale_on_fullscreen(
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    mut ui_scale: ResMut<UiScale>,
+) {
     const BASE_WIDTH: f32 = 1280.0;
     const BASE_HEIGHT: f32 = 720.0;
 

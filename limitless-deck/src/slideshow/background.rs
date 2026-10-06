@@ -123,8 +123,6 @@ fn setup_background(mut commands: Commands) {
                     rot_speed,
                     bounds: Vec2::new(750.0, 420.0),
                 },
-                Visibility::default(),
-                InheritedVisibility::default(),
             ))
             .with_children(|chain| {
                 // Cutout hole

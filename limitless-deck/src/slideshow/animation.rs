@@ -14,9 +14,9 @@ pub fn ease_out_back(t: f32) -> f32 {
 pub struct SlamEntrance {
     pub initial_offset: Vec2,
     pub initial_rot_offset: f32,
-    pub target_translation: Vec3,
-    pub target_rotation: Quat,
-    pub target_scale: Vec3,
+    pub target_translation: Vec2,
+    pub target_rotation: f32,
+    pub target_scale: Vec2,
     pub delay: f32,
     pub duration: f32,
     pub elapsed: f32,
@@ -28,53 +28,13 @@ impl SlamEntrance {
         Self {
             initial_offset: offset,
             initial_rot_offset: rot_offset,
-            target_translation: Vec3::ZERO,
-            target_rotation: Quat::IDENTITY,
-            target_scale: Vec3::ONE,
+            target_translation: Vec2::ZERO,
+            target_rotation: 0.0,
+            target_scale: Vec2::ONE,
             delay,
-            duration: SLAM_DURATION, // ~17 frames at 60fps - ultra snappy!
+            duration: SLAM_DURATION,
             elapsed: 0.0,
             initialized: false,
-        }
-    }
-}
-
-/// Component providing erratic living micro-jitter and breathing for punk aesthetics
-#[derive(Component)]
-pub struct PunkJitter {
-    pub base_rotation: f32,
-    pub amplitude: f32,
-    pub frequency: f32,
-    pub phase: f32,
-    pub twitch_timer: f32,
-    pub current_twitch: f32,
-}
-
-impl PunkJitter {
-    pub fn new(base_rotation: f32, amplitude: f32) -> Self {
-        Self {
-            base_rotation,
-            amplitude,
-            frequency: JITTER_FREQUENCY,
-            phase: 0.0,
-            twitch_timer: JITTER_TWITCH_INTERVAL,
-            current_twitch: 0.0,
-        }
-    }
-}
-
-/// Component for animated bobbing selection cursor (dagger/arrow)
-#[derive(Component)]
-pub struct BobbingCursor {
-    pub speed: f32,
-    pub distance: f32,
-}
-
-impl Default for BobbingCursor {
-    fn default() -> Self {
-        Self {
-            speed: BOBBING_SPEED,
-            distance: BOBBING_DISTANCE,
         }
     }
 }
@@ -96,8 +56,6 @@ impl Plugin for AnimationPlugin {
             Update,
             (
                 animate_slam_entrances.run_if(any_with_component::<SlamEntrance>),
-                animate_punk_jitter,
-                animate_bobbing_cursors,
                 animate_screen_slashes.run_if(any_with_component::<ScreenSlashBlade>),
             ),
         );
@@ -107,21 +65,48 @@ impl Plugin for AnimationPlugin {
 fn animate_slam_entrances(
     mut commands: Commands,
     time: Res<Time>,
-    mut query: Query<(Entity, &mut Transform, &mut SlamEntrance)>,
+    mut query: Query<(
+        Entity,
+        Option<&mut UiTransform>,
+        Option<&mut Transform>,
+        &mut SlamEntrance,
+    )>,
 ) {
     let dt = time.delta_secs();
 
-    for (entity, mut transform, mut slam) in &mut query {
+    for (entity, mut ui_transform, mut sprite_transform, mut slam) in &mut query {
         if !slam.initialized {
-            slam.target_translation = transform.translation;
-            slam.target_rotation = transform.rotation;
-            slam.target_scale = transform.scale;
+            if let Some(ref ui) = ui_transform {
+                let tx = match ui.translation.x {
+                    Val::Px(v) => v,
+                    _ => 0.0,
+                };
+                let ty = match ui.translation.y {
+                    Val::Px(v) => v,
+                    _ => 0.0,
+                };
+                slam.target_translation = Vec2::new(tx, ty);
+                slam.target_rotation = ui.rotation.as_radians();
+                slam.target_scale = ui.scale;
+            } else if let Some(ref tr) = sprite_transform {
+                slam.target_translation = tr.translation.truncate();
+                slam.target_rotation = tr.rotation.to_euler(EulerRot::ZYX).0;
+                slam.target_scale = tr.scale.truncate();
+            }
 
-            // Start far off along the violent slam trajectory
-            transform.translation += Vec3::new(slam.initial_offset.x, slam.initial_offset.y, 0.0);
-            transform.rotation =
-                slam.target_rotation * Quat::from_rotation_z(slam.initial_rot_offset);
-            transform.scale = slam.target_scale * SLAM_INITIAL_SCALE; // burst up from compact scale
+            if let Some(ref mut ui) = ui_transform {
+                ui.translation = Val2::px(
+                    slam.target_translation.x + slam.initial_offset.x,
+                    slam.target_translation.y + slam.initial_offset.y,
+                );
+                ui.rotation = Rot2::radians(slam.target_rotation + slam.initial_rot_offset);
+                ui.scale = slam.target_scale * SLAM_INITIAL_SCALE;
+            } else if let Some(ref mut tr) = sprite_transform {
+                tr.translation.x += slam.initial_offset.x;
+                tr.translation.y += slam.initial_offset.y;
+                tr.rotation = Quat::from_rotation_z(slam.target_rotation + slam.initial_rot_offset);
+                tr.scale = (slam.target_scale * SLAM_INITIAL_SCALE).extend(1.0);
+            }
 
             slam.initialized = true;
         }
@@ -129,73 +114,44 @@ fn animate_slam_entrances(
         slam.elapsed += dt;
 
         if slam.elapsed < slam.delay {
-            // Still waiting for staggered entrance
             continue;
         }
 
         let progress = ((slam.elapsed - slam.delay) / slam.duration).clamp(0.0, 1.0);
         let factor = ease_out_back(progress);
 
-        // Interpolate position with spring bounce
         let remaining_offset = slam.initial_offset * (1.0 - factor);
-        transform.translation =
-            slam.target_translation + Vec3::new(remaining_offset.x, remaining_offset.y, 0.0);
-
-        // Interpolate rotation
         let remaining_rot = slam.initial_rot_offset * (1.0 - factor);
-        transform.rotation = slam.target_rotation * Quat::from_rotation_z(remaining_rot);
-
-        // Interpolate scale
         let current_scale = SLAM_INITIAL_SCALE + (1.0 - SLAM_INITIAL_SCALE) * factor;
-        transform.scale = slam.target_scale * current_scale;
 
-        if progress >= 1.0 {
-            // Snap cleanly to target transform and remove slam component
-            transform.translation = slam.target_translation;
-            transform.rotation = slam.target_rotation;
-            transform.scale = slam.target_scale;
-            commands.entity(entity).remove::<SlamEntrance>();
+        if let Some(ref mut ui) = ui_transform {
+            ui.translation = Val2::px(
+                slam.target_translation.x + remaining_offset.x,
+                slam.target_translation.y + remaining_offset.y,
+            );
+            ui.rotation = Rot2::radians(slam.target_rotation + remaining_rot);
+            ui.scale = slam.target_scale * current_scale;
+
+            if progress >= 1.0 {
+                ui.translation = Val2::px(slam.target_translation.x, slam.target_translation.y);
+                ui.rotation = Rot2::radians(slam.target_rotation);
+                ui.scale = slam.target_scale;
+                commands.entity(entity).remove::<SlamEntrance>();
+            }
+        } else if let Some(ref mut tr) = sprite_transform {
+            tr.translation.x = slam.target_translation.x + remaining_offset.x;
+            tr.translation.y = slam.target_translation.y + remaining_offset.y;
+            tr.rotation = Quat::from_rotation_z(slam.target_rotation + remaining_rot);
+            tr.scale = (slam.target_scale * current_scale).extend(1.0);
+
+            if progress >= 1.0 {
+                tr.translation.x = slam.target_translation.x;
+                tr.translation.y = slam.target_translation.y;
+                tr.rotation = Quat::from_rotation_z(slam.target_rotation);
+                tr.scale = slam.target_scale.extend(1.0);
+                commands.entity(entity).remove::<SlamEntrance>();
+            }
         }
-    }
-}
-
-fn animate_punk_jitter(
-    time: Res<Time>,
-    mut query: Query<(&mut Transform, &mut PunkJitter), Without<SlamEntrance>>,
-) {
-    let dt = time.delta_secs();
-
-    for (mut transform, mut jitter) in &mut query {
-        jitter.phase += dt * jitter.frequency;
-        jitter.twitch_timer -= dt;
-
-        // Rapid-fire erratic twitch every 0.15 - 0.45s
-        if jitter.twitch_timer <= 0.0 {
-            jitter.twitch_timer =
-                JITTER_TWITCH_MIN + (jitter.phase.sin().abs() * JITTER_TWITCH_RANGE);
-            // Aggressive punk twitch
-            jitter.current_twitch = (jitter.phase * std::f32::consts::PI).sin() * 0.045;
-        } else {
-            // Decay twitch back towards zero
-            jitter.current_twitch *= (1.0 - dt * JITTER_TWITCH_DECAY).max(0.0);
-        }
-
-        let organic_sine = (jitter.phase).sin() * jitter.amplitude;
-        let total_rot = jitter.base_rotation + organic_sine + jitter.current_twitch;
-        transform.rotation = Quat::from_rotation_z(total_rot);
-
-        // Micro-pulse scale (1.0 to 1.015)
-        let pulse = 1.0 + (jitter.phase * 1.5).sin().abs() * JITTER_PULSE_SCALE;
-        transform.scale = Vec3::splat(pulse);
-    }
-}
-
-fn animate_bobbing_cursors(time: Res<Time>, mut query: Query<(&mut Node, &BobbingCursor)>) {
-    let elapsed = time.elapsed_secs();
-
-    for (mut node, cursor) in &mut query {
-        let offset = ((elapsed * cursor.speed).sin().abs()) * cursor.distance;
-        node.margin.left = Val::Px(offset);
     }
 }
 

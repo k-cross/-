@@ -29,21 +29,6 @@ pub struct FontAssets {
     pub math: Handle<Font>,
 }
 
-impl FontAssets {
-    /// Selects a font family from the cutout rotation palette based on character index.
-    /// Provides authentic magazine-cutout / ransom-note typography variety.
-    #[allow(dead_code)]
-    pub fn cutout_font(&self, index: usize) -> Handle<Font> {
-        match index % 5 {
-            0 => self.display.clone(),
-            1 => self.sans_heavy.clone(),
-            2 => self.serif.clone(),
-            3 => self.monospace.clone(),
-            _ => self.sans.clone(),
-        }
-    }
-}
-
 impl FromWorld for FontAssets {
     fn from_world(world: &mut World) -> Self {
         let mut fonts = world.resource_mut::<Assets<Font>>();

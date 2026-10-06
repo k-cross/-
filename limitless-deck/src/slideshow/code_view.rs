@@ -8,23 +8,6 @@ use bevy::ui::ScrollPosition;
 #[derive(Component)]
 pub struct CodeBlockScroll;
 
-#[derive(Component)]
-pub struct BlinkingLine;
-
-const BLINK_HZ: f32 = 1.5;
-const BLINK_PEAK_ALPHA: f32 = 0.75;
-
-pub fn blink_alert_lines(
-    time: Res<Time>,
-    mut lines: Query<&mut BackgroundColor, With<BlinkingLine>>,
-) {
-    let wave = (time.elapsed_secs() * BLINK_HZ * std::f32::consts::TAU).sin();
-    let intensity = ((wave * 3.0).clamp(-1.0, 1.0) * 0.5 + 0.5) * BLINK_PEAK_ALPHA;
-    for mut background in &mut lines {
-        background.0 = P5_RED.with_alpha(intensity);
-    }
-}
-
 pub fn scroll_code_blocks(
     mouse_scroll: Res<AccumulatedMouseScroll>,
     keyboard: Res<ButtonInput<KeyCode>>,
@@ -39,7 +22,7 @@ pub fn scroll_code_blocks(
     }
     if delta_y != 0.0 {
         for mut pos in &mut query {
-            pos.y = (pos.y + delta_y).max(0.0);
+            pos.y = (pos.y + delta_y).clamp(0.0, 1500.0);
         }
     }
 }
@@ -190,7 +173,7 @@ pub fn spawn_styled_code_block(
                         ..default()
                     },));
                     if is_alert {
-                        row_entity.insert((BackgroundColor(P5_RED.with_alpha(0.0)), BlinkingLine));
+                        row_entity.insert(BackgroundColor(P5_RED.with_alpha(0.20)));
                     }
                     row_entity.with_children(|row| {
                         // Line number gutter with subtle pointer

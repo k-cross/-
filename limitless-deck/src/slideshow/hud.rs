@@ -11,11 +11,6 @@ pub struct SlideCounterText;
 #[derive(Component)]
 pub struct ProgressBarFill;
 
-#[derive(Component)]
-pub struct RotatingStar {
-    pub speed: f32,
-}
-
 pub fn setup_hud(
     mut commands: Commands,
     controller: Res<SlideController>,
@@ -23,262 +18,241 @@ pub fn setup_hud(
 ) {
     // Root HUD node (non-blocking, full-screen overlay)
     commands
-        .spawn((
-            Node {
-                position_type: PositionType::Absolute,
-                width: Val::Percent(100.0),
-                height: Val::Percent(100.0),
-                flex_direction: FlexDirection::Column,
-                justify_content: JustifyContent::SpaceBetween,
-                padding: UiRect::axes(Val::Px(28.0), Val::Px(20.0)),
-                ..default()
-            },
-            Transform::default(),
-            Visibility::default(),
-            InheritedVisibility::default(),
-        ))
+        .spawn((Node {
+            position_type: PositionType::Absolute,
+            width: Val::Percent(100.0),
+            height: Val::Percent(100.0),
+            flex_direction: FlexDirection::Column,
+            justify_content: JustifyContent::SpaceBetween,
+            padding: UiRect::axes(Val::Px(28.0), Val::Px(20.0)),
+            ..default()
+        },))
         .with_children(|root| {
             // ==============================================================
             // TOP BAR: Persona 5 Calendar & High-Security Alert Widgets
             // ==============================================================
-            root.spawn((
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Row,
-                    justify_content: JustifyContent::FlexEnd,
-                    align_items: AlignItems::FlexStart,
-                    ..default()
-                },
-                Transform::default(),
-                Visibility::default(),
-                InheritedVisibility::default(),
-            ))
-            .with_children(|top_bar| {
-                // Top Right: Persona 5 Target Intel Badge
-                top_bar
-                    .spawn((
-                        Node {
-                            padding: UiRect::axes(Val::Px(16.0), Val::Px(8.0)),
-                            flex_direction: FlexDirection::Column,
-                            align_items: AlignItems::FlexEnd,
-                            row_gap: Val::Px(4.0),
-                            border: UiRect {
-                                left: Val::Px(2.0),
-                                top: Val::Px(2.0),
-                                right: Val::Px(4.5),
-                                bottom: Val::Px(2.0),
+            root.spawn((Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::FlexEnd,
+                align_items: AlignItems::FlexStart,
+                ..default()
+            },))
+                .with_children(|top_bar| {
+                    // Top Right: Persona 5 Target Intel Badge
+                    top_bar
+                        .spawn((
+                            Node {
+                                padding: UiRect::axes(Val::Px(16.0), Val::Px(8.0)),
+                                flex_direction: FlexDirection::Column,
+                                align_items: AlignItems::FlexEnd,
+                                row_gap: Val::Px(4.0),
+                                border: UiRect {
+                                    left: Val::Px(2.0),
+                                    top: Val::Px(2.0),
+                                    right: Val::Px(4.5),
+                                    bottom: Val::Px(2.0),
+                                },
+                                ..default()
                             },
-                            ..default()
-                        },
-                        BackgroundColor(P5_BLACK),
-                        BorderColor {
-                            left: P5_WHITE,
-                            top: P5_WHITE,
-                            right: P5_RED,
-                            bottom: P5_WHITE,
-                        },
-                        rot_counter(),
-                    ))
-                    .with_children(|status| {
-                        status.spawn((
-                            Text::new("TARGET: CORRUPT LORD OF MUTEXES"),
-                            TextFont::from_font_size(FONT_CAPTION_LG)
-                                .with_font(font_assets.display.clone()),
-                            TextColor(P5_WHITE),
-                        ));
-                        status.spawn((
-                            Text::new("CHAINS OF SERIALIZATION: BREAKING"),
-                            TextFont::from_font_size(FONT_LABEL_SM)
-                                .with_font(font_assets.sans.clone()),
-                            TextColor(P5_LIGHT_GREY),
-                        ));
-                    });
-            });
+                            BackgroundColor(P5_BLACK),
+                            BorderColor {
+                                left: P5_WHITE,
+                                top: P5_WHITE,
+                                right: P5_RED,
+                                bottom: P5_WHITE,
+                            },
+                            rot_counter(),
+                        ))
+                        .with_children(|status| {
+                            status.spawn((
+                                Text::new("TARGET: CORRUPT LORD OF MUTEXES"),
+                                TextFont::from_font_size(FONT_CAPTION_LG)
+                                    .with_font(font_assets.display.clone()),
+                                TextColor(P5_WHITE),
+                            ));
+                            status.spawn((
+                                Text::new("CHAINS OF SERIALIZATION: BREAKING"),
+                                TextFont::from_font_size(FONT_LABEL_SM)
+                                    .with_font(font_assets.sans.clone()),
+                                TextColor(P5_LIGHT_GREY),
+                            ));
+                        });
+                });
 
             // ==============================================================
             // BOTTOM BAR: Slide Progress & "TAKE YOUR TIME" Action Strip
             // ==============================================================
-            root.spawn((
-                Node {
-                    width: Val::Percent(100.0),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(8.0),
-                    ..default()
-                },
-                Transform::default(),
-                Visibility::default(),
-                InheritedVisibility::default(),
-            ))
-            .with_children(|bottom_container| {
-                // Control banner & Slide counter
-                bottom_container
-                    .spawn((
-                        Node {
+            root.spawn((Node {
+                width: Val::Percent(100.0),
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(8.0),
+                ..default()
+            },))
+                .with_children(|bottom_container| {
+                    // Control banner & Slide counter
+                    bottom_container
+                        .spawn((Node {
                             width: Val::Percent(100.0),
                             flex_direction: FlexDirection::Row,
                             justify_content: JustifyContent::SpaceBetween,
                             align_items: AlignItems::Center,
                             ..default()
-                        },
-                        Transform::default(),
-                        Visibility::default(),
-                        InheritedVisibility::default(),
-                    ))
-                    .with_children(|banner| {
-                        // Left: Slide Counter Cutout Badge
-                        banner
-                            .spawn((
-                                Node {
-                                    padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)),
-                                    flex_direction: FlexDirection::Row,
-                                    align_items: AlignItems::Center,
-                                    column_gap: Val::Px(8.0),
-                                    border: UiRect {
-                                        left: Val::Px(4.5),
-                                        top: Val::Px(2.0),
-                                        right: Val::Px(2.0),
-                                        bottom: Val::Px(2.0),
+                        },))
+                        .with_children(|banner| {
+                            // Left: Slide Counter Cutout Badge
+                            banner
+                                .spawn((
+                                    Node {
+                                        padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)),
+                                        flex_direction: FlexDirection::Row,
+                                        align_items: AlignItems::Center,
+                                        column_gap: Val::Px(8.0),
+                                        border: UiRect {
+                                            left: Val::Px(4.5),
+                                            top: Val::Px(2.0),
+                                            right: Val::Px(2.0),
+                                            bottom: Val::Px(2.0),
+                                        },
+                                        ..default()
                                     },
-                                    ..default()
-                                },
-                                BackgroundColor(P5_BLACK),
-                                BorderColor {
-                                    left: P5_RED,
-                                    top: P5_WHITE,
-                                    right: P5_WHITE,
-                                    bottom: P5_WHITE,
-                                },
-                                rot_primary(),
-                            ))
-                            .with_children(|badge| {
-                                badge.spawn((
-                                    Text::new("///"),
-                                    TextFont::from_font_size(FONT_HUD_STAR)
-                                        .with_font(font_assets.display.clone()),
-                                    TextColor(P5_RED),
-                                ));
-                                badge.spawn((
-                                    Text::new(format!(
-                                        "SLIDE {:02} / {:02}",
-                                        controller.current_index + 1,
-                                        controller.total_slides
-                                    )),
-                                    TextFont::from_font_size(FONT_HUD_COUNTER)
-                                        .with_font(font_assets.display.clone()),
-                                    TextColor(P5_WHITE),
-                                    SlideCounterText,
-                                ));
-                            });
-
-                        // Center / Right: Persona 5 "TAKE YOUR TIME" & Combat Key Prompts
-                        banner
-                            .spawn((
-                                Node {
-                                    padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)),
-                                    flex_direction: FlexDirection::Row,
-                                    align_items: AlignItems::Center,
-                                    column_gap: Val::Px(12.0),
-                                    border: UiRect {
-                                        left: Val::Px(2.0),
-                                        top: Val::Px(2.0),
-                                        right: Val::Px(4.5),
-                                        bottom: Val::Px(2.0),
+                                    BackgroundColor(P5_BLACK),
+                                    BorderColor {
+                                        left: P5_RED,
+                                        top: P5_WHITE,
+                                        right: P5_WHITE,
+                                        bottom: P5_WHITE,
                                     },
-                                    ..default()
-                                },
-                                BackgroundColor(P5_BLACK),
-                                BorderColor {
-                                    left: P5_WHITE,
-                                    top: P5_WHITE,
-                                    right: P5_RED,
-                                    bottom: P5_WHITE,
-                                },
-                                rot_counter(),
-                            ))
-                            .with_children(|prompt| {
-                                // Animated Persona 5 "Take Your Time" rotating star
-                                prompt.spawn((
-                                    Text::new("★"),
-                                    TextFont::from_font_size(FONT_HUD_STAR)
-                                        .with_font(font_assets.symbols.clone()),
-                                    TextColor(P5_RED),
-                                    RotatingStar { speed: 2.5 },
-                                ));
-                                prompt.spawn((
-                                    Text::new("TAKE YOUR TIME"),
-                                    TextFont::from_font_size(FONT_HUD_LABEL)
-                                        .with_font(font_assets.display.clone()),
-                                    TextColor(P5_LIGHT_GREY),
-                                ));
-                                prompt.spawn((
-                                    Text::new("|"),
-                                    TextFont::from_font_size(FONT_HUD_LABEL)
-                                        .with_font(font_assets.sans.clone()),
-                                    TextColor(P5_BORDER),
-                                ));
-                                prompt.spawn((
-                                    Text::new("[SPACE / →] EXECUTE ATTACK"),
-                                    TextFont::from_font_size(FONT_HUD_PROMPT)
-                                        .with_font(font_assets.sans_heavy.clone()),
-                                    TextColor(P5_WHITE),
-                                ));
-                                prompt.spawn((
-                                    Text::new("★"),
-                                    TextFont::from_font_size(FONT_HUD_LABEL)
-                                        .with_font(font_assets.symbols.clone()),
-                                    TextColor(P5_RED),
-                                ));
-                                prompt.spawn((
-                                    Text::new("[←] BATON PASS"),
-                                    TextFont::from_font_size(FONT_HUD_PROMPT)
-                                        .with_font(font_assets.sans_heavy.clone()),
-                                    TextColor(P5_WHITE),
-                                ));
-                                prompt.spawn((
-                                    Text::new("★"),
-                                    TextFont::from_font_size(FONT_HUD_LABEL)
-                                        .with_font(font_assets.symbols.clone()),
-                                    TextColor(P5_RED),
-                                ));
-                                prompt.spawn((
-                                    Text::new("[F] ALL-OUT ATTACK (FULLSCREEN)"),
-                                    TextFont::from_font_size(FONT_HUD_PROMPT)
-                                        .with_font(font_assets.sans_heavy.clone()),
-                                    TextColor(P5_WHITE),
-                                ));
-                            });
-                    });
+                                    rot_primary(),
+                                ))
+                                .with_children(|badge| {
+                                    badge.spawn((
+                                        Text::new("///"),
+                                        TextFont::from_font_size(FONT_HUD_STAR)
+                                            .with_font(font_assets.display.clone()),
+                                        TextColor(P5_RED),
+                                    ));
+                                    badge.spawn((
+                                        Text::new(format!(
+                                            "SLIDE {:02} / {:02}",
+                                            controller.current_index + 1,
+                                            controller.total_slides
+                                        )),
+                                        TextFont::from_font_size(FONT_HUD_COUNTER)
+                                            .with_font(font_assets.display.clone()),
+                                        TextColor(P5_WHITE),
+                                        SlideCounterText,
+                                    ));
+                                });
 
-                // Sleek Progress Track with Crimson Fill & White Border
-                bottom_container
-                    .spawn((
-                        Node {
-                            width: Val::Percent(100.0),
-                            height: Val::Px(4.0),
-                            border: UiRect::all(Val::Px(1.0)),
-                            ..default()
-                        },
-                        BackgroundColor(P5_BLACK),
-                        BorderColor::all(P5_BORDER),
-                    ))
-                    .with_children(|track| {
-                        let progress_pct = if controller.total_slides > 0 {
-                            ((controller.current_index + 1) as f32 / controller.total_slides as f32)
-                                * 100.0
-                        } else {
-                            100.0
-                        };
-                        track.spawn((
+                            // Center / Right: Persona 5 "TAKE YOUR TIME" & Combat Key Prompts
+                            banner
+                                .spawn((
+                                    Node {
+                                        padding: UiRect::axes(Val::Px(16.0), Val::Px(6.0)),
+                                        flex_direction: FlexDirection::Row,
+                                        align_items: AlignItems::Center,
+                                        column_gap: Val::Px(12.0),
+                                        border: UiRect {
+                                            left: Val::Px(2.0),
+                                            top: Val::Px(2.0),
+                                            right: Val::Px(4.5),
+                                            bottom: Val::Px(2.0),
+                                        },
+                                        ..default()
+                                    },
+                                    BackgroundColor(P5_BLACK),
+                                    BorderColor {
+                                        left: P5_WHITE,
+                                        top: P5_WHITE,
+                                        right: P5_RED,
+                                        bottom: P5_WHITE,
+                                    },
+                                    rot_counter(),
+                                ))
+                                .with_children(|prompt| {
+                                    prompt.spawn((
+                                        Text::new("★"),
+                                        TextFont::from_font_size(FONT_HUD_STAR)
+                                            .with_font(font_assets.symbols.clone()),
+                                        TextColor(P5_RED),
+                                    ));
+                                    prompt.spawn((
+                                        Text::new("TAKE YOUR TIME"),
+                                        TextFont::from_font_size(FONT_HUD_LABEL)
+                                            .with_font(font_assets.display.clone()),
+                                        TextColor(P5_LIGHT_GREY),
+                                    ));
+                                    prompt.spawn((
+                                        Text::new("|"),
+                                        TextFont::from_font_size(FONT_HUD_LABEL)
+                                            .with_font(font_assets.sans.clone()),
+                                        TextColor(P5_BORDER),
+                                    ));
+                                    prompt.spawn((
+                                        Text::new("[SPACE / →] EXECUTE ATTACK"),
+                                        TextFont::from_font_size(FONT_HUD_PROMPT)
+                                            .with_font(font_assets.sans_heavy.clone()),
+                                        TextColor(P5_WHITE),
+                                    ));
+                                    prompt.spawn((
+                                        Text::new("★"),
+                                        TextFont::from_font_size(FONT_HUD_LABEL)
+                                            .with_font(font_assets.symbols.clone()),
+                                        TextColor(P5_RED),
+                                    ));
+                                    prompt.spawn((
+                                        Text::new("[←] BATON PASS"),
+                                        TextFont::from_font_size(FONT_HUD_PROMPT)
+                                            .with_font(font_assets.sans_heavy.clone()),
+                                        TextColor(P5_WHITE),
+                                    ));
+                                    prompt.spawn((
+                                        Text::new("★"),
+                                        TextFont::from_font_size(FONT_HUD_LABEL)
+                                            .with_font(font_assets.symbols.clone()),
+                                        TextColor(P5_RED),
+                                    ));
+                                    prompt.spawn((
+                                        Text::new("[F] ALL-OUT ATTACK (FULLSCREEN)"),
+                                        TextFont::from_font_size(FONT_HUD_PROMPT)
+                                            .with_font(font_assets.sans_heavy.clone()),
+                                        TextColor(P5_WHITE),
+                                    ));
+                                });
+                        });
+
+                    // Sleek Progress Track with Crimson Fill & White Border
+                    bottom_container
+                        .spawn((
                             Node {
-                                width: Val::Percent(progress_pct),
-                                height: Val::Percent(100.0),
+                                width: Val::Percent(100.0),
+                                height: Val::Px(4.0),
+                                border: UiRect::all(Val::Px(1.0)),
                                 ..default()
                             },
-                            BackgroundColor(P5_RED),
-                            ProgressBarFill,
-                        ));
-                    });
-            });
+                            BackgroundColor(P5_BLACK),
+                            BorderColor::all(P5_BORDER),
+                        ))
+                        .with_children(|track| {
+                            let progress_pct = if controller.total_slides > 0 {
+                                ((controller.current_index + 1) as f32
+                                    / controller.total_slides as f32)
+                                    * 100.0
+                            } else {
+                                100.0
+                            };
+                            track.spawn((
+                                Node {
+                                    width: Val::Percent(progress_pct),
+                                    height: Val::Percent(100.0),
+                                    ..default()
+                                },
+                                BackgroundColor(P5_RED),
+                                ProgressBarFill,
+                            ));
+                        });
+                });
         });
 }
 
@@ -301,13 +275,5 @@ pub fn update_hud(
             100.0
         };
         node.width = Val::Percent(progress_pct);
-    }
-}
-
-pub fn animate_hud(time: Res<Time>, mut star_query: Query<(&mut Transform, &RotatingStar)>) {
-    let dt = time.delta_secs();
-
-    for (mut transform, star) in &mut star_query {
-        transform.rotate_z(star.speed * dt);
     }
 }
