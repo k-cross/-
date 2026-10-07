@@ -542,7 +542,7 @@ crossing, and a ring between real processes would pay mapping and a second sched
 top of this. And `ext_proc`'s row is its fit **extrapolated down** to 64 B from a 367 B floor,
 for the reason given above.
 
-`ext_proc` at 4 nodes (142 µs) already exceeds a warm FaaS invocation's modelled ~129 µs. At a
+`ext_proc` at 4 nodes (142 µs) already exceeds a warm FaaS invocation's modelled ~120 µs. At a
 fleet of 32 or 128, `ext_proc` and gRPC unary both push the scheduler's decision rate below a
 plausible cluster request rate; `Native` and `Wasm` do not. So the zero-cost-extension claim is
 *conditional* on the boundary, and the condition is sharp: an out-of-process hook belongs where
@@ -718,9 +718,9 @@ Two rules the score needs to be a decision rather than a suggestion:
 
 ## Results
 
-All numbers below are split memory unless marked unified, and run with the ledger allocating KV
-unless marked **engine**: *Engine allocation*, *Belief* and *Influence* give the corrected side. Two
-rules apply to everything here:
+All numbers below are split memory unless marked unified. Up to *Regret, oracle, coupling* they run
+with the ledger allocating KV; from *Engine allocation* on, with the engine allocating -- the
+corrected side -- unless a result says it is the ledger's. Two rules apply to everything here:
 
 - **Service time leads.** Once decode cost depends on the batch a request joins, placement
   moves execution as well as waiting. `stall` excludes execution, so on its own it misreports
@@ -794,7 +794,9 @@ has to pay it. Greedy prefix affinity is still the arm that collapses past the k
 
 ### Placement across distance
 
-Same cluster, 15k requests, `--rate 250`.
+Same cluster, 15k requests, `--rate 250`. At `region` each of the four nodes is a region of its
+own and a request has no client, so nothing pays to reach a node or to come back: the column is a
+global argmin across regions that cost nothing to reach. *Regions* puts clients in regions.
 
 | arm | socket | rack | zone | region | stall (rack) | siblings co-located | tool calls beside agent: zone / region |
 |---|---|---|---|---|---|---|---|
@@ -892,7 +894,9 @@ preference, and the table reports it as a check.
 request at region distance, against 0.16 ms on the same socket: a 380× spread on the one term
 placement cannot move. It is 15% of end-to-end service time at region and 0.04% at socket.
 Separating the orchestrator from the accelerator is affordable within a zone and expensive
-across regions, and that conclusion is independent of how good the scheduler is.
+across regions, and that conclusion is independent of how good the scheduler is. What decides who
+pays it is where the global tier puts each model: with Phase 6's replica counts laid across three
+regions, 3.4% of client-facing requests find their model elsewhere, for +0.7% (*Regions*).
 
 **What the scheduler can move is everything else, and it is worth about 0.7%.** `scored` beats
 hashing by 2.8 ms at region, almost all of it from keeping tool calls off the link: it holds
@@ -1111,9 +1115,9 @@ preempting and recomputing when a sequence cannot fit, with the connector's own 
 offload sub-budget and an `NVMe` spill sub-budget. The orchestrator keeps every read exact
 (`belief` is zero with the bit on, by test) and loses every write. Refusal for inference moves to a
 router check against the partition, over reservations the router made itself (`--admit`); decode
-output can be modelled and held for the decode's length (`--decode-kv`). Each result below is
-marked **ledger** or **engine** for the side of the bit that produced it; every number without a
-mark in this document is **ledger**.
+output can be modelled and held for the decode's length (`--decode-kv`). Each result in this
+section is marked **ledger** or **engine** for the side of the bit that produced it; the sections
+after it run on the engine side unless a result says it is the ledger's.
 
 **Goodput is not comparable across the bit.** On the ledger a KV refusal is the ledger's; with the
 engine it is a router refusal or an engine preemption, counted apart (`refused`, `refused by
@@ -1281,9 +1285,8 @@ ledger (task-latency margin over `blind`, split memory, seeds 1 / 2 / 3): the bu
 resident, 5.4 / 4.5 / 4.9%, is `host-only`'s 5.3 / 4.8 / 4.5%; the prewarm alone, 10.4 / 11.3 /
 10.9%, is the published 10.7 / 10.6 / 10.3%. Unified memory says the same (5.2 / 5.8 / 3.8% against
 `host-only`'s 5.1 / 6.4 / 4.3%; 16.2 / 18.1 / 16.2% against 17.6 / 17.9 / 16.0%), and so does owned
-state: a `Snapshot` bump is worth 0.0 / 0.0 / 0.1%, admitting the cell 5.2 / 4.7 / 4.5%. Phase 3's
-"a directive is the only honest way left to buy it back" is retracted: a directive cannot create a
-block.
+state: a `Snapshot` bump is worth 0.0 / 0.0 / 0.1%, admitting the cell 5.2 / 4.7 / 4.5%. So a
+retention directive cannot buy back what the correction removed: a directive cannot create a block.
 
 **A dispatch can, and buys more than the ledger's prewarm did.** Prefilling the declared
 downstream's missing blocks when its hint arrives, through the engine's own allocator:
@@ -1495,27 +1498,27 @@ class: 0.77-0.93 and 1.42-1.78 MB at 200 bytes a token, 0.009-0.021% of a node's
 ### Programs: closed-loop agents, and what the open-loop trace overstated
 
 `polyphonic programs` (`phase-7.md`) submits agent programs step by step, each step when its
-predecessor completes, on the belief cluster's shape with no control crossing charged: 900 programs a
-run at 12 a second, compress 5, three seeds, every figure one value per seed. The published trace is
-open loop and these are not its replacement; every row above is still the trace's.
+predecessor completes, on the belief cluster's shape with no control crossing charged: 900 programs
+a run at 12 a second, compress 5, three seeds, every figure one value per seed. The published trace
+is open loop and these are not its replacement; every row above is still the trace's.
 
 **Causality.** The published trace submits a tool call 28 ms after its turn whatever the turn is
 doing: 100% of an agent turn's tool calls and fan-outs arrive before the turn ends, by a median of
 1.0-1.1 s, 18% of a session's consecutive turns overlap, and a `FaaS` call's inference arrives 28 ms
 after it. Released when their upstream finishes, none does. A closed-loop turn is 3.6-3.8x the open
 loop's (5.4-5.8 s against 1.5 s) and a session 1.9-2.0x (16.4-17.1 s against 8.1-8.7 s, the open
-loop keeping each session's think time). Every flow result above that depends on a
-downstream arriving before its upstream ends -- *announce*, *prefill-ahead*, the flow stall -- is an
-open-loop figure and is kept as measured.
+loop keeping each session's think time). Every flow result above that depends on a downstream
+arriving before its upstream ends -- *announce*, *prefill-ahead*, the flow stall -- is an open-loop
+figure and is kept as measured.
 
 **Hints by grade.** Against prefill-ahead off, in published order, the flow downstream's stall falls
 63 / 64 / 62% with the declared downstream, 47% with the declared template only and 31 / 28 / 24%
 with a template learned per function (known for 74% of flows); gated at P(flow) 0.5 the learned
-figure is 23 / 19 / 14%. Released when the upstream finishes, the figures are 0.5 / 1.9 / 3.2%, 0.4 /
-3.4 / 5.4% and -0.1 / +2.9 / -0.0%, and at half the partition the template-only hint costs +4.6 /
-+4.7 / +10.7%. Warm-ups before a tool on long-running agents are -0.03 to -0.04% of turn latency whether
-the name is predicted or read from the stream; a declared fixed pipeline's is -0.25 / -0.23 / -0.26%
-at 2 GiB of DDR a node.
+figure is 23 / 19 / 14%. Released when the upstream finishes, the figures are 0.5 / 1.9 / 3.2%, 0.4
+/ 3.4 / 5.4% and -0.1 / +2.9 / -0.0%, and at half the partition the template-only hint costs +4.6 /
++4.7 / +10.7%. Warm-ups before a tool on long-running agents are -0.03 to -0.04% of turn latency
+whether the name is predicted or read from the stream; a declared fixed pipeline's is -0.25 / -0.23
+/ -0.26% at 2 GiB of DDR a node.
 
 | | coding tools | research tools, open reads allowed |
 |---|---|---|
@@ -1531,16 +1534,16 @@ latency by -1.1 to +2.6%; priced, it stays within 2.1% of none.
 **Leases, retention, the lifecycle.** A lease on a `SideEffecting` call's cell pins 7.0% of a node's
 DDR at its peak at 8 GiB and 27-30% at 4 GiB, with none broken and no durable cell lost; reclaiming
 drafts moves turn latency by +0.00% at 8 GiB and by under 1% either way below it. Every agentic run
-abandons 60-61 of 2700 programs when the router's admission refuses a call. Continuum's TTL
-emits 2.4-2.6 million marks a run and moves turn latency by +0.00% at 6, 12 and 18 sessions a second:
-the excess rebuild a call pays, 0.03-7 ms (8-9 ms at half the partition), is the sequence's own
+abandons 60-61 of 2700 programs when the router's admission refuses a call. Continuum's TTL emits
+2.4-2.6 million marks a run and moves turn latency by +0.00% at 6, 12 and 18 sessions a second: the
+excess rebuild a call pays, 0.03-7 ms (8-9 ms at half the partition), is the sequence's own
 preemption, not an eviction between calls. The two timers (KV 300 s, sandbox 900 s, divided by the
 compression) disagree on 19.2% of 4671 turn boundaries; the joint decision differs from the pair on
 45.5% of them, frees 62.8% of idle time against the timers' 64.5%, and moves a turn by +0.07 / +0.13
 / +0.06% at 8 GiB and +0.03 / +0.08 / +0.03% at 2 GiB.
 
-**The logged tier.** An intent and an outcome per `SideEffecting` call are 6.9 writes a second on the
-pipeline preset (40% of its soft decisions), 7.1 on the agentic (20%; 13.9 and 38% with MCP's
+**The logged tier.** An intent and an outcome per `SideEffecting` call are 6.9 writes a second on
+the pipeline preset (40% of its soft decisions), 7.1 on the agentic (20%; 13.9 and 38% with MCP's
 defaults for edits) and 14.6 on the multi-agent (44%); the long-running preset writes 0.59 a second
 (66% of its 0.9 decisions); one-shot, extraction, conversational, retrieval and batch write nothing.
 The record tier's planner writes 0.046 a second.
@@ -1551,12 +1554,12 @@ and 27.6% infinite); reuse by content under any parent finds 64.0 / 64.1 / 63.2%
 residency counterfactual that nets 54% after the 15% it recomputes. At 100,000 chunks: 32.1% and
 10.3%, and 55.7%.
 
-**Roles and class inference.** A pooled p90 claim of 242 tokens overruns on 63 / 65% of reviewers and
-23 / 24% of explorers; a role's own p90 on 8.5-13.3% of each, reserving 220 tokens an agent. Fan-out
-service moves by -0.1% at a 256 MiB partition a node and -2.8% (claims) / +3.3% (score) at 160 MiB,
-where the pooled claim completes 1193 of 1242 fan-outs and the role's 1181 of 1245. The class read
-from observables is right for 60.6% of requests at their first call, 85.7% at their last and 79.1%
-over every call.
+**Roles and class inference.** A pooled p90 claim of 242 tokens overruns on 63 / 65% of reviewers
+and 23 / 24% of explorers; a role's own p90 on 8.5-13.3% of each, reserving 220 tokens an agent.
+Fan-out service moves by -0.1% at a 256 MiB partition a node and -2.8% (claims) / +3.3% (score) at
+160 MiB, where the pooled claim completes 1193 of 1242 fan-outs and the role's 1181 of 1245. The
+class read from observables is right for 60.6% of requests at their first call, 85.7% at their last
+and 79.1% over every call.
 
 **The table.** Locality coupling by pattern, 8 GiB: one-shot, extraction, conversational, retrieval
 and batch 0.0%; tool pipeline 15.2 / 14.8 / 13.0%; agentic 4.1 / 4.1 / 3.8%; multi-agent 7.2 / 7.6 /
@@ -1590,7 +1593,7 @@ a warm `FaaS` invocation of 120 us.
 
 **A scheduler restart.** Streams held below the scheduler: an outage of 0.1 s costs -0.5 to +6.9
 request-seconds, 1 s costs 126-139 (`λD²/2` = 125) and a 15 s lease 32,426-38,829, with 236-374
-requests unserved and a first-token p99 of 14.7-14.8 s; backing off instead of bursting costs 26-32%
+requests unserved and a first-token p99 of 14.7-14.8 s; backing off instead of bursting costs 29-32%
 more at 15 s and leaves 9-18% fewer unserved. Streams that die with it reach 102-112 (20-24 a gang's
 agents), throw away 61-73 decode-seconds and cost 63-75 at a 0.1 s outage, 284-370 at 1 s with a
 restart and 233-276 with the client's continuation. Of the state a restart loses, the belief and the
@@ -1625,6 +1628,180 @@ s takeover; 1.9-3.2 hours held at 1 s; 1.0-1.8 hours with streams dying at 0.1 s
 with a restart; 2.9-4.9 weeks under a 15 s lease (1.1-8.9 hours and 3.4-5.8 weeks at 0.75x). The
 sidecar's own window, 15 s of hash-only routing with every stream intact, costs 30 / 53 / 38
 request-seconds at 1.0x and 21 / 12 / 41 at 0.75x.
+
+### Regions: a scheduler per region under global budgets
+
+`phase-11.md`, implemented. `polyphonic regions` runs three regions of four of the `belief`
+cluster's nodes (4 GiB HBM, 8 GiB DDR, 16 GiB `NVMe` each), rack within a region and 30 ms one way
+between regions, or Azure's published round trips between East US, West Europe and Japan East (83 /
+162 / 233 ms); the engine allocating, `scored + fetch` within a region, no control crossing charged,
+10% fan-out, a flat class mix, 60 s of arrivals at 250 and 325 req/s a region, seeds 1-3. A session,
+and every turn of it, belongs to a region; a client-facing request served in another region pays the
+round trip, in the score and when it runs, while tool calls, flow downstreams, resumes and a
+fan-out's agents pay the handoff the score already prices. Every figure is mean service against
+regional schedulers at equal demand on the same seed and load, the range over seeds, unless it says
+otherwise. The burst is one region taking 75% of arrivals, 2.25 times its share, from 30% to 60% of
+the run; the day moves each region's share as `1 + 0.75 cos` with its peak at 14:00 local. Every
+cross-region arm is unenforced -- no router queue, no engine that waits -- and the command's p99 is
+`round((n - 1) q)` rather than the other commands' `floor(n q)`.
+
+**Clients.** Regional schedulers serve 459.5 / 454.7 / 461.4 ms at 250 req/s a region. The global
+argmin as every other section runs it, with no round trip in its score, serves 66.3-66.7% of
+client-facing requests in another region and a warm `FaaS` call in 40.4-40.7 ms instead of 0.6, at
++7.1 / +7.2 / +7.1%. With the round trip priced it still serves 36.9-40.1% elsewhere, at +4.3 to
++4.6% (+4.1 to +4.3% at 325 req/s, +11.2 to +12.2% on Azure's round trips): the terms that choose
+among a region's nodes price an instant, while a round trip and the prefix a moved turn leaves
+behind are certain.
+
+**The burst and the day.**
+
+| 250 req/s a region | equal demand | burst | day |
+|---|---|---|---|
+| regional, no cross-region rule | 0 | +71.7 to +82.1% | +16.6 to +23.3% |
+| global argmin, round trip priced | +4.3 to +4.6% | +4.2 to +4.7% | +4.0 to +5.6% |
+| node price, an exact view | +0.8% | +1.3 to +1.5% | +1.5 to +1.7% |
+| node price, 1 s summary | +2.0 to +2.4% | +2.7 to +2.9% | +3.3 to +3.5% |
+| the same with own forwards | +1.0 to +1.1% | +1.5 to +1.7% | +1.6 to +1.8% |
+| the same, 5 s summary | +1.3 to +1.5% | +2.0 to +2.2% | +2.0 to +2.2% |
+| region mean, 1 s summary, own forwards | +0.6 to +0.7% | +1.2 to +1.4% | +1.4 to +1.7% |
+| region mean, 5 s summary, own forwards | +1.0 to +1.1% | +1.8 to +2.0% | +1.8 to +2.0% |
+| threshold 0.5, 1 s summary | +1.4% | +2.0 to +2.1% | +2.5 to +2.9% |
+| threshold 0.7, 1 s summary | 0.0% | +1.2 to +1.6% | +2.8 to +3.4% |
+| table, 1 s epoch | +0.1% | +2.0 to +2.4% | +2.3 to +2.8% |
+| table, 5 s epoch | 0.0% | +9.3 to +19.0% | +3.2 to +3.7% |
+| table, 1 s epoch, over the region mean | +0.8% | +1.3 to +1.5% | +1.7 to +1.9% |
+
+| 325 req/s a region | equal demand | burst | day |
+|---|---|---|---|
+| regional, no cross-region rule | 0 | +222.6 to +249.6% | +160.9 to +174.2% |
+| global argmin, round trip priced | +4.1 to +4.3% | +4.0 to +4.3% | +4.2 to +4.3% |
+| node price, an exact view | +1.0 to +1.1% | +1.5 to +1.7% | +1.7 to +1.8% |
+| node price, 1 s summary | +3.1 to +3.2% | +3.3 to +3.6% | +3.8% |
+| the same with own forwards | +1.2 to +1.3% | +1.8 to +1.9% | +2.0 to +2.1% |
+| region mean, 1 s summary, own forwards | +1.0 to +1.2% | +1.7 to +1.8% | +1.9 to +2.1% |
+| threshold 0.5, 1 s summary | 0.0 to +0.2% | +1.6 to +2.2% | +3.8 to +4.0% |
+| threshold 0.7, 1 s summary | +1.2 to +1.4% | +1.8 to +2.0% | +2.5 to +2.8% |
+| table, 1 s epoch | 0.0 to +0.1% | +39.2 to +51.8% | +17.6 to +20.8% |
+| table, 5 s epoch | 0.0% | +70.3 to +89.7% | +35.2 to +44.8% |
+| table, 1 s epoch, over the region mean | +1.1 to +1.2% | +1.7 to +2.0% | +2.1 to +2.3% |
+
+A region alone collapses past about twice its share, and every cross-region rule recovers it to
+within 5.6% of equal demand at 250 req/s and 4.3% at 325, the table near the knee aside. A node
+price on a summary a second old herds -- a region sees another as idle until the summary refreshes,
+and forwards to it all second -- and counting the sender's own forwards still in flight removes
+most of it. Priced by each region's mean rather than its best node, the spill is within 0.4 points
+of the exact view in every shape and below it at equal demand. A threshold is right at one load:
+0.7 costs nothing at equal demand at 250 and 1.2-1.4% at 325, and 0.5 the reverse. The table costs
+nothing at equal demand, misses what is shorter than its epoch and under-forwards near the knee,
+where Phase 6's mean-value cost model sees a region below its capacity that still saturates on its
+fluctuations; over the region-mean spill it lands within 0.3 points of the spill alone. On Azure's
+round trips at 250 req/s a forwarded request pays more and fewer are worth forwarding -- 3% of
+requests leave at equal demand against 6% at 30 ms -- and the region mean costs +0.6 to +0.7%, +1.9
+to +2.0% and +3.1 to +3.5% at equal demand, on the burst and on the day; the exact-view node price
++0.8%, +2.0 to +2.1% and +3.2 to +3.5%; threshold 0.5 +3.0 to +3.4%, +4.4 to +4.7% and +6.0 to
++6.8%; and the global argmin +11.2 to +12.2% at equal demand and +9.5 to +12.3% on the day, every
+rule within 6.8%. Every cell served every request.
+
+**Budgets.** A 240 s day, a second of which is six minutes of a real one, over twelve running nodes
+on six slots a region, against regional schedulers at equal demand over 240 s on four nodes a
+region (about 457 / 455 / 454 ms at 250 req/s and 484 / 483 / 482 at 325). *On time*, *10 s late*
+and *30 s late* are the clairvoyant allocation with an 8 s load, *30 s load* is on time with a 30 s
+load, and *rent-or-buy* is Phase 6's planner lifted to regions, with an 8 s load and a 5 s epoch.
+Regional schedulers with no cross-region rule:
+
+| day | static | on time | 10 s late | 30 s late | 30 s load | rent-or-buy |
+|---|---|---|---|---|---|---|
+| 250 req/s, amplitude 0.5 | +3.1 to +3.2% | +1.0% | +1.4 to +1.5% | +6.1 to +11.2% | +3.9 to +5.6% | +1.8 to +3.0% |
+| 250 req/s, amplitude 0.75 | +67.2 to +79.6% | +1.6 to +1.7% | +2.6 to +2.8% | +91.8 to +107.2% | +15.8 to +23.5% | +4.0 to +10.4% |
+| 325 req/s, amplitude 0.5 | +181.9 to +207.1% | +1.5% | +4.3 to +5.7% | +153.7 to +160.6% | +50.9 to +55.9% | +9.6 to +12.8% |
+| 325 req/s, amplitude 0.75 | +625.3 to +645.7% | +2.8 to +4.7% | +31.8 to +45.3% | +533.7 to +566.5% | +271.8 to +314.0% | +16.3 to +39.6% |
+
+Budgets that follow the day recover it, and lateness is their price: thirty seconds late, three
+hours of a real day, moves capacity away from the region about to peak and is worse than never
+moving at 250 req/s. Rent-or-buy waits until the loss it has suffered covers a move, and on a day's
+ramp it lands between 10 s and 30 s late, level with 10 s late at 325 and amplitude 0.75. A spill or
+the table beneath the budget covers what it misses: with a 0.7 threshold or a 5 s table over it,
+rent-or-buy is within 1.3 points of 10 s late seed by seed in every cell bar one, and at 250 req/s a
+static budget costs +1.5 to +3.4%, on time +1.0 to +1.6% and rent-or-buy +1.4 to +3.2%. Near the
+knee a threshold
+misfires on budgets that follow -- at 325 req/s on time costs +3.2 to +3.7% against +2.0 to +2.1% on
+a static budget at amplitude 0.5, and +4.3 to +5.1% against +2.6 to +2.9% at 0.75, every region
+sitting near the threshold and spilling on noise -- and the table needs them: +57.1 to +65.0% on a
+static budget at 325 and amplitude 0.75, +2.5 to +2.7% on time.
+
+**Models by region.** Phase 6's fleet -- one model per node, a batch per model priced -- with four
+models at 55 / 25 / 12 / 8% of demand, at 250 req/s a region, against regional schedulers on the
+published engine; Phase 6's counts for twelve nodes are [6, 3, 2, 1]:
+
+| placement | regional | global argmin | threshold 0.7 | served away; forced forwards |
+|---|---|---|---|---|
+| every model in every region | +268.7 to +298.9% | +270.9 to +297.2% | +268.7 to +298.9% | none |
+| the fleet's counts, spread across regions | +0.7% | +3.2 to +3.3% | +0.7% | 3.4%; 5.0-5.1% of client-facing requests |
+| the fleet's counts, each region filled in turn | +2.1 to +2.2% | +4.2 to +4.3% | +2.1 to +2.2% | 14.3-14.6%; 21.2-21.4% |
+
+A model in every region gives the model with half the demand one replica a region, and 48-49% of
+decodes arrive at a full batch. A request for a model its region lacks goes to the nearest region
+that has one, never by an overflow rule, so the threshold's column is the regional one.
+
+**Tenants.** Each tenant's quota is split into regional shares, a token bucket two seconds deep in
+each region, metered on generated tokens because the region runs do not price prefill; a share is
+fixed at an even split or leased, each region's share set at every refresh from its clients' recent
+demand. Requests refused, as a share of all requests:
+
+| headroom, at 250 / 325 req/s | 10%, equal demand | 10%, the day | 50%, equal demand | 50%, the day |
+|---|---|---|---|---|
+| static split | 2.5-2.6% / 2.2% | 4.8-5.0% / 4.5-4.8% | 0.6-0.7% / 0.5% | 2.2-2.3% / 1.9-2.2% |
+| lease, every 0.1 s | 2.9-3.0% / 2.5-2.6% | 2.8-3.0% / 2.4-2.6% | 0.9% / 0.6-0.7% | 0.9-1.1% / 0.7-0.8% |
+| lease, every 0.5 s | 2.6-2.7% / 2.3% | 2.7-2.9% / 2.2-2.4% | 0.7% / 0.5-0.6% | 0.8-1.0% / 0.5-0.6% |
+| lease, every 2 s | 2.5-2.6% / 2.2-2.3% | 3.2-3.3% / 2.7-3.0% | 0.6-0.7% / 0.5% | 1.2-1.3% / 0.9-1.0% |
+
+The day adds 2.2 to 2.6 points of refusals to a static split at 10% of headroom and 1.4 to 1.7 at
+50%, and -0.2 to +0.3 to a lease refreshed every 0.1 or 0.5 s. A 0.1 s refresh chases noise, 0.1 to
+0.4 points above the static split at equal demand, and a 2 s one lags, 0.3 to 0.8 points more on
+the day than at equal demand. Both are the compression's: the run compresses the day 1,440 times
+and its arrivals not at all, and in Doorman's 16 s refresh a region's share moves at most 0.04
+points. Every split keeps a floor from each tenant's own bursts on a two-second bucket. Serving what
+a static split refuses costs a region that cannot spill: at 325 req/s and 10% of headroom, mean
+service is +106.3 to +121.6% with a lease and +13.4 to +15.2% with a static split that sheds it.
+
+**Residency.** The burst under the region-mean spill on a 1 s summary with own forwards, with a
+share of tenants confined to their client's region:
+
+| tenants confined | 250 req/s | served away | 325 req/s | served away |
+|---|---|---|---|---|
+| 0% | +1.2 to +1.4% | 11.6-12.3% | +1.7 to +1.8% | 15.7-16.6% |
+| 25% | +2.1 to +3.6% | 6.7-7.1% | +34.0 to +39.8% | 9.7-9.9% |
+| 50% | +3.5 to +13.4% | 5.8-6.1% | +55.5 to +67.5% | 8.1-8.4% |
+| 75% | +21.6 to +33.6% | 3.5-3.8% | +121.2 to +128.2% | 4.5-5.1% |
+| 100% | +71.7 to +82.1% | 0% | +222.6 to +249.6% | 0% |
+
+Residency is a graded cost, and near the knee a steep one: at 325 req/s a quarter of the tenants
+staying home costs +34.0 to +39.8%, the hot region having no headroom for demand that cannot leave.
+
+**Active-active schedulers.** Two or four schedulers a region, each taking a session's requests by
+hash, knowing its own decodes in flight exactly and its peers' as last reported, against one
+scheduler a region at equal demand:
+
+| reports every | two, 250 req/s | four, 250 req/s | two, 325 req/s | four, 325 req/s |
+|---|---|---|---|---|
+| continuously | identical | identical | identical | identical |
+| 25 ms | +0.0% | +0.0% | +0.0 to +0.1% | +0.1% |
+| 250 ms | +0.0 to +0.1% | +0.2 to +0.3% | +0.0 to +0.1% | +0.3 to +0.5% |
+| 1 s | +0.2% | +1.6 to +1.9% | +0.1 to +0.3% | +11.7 to +13.4% |
+| 5 s | +0.2 to +0.6% | +27.6 to +30.2% | +0.0 to +0.1% | +69.9 to +73.7% |
+
+Four schedulers on reports five seconds old put 51-53% of decodes at a full batch at 250 req/s.
+
+**The arithmetic.** A global scheduler on the request path adds a round trip to two-thirds of
+requests: a mean of 40.0 ms at 30 ms one way and 82.0, 105.3 or 131.3 ms on Azure's triangle as it
+sits in East US, West Europe or Japan East -- 534-910 and 1,094-2,987 times the sidecar tax and
+4.0% and 8.2-13.1% of a one-second turn -- and a region cut off from it for 60 s at 250 req/s loses
+450,000 request-seconds (`λD²/2`). At 10,000 nodes in three regions, liveness is 333 writes a second
+a region and the global record 0.16-0.19 a second -- the table's six fractions every five minutes
+and the clairvoyant budget's 14 and 18 node moves a day, scaled -- 1,700-2,200 times fewer. A static
+split of a tenant's quota by its mean share refuses 15.6% and 23.5% of its demand on a real day of
+amplitude 0.5 and 0.75, 5.2% and 12.4% with 25% of headroom and 0.3% and 4.2% with 50%; in 16 s of a
+real day a region's share moves at most 0.023 and 0.037 points.
 
 ## Method
 
@@ -1717,8 +1894,8 @@ the decision loop.
 
 [`owned-and-observed.md`](owned-and-observed.md) is the design this ledger is being corrected
 toward: what the orchestrator *owns*, *infers* and only *observes*, the data path, the workload
-taxonomy in [`taxo.md`](taxo.md) as a scheduler input, and the phase plan (§9 there). Phases 0-10
-are built, and their results are above. Phase 11 (regions) is design.
+taxonomy in [`taxo.md`](taxo.md) as a scheduler input, and the phases (§9 there). Phases 0-11 are
+built, their results are above, and §9 there lists what they leave open.
 
 ## Not built
 
@@ -1730,7 +1907,9 @@ unified memory domain, so every cross-node constant is modelled and the HBM/DDR 
 only in the model. There is no accelerator runtime: KV and weights are sized and priced, never
 computed. The fleet has no half-width node, no second engine per node, no per-tenant axis on
 `Quota` for host DDR, and no replica set per tenant; fan-out agents are not paired with a prefiller;
-a replica set is one neighbour's.
+a replica set is one neighbour's. The regions have one accelerator class, ship no KV between
+regions, inject no WAN partition and plan no budget from a forecast; `distributed` and `code-review`
+place no client in a region.
 
 ## Standing
 
@@ -1745,10 +1924,10 @@ a replica set is one neighbour's.
 | greedy prefix affinity | right at low load, collapses past the knee |
 | scored placement | best arm at every load and distance on the published engine — **4–6% end to end at moderate load, 38% near the knee**, and on a fleet of several models a lead that depends on layout (*Fleet*); restated as regret — its heuristic and execution gaps are exactly zero, every ns of its regret is model gap |
 | score adapts sibling co-location to load | holds — 63–66% vs 85–86% for filtered specialists |
-| score adapts tool placement to distance | holds — all calls local across regions, where hashing pays 10× |
+| score adapts tool placement to distance | holds — all calls local across regions, where hashing pays 10×, on a global argmin with no client; with a scheduler per region a function call never leaves its region (*Regions*) |
 | all-or-nothing fan-out admission | holds where it binds, on the ledger's per-block test and on the router's partition check alike; the **+22%** is sensitive to the control crossing (+2% with none charged) |
 | heterogeneous nodes (model host + agent host) | expressible — per-node memory, decode filter, origin round trip; a fleet of replicas per model, each a node with its own model, step and partition, is the same case |
-| separating the orchestrator from the accelerator | free within a zone (0.16–1.7 ms), **61 ms per turn across regions** |
+| separating the orchestrator from the accelerator | free within a zone (0.16–1.7 ms), **61 ms per turn across regions** -- paid by the demand whose model the global tier placed elsewhere, 3.4% of client-facing requests at Phase 6's counts (*Regions*) |
 | placement policy on that topology | worth 0.7% — the round trip and decode dominate, and no policy moves either |
 | KV state transfer | roughly neutral end to end |
 | state transfer taxes the FaaS warm pool | **retracted** — a unified-memory and capacity artifact |
@@ -1819,3 +1998,16 @@ a replica set is one neighbour's.
 | write-through checkpoints | **ruled out** -- 0.6-21 times a warm `FaaS` invocation at a protected-drive or FoundationDB commit, 4 ms with this host's full flush |
 | the logged tier outgrows FoundationDB | **no** -- 146,000-491,000 writes a second at 10,000 nodes against 820,000 published |
 | the integrated path pays for its crashes | **while it crashes no more than about once a minute or two with its streams held and once an hour or two with them fate-shared**; a fail-open proxy's window costs 12-53 request-seconds |
+| with clients in regions, the published global argmin serves two-thirds of requests elsewhere | **holds** -- 66.3-66.7% of client-facing requests, a warm `FaaS` call in 40.4-40.7 ms instead of 0.6, +7.1-7.2% over a scheduler per region; every other region-distance figure here has no client |
+| the global argmin is the bound on regional schedulers | **no** -- with the round trip priced it still serves 37-41% of requests elsewhere and is 4.1-4.6% slower at 30 ms between regions and 11.2-12.2% on Azure's round trips; the score's engine and congestion terms decide within a region |
+| a region absorbs its own peak | **no** -- a burst of 2.25 times its share costs +72-82% at 250 req/s a region and +223-250% at 325; every cross-region rule recovers it to within 5.6% and 4.3%, 6.8% on Azure's round trips |
+| a spill priced on a stale summary | **herds**, and counting the sender's own forwards removes most of it; priced by each region's mean, within 0.4 points of the exact view in every shape; a threshold is right at one load (0.7: 0.0% at 250, +1.2-1.4% at 325; 0.5 the reverse) |
+| a global routing table on the provisioning clock | free at equal demand, blind to a burst shorter than its epoch (+9.3-19.0% at 5 s) and short near the knee (+39.2-51.8% on the burst at 325); over the region-mean spill, within 0.3 points of the spill alone |
+| node budgets that follow the day | **recover it** -- on time +1.0-1.7% with headroom and +1.5-4.7% near the knee, against fixed budgets' +3-80% and 2.8-7.5 times the service; lateness is the price, and 30 s late is worse than never moving at 250 req/s |
+| a rent-or-buy budget planner lands between on time and 10 s late | **no** -- between 10 s and 30 s late; a spill or the table beneath the budget brings it within 1.3 points of 10 s late |
+| a model in another region costs its round trip; every model in every region costs a knee | **holds** -- Phase 6's counts spread across regions forward 3.4% of client-facing requests for +0.7%; every model everywhere is 3.7-4.0 times the service, 48-49% of decodes at a full batch |
+| a tenant's regional share is a lease | **holds** -- refreshed every 0.1-0.5 s it removes the 1.4-2.6 points of refusals a day adds to a static split; a faster refresh chases noise and a slower one lags, both artefacts of the compressed day |
+| residency is a switch | **no, a graded cost** -- a quarter of tenants kept home costs +2.1-3.6% at 250 req/s a region and +34.0-39.8% at 325 |
+| active-active schedulers in a region are free at the engine's step | **holds** -- within 0.1% on 25 ms reports; on 1 s reports four herd, +1.6-1.9% at 250 req/s and +11.7-13.4% at 325, and two stay within 0.6% at every age |
+| a scheduler on the request path can be global | **no** -- 40-131 ms a request, 534-2,987 times the sidecar tax; a minute's partition costs a region 450,000 request-seconds at 250 req/s |
+| the global record writes under once a second at 10,000 nodes | **holds** -- 0.16-0.19 a second, 1,700-2,200 times under one region's liveness |

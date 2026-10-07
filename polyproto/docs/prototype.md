@@ -22,7 +22,7 @@ split by default.
 - [`README.md`](../README.md) -- the direction: what Polyphonic is for.
 - [`taxo.md`](taxo.md) -- the workload taxonomy the scheduler has to serve.
 - [`owned-and-observed.md`](owned-and-observed.md) -- the design: what the scheduler owns, infers
-  and observes, the data path, the system of record, and the phase plan.
+  and observes, the data path, the system of record, and the phases and what they leave open.
 - [`residency-ledger.md`](residency-ledger.md) -- the simulator's model and its current results.
 - `phase-N.md` -- one per phase: the plan, the predictions stated before the run, and what was
   measured. These are the historical record and keep their results as measured; every other

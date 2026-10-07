@@ -4,7 +4,7 @@ The design for where polyproto's scheduler draws its boundaries: what it owns, i
 observes (§1), what carries a request (§2), what that changes in the engine (§3), the workload
 taxonomy as a scheduler input (§4), and which advantages are emergent rather than assumed (§5). §6
 reads a sibling prototype, §7 states the method for constants, §8 covers feasibility and the system
-of record, and §9 is the phase plan.
+of record, and §9 lists the phases and what they leave open.
 
 Two boundaries, resolved in opposite directions. §1 hands the engine's memory back to the engine.
 §2 refuses to put a process boundary on the request path -- a statement about where the code runs,
@@ -12,17 +12,10 @@ not about who wrote it; the HTTP itself is a linked library's (§2.6). **Cede th
 path** -- and the second is only defensible because of the first, since routing and cancellation
 are what is left to decide with once allocation is gone.
 
-**Status.** Phases 0-10 are built and measured; Phase 11 is design (§9). Current
-results are in [`residency-ledger.md`](residency-ledger.md); each phase's plan, predictions and
-outcomes are in its own `phase-N.md`. The corrected architecture runs behind bits that are off by
-default -- `--engine-cache` (Phase 3), `--belief` (Phase 4), `--directives`, `--prefill-ahead` and
-`--retain` (Phase 5), `--model-batches`, `--prefill-time`, `--model-keyed` and `--fleet`
-(Phase 6), and `--engine-wait`, `--queue`, `--admit quantile | tiered | gate`, `--cancel`,
-`--victim`, `--disconnect`, `--leak`, `--batch` and `--stream-buffer` (Phase 9), and `--hint-grade`
-and `--learn-gate` for the base trace and `polyphonic programs` for closed-loop agent programs
-(Phase 7), and `--count-writes`, `--track-flights`, `--observe`, `--node-check`,
-`--snapshot-estimators` and `--copy-durable` with `polyphonic durability` for faults (Phase 10) --
-so a published number is the ledger's unless it is marked otherwise.
+**Status.** Phases 0-11 are built and measured (§9). Current results are in
+[`residency-ledger.md`](residency-ledger.md); each phase's plan, predictions and outcomes are in its
+own `phase-N.md`. The corrected architecture runs behind bits that are off by default, which §9
+names phase by phase, so a published number is the ledger's unless it is marked otherwise.
 
 **On the numbers.** Four grades of evidence, kept apart:
 
@@ -38,7 +31,8 @@ so a published number is the ledger's unless it is marked otherwise.
   the ledger allocating the engine's KV, which §1 disclaims. §1 says which results survive the
   correction; the ledger's *Standing* table says which claims hold, failed or were retracted.
 - **Not from the runs.** Arithmetic on published figures -- §3.8's HBM budget, §1's
-  consensus-commit latency -- worth exactly what its inputs are and labelled wherever it appears.
+  consensus-commit latency, §2.2's global scheduler -- worth exactly what its inputs are and
+  labelled wherever it appears.
 
 So a number here is a reason to run an experiment, not a result to build on (§7).
 
@@ -102,9 +96,9 @@ So durability is a column of its own, with one value per clock:
 
 | durability | changes | holds | lives in |
 |---|---|---|---|
-| **soft** | per decision | admission, placement, flow graph, directives with a TTL, staged reservations, all inferred state | process memory, rebuilt from node agents and engines on restart |
+| **soft** | per decision | admission, placement, flow graph, directives with a TTL, staged reservations, a tenant's regional lease, all inferred state | process memory, rebuilt from node agents and engines on restart |
 | **logged** | per session transition | `SideEffecting` intents, suspended-session records, approval pauses, per-tenant usage | an append-only log in its own failure domain: a second FoundationDB cluster (§8) |
-| **record** | per provisioning change | membership and leases, quotas, tenancy, partition sizes, model placement | the system of record (§8), strictly serializable, low rate |
+| **record** | per provisioning change | membership and leases, quotas, tenancy, partition sizes, model placement, each region's node budget and the routing table between regions | the system of record (§8): a record per region and a global one, strictly serializable, low rate |
 
 §2.2's rule decides the first row. A consensus commit costs at least an fsync and a quorum round
 trip -- hundreds of microseconds at best and low milliseconds typically, **on published figures,
@@ -131,22 +125,27 @@ restart costs the arrivals its outage delays, `λD²/2`: 0.7-1.3 request-seconds
 takeover for a scheduler on the request path, and node agents enforcing their own partitions are
 what let a standby take over without one. With the streams fate-shared with the scheduler (§2.6) a
 crash adds 61-73 decode-seconds thrown away and costs 63-75 request-seconds at a 0.1 s takeover,
-284-370 at 1 s with a restart and 233-276 with the client's continuation. Of the soft state, the
-belief, the flow graph, the tenant meters and the length estimators cost nothing a run can see when
-lost (within 10 request-seconds where memory does not bind hardest): residency is re-learned from
-the scheduler's own dispatches within a second or two. A reservation ledger that is not rebuilt from
-node agents over-admits 3-30% of what it admits blind, and only at 0.6x of the granted partition and
-below; the engine's wait absorbs it, and node agents that check their own partitions leave 0-4. The
-estimators' snapshot (32 KiB every 10 s) is not needed, since lengths observed when a decode ends
-re-learn within a fraction of a second. An engine crash costs its replica's restart, 3.6-5
-request-seconds for every second one engine of four is down whatever happens to its KV or its spill,
-so every belief about it going to `P(resident) = 0` costs nothing measurable. A node is dead when
-its lease in the record expires, which makes liveness **owned**, not observed: "is this replica
-still serving" is a correctness question by the second test above, and two schedulers must never
-hand out one node's capacity. But routing cannot wait for the lease: a router that learns of a lost
-node after 10 s pays 4,200-4,800 request-seconds and after 40 s about 65,000, the requests placed on
-it parked until then, so suspicion routes at the first failed dispatch and the lease decides only
-re-placement and budgets. Utilisation and power stay observed.
+284-370 at 1 s with a restart and 233-276 with the client's continuation. A client that backs off
+rather than retrying at once costs 7-32% more request-seconds and leaves 9-18% fewer requests
+unserved.
+
+Of the soft state, the belief, the flow graph, the tenant meters and the length estimators cost
+nothing a run can see when lost (within 10 request-seconds where memory does not bind hardest):
+residency is re-learned from the scheduler's own dispatches within a second or two. A reservation
+ledger that is not rebuilt from node agents over-admits 3-30% of what it admits blind, and only at
+0.6x of the granted partition and below; the engine's wait absorbs it, and node agents that check
+their own partitions leave 0-4. The estimators' snapshot (32 KiB every 10 s) is not needed, since
+lengths observed when a decode ends re-learn within a fraction of a second.
+
+An engine crash costs its replica's restart, 3.6-5 request-seconds for every second one engine of
+four is down whatever happens to its KV or its spill, so every belief about it going to
+`P(resident) = 0` costs nothing measurable. A node is dead when its lease in the record expires,
+which makes liveness **owned**, not observed: "is this replica still serving" is a correctness
+question by the second test above, and two schedulers must never hand out one node's capacity. But
+routing cannot wait for the lease: a router that learns of a lost node after 10 s pays 4,200-4,800
+request-seconds and after 40 s about 65,000, the requests placed on it parked until then, so
+suspicion routes at the first failed dispatch and the lease decides only re-placement and budgets.
+Utilisation and power stay observed.
 
 **The tiers' rates are counted** (Phases 7 and 10), on four nodes at 250 req/s with the engine
 allocating. The soft tier makes 3.1 owned changes a request with nothing enforced and 5.0 under
@@ -164,11 +163,14 @@ set by the fleet's size rather than its traffic. The record is three orders belo
 four nodes (1,400-3,000 times) and the logged tier is not. At 10,000 nodes the soft tier is 3.0
 million owned changes a second (0.14 cores a node at FoundationDB's published cluster write rate),
 the logged tier 146,000-491,000 a second on the agent presets, under the 820,000 writes a second of
-FoundationDB's published 384-core benchmark, and the record about 1,060 a second. A commit per
-decision costs a request 72 us on a protected drive within a rack, 0.8 ms across a zone and 1.5-2.5
-ms at FoundationDB's published commit -- 0.6-21 times a warm `FaaS` invocation -- and 4 ms with this
-host's full flush (an append is 1.6 us and an `fsync` 18 us), so write-through is ruled out on
-latency before any restart is priced.
+FoundationDB's published 384-core benchmark, and the record about 1,060 a second; split across three
+regions, liveness stays in each region's record and the global record writes 0.16-0.19 a second
+(Phase 11, §8).
+
+A commit per decision costs a request 72 us on a protected drive within a rack, 0.8 ms across a zone
+and 1.5-2.5 ms at FoundationDB's published commit -- 0.6-21 times a warm `FaaS` invocation -- and 4
+ms with this host's full flush (an append is 1.6 us and an `fsync` 18 us), so write-through is ruled
+out on latency before any restart is priced.
 
 ### Where polyproto's state falls
 
@@ -183,10 +185,13 @@ latency before any restart is priced.
 | gang membership, staged reservations | **owned** | soft; logged when `SideEffecting` | `staged_*`, `cancelled` |
 | retention directives it issued | **owned** | soft | `Entry.retain_until` on the ledger (`--retain`); on the engine a mark on a dispatch, believed once the stream acknowledges it (§3.3) |
 | placement decisions, flow graph | **owned** | soft | `upstream`, `tool_anchor`, `origin` |
-| partition sizes, model placement | **owned** | record | `Fleet` under `--fleet`: a replica per node, its role, and the partition its weights leave, changed by the planner about once in 20 s on the rotating mix (§9, Phase 6) |
+| partition sizes, model placement | **owned** | record | `Fleet` under `--fleet`: a replica per node, its role, and the partition its weights leave, changed by the planner about once in 20 s on the rotating mix (Phase 6) |
 | side-effect intents, suspended sessions, approval pauses | **owned** | logged | **counted, not stored** (Phase 7): `programs::LogCause` counts the writes by cause; the log's store is §8's and the simulator has none |
 | tenant identity and per-tenant quota | **owned** | record | identity declared on `Request`, and the router's two per-tenant meters built (§3.8); the per-tenant axis on `Quota` is **missing** |
 | node liveness and membership | **owned** | record | counted, not stored (Phase 10): a lease renewal a node every 10 s is the record's largest writer; a node declared lost leaves placement, and a router that waits for the lease parks a quarter of its traffic |
+| a region's node budget, model counts by region, the routing table | **owned** | record (global) | `Budgets` and `RoutingTable` on `Regions` (Phase 11), set by the global tier on the provisioning clock; counted, not stored |
+| a tenant's regional share | **owned** | soft | `TenantShares` (Phase 11): a lease from the global tier, relearned after a restart; the tenant's global quota and region set are record |
+| another region's load | **inferred** | soft | a summary on a clock plus the sender's own forwards in flight (Phase 11) |
 | shadow price per pool | **inferred** | soft | `TierPool::marginal_price` |
 | regret rate per class | **inferred** | soft | `TierPool::regret_rate`, from a ghost list |
 | per-tool re-arrival gap | **inferred** | soft | built for programs (Phase 7): the tool-transition estimator and the idle-gap survival the lifecycle reads; not on the base trace |
@@ -202,14 +207,15 @@ Two inferred entries are estimates by design. `marginal_price` is deliberate, be
 dry run costs as much as the eviction it prices; `regret_rate` is measured from a bounded ghost list
 rather than assumed. Both show the engine already has somewhere to put this kind of quantity.
 
-Three entries were cheats -- information no deployment has -- and two now have honest replacements
-behind bits. The score read the exact output length; under `--observables` it reads the observed
+Three entries were cheats -- information no deployment has -- and each has an honest replacement
+behind a bit. The score read the exact output length; under `--observables` it reads the observed
 mean, which costs nothing on this workload (§3.2). `Control::Gossip` handed over a stale but
 **exact** engine residency set, which telemetry cannot produce (below); under `--belief` the
-engine's KV comes from its event stream instead. The third is open and load-bearing:
-`FlowHint.probability` is `1.0` in the published runs, so every published cross-workload flow result
-rests on the scheduler being *told* the future with certainty (§3.2); Phase 7 prices what is left
-when it is not.
+engine's KV comes from its event stream instead. The third is load-bearing: `FlowHint.probability`
+is `1.0` in the published runs, so every published cross-workload flow result rests on the scheduler
+being *told* the future with certainty. Under `--hint-grade` a hint is learned instead, and a
+learned template keeps about half of prefill-ahead's open-loop win and almost none once a downstream
+arrives when its upstream ends (§3.2).
 
 ### The correction: the orchestrator does not allocate the KV cache
 
@@ -279,17 +285,22 @@ are known at admission; output length is not. Two options, neither clean:
 Per-block authority is not replaced by partition authority, then. It is replaced by a
 **bound-versus-utilisation tradeoff** -- and the tradeoff is not a scalar, because an overcommit's
 cost does not land on the request that caused it. The engine resolves it on its own order, blind to
-tenant and priority (§3.8). Measured, the cost is **class-blind**: whichever sequence the engine
-preempts pays, and interactive turns and task stages lose p99 about equally (Phase 3). So an
-optimistic admission converts a *mean* utilisation gain into a *tail* loss spread across everyone,
-and a sweep reporting mean service time prices that at approximately zero. Phase 9 corrected the
-size and not the direction. At half the partition, the engine Phase 3 measured on ran a sixth to a
-fifth of its decodes with no memory instead of making them wait (on the `belief` cluster), so the
-half partition is an overload and the bracket understated it. The loss is class-blind on the engine's own order, and it
-moves onto the throughput class once the router chooses the victim (below).
+tenant and priority (§3.8), so the cost is **class-blind**: whichever sequence the engine preempts
+pays, and interactive turns and task stages lose p99 about equally (Phase 3). An optimistic
+admission converts a *mean* utilisation gain into a *tail* loss spread across everyone, and a sweep
+reporting mean service time prices that at approximately zero. Once the router chooses the victim
+the loss stops being class-blind and moves onto the throughput class (below).
 
-The asymmetry is also where a fix would live -- a **per-class mix of the two**, on an axis §4 turns
-out to need:
+The scalar rules span a bracket -- `bound` against `max_tokens`, `perfect` against the exact output,
+`none` against the prompt alone -- that is narrow at the published partition. At half of it `bound`
+refuses 17%, `perfect` 8.6%, and `none` refuses nothing but preempts 10.5% -- but the engine those
+figures ran on decodes a sequence it cannot place with no memory rather than making it wait, 18-20%
+of decodes at half the partition on the `belief` cluster. With an engine that waits
+(`--engine-wait`) the half partition is past saturation, so those are an overload's figures, over
+different sets of served requests.
+
+The asymmetry is also where the fix lives: a **per-class mix of the two options**, on an axis §4
+turns out to need.
 
 - **Reserve conservatively for latency-bearing work** -- whatever a user or a blocked agent is
   waiting on. Admit it against a high quantile of the predicted output length rather than its mean,
@@ -298,22 +309,18 @@ out to need:
   designated victim when the conservative class expands into the slack.
 
 §3.7 arrives at the same quantile from the routing side, which is the reason to believe the axis is
-real rather than convenient. **Phase 9 built it, and the mean half survives only where memory binds
-lightly.** Phase 3's admission sweep found the bracket narrow at the published partition and wide at
-half of it -- `bound` refuses 17%, `perfect` 8.6%, and `none` refuses nothing but preempts 10.5% --
-and while the loss is class-blind, a two-tier mix buys nothing a scalar bound would not until
-requests carry a class it can act on -- the `slo` field (§4), declared since Phase 4 -- and the
-router can choose the victim, which only cancellation allows (below). Phase 9 gave it both and
-measured the form that works: **one declared quantile of each class's own observed distribution, a
-priority order at a router queue, and a victim class** ([`phase-9.md`](phase-9.md), P5). Where the
-classes are drawn alike one p90 and the tiered claim are a scalar; where they are not, the pooled
-quantile lets the interactive first-token p99 reach 0.5-6.7 s with a batch class and a class's own
-quantile holds it to 0.18-0.59 s, and 63-67 ms with a cancel. Borrowing against the mean lets more
-throughput work in and the cancel evicts it: at 0.6x of the grant with prefill taking engine time it
-finishes the throughput class 1.5-1.7x later than its own p90 does and the interactive class's first
-token 2.5-5.1x later, so the mean half is retired there; at 0.75x it is level, or ahead on two seeds
-of three. The half partition Phase 3 used is an overload for the engine once a sequence it cannot
-hold waits (`--engine-wait`), and its bracket compared different sets of served requests.
+real rather than convenient. **Built (Phase 9), the mean half survives only where memory binds
+lightly.** While the loss is class-blind, a two-tier mix buys nothing a scalar bound would not; it
+needs requests that carry a class it can act on -- the `slo` field (§4) -- and a router that can
+choose the victim, which only cancellation allows (below). With both, the form that works is **one
+declared quantile of each class's own observed distribution, a priority order at a router queue, and
+a victim class** ([`phase-9.md`](phase-9.md), P5). Where the classes are drawn alike one p90 and the
+tiered claim are a scalar; where they are not, the pooled quantile lets the interactive first-token
+p99 reach 0.5-6.7 s with a batch class and a class's own quantile holds it to 0.18-0.59 s, and
+63-67 ms with a cancel. Borrowing against the mean lets more throughput work in and the cancel
+evicts it: at 0.6x of the grant with prefill taking engine time it finishes the throughput class
+1.5-1.7x later than its own p90 does and the interactive class's first token 2.5-5.1x later, so the
+mean half is retired there; at 0.75x it is level, or ahead on two seeds of three.
 
 **The catch is that the orchestrator cannot cash that understanding inside the engine.** Ceding
 eviction ceded the **choice of victim**: the engine still preempts and recomputes under pressure,
@@ -428,6 +435,14 @@ emits directly, batched at the engine's own step boundary:
 The simulator models this channel's cadence, lag and loss (`--belief`, with `--loss`, `--recovery`
 and `--silence`), not its transport cost, which is free at this rate whichever boundary carries it.
 
+**The header is also what schedulers sharing a region read of each other** (Phase 11). Active-active
+schedulers over one region's nodes each know their own dispatches exactly and their peers' through
+the engines' `queued` and `running`. Reported at the engine's step, 25 ms, two or four of them place
+within 0.1% of one scheduler at 250 and at 325 req/s a region, so a region's scheduler scales out on
+telemetry this section already specifies. On reports a second old four herd onto whichever node
+looked idle -- +1.6-1.9% at 250 req/s and +11.7-13.4% at 325 -- while two stay within 0.6% at every
+report age and load.
+
 #### Two control loops, two clocks
 
 Step-aligned ingestion closes the loop on **routing and admission**: the orchestrator learns of
@@ -509,6 +524,7 @@ rule covers every seam:
 
 | rate | seam | llm-d | polyproto | affordable boundaries |
 |---|---|---|---|---|
+| per epoch, seconds to minutes | budgets, routing and tenants' shares between regions | -- | a global tier on the provisioning clock (§8) | anything, a WAN round trip included |
 | per connection | TLS, ALPN, protocol normalisation | Envoy listener | commodity edge or own listener | anything |
 | per step, 40-100 Hz | engine telemetry | KV events, scraped metrics | same, step-aligned (§1) | anything; choose for adoptability |
 | per request | dispatch to the engine | sidecar -> localhost HTTP, a 15.5 us loopback round trip | direct, UDS: **5.2-7.5 us** (the ladder's least stable rung, non-monotone in payload) | sockets; a ring for short-request classes |
@@ -527,7 +543,7 @@ multiplier at a higher rate.
 
 `best_scored` is an argmin over candidates, so a pluggable scoring term runs once per candidate. An
 `ext_proc`-shaped callout on a stream the hook service keeps open costs **36 us**. At 4 nodes that
-is **142 us per placement** -- more than a warm FaaS invocation's modelled ~129 us. At a fleet of 32
+is **142 us per placement** -- more than a warm FaaS invocation's modelled ~120 us. At a fleet of 32
 it is **1.1 ms**, and the scheduler's decision rate becomes the cluster's throughput ceiling. The
 same fleet over a ring costs 2.1 us; over WASM, 0.4 us.
 
@@ -536,6 +552,17 @@ once, at the gateway, with the policy pre-collapsed into a single score. At 13-2
 candidate, per eviction candidate, per telemetry batch. A warm WASM call measures *below* the ring,
 so this is where the README's zero-cost-extension claim cashes out for a sandboxed extension
 specifically, not just an in-process one.
+
+**The same rule, at the WAN's scale, makes every per-request decision regional** (Phase 11). A
+scheduler on the request path is a seam every request crosses, so one global scheduler puts the WAN
+in front of every request from another region: with three regions of equal demand, two-thirds of
+requests pay a round trip before they are decided, a mean of 40 ms at 30 ms one way and 82-131 ms on
+Azure's published round trips -- 530-3,000 times the sidecar tax §2.3 measures, and 4-13% of a
+one-second agent turn. A partition that cuts a region off from it is an outage, and priced as §1
+prices a scheduler's, a minute of one at 250 req/s costs 450,000 request-seconds (`λD²/2`). So a
+region schedules its own requests, and what crosses the WAN is what changes on the provisioning
+clock -- the first row of the table. Kubernetes can run one control plane over many clusters for the
+converse reason: its decisions are placements, off the request path.
 
 ### 2.3 The honest accounting
 
@@ -556,7 +583,7 @@ the measured tax:
 | 30 ms classification or extraction | illustrative | 0.15-0.25% |
 | 1 ms of work | illustrative | 4.4-7.5% |
 | warm service request, 250 us | `SERVICE_EXEC_NS`, a **chosen constant** | 18-30% |
-| warm FaaS invocation, ~129 us | `FAAS_EXEC_MIN_NS` 40 us + `U[0, 160 us]`, a **chosen constant** | 34-58% |
+| warm FaaS invocation, ~120 us | `FAAS_EXEC_MIN_NS` 40 us + `U[0, 160 us]`, a **chosen constant** | 37-62% |
 
 The bottom two are workload constants, not measurements.
 
@@ -716,13 +743,13 @@ What remains, worst first:
      priority model, not just a wasted GPU.
    - **Backpressure, and where it lands.** A slow client stalls its HTTP/2 receive window and the
      tokens already generated have to go somewhere: buffered in host DDR, or pushed back into the
-     decode loop as head-of-line blocking that looks exactly like engine slowness. For
-     text the first is cheap, and Phase 9 retracts the sentence that called it an occupant of the
-     pool §5 prices: if every decode in flight on a node stalled for its whole decode the buffer
-     peaks at 4,600 tokens a node on the published workload and 8,900 with a batch class, 0.9 and
+     decode loop as head-of-line blocking that looks exactly like engine slowness. For text the
+     buffer is cheap: if every decode in flight on a node stalled for its whole decode it would
+     peak at 4,600 tokens a node on the published workload and 8,900 with a batch class, 0.9 and
      1.8 MB at 200 bytes a token, 0.01-0.02% of a node's host DDR, against 15 KiB of HBM a token
-     for pausing the decode instead. The rule is to buffer and never pause; the sentence stands for
-     audio and image output, where a stalled stream carries tens of kilobytes a second.
+     for pausing the decode instead (Phase 9). The rule is to buffer and never pause. Audio and
+     image output differ: a stalled stream carries tens of kilobytes a second, and there the buffer
+     is an occupant of the host DDR §5 prices.
    - **Retry, timeout and hedge against a stateful backend.** Re-issuing a partly-decoded request
      is not idempotent and throws away a warm prefix; hedging one duplicates prefill. These are
      scheduling decisions wearing transport clothes, which is an argument for holding them here,
@@ -802,9 +829,9 @@ this workload's decision rate, against ~1000 for a warm WASM hook (§5).
 
 Ordered by what makes the rest trustworthy: the boundary first (3.1), then the estimates that
 replace declarations (3.2-3.3), then the apparatus that makes any of it measurable (3.4-3.6), then
-confidence and tenancy (3.7-3.8), and three smaller points (3.9-3.11). Built: 3.1, 3.3, 3.4, 3.5,
-3.6, 3.7, 3.11, 3.10's term, and 3.8's measurements (Phase 6). Open: the flow estimator in 3.2
-(Phase 7) and the per-tenant axis on `Quota` in 3.8.
+confidence and tenancy (3.7-3.8), and three smaller points (3.9-3.11). All of it is built but two
+pieces: the shared L2 tier itself, which 3.10 prices in the argmin, and the per-tenant axis on
+`Quota` in 3.8.
 
 ### 3.1 A `Telemetry` boundary
 
@@ -823,31 +850,27 @@ replaces it: exact by default, the observed mean under `--observables` (§3.2).
 
 ### 3.2 Predicted flows and predicted lengths replace declared ones
 
-**Flows.** Replace `FlowHint { probability: 1.0, lead_ops, payload_bytes }` with an estimator over
-observed history, one per (tool, session-class): P(this turn calls a tool); which tool, as a
-distribution; re-arrival gap as EWMA mean **and variance**, so confidence is available rather than
-invented; and payload size.
+**Flows.** A declared `FlowHint { probability: 1.0, lead_ops, payload_bytes }` tells the scheduler
+the future with certainty. What replaces it is an estimator over observed history (Phase 7),
+`ToolGapIndex`'s shape widened: keyed by observables -- the prompt's template root and the previous
+tool -- it keeps a distribution over the next step, the gap as an empirical distribution over the
+key's recent observations, from which a mean, a variance and any quantile are read rather than
+invented, and the payload. Agent programs read it; on the base trace a hint carries a grade
+(`--hint-grade`): the declared downstream, the declared template only (the leading blocks the flow
+shares), or a template learned per function whose probability is the observed rate, gated by
+`--learn-gate`. `Hierarchy::anticipate(id, weight)` already takes a probability and caps an
+announced access at one real access, so an estimate needs no change to the ledger.
 
-`Hierarchy::anticipate(id, weight)` already takes a probability and already caps an announced
-access at one real access. It has only ever been fed `1.0`. Feed it the predicted probability and
-the mechanism becomes honest with no change to the ledger.
-
-This unlocks the falsification the prewarm results need: **how much of the coupling-tier-1 win
-survives when the hint is an estimate?** Against a perfect declaration, announce buys 11-18% task
-latency on the ledger and 3.2-9.0% with the engine allocating (§1). Against an EWMA with real
-variance it buys less, and the amount it loses is the honest value of the mechanism.
-
-**Measured (Phase 7).** Hints have three grades: the declared downstream, the declared template
-only (the leading blocks the flow shares), and a template learned per function. On the published
-trace in its published order, prefill-ahead cuts the flow downstream's stall by 63% with the
-declared downstream, 47% with the template only and 24-31% with a learned template (which exists
+The question an estimate answers is how much of the coupling-tier-1 win survives it. On the
+published trace in its published order, prefill-ahead cuts the flow downstream's stall by 63% with
+the declared downstream, 47% with the template only and 24-31% with a learned template (which exists
 for 74% of flows when their upstream arrives); at half the partition 40-49%, 37-40% and 17-25%.
 Those are open-loop figures: the trace submits a downstream 28 ms after its upstream whether or not
 the upstream has finished, and 100% of an agent turn's tool calls arrive before the turn ends.
 Released when the upstream finishes, the same hints cut the stall by 0-5%, and the learned template
-by nothing (-0.1 / +2.9 / -0.0%). The published prefill-ahead and announce figures stay on record
-as open-loop figures. The name of a tool arriving in the stream warms its sandbox as well as
-prediction does, since a restore takes about 3 ms against a decode of a second.
+by nothing (-0.1 / +2.9 / -0.0%), so every published prefill-ahead and announce figure is an
+open-loop figure. The name of a tool arriving in the stream warms its sandbox as well as prediction
+does, since a restore takes about 3 ms against a decode of a second.
 
 **Lengths.** For the score, the observed running mean of completed output lengths is enough: under
 `--observables` it lands within 0.13% of the exact length on this workload, and no estimator can do
@@ -1147,9 +1170,10 @@ arm for compute:
   quota admits its engine-seconds wherever they land, and a set confines them to one replica.
 - **A cap on sequences in flight per tenant** cannot tell a neighbour from a busy tenant: it refuses
   16-27% of the others' requests.
-- **A second engine on the node** remains the worst instrument, on the pre-measurement's +91-96%.
+- **A second engine on the node** is the worst instrument, at +91-96% on a pre-measurement; it is
+  not built.
 
-The tenant-aware block manager §3.8 anticipates as promotion tier 2 was built as a ceiling, a
+The tenant-aware block manager this section names as promotion tier 2 was built as a ceiling, a
 per-tenant floor in the engine's eviction: at the published partition it moves any tenant group's
 mean service by at most 0.3% while raising the quietest twelve's hit rate by 5-10 points; at half
 the partition with prefill taking engine time the quiet half gain 0.2-1.8%. That is the regret
@@ -1158,9 +1182,10 @@ number to ask with, and it is small where the partition is not tight.
 **The quota axis is missing on the ledger and built at the router.** `Quota` is per *class*:
 `band`, `floor` and `limit` are all `[_; BlobKind::N]`. Soft tenancy needs a second axis per tenant,
 and the two interact the standard way -- when a tenant is over quota and an under-floor class wants
-its bytes, one has to yield. A request now declares its tenant, as it declares its `slo`, and the
-router meters prefill work and sequences in flight per tenant; host DDR's `Snapshot` and
-`ServiceHeap` still have no tenant axis, and no measurement says it binds.
+its bytes, one has to yield. A request declares its tenant, as it declares its `slo`, and the router
+meters prefill work and sequences in flight per tenant; across regions a tenant's quota is split
+into regional shares, leased from the global tier (Phase 11, §8). Host DDR's `Snapshot` and
+`ServiceHeap` have no tenant axis, and no measurement says it binds.
 
 One reframing falls out. The soft-floors-beat-hard-partitions result **is** this argument in
 miniature: a soft floor lets a class borrow idle capacity where a hard partition strands it, which
@@ -1179,11 +1204,27 @@ recorded runs congestion alone changes 4.7% of placements and load 13.6%. The fa
 the other side too: a stale view helps residency-greedy at the published partition and hurts it at
 half of it, while the scored arm moves by under 0.05% either way (§1).
 
+**Those terms decide within a region, not across one** (Phase 11). They price an instant: a load
+difference between two nodes is gone within a decode, while a round trip and a prefix left behind
+are certain. With clients in regions and their round trip in the score, an argmin over every
+region's nodes still sends 37-41% of requests to another region when no region is busier than
+another on average, and is 4.1-4.6% slower than a scheduler per region at 30 ms between regions and
+11-12% slower on Azure's round trips. It is the ledger's *falsification test that fails* one level
+up: a greedy per-request score cannot price what its decisions do to the next ones. Across regions
+the decision is a rule on a clock -- a spill priced on a summary, a table, a budget (§5).
+
 **"Use `alpha * PrefixOverlap - beta * TokenLoad`."** The same idea, weaker. A weighted sum needs
 alpha and beta tuned per deployment and they are not commensurable -- a unit of overlap and a unit
 of load have no exchange rate, so the tuning *is* the policy. The cost model denominates every term
 in **nanoseconds**, which have an exchange rate by construction. Nothing is tuned because nothing
 needs converting, which is also why a term can be added without re-tuning the others.
+
+Across regions the objection has a measurement (Phase 11). Every shipped cross-region balancer
+spills on a utilisation threshold, and the threshold that is best at one load is worst at another:
+0.7 costs nothing at equal demand at 250 req/s a region and 1.2-1.4% at 325, and 0.5 the reverse. A
+spill priced in nanoseconds -- each region's mean quote plus the round trip -- is within about a
+point of the better threshold at equal demand and level with or ahead of both under a peak, at both
+loads, with nothing to tune.
 
 That rule is why §3.7 turns down the risk penalty: `lambda * sigma` would have been the first
 dimensionless constant in the score, and the shape of the uncertainty -- one binary fact with two
@@ -1252,7 +1293,9 @@ is the reason to think it is real rather than a knob.
 Unlike the other four it is **declared, not inferred**: a caller states a latency objective the way
 it states `max_tokens`, so this field needs none of the estimator machinery below. That is also
 what keeps §3.7 free of a tuned constant -- the quantile arrives with the request instead of being
-swept into existence.
+swept into existence. The declaration-free alternative, ordering by attained service, ranks the
+classes backwards on this workload: the throughput class first and interactive agent sessions last
+(Phase 9).
 
 Each of the ten patterns becomes a named preset over those fields, the way `sched_lm` takes
 `--mix tool=0.5,rag=0.3,oneshot=0.2`. Three consequences:
@@ -1263,20 +1306,20 @@ case -- is definitionally the one that cannot be declared and must be predicted.
 declared hints felt natural: they are the *fixed*-pipeline case, and the prototype has been testing
 the easy half of the dimension.
 
-**RAG-grounded was missing, and is built (Phase 7).** Retrieved chunks are shared across *sessions* with Zipf
-popularity, not chain-structured like a KV prefix, so they evict differently from anything modelled
-and contend with KV for the same pool. `sched_lm` models this (`--rag-docs`, `--rag-zipf`);
-polyproto has no equivalent. It was the cheapest high-value addition, and the one grounding mode
-that changes the ledger's contention shape. Under prefix caching a finite partition reuses 36% of the
-chunk tokens a call retrieves when the chunks arrive in a fixed order and 12% when they arrive in
-relevance order (k = 5, 10,000 chunks), against 52% and 28% with an infinite cache; reuse
-independent of position finds 64% (96% infinite) and nets 54% after recomputing about 15%. The
-position-independent figure is a residency counterfactual, not an executed arm.
+**RAG-grounded is a class of its own** (Phase 7). Retrieved chunks are shared across *sessions*
+with Zipf popularity, not chain-structured like a KV prefix, so they evict differently from anything
+else modelled and contend with KV for the same pool -- the one grounding mode that changes the
+ledger's contention shape, and one `sched_lm` also models (`--rag-docs`, `--rag-zipf`). Under
+prefix caching a finite partition reuses 36% of the chunk tokens a call retrieves when the chunks
+arrive in a fixed order and 12% when they arrive in relevance order (k = 5, 10,000 chunks), against
+52% and 28% with an infinite cache; reuse independent of position finds 64% (96% infinite) and nets
+54% after recomputing about 15%. The position-independent figure is a residency counterfactual, not
+an executed arm.
 
-**Durable memory breaks an invariant, and the invariant holds (Phase 7).** Every class in the ledger is evictable at a priced cost.
-Durable state must never be *lost*, only demoted -- a correctness constraint, not a cost tradeoff.
-Before Phase 7 that existed only as `ServiceHeap`'s serving pin; a durable cell is now pinned to
-the cold tier and demoted, never dropped, and no durable cell was lost in any run. The one fault
+**Durable memory breaks an invariant, and the invariant holds** (Phase 7). Every other class in the
+ledger is evictable at a priced cost, a serving `ServiceHeap` aside. Durable state must never be
+*lost*, only demoted -- a correctness constraint, not a cost tradeoff -- so a durable cell is pinned
+to the cold tier and demoted, never dropped, and no durable cell was lost in any run. The one fault
 it does not hold against is losing the node (Phase 10): a long-running run that loses a node half
 way through the arrivals loses 18-20 durable cells and leaves a program each holding lost state --
 a correctness failure that turn latency does not show (0.1-0.4%) -- while a copy made when each cell
@@ -1333,37 +1376,33 @@ first call, 85.7% at their last with its history and 79.1% over every call; conv
 and multi-agent requests look like agentic ones at their first call. The consumers hardly care:
 speculation's gate is unchanged, a claim by inferred class overruns 2-5% less than by the true
 class, and joint suspension frees 15% more, -5% and -1% idle time on three seeds. A role's own p90
-claim overruns on 9-13% of its agents against a pooled claim's 63% for reviewers, and changes fan-out
-service by -2.8% to +3.3% at the one partition where claims bind.
+claim overruns on 9-13% of its agents against a pooled claim's 63% for reviewers, and changes
+fan-out service by -2.8% to +3.3% at the one partition where claims bind.
 
 ### Per-pattern coupling is the falsifier
 
-Run coupled % per taxonomy cell on both axes. The output is a two-column table saying, for each
-pattern, whether a unified orchestrator can help at all.
+Coupled % per taxonomy cell, on both axes, says for each pattern whether a unified orchestrator can
+help at all (Phase 7). Locality coupling on the programs is 0% for one-shot, extraction,
+conversational, retrieval and batch programs, 13-15% for tool pipelines, 4% for agentic, 7% for
+multi-agent and 2% for long-running ones. Memory coupling is 0% for every pattern, because no
+program contends with a second class in host DDR; on the published trace at 2 GiB it is 4-41% by
+pattern, driven by the services and function cells.
 
-Phase 7 built it. Locality coupling on the programs is 0% for one-shot, extraction, conversational,
-retrieval and batch programs, 13-15% for tool pipelines, 4% for agentic, 7% for multi-agent and 2%
-for long-running ones; memory coupling is 0% for every pattern, because no program contends with a
-second class in host DDR. On the published trace at 2 GiB it is 4-41% by pattern, driven by the
-services and function cells. The table is smaller than the expected shape below: coupling lives on
-flows, and the host-memory half of the claim for long-running agents did not appear.
-
-Expected shape, stated in advance so it can be wrong: batch inference and one-shot generation show
-near-zero coupling on both axes (independent requests, nothing to co-decide); multi-agent and
-long-running agents show high locality coupling (shared context, cross-node dataflow, atomic
-admission) and moderate-to-high memory coupling on the host. If that fails, the thesis is narrower
-than claimed and this document should say so.
+So the thesis is narrower than the taxonomy suggests. Coupling lives on flows: patterns with nothing
+to co-decide show none, multi-agent and long-running agents -- shared context, cross-node dataflow,
+atomic admission -- couple a few percent of their placements rather than most of them, and the
+host-memory coupling a long-running agent's state seemed to promise does not appear.
 
 ---
 
 ## 5. Emergent properties
 
 An advantage is *emergent* if no silo can produce it independently and it is not merely a hint
-away. Five are simulated, and all five were re-run with the engine allocating KV (§1); two are
-measured end to end (Phase 8); five are proposed.
-
-**On the first five:** simulated on modelled constants, so treat each as directional rather than
-sized. The properties worth most are the ones whose *existence* does not depend on a constant.
+away. Twelve are named below: five simulated and re-run with the engine allocating KV (§1), two
+measured end to end (Phase 8), four that §3 and §4 had to build before they could be measured, and
+the measure itself. All but the seam costs rest on modelled constants, so treat each as directional
+rather than sized; the properties worth most are the ones whose *existence* does not depend on a
+constant.
 
 **Within host DDR (orchestrator-budgeted memory).** Budgeted, not owned: the orchestrator sizes the
 pool and sets its floors, but one occupant it arbitrates -- the engine's offload tier -- is
@@ -1382,10 +1421,14 @@ whoever fills it.
 
 **Across topology.**
 
-3. **Congestion and residency in one argmin.** Neither an inference router nor a FaaS control plane
-   can price "place the tool call near the active GPU context unless the link is congested or local
-   memory is full". Measured consequence: the tool-placement decision **inverts** between
-   unpressured and memory-bound regimes, and again at region distance.
+3. **Congestion and residency in one argmin, within a region.** Neither an inference router nor a
+   FaaS control plane can price "place the tool call near the active GPU context unless the link is
+   congested or local memory is full". Measured consequence: the tool-placement decision
+   **inverts** between unpressured and memory-bound regimes. Across regions it is the wrong
+   instrument (Phase 11, §3.9): with the client's round trip in the score the argmin still spreads
+   37-41% of requests across regions and is 4-12% slower than a scheduler per region, so a region
+   places its own work and a function call never leaves it -- 0.1 ms of work against a round trip of
+   60 ms.
 4. **Cross-workload atomic admission.** All-or-nothing placement of a fan-out across nodes is not
    expressible per request. Where it binds: 22% more fan-outs completed and 10% less inference
    stall; it holds on the router's partition check, though its size is sensitive to the control
@@ -1395,6 +1438,19 @@ whoever fills it.
    same host DDR units can be traded against each other. A siloed hint is advisory and unpriced. On
    the ledger the trade comes out lopsided (Phase 5): a host hint's retention half is worth 0.0-0.7%
    of task latency and its prewarm half 4.1-6.0%.
+
+**Across regions, two mechanisms that are not emergent** (Phase 11). A region alone collapses past
+about twice its share of demand -- a burst of 2.25 times it costs a scheduler per region +72-82% at
+250 req/s a region and +223-250% at 325 -- and every cross-region rule built recovers to within 6%
+of equal demand on 30 ms round trips and 7% on Azure's, the table near the knee aside. Every shipped
+global balancer already spills on a utilisation threshold; pricing adds only a spill with nothing to
+tune, within about a point of the better threshold at each load (§3.9). Node budgets that follow a
+day recover it -- on time, +1.0-1.7% over equal demand with headroom and +1.5-4.7% near the knee,
+where fixed budgets cost +3% to +80% and 2.8-7.5 times the service respectively -- and lateness is
+their price, as it is for a placement (§1): a rent-or-buy planner lands between 10 s and 30 s late
+on a compressed day, and a spill beneath the budget covers what it misses. A capacity planner that
+sees one workload's demand per region can do the same, so neither is a property only unification
+has.
 
 **Measured end to end (§2, Phase 8).**
 
@@ -1419,21 +1475,26 @@ whoever fills it.
    saturates between **19 and 20 nodes**; scoring a warm `Wasm` hook, **~1000**. No silo needs this
    ordering, because no silo is simultaneously a scheduler and a data plane.
 
-**Proposed, and the reason to do §3 and §4.**
+**Measured once §3 and §4 made them expressible.**
 
-8. **Learned cross-class retention (Phase 7: measured, and small).** "This agent returns to this tool in ~800 ms, confidence 0.7"
+8. **Learned cross-class retention.** "This agent returns to this tool in ~800 ms, confidence 0.7"
    driving a FaaS warm-cell retention decision priced against what holding it displaces. A silo can
-   receive that as a hint; it cannot weigh it. Phase 5 bounds what it could be worth through a
-   directive on this workload: an emitter that knows every next use buys at most 1.4% of stall.
-9. **Authority-driven speculative scheduling (Phase 7: measured, and small where tools are short).** Pre-executing `ReadOnly` tool calls concurrently
+   receive that as a hint; it cannot weigh it. Measured, it is small on this workload: an emitter
+   that knows every next use buys at most 1.4% of stall through a directive (Phase 5), retention
+   through a tool call with Continuum's TTL moves turn latency by 0.00%, and one suspend decision
+   over a session's KV and its sandbox frees 63% of idle time against two timers' 65% (Phase 7).
+9. **Authority-driven speculative scheduling.** Pre-executing `ReadOnly` tool calls concurrently
    with decode, and scheduling `DraftOnly` work into burstable capacity with zero-compensation
    preemption -- reclaimed by eviction where the orchestrator still owns the pool and by
    cancellation where the engine does (§4). Both require knowing the authority class, which is a
-   property of the *workload*, not of any one runtime. Its non-speculative core is built (Phase 5):
-   a declared flow's downstream prefilled when its hint arrives. The cancellation half is measured
-   (Phase 9): with a victim class, a cancel takes the interactive first-token p99 to 63-67 ms where
-   a pooled quantile lets it reach 0.5-6.7 s, and what it costs lands on the throughput class's
-   completion.
+   property of the *workload*, not of any one runtime. Measured, it is small where tools are short
+   (Phase 7): speculation moves turn latency by -1.3 to +1.6% on coding tools and -3.2 to -3.7% on
+   research tools at published accuracies, against -17% for a perfect predictor, and reclaiming
+   drafts by under 1%. Its non-speculative core is built (Phase 5) -- a declared flow's downstream
+   prefilled when its hint arrives -- and its published win is an open-loop figure (§3.2). Its
+   cancellation half moves the loss (Phase 9): with a victim class, a cancel takes the interactive
+   first-token p99 to 63-67 ms where a pooled quantile lets it reach 0.5-6.7 s, and what it costs
+   lands on the throughput class's completion.
 10. **Joint prefill/decode pairing and ratio.** Disaggregation as a two-member gang with a
     direction, plus the fleet ratio behind it (§2.5). A sidecar picks a prefiller from a list.
     Measured (Phase 6), it is worth 1.6-2.6% at one prefiller in eight on the published mix and
@@ -1450,20 +1511,21 @@ whoever fills it.
     is engine time and not cache, so the cheaper arm is the router's quota on prefill work
     (+1.9-3.5% to the others where sharing costs +11%), with a replica set the hard version of it,
     and the engine-side floor a ceiling worth under 1% at the published partition.
-12. **Two-dimensional coupling as a published quantity.** Not an advantage but the measure of one.
+12. **Two-dimensional coupling as a published quantity.** Not an advantage but the measure of one
+    (§3.4), and per pattern the falsifier (§4).
 
-Plainly: the largest defensible effects are **topological dataflow co-placement**,
+Plainly: the largest defensible effects are **topological dataflow co-placement** within a region,
 **macro-orchestration of weights, partitions and gangs**, and **targeted host DDR multiplexing** --
-not cross-hardware arbitration of HBM bytes. Macro-orchestration of weights has a size and a
-condition (Phase 6): one model per node at the partition its weights leave is within 0.3% of the
-pooled engine and 71% ahead of weights cached per request with a batch per model, and it holds only
-while the placement follows the mix -- a placement that is late by 30 s costs 110-120% more than
-one that is on time. Once the orchestrator stops pretending it allocates KV
-blocks, what remains is a system solving three problems existing stacks fail at: joint dataflow
-placement across network boundaries, macro capacity and gang coordination, and authority-aware
-speculative execution. Phase 3 showed the first two survive the correction; Phase 7 tested the third: speculation is worth
-about 1% on coding tools and 3-4% on research tools at published accuracies, and a perfect predictor
-bounds it at 17%.
+not cross-hardware arbitration of HBM bytes, and not a per-request argmin across regions.
+Macro-orchestration of weights has a size and a condition (Phase 6): one model per node at the
+partition its weights leave is within 0.3% of the pooled engine and 71% ahead of weights cached per
+request with a batch per model, and it holds only while the placement follows the mix -- a placement
+that is late by 30 s costs 110-120% more than one that is on time. Once the orchestrator stops
+pretending it allocates KV blocks, what remains is a system solving three problems existing stacks
+fail at: joint dataflow placement across the network boundaries inside a region, macro capacity
+and gang coordination, and authority-aware speculative execution. The first two survive the
+correction (Phase 3); the third is small where tools are short, a few percent of turn latency at
+published accuracies and at most 17% with a perfect predictor (Phase 7).
 
 ---
 
@@ -1575,7 +1637,7 @@ Worst first.
 
 1. **Per-block admission control over inference state disappears.** An engine evicts and
    recomputes; it does not refuse for lack of KV, so `Admission::Pending` stops being reachable for
-   an individual `KvBlock`, and for `WeightShard` once Phase 6 moves weights. What it does *not*
+   an individual `KvBlock`, and under `--fleet` for `WeightShard`. What it does *not*
    lose is the partition: the orchestrator sized it, so its capacity stays an owned fact and a
    byte- or token-depth check against it stays authoritative. The loss is **granularity, not
    authority**. Three things lean on the granularity:
@@ -1610,11 +1672,10 @@ Worst first.
    cancel into an engine abort, decide where a stalled stream's tokens accumulate, and choose retry
    and hedge against a backend holding warm state. It threatens no result here -- the simulator
    charges seam costs from a measured ladder and never parses a byte of HTTP -- but it is the
-   largest gap between this design being right and being shipped, and one piece of it has a
-   modelling consequence, which Phase 9 measured and retracted for text: a stalled stream's buffer
-   peaks under 2 MB a node, a counter and not a term of the ledger. A departure does matter: with
-   20% of clients leaving, an unpropagated one holds 200-830 sequence-seconds of decode and costs
-   the interactive first-token p99 1.7-3.2x where memory binds.
+   largest gap between this design being right and being shipped. For text, a stalled stream's
+   buffer peaks under 2 MB a node, a counter and not a term of the ledger (Phase 9). A departure
+   does matter: with 20% of clients leaving, an unpropagated one holds 200-830 sequence-seconds of
+   decode and costs the interactive first-token p99 1.7-3.2x where memory binds.
 
 ### What gets easier
 
@@ -1640,13 +1701,14 @@ Worst first.
   as the prompt of a continuation. The reservation the cancel releases is the router's own.
 
   Context window earns its place because it is *declared metadata*, like size and load time, and
-    Phase 6's fleet uses it: dispatching a 200k-token prompt to a 32k model produces a
-  failure and a retry costing more than the placement saved. It also marks where the list stops.
+  Phase 6's fleet uses it: dispatching a 200k-token prompt to a 32k model produces a failure and a
+  retry costing more than the placement saved. It also marks where the list stops.
   Routing by **model accuracy** needs per-model, per-workload evaluation, which is model-specific by
   definition and is what §1 gave up KV ownership to avoid. A capability *gate* is in scope; a
   quality *ranking* is not, and the test is whether the engine can state the fact about itself.
-- **Weights become orchestration rather than caching** (Phase 6) -- more realistic, and a
-  capability no arm has today; the ledger never sees a weight again under `--fleet`.
+- **Weights become orchestration rather than caching** (Phase 6). Under `--fleet` a model is a
+  placement -- a replica per node, at the partition its weights leave -- moved by a planner on the
+  provisioning clock, and the ledger never sees a weight.
 
 ### The system of record
 
@@ -1707,10 +1769,37 @@ regions puts the WAN on every write.
 
 So the shape is **a record per region** for what must keep working through a WAN partition --
 leases above all, since a lease renewed across the WAN expires when the WAN does -- and **a global
-record**, in the two-region mode, for tenancy, the model catalogue and each region's **budget**.
-The global tier sizes regional budgets on the provisioning clock and each region admits within its
-own: §1's capacity-versus-allocation seam, one level up. `README.md`'s "spin up resources close to
-that region" is a decision on that clock, the one clock where a WAN round trip is affordable.
+record**, in the two-region mode, for tenancy, the model catalogue and what the global tier decides
+between regions. The global tier sets each region's **budget** on the provisioning clock and each
+region admits within its own: §1's capacity-versus-allocation seam, one level up. `README.md`'s
+"spin up resources close to that region" is a decision on that clock, the one clock where a WAN
+round trip is affordable (§2.2).
+
+Phase 11 built that split and counted what each record writes, at 10,000 nodes in three regions:
+
+| record | holds | writes |
+|---|---|---|
+| per region | node leases, the region's replicas and roles, its partition sizes | liveness, 333 a second a region at a 10 s renewal; the planner's placements |
+| global | tenancy, each tenant's global quota and region set, the model catalogue, each region's node budget and model counts, the routing table between regions | 0.16-0.19 a second: the table's six fractions every five minutes and 14-18 node moves a day, scaled from twelve nodes |
+| soft, at the global tier | each tenant's regional shares, the regions' demand summaries | none: relearned after a restart, as Doorman's master relearns its clients' leases |
+
+The global record writes 1,700-2,200 times less than one region's liveness, which the two-region
+mode, with a WAN round trip on every commit from the second region, carries with room.
+
+**What a region holds from the global tier is a lease with a safe value.** Its node budget, its
+routing fractions and its tenants' shares outlive a partition until they expire, and then the
+region runs on its own capacity and its own demand -- the static arms Phase 11 measured: on a
+compressed day at 250 req/s a region, +3% over equal demand at amplitude 0.5 and +67-80% at 0.75 on
+its own, and +1.5-3.4% with a spill or the table to regions it can still reach. Injected partitions
+are not built. A tenant's regional share can be soft for the same reason: a lease refreshed every
+0.1 or 0.5 s of the run removes the 1.4-2.6 points of refusals a day adds to a static split, and the
+noise a faster refresh chases and the lag of a slower one are artefacts of compressing the day 1,440
+times and its arrivals not at all.
+
+**The global argmin is a comparison, never a design.** Run with no decision latency and an exact
+view of every region -- the most favourable form a global scheduler could take -- it buys nothing
+that regional schedulers under budgets give up, at any demand measured (§3.9), and on the request
+path it would put the WAN in front of every request (§2.2).
 
 **Build the layer, not the database.** RFD 53 rejects FoundationDB as "more of a foundation for
 building a custom storage system than a full-featured system", with indexes "significantly more
@@ -1724,9 +1813,10 @@ document. What is specific to polyproto is the data model, and that is what a la
 - **Typed records with secondary indexes** -- by tenant, by region, by lease expiry.
 - **Leases**, on read versions (requirement 4).
 - **A change feed**, the versionstamped log the scheduler follows.
-- **Capacity budgets.** The global record grants each region a budget per tenant, model and
-  accelerator class, and the region admits within it -- the inference and multi-region piece no
-  general-purpose store supplies.
+- **Capacity budgets.** The global record holds each region's node budget and model counts, per
+  accelerator class, and each tenant's global quota and region set; a region admits within them,
+  and a tenant's regional share is a lease the global tier grants from them -- the inference and
+  multi-region piece no general-purpose store supplies.
 - **Selective replication** of the global record into each regional one, driven by the change feed,
   so tenancy and catalogue reads stay regional despite the two-region limit; the global record
   changes only on the provisioning clock. This is RFD 53's "logical replication of chunks of the
@@ -1783,9 +1873,10 @@ than fixed:
   cheap.
 - **Prefix sharing is a timing channel between tenants.** A cache hit is observable as faster TTFT,
   so one team can in principle detect that another sent a given prefix. Under soft tenancy that is
-  an accepted and favourable trade -- cross-tenant sharing of system prompts is the highest-value
-  hit in this workload. It stops being acceptable for a regulated subset, which wants an opt-out
-  rather than a global policy: a cache scope on the request, of the shape RFC-0001's
+  an accepted trade, and on this workload a cheap one: no block is touched by two tenants on the
+  published workload, and a prefix shared across tenants raises the hit rate 2-3 points for no
+  measurable service (§3.8). It stops being acceptable for a regulated subset, which wants an
+  opt-out rather than a global policy: a cache scope on the request, of the shape RFC-0001's
   `scope=<session>` already has (§3.3). Cheap, and worth adding before a result depends on sharing
   being universal.
 
@@ -1795,205 +1886,55 @@ than fixed:
 
 Each phase compiles, runs, and ends with a number, and the measurement apparatus comes before the
 thing it measures. Each has its own `phase-N.md` with the plan, the predictions stated before the
-run, and what was measured; the current numbers are in the ledger.
+run, and what was measured; the current numbers are in the ledger, and the sections above say what
+each phase settled.
 
 | phase | what | status | headline |
 |---|---|---|---|
 | [0](phase-0.md) | price the seams: WASM and `ext_proc` rungs on the ladder | done | a warm WASM hook costs 13-25 ns; an `ext_proc` callout 36-63 us |
 | [1](phase-1.md) | name the memory boundary in types: `own::authority`, the `Telemetry` boundary, the census | done | 13 allocation-authority entry points, all in `cache.rs`; results byte-identical |
-| [2](phase-2.md) | oracle, regret, coupling, the wait regime, per-request spans | done | `scored`'s regret is all model gap; coupling is a statement about a regime |
-| [3](phase-3.md) | the engine allocates; the orchestrator sizes the partition (`--engine-cache`) | done | ceding allocation moves mean service by -0.2% where decode dominates; budgets survive and grow, per-block authority does not (§1) |
-| [4](phase-4.md) | belief, not truth: lossy telemetry and `P(resident)` (`--belief`) | done | within 0.16% of the exact view at 20% batch loss with no recovery |
-| [5](phase-5.md) | influence: retention directives, prefill-ahead, divergence by cause (`--directives`, `--prefill-ahead`, `--retain`) | done | an oracle's retention directives buy at most 1.4% of stall; a prefill of a declared downstream buys 24-28% of task latency where `announce` bought 10-18% |
+| [2](phase-2.md) | oracle, regret, coupling, the wait regime, per-request spans (`--regret`, `--clairvoyant`) | done | `scored`'s regret is all model gap; coupling is a statement about a regime |
+| [3](phase-3.md) | the engine allocates; the orchestrator sizes the partition (`--engine-cache`, `--decode-kv`, `--shared-l2`) | done | ceding allocation moves mean service by -0.2% where decode dominates; budgets survive and grow, per-block authority does not (§1) |
+| [4](phase-4.md) | belief, not truth: lossy telemetry and `P(resident)` (`--belief`, `--scoring`, `--observables`, `--throughput`) | done | within 0.16% of the exact view at 20% batch loss with no recovery |
+| [5](phase-5.md) | influence: retention directives, prefill-ahead, divergence by cause (`--directives`, `--prefill-ahead`, `--retain`) | done | an oracle's retention directives buy at most 1.4% of stall; a prefill of a declared downstream buys 24-28% of task latency where `announce` bought 10-18%, both open-loop figures |
 | [6](phase-6.md) | macro authority: weight placement, partitions, disaggregated prefill/decode, tenancy (`--model-batches`, `--prefill-time`, `--model-keyed`, `--fleet`, `--planner`, `--pairing`, `--neighbour`) | done | one model per node is within 0.3% of the pooled engine and a late placement is the whole price (30 s start +77-82%); a pair wins 1.6-2.6% at one prefiller in eight and loses past it; a router quota beats sharing against a neighbour |
-| [7](phase-7.md) | learned flows, speculative authority, sessions that suspend, the taxonomy (`--hint-grade`, `--learn-gate`, `polyphonic programs`) | done | closed-loop turns are 3.6-3.8x the open-loop trace's, and the same hints cut the flow stall by 0-5% rather than 47-63%; speculation is worth about 1% on coding tools; the logged tier writes 20-66% of the soft tier's decisions on agent presets |
-| [8](phase-8.md) | the data path as an arm | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
-| [9](phase-9.md) | enforcement: a queue at the router, cancellation on the path, and two-tier admission (`--engine-wait`, `--queue`, `--admit`, `--cancel`, `--victim`, `--disconnect`, `--batch`, `--stream-buffer`) | done | a cancel by declared class takes the interactive first-token p99 to 63-66 ms, a restart is 26-183% later than a continuation, and the stalled-stream buffer is under 2 MB a node |
-| [10](phase-10.md) | durability: what each tier writes, and what a crash costs (`--count-writes`, `--track-flights`, `--observe`, `--node-check`, `--snapshot-estimators`, `--copy-durable`, `polyphonic durability`) | done | a restart costs its outage (112-143 request-seconds at 1 s, 32,000-39,000 at a 15 s lease) and the streams that die with it; the soft state it loses costs nothing a run can see; the record's largest writer is liveness; a router that waits 40 s for a lease pays about 65,000 request-seconds |
-| [11](phase-11.md) | regions: a scheduler per region under global budgets | planned | |
+| [7](phase-7.md) | learned flows, speculative authority, sessions that suspend, the taxonomy (`--hint-grade`, `--learn-gate`, `polyphonic programs`) | done | closed-loop turns are 3.6-3.8x the open-loop trace's, and the same hints cut the flow stall by 0-5% rather than 47-63%; speculation moves coding-tool turns by under 2%; the logged tier writes 20-66% of the soft tier's decisions on agent presets |
+| [8](phase-8.md) | the data path as an arm (`polyphonic data-path`) | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
+| [9](phase-9.md) | enforcement: a queue at the router, cancellation on the path, and two-tier admission (`--engine-wait`, `--queue`, `--admit`, `--cancel`, `--victim`, `--disconnect`, `--leak`, `--batch`, `--stream-buffer`) | done | a cancel by declared class takes the interactive first-token p99 to 63-67 ms, a restart is 26-183% later than a continuation, and the stalled-stream buffer is under 2 MB a node |
+| [10](phase-10.md) | durability: what each tier writes, and what a crash costs (`--count-writes`, `--track-flights`, `--observe`, `--node-check`, `--snapshot-estimators`, `--copy-durable`, `polyphonic durability`) | done | a restart costs its outage (126-139 request-seconds at 1 s, 32,000-39,000 at a 15 s lease) and the streams that die with it; the soft state it loses costs nothing a run can see; the record's largest writer is liveness; a router that waits 40 s for a lease pays about 65,000 request-seconds |
+| [11](phase-11.md) | regions: a scheduler per region under global budgets (`polyphonic regions`) | done | with clients in regions the global argmin is 4-12% slower than a scheduler per region; a region alone collapses past about twice its share and every cross-region rule recovers it to within 7%; node budgets that follow a day recover it, and lateness is their price; the global record writes under once a second at 10,000 nodes |
 
-Built bits are off by default, and every result behind them is an A/B against the run without them.
-Phase numbers are stable once cited, so phases added later take new numbers and *Ordering* sets the
-sequence.
+Every bit is off by default, and every result behind one is an A/B against the run without it.
+Phase numbers are stable once cited, so a phase added later takes a new number and its dependencies
+set the order: the memory chain 1 -> 2 -> 3 -> 4 -> 5 -> 6; the engine interface 4 -> 5 -> 9 --
+observe, influence, enforce -- in which cancellation is the one channel that is authoritative rather
+than advisory (§8); and the path chain 0 -> 8. Phase 7 follows 9, because `DraftOnly` preemption
+inside an engine is a cancel; Phase 10 follows 7, which added the logged tier's writers; Phase 11
+follows 6 and 10, whose budgets, partitions and leases it moves across regions. The system of
+record (§8) is infrastructure rather than a phase, since the simulator models no store; Phases 6,
+7, 10 and 11 count what it would hold.
 
-### Phase 6 -- Macro authority: placement, partitions, prefill/decode, tenancy
+### What is open
 
-Plan, predictions and outcomes: [`phase-6.md`](phase-6.md). **Status:** built and measured, behind
-`--model-batches`, `--prefill-time`, `--model-keyed` and `--fleet` with their planner, pairing and
-tenancy bits; current numbers are in the ledger's *Fleet* section. The slow, coarse,
-orchestrator-owned decisions -- §2.4's provisioning tier, and between them everything Phase 3
-froze -- are also the decisions the system of record holds (§8).
-
-The phase is two corrections to the engine and three decisions.
-
-**The engine's two corrections.** The published engine decoded four models in one batch and
-charged prefill nothing, so neither placement nor pairing had anything to act on.
-
-- **A batch per model.** A step reads each resident model's weights once, so a node decoding four
-  models pays four reads a round: a four-model node is +241-279% of the pooled figure, and pricing
-  the batch in the score recovers 21-29 points of it. No score finds the placement that avoids it.
-- **Prefill takes engine time.** A prefill stretches the decodes it overlaps, by 13-17% of mean
-  service at the published partition and 63-81% at half of it. Prefill-ahead keeps its stall
-  saving (-56%) and costs +2.7% of service. KV keyed by model adds 27-32% to prefill work where a
-  fan-out crosses models, which is 48-49% of its agents.
-
-**Three decisions.**
-
-- **Placement.** Weights leave the ledger: a replica is one model on one node, the KV partition is
-  what the weights leave, and a model's load costs its start time and a copy. One model per node is
-  within 0.3% of the published engine and 71% ahead of the lazy cache. The clock is the result
-  (§1's *Two control loops, two clocks*): a planner that moves by rent-or-buy lands +8.5-9.6% over
-  a clairvoyant one, and three model sizes move the allocation to 1 / 2 / 2 / 3 replicas of eight
-  with a saving of 24-36% against an even split.
-- **Pairing and ratio** (§2.5). `joint` pairing with an unpaired option beats a list everywhere it
-  is unsafe, and the ratio is one or two in eight depending on mix and rate.
-- **Tenancy** (§3.8). Cross-tenant prefix sharing is zero on the published workload; a neighbour's
-  damage is engine time; the router's quota on prefill work is the arm and a replica set the hard
-  version of it; a tenant-aware block manager is worth under 0.3% at the published partition.
-
-The decisions are the record tier's writers, and the planner's are counted: 0.046 a second on the
-rotating mix.
-
-- **Not built:** the per-tenant axis on `Quota` for host DDR, a second engine per node (still
-  §3.8's +91-96% pre-measurement), a replica set per tenant, and a half-width node, so the regime
-  in which a partition binds on a placed fleet is not reached.
-- **Open:** whether `--model-batches` and `--prefill-time` become the default. They move every
-  published cluster number, which the other bits did not, so they stay off and the published
-  results stay the ledger's, read as a fleet of one model.
-
-### Phase 7 -- Learned flows, speculative authority, and the taxonomy
-
-Plan, predictions and outcomes: [`phase-7.md`](phase-7.md). **Status:** built and measured, behind
-`--hint-grade` and `--learn-gate` for the base trace and `polyphonic programs` for the rest; every
-bit is off by default and the byte-identity gate holds on the twelve-command set.
-
-Predicted flows replacing declared ones (§3.2), a tool-gap estimator, taxonomy presets, the RAG
-class, durable retention, and authority-driven speculative scheduling (`ReadOnly` pre-execution,
-`DraftOnly` burst preemption, non-preemptible `SideEffecting` leases), then per-pattern coupled %.
-`DraftOnly` preemption inside an engine is a cancel (§4), so this phase follows Phase 9.
-
-**Sessions that suspend.** `taxo.md`'s long-running agent -- durable memory, checkpoints, human
-approval -- needs a session lifecycle the workload does not have: active, idle, suspended to cold
-storage, resumed. It is also the only writer of the logged tier (§1): `SideEffecting` intents,
-suspended-session records and approval pauses, so Phase 7 extends Phase 10's count with them, and
-§8's choice of store for the logged tier can now be tested against that count.
-
-- **Deliverable:** what the coupling-tier-1 win is worth against estimates rather than oracles; the
-  latency and goodput delta from speculative scheduling; the logged tier's write rate; and a table
-  saying for which workload patterns a unified orchestrator can help at all.
-- **Risk:** the coupling table may show the advantage confined to a few cells. That is a result.
-  **Size:** large, separable into increments.
-
-### Phase 9 -- Enforcement: cancellation on the path, and two-tier admission
-
-Plan, predictions and outcomes: [`phase-9.md`](phase-9.md). **Status:** built and measured, behind
-`--engine-wait`, `--queue`, `--admit quantile | tiered | gate`, `--cancel`, `--victim`,
-`--disconnect`, `--leak`, `--batch` and `--stream-buffer`; current numbers are in the ledger's
-*Enforcement* section. `--engine-wait` stays off by default, so the published engine and every
-earlier phase's results are unchanged.
-
-§1 ceded the choice of victim, so every priority policy in this document -- two-tier admission
-(§1), `DraftOnly` preemption (§4), the tenancy trade (§3.8) -- has one enforcement arm: **cancel
-the request on the path it arrived on** (§2.3). The simulator had no cancel and no engine that
-waits, so the phase added both, with a queue at the router and the stream semantics Phase 8 left
-out of scope:
-
-- **The engine that waits.** A sequence the partition cannot hold waits at its node instead of
-  running with no memory, which the published engine does at 18-20% of decodes at half the
-  partition. The half partition is an overload once it does.
-- **The router queue and the cancel.** Requests wait at the router in class order and are placed
-  when they leave; a cancel releases a flight's batch slot, pins and reservation, and the victim
-  continues from the blocks it decoded. It fires when the router's own check fails and when a
-  higher-class request waits at an engine.
-- **Departures and the stalled-stream buffer.** A client that leaves is an abort or a leak, and the
-  buffer is a counter.
-
-**What it found.** Where the loss lands: with a victim class the interactive first-token p99 is at
-the 63 ms floor and the throughput class's completion pays. A claim at each class's own quantile is
-what separates the arms; the tiered claim's mean costs the throughput class 1.5-1.7x at 0.6x with
-prefill taking engine time, and at 0.75x it is level or ahead on two seeds of three. A second cancel
-trigger at the engine, predicted to be needed, is not: at 0.75x the router's own check keeps the
-interactive class under 1 s on every seed. A
-restart finishes the batch class 26-183% later than a continuation. An llm-d-shaped gate evicts up
-to 3.6x as often for a throughput completion 2.2-4.4x later where memory binds, and at 0.75x with
-prefill taking engine time it costs the interactive class too. Attained service orders the
-throughput class first and the interactive class last on this workload. A leaked departure costs
-1.7-3.2x on the interactive first-token p99 at 20% leaving and 0.9-1.3x at 5%. The buffer peaks
-under 1.8 MB a node. Several cells lie outside their stated bands and `phase-9.md` says which, and
-the batch arms are graded on bands against a draw that is not the pre-measurement's.
-
-### Phase 10 -- Durability: what each tier writes, and what a crash costs
-
-Plan, predictions and outcomes: [`phase-10.md`](phase-10.md). **Status:** built and measured, behind
-`--count-writes`, `--track-flights`, `--observe`, `--node-check`, `--snapshot-estimators` and
-`--copy-durable`; current numbers are in the ledger's *Durability* section. Every bit is off by
-default and the byte-identity gate holds on the thirteen-command set.
-
-§1 made two claims about durability that no run tested: the three tiers' write rates sit orders of
-magnitude apart, and soft state can be rebuilt rather than stored. The phase counted the tiers,
-injected a scheduler restart, an engine crash and a node loss into runs whose requests were still
-open, and priced the crossover against the sidecar's tax.
-
-- **The count.** The soft tier makes 3.1-5.0 owned changes a request and the KV event stream 51-77
-  events; the logged tier is 20-66% of the soft tier's decisions on the agent presets; the record's
-  largest writer is liveness. The record is three orders below the soft tier and the logged tier is
-  not (§1). A commit per decision is 0.6-21 times a warm `FaaS` invocation.
-- **A restart costs its outage and its streams, not its state.** `λD²/2` with the streams held;
-  61-73 decode-seconds more when they die with the scheduler. Losing the belief, the flow graph and
-  the estimators costs nothing a run can see; a blind ledger over-admits only at 0.6x and below, and
-  node agents that check their own partitions remove it. A client that backs off costs more
-  request-seconds than a burst and refuses fewer requests.
-- **An engine crash costs its replica's restart; a node loss adds its host work and its gangs, and
-  the lease sets the price.** 3.6-5 request-seconds a second down; 32-62 more for a lost node;
-  4,200-4,800 request-seconds if the router waits 10 s to learn of it and about 65,000 at 40 s.
-- **The crossover.** A crash costs as much as the sidecar's tax saves in under 90 s to 7.5 hours at
-  sub-second takeovers and weeks under a 15 s lease; a fail-open proxy's window costs 12-53
-  request-seconds (§5).
-
-**Predictions that failed:** that spreading retries by a client's backoff removes the burst's cost
-(it adds 7-32%), that losing the estimators costs a first-token tail at the tightest partition (it
-does not), that continuing a failed stream beats restarting it on every seed (it does on two of
-three), and that the sidecar's failover costs 300-900 request-seconds (it costs 12-53).
-
-**Not built:** the FoundationDB commit rung, a replaying subscriber, re-placement of a lost node's
-replicas under `--fleet`, fan-outs parked on a lease, and active-active schedulers (Phase 11).
-
-### Phase 11 -- Regions: a scheduler per region under global budgets
-
-Implementation plan: [`phase-11.md`](phase-11.md), which states its predictions before the run.
-
-§8's shape puts a routing tier in each region, admitting within a budget the global tier sets on
-the provisioning clock. Every region-distance result so far is one scheduler taking a global
-argmin across regions, which that shape does not run.
-
-Model a scheduler per region, a global tier that sizes each region's budget per tenant, model and
-accelerator class, and rebalancing on the provisioning clock -- against today's single global
-argmin.
-
-- **Deliverable:** the price of the regional split -- what the global argmin buys across regions
-  that regional schedulers under budgets give up, and how much rebalancing recovers. Predicted
-  small: the scored arm already keeps tool calls in-region at region distance. The place it could
-  bind is an agent host and its model host in different regions, where the origin round trip is
-  61 ms and no placement moves it. A forecast-driven budget planner against a reactive one is an
-  optional arm, and needs traces with real time structure.
-- **Risk:** needs more than one scheduler in the simulator, which is a structural change to
-  `Machine`. **Size:** medium.
-
-### Ordering
-
-**The memory chain: 1 -> 2 -> 3 -> 4 -> 5 -> 6**, done. Phase 6 unfroze what Phase 3 held fixed --
-the partition's size and the weights' placement.
-
-**The engine interface: 4 -> 5 -> 9.** Observe, influence, enforce -- the engine interface's three
-channels. Cancellation is the only one that is authoritative rather than advisory (§8), and Phase 7
-depends on it, so Phase 9 precedes 7.
-
-**The path chain: 0 -> 8**, done.
-
-**Phase 7** follows Phase 9. **Phase 10** was independent and ran after 7 added its writers.
-**Phase 11** follows 6, whose budgets and partitions it moves across regions.
-
-**The system of record** (§8) is built after Phase 6, whose decisions are now real and whose first
-writer is counted, and sized by Phase 10's count, which finds the logged tier within FoundationDB's
-published rate. It is infrastructure rather than a phase, since
-the simulator models no store.
+- **Defaults.** `--model-batches` and `--prefill-time` correct the engine -- a step reads each
+  resident model's weights once, so a four-model node is +241-279% of the pooled figure, and
+  prefill takes engine time, +13-17% of mean service at the published partition -- and
+  `--engine-wait` makes a sequence the partition cannot hold wait instead of running with no memory.
+  Each moves published numbers, the first two every cluster figure and the third wherever a
+  partition binds, so each stays off and the published results stay the ledger's, read as a fleet
+  of one model on an engine that never waits. Whether they become the default is open.
+- **The fleet** (Phase 6): a half-width node, so the regime in which a partition binds on a placed
+  fleet is not reached; a second engine per node; a replica set per tenant; and the per-tenant axis
+  on `Quota` for host DDR.
+- **Programs** (Phase 7): `distributed --programs`, fan-out agents as victims and gangs queued
+  whole, durable memory beyond the sandbox, and real traces in place of the presets.
+- **Durability** (Phase 10): the FoundationDB commit rung, a replaying subscriber, re-placing a lost
+  node's replicas under `--fleet`, and fan-outs parked on a lease.
+- **Regions** (Phase 11): `--regions` on `distributed` and `code-review`, whose region-distance
+  figures still have no client; node agents' checks for active-active schedulers; per-tenant and
+  per-scheduler instruments; a tenant's region set larger than one; KV across regions; accelerator
+  classes; a forecast-driven budget planner; injected WAN partitions; and a cross-region run on
+  Phase 9's enforced arm.
+- **Infrastructure the simulator prices before it is built:** the shared L2 tier (§3.10), a
+  request-path ring (§2.2), and the system of record -- its layer, the regional and global records
+  and the log (§8).
