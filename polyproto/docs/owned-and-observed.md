@@ -98,13 +98,13 @@ So durability is a column of its own, with one value per clock:
 |---|---|---|---|
 | **soft** | per decision | admission, placement, flow graph, directives with a TTL, staged reservations, a tenant's regional lease, all inferred state | process memory, rebuilt from node agents and engines on restart |
 | **logged** | per session transition | `SideEffecting` intents, suspended-session records, approval pauses, per-tenant usage | an append-only log in its own failure domain: a second FoundationDB cluster (§8) |
-| **record** | per provisioning change | membership and leases, quotas, tenancy, partition sizes, model placement, each region's node budget and the routing table between regions | the system of record (§8): a record per region and a global one, strictly serializable, low rate |
+| **record** | per provisioning change and lease renewal | membership and leases, quotas, tenancy, partition sizes, model placement, each region's node budget and the routing table between regions | the system of record (§8): a record per region and a global one, strictly serializable, low rate |
 
 §2.2's rule decides the first row. A consensus commit costs at least an fsync and a quorum round
-trip -- hundreds of microseconds at best and low milliseconds typically, **on published figures,
-not measured here** -- roughly 5-100x the 44-75 us per request §2.3 measures for the sidecar path
-this document removes. Group commit raises throughput, not latency; writing behind removes the
-latency and leaves process memory as the authority, which is the soft tier by another name. And
+trip -- within a rack about the 44-75 us per request §2.3 measures for the sidecar path this
+document removes, and 20-57 times it at FoundationDB's published commit, **on published figures,
+not measured here** (below). Group commit raises throughput, not latency; writing behind removes
+the latency and leaves process memory as the authority, which is the soft tier by another name. And
 §2.6 puts the data path in the scheduler's address space, so per-request state is **fate-shared**
 with the connections it describes: persisting it records requests that died with the process.
 
@@ -320,7 +320,9 @@ p99 reach 0.5-6.7 s with a batch class and a class's own quantile holds it to 0.
 63-67 ms with a cancel. Borrowing against the mean lets more throughput work in and the cancel
 evicts it: at 0.6x of the grant with prefill taking engine time it finishes the throughput class
 1.5-1.7x later than its own p90 does and the interactive class's first token 2.5-5.1x later, so the
-mean half is retired there; at 0.75x it is level, or ahead on two seeds of three.
+mean half is retired there. At 0.75x it is level when prefill is free and splits by seed when
+prefill takes engine time: ahead on two seeds (0.87 and 0.88x) and 1.49x later on the third, as far
+behind as at 0.6x.
 
 **The catch is that the orchestrator cannot cash that understanding inside the engine.** Ceding
 eviction ceded the **choice of victim**: the engine still preempts and recomputes under pressure,
@@ -348,8 +350,9 @@ What remains is three real mechanisms:
    from it (§3.8).
 3. **Targeted intra-host DDR arbitration.** Where tool execution is co-located with inference,
    shadow pricing binds between **host-side offload connectors** and **ephemeral tool cells**
-   (`Snapshot`). Soft floors beat hard partitions by balancing local tool working sets against
-   offloaded inference state without starving the PCIe pipeline.
+   (`Snapshot`). Soft floors beat hard partitions by letting offloaded inference state -- weights,
+   where they are cached on demand (§5) -- borrow the DDR local tool working sets leave idle,
+   without starving the PCIe pipeline.
 
 So the unified advantage is macro capacity and gang orchestration, joint dataflow placement across
 topological boundaries, and targeted host DDR multiplexing -- not cross-hardware arbitration of HBM
@@ -367,11 +370,11 @@ result and the same run with `--engine-cache` (ledger *Engine allocation*):
 | soft floors beat hard partitions by 31.6% (oracle-tuned, 20k ops) | **grows**: +36.2% at 20k ops, +44.5% at 60k (+38.5% on the ledger); soft-floor weight hit 0.66 -> 0.77; unified memory goes from a tie (-4.0%) to +7.3%. The mechanism is weights, which inherit the slack KV used to borrow |
 | fixed per-class budgets cost 4.0% service and 2.7pp goodput | **holds**: +4.2-4.5% service, 2.7pp goodput. The refusals are host classes', which stay owned |
 | 90% of tool calls shipped to idle model-host DDR | **holds**: 90.1%. The connector's DDR sub-budget does not reach the `Snapshot` slice the option uses |
-| all-or-nothing fan-out admission completes 22% more fan-outs | **holds on the router's partition check**, winning or tying wherever admission binds; the size is sensitive to the control crossing (+2% with none charged), because gang feasibility has a cliff at one model of slack |
-| tool placement inverts under memory pressure | **holds**: ~10% of tool calls kept home under pressure, 65.7% at region, 57.9% under hard pools |
+| all-or-nothing fan-out admission completes 22% more fan-outs | **holds on the router's partition check**, winning or tying wherever admission binds; the size is sensitive to the control crossing -- with none charged, +2% on the ledger and +9% on the engine, +16% with decode KV held -- because gang feasibility has a cliff at one model of slack |
+| tool placement inverts under memory pressure | **holds**: ~10% of tool calls kept home under pressure, 65.7% at region on a global argmin with no client, 57.9% under hard pools |
 | KV ships within a rack and is rebuilt across a zone | **holds**: `scored + fetch` fetches 25.8% of what it acquires at rack (30.5% on the ledger), 0.1% from zone out |
 | boundary ladder, origin round trip, congestion toll | **unaffected** |
-| `announce` buys 11-18% task latency | **shrinks**: KV prewarm carried 50% of the margin on split memory and 71% on unified; with the engine allocating, announce buys 9.0% (split) and 3.2% (unified) from what it can still prewarm. **A dispatch buys it back, and more**: prefilling the declared downstream's prompt when its hint arrives buys 24-28% (Phase 5, §3.3) |
+| `announce` buys 11-18% task latency | **shrinks**: KV prewarm carried 50% of the margin on split memory and 71% on unified; with the engine allocating, announce buys 9.0% (split) and 3.2% (unified) from what it can still prewarm. **A dispatch buys it back on the open-loop trace**: prefilling the declared downstream's prompt when its hint arrives buys 24-28% there, and cuts the flow stall by 0-5% once the downstream waits for its upstream (§3.2, §3.3) |
 | 54-85% of DDR evictions are cross-class at 4 GiB DDR per node | **mostly gone**: 0-26%, and 0-2% on the scored arms. Most of it was the ledger allocating the engine's offload |
 
 The pattern: results about **costs** survive; results about **per-block authority over inference
@@ -440,8 +443,9 @@ schedulers over one region's nodes each know their own dispatches exactly and th
 the engines' `queued` and `running`. Reported at the engine's step, 25 ms, two or four of them place
 within 0.1% of one scheduler at 250 and at 325 req/s a region, so a region's scheduler scales out on
 telemetry this section already specifies. On reports a second old four herd onto whichever node
-looked idle -- +1.6-1.9% at 250 req/s and +11.7-13.4% at 325 -- while two stay within 0.6% at every
-report age and load.
+looked idle -- +1.6-1.9% at 250 req/s and +11.7-13.4% at 325, and on reports five seconds old
++27.6-30.2% and +69.9-73.7%, with half the decodes at 250 arriving at a full batch -- while two stay
+within 0.6% at every report age and load.
 
 #### Two control loops, two clocks
 
@@ -465,13 +469,15 @@ arriving at a full batch. A planner that moves when the loss suffered pays for t
 interval, +56% at 15 s. So the start time is the number worth asking a serving stack for, and the
 planner is a bound on lateness.
 
-**Freshness matters little, for a structural reason.** Under `--belief`, mean service stays within
-0.16% of the exact view at every point measured -- up to 20% batch loss with no recovery, with the
-belief wrong 37-60% of the time -- because the terms that would have to be fooled, `engine` and
-`congestion`, read the in-flight count, which the integrated router knows exactly: it carries every
-request and response (Phase 4). So "how fresh is your view" is the wrong question to organise the
-experiment around. The right one is "does the score price congestion" -- and a score that does
-needs no fresh view to avoid concentrating.
+**Freshness matters little where the in-flight count is exact, for a structural reason.** Under
+`--belief`, mean service stays within 0.16% of the exact view at every point measured -- up to 20%
+batch loss with no recovery, with the belief wrong 37-60% of the time -- because the terms that
+would have to be fooled, `engine` and `congestion`, read the in-flight count, which the integrated
+router knows exactly: it carries every request and response (Phase 4). Schedulers sharing a region
+each carry only their own, read their peers' from the stream and herd on stale reports though the
+score prices congestion (above). So "how fresh is your view" is the wrong question to organise the
+experiment around. The right one is "does the score price congestion on a count it knows" -- and a
+score that does needs no fresh view of residency to avoid concentrating.
 
 ---
 
@@ -635,21 +641,24 @@ first is about speed.
 
 ### 2.4 The split moves; it does not vanish
 
-Polyproto still has two processes, a global scheduler and a node agent. What changes is where the
-seam falls, and it falls where §1 puts the memory seam:
+Polyproto still splits a scheduler from a node agent, with a scheduler per region and a global tier
+above them that decides only on the provisioning clock (§2.2). What changes is where the seam
+falls, and it falls where §1 puts the memory seam:
 
-| | clock | §1: who owns the bytes | §2: who owns the decision | state (§1) |
-|---|---|---|---|---|
-| **provisioning** | seconds to minutes | HBM partition sizing, model placement | replica counts, the P:D ratio, which tenants share a replica set | record |
-| **routing** | per request | -- | cross-node routing, P/D pairing, gang admission | soft |
-| **local** | per request, per step | KV block allocation and eviction (engine) | dispatch, backpressure, policy hooks (node agent) | soft, and the engine's own |
+| | clock | §1: who owns the bytes | §2: who owns the decision | runs in | state (§1) |
+|---|---|---|---|---|---|
+| **provisioning** | seconds to minutes | HBM partition sizing, model placement | replica counts, the P:D ratio, which tenants share a replica set; between regions, node budgets, the routing table and tenants' shares | a planner per region; the global tier | record; tenants' shares soft |
+| **routing** | per request | -- | cross-node routing, P/D pairing, gang admission, policy hooks inside the argmin | the region's scheduler | soft |
+| **local** | per request, per step | KV block allocation and eviction (engine) | dispatch, backpressure, the engine's connection and its buffer, the node's own partition check and liveness lease | the node agent | soft, and the engine's own; the lease is record |
 
 A decision goes to the tier holding the state it needs, and the tier boundary is crossed at the
 rate of the **coarser** tier. The sidecar pattern inverts this: it cuts the path at a seam every
 request must cross, rather than at one only globally-informed decisions cross.
 
-Provisioning and routing can share the global process; they share neither a clock nor a store. Only
-provisioning writes to the system of record, and nothing on the request path waits for it.
+A region's planner can share its scheduler's process; the two share neither a clock nor a store.
+The record is written on the provisioning clock by the planners and the global tier, and every 10 s
+by each node agent renewing its lease -- most of its writes (§1) -- and nothing on the request path
+waits for either.
 
 ### 2.5 Prefill/decode: pair the request, size the fleet
 
@@ -681,9 +690,9 @@ control-plane round trip in the middle of TTFT: prefill finishes, the engine rep
 orchestrator then dispatches the decode. Both endpoints are chosen *before* dispatch and both are
 told then, so prefill completion signals its paired decoder directly, peer to peer alongside the KV
 transfer, and the orchestrator learns of it on the telemetry clock like everything else. Relaying
-it instead would cost one intra-cluster round trip -- hundreds of microseconds within a rack, past
-a millisecond across zones -- on a prefill of tens of milliseconds: single-digit percent, pure
-loss, and avoidable by construction.
+it instead would cost one intra-cluster round trip -- 60 us within a rack and 800 us across a zone
+at the model's links -- on a prefill of tens of milliseconds: 0.1-0.6% within a rack and 1.6-8%
+across a zone, pure loss, and avoidable by construction.
 
 An orchestrator picks the pair and sets the ratio; a sidecar picks a prefiller from a list. That
 difference is a **coupling-tier-2** joint decision, and coupled % (§3.4) sizes it.
@@ -757,15 +766,18 @@ What remains, worst first:
    - **Whose crash ends the stream.** In the scheduler's address space a scheduler crash ends every
      stream through it, and Phase 10 prices that: the node agent aborts the engine's sequence, and
      with a 0.1 s takeover the crash throws away 61-73 decode-seconds and costs 63-75
-     request-seconds beyond the outage's own, 284-370 at 1 s with a restart and 233-276 with the
-     client's continuation, against nothing beyond the outage with the stream held. Holding it below
-     the scheduler -- the node agent keeps the engine's connection and its buffer, under 1.8 MB a
-     node, and the client re-attaches through whichever scheduler answers, as OpenAI's background
-     mode resumes a stream `starting_after` a sequence number -- makes a crash cost its outage and
-     no more. The scheduler owns the decision and the node agent the connection.
+     request-seconds beyond the outage's own; at 1 s it costs 158-240 beyond the outage's 126-139
+     with a restart and 107-146 with the client's continuation, against nothing beyond the outage
+     with the stream held. Holding it below the scheduler -- the node agent keeps the engine's
+     connection and its buffer, under 1.8 MB a node, and the client re-attaches through whichever
+     scheduler answers, as OpenAI's background mode resumes a stream `starting_after` a sequence
+     number -- makes a crash cost its outage and no more. The scheduler owns the decision and the
+     node agent the connection.
 2. **In-process extensions trade isolation for the 0 ns.** `ext_proc`'s 36-63 us buys a separate
-   address space. A first-party ABI extension can corrupt the scheduler, and a segfault takes the
-   node's control plane with it.
+   address space. A first-party ABI extension can corrupt the scheduler, and a segfault takes down
+   the scheduler running it, with every stream through it unless the node agents hold them (as in
+   item 1). Policy code therefore shares the integrated path's crash budget: about one crash a
+   minute or two with the streams held and one an hour or two with them fate-shared (§5).
 3. **Ecosystem.** SPIFFE/mTLS wiring, the WASM filter catalogue, observability that assumes an
    Envoy in the path.
 
@@ -801,7 +813,7 @@ bounds what an in-process ABI extension costs, not because it is an isolation op
 "Can this extension be trusted" then has an answer in nanoseconds, priced by the ladder rather
 than settled by an architecture review -- and a different answer depending on whether the trust
 boundary is per tenant (share the instance, pay 13-25 ns) or per call (pay ~9.5 us for isolation
-that survives a hostile input). Per-call isolation costs **400-750x** a warm instance, so it leaves
+that survives a hostile input). Per-call isolation costs **380-730x** a warm instance, so it leaves
 the argmin entirely: it belongs off to the side with the foreign-runtime row, not inside a
 per-candidate score.
 
@@ -870,7 +882,7 @@ the upstream has finished, and 100% of an agent turn's tool calls arrive before 
 Released when the upstream finishes, the same hints cut the stall by 0-5%, and the learned template
 by nothing (-0.1 / +2.9 / -0.0%), so every published prefill-ahead and announce figure is an
 open-loop figure. The name of a tool arriving in the stream warms its sandbox as well as prediction
-does, since a restore takes about 3 ms against a decode of a second.
+does, since a sandbox restores in 3-9 ms against a decode of a second.
 
 **Lengths.** For the score, the observed running mean of completed output lengths is enough: under
 `--observables` it lands within 0.13% of the exact length on this workload, and no estimator can do
@@ -906,18 +918,21 @@ to owned state, and a deadline is strictly better than the bump for the reason i
 priority inflation with no deadline never self-corrects when the prediction was wrong, while a lease
 does.
 
-Measured, a directive is worth almost nothing on this workload, and a dispatch is worth a great
-deal. None of `announce`'s KV margin was retention: the bump alone on what was resident carried
-between -5% and +9% of it, and the prewarm -- admitting what was not resident -- carried all of
-it, so a retention directive cannot buy back what Phase 3 removed. Holding what a declared flow
-needs costs nothing and buys nothing (0.0-0.1pp of task latency); retaining a fan-out's parent chain
-is within ±0.5% of stall at the published partition and costs 0.2-1.0% at half of it; evict-first on
-one-shot scopes is within ±2%; and an oracle emitter that knows every block's next use, a ceiling
-and never an arm, buys at most 1.4% of stall and 0.1% of service with the sign changing across
-seeds. Prefill-ahead buys 24-28% of task latency on one node against the ledger's 10-18%, and on the
-cluster cuts a flow downstream's stall by 64% at rack, 31% at zone and 7% at region. On the ledger a
-deadline is the better form: bounded state, and one to two points of task latency even with honest
-hints, because a hinted prefix's interior otherwise keeps an inflated priority indefinitely.
+Measured, a directive is worth almost nothing on this workload, and a dispatch a great deal on the
+open-loop trace and little in a closed loop. None of `announce`'s KV margin was retention: the bump
+alone on what was resident carried between -5% and +9% of it, and the prewarm -- admitting what was
+not resident -- carried all of it, so a retention directive cannot buy back what Phase 3 removed.
+Holding what a declared flow needs costs nothing and buys nothing (0.0-0.1pp of task latency);
+retaining a fan-out's parent chain is within ±0.5% of stall at the published partition and costs
+0.2-1.0% at half of it; evict-first on one-shot scopes is within ±2%; and an oracle emitter that
+knows every block's next use, a ceiling and never an arm, buys at most 1.4% of stall and 0.1% of
+service with the sign changing across seeds. Prefill-ahead buys 24-28% of task latency on one node
+against the ledger's 10-18%, and on the cluster cuts a flow downstream's stall by 64% at rack, 31%
+at zone and 7% at region with no client in a region, for 1.5-1.7x its saving in prefill work. Those
+are open-loop figures: released when its upstream finishes, a downstream's stall falls by 0-5%
+(§3.2). On the ledger a deadline is the better form: bounded state, and one to two points of task
+latency even with honest hints, because a hinted prefix's interior otherwise keeps an inflated
+priority indefinitely.
 
 The unified angle: a directive priced in the same ns/byte as everything else can be weighed against
 what it displaces, where in a siloed stack a retention hint is advisory and unpriced. On this
@@ -953,9 +968,11 @@ Three metrics, imported from `sched_lm`:
 
 **Coupled % is the best available answer to "does unified beat siloed."** It measures how much a
 decision depends on state a silo would not have, per request, with no baseline to tune and no arm
-to handicap. It also **bounds the unified advantage from above**: where coupling is low, a unified
-view provably cannot help much, and we should say so rather than hunt for a configuration where it
-does.
+to handicap. Where coupling is low a unified view changes few decisions taken one at a time, and we
+should say so rather than hunt for a configuration where it does. It is not a bound: it counts
+decisions rather than what they cost, and it cannot see a policy whose value is the state its
+decisions leave -- the residency a placement creates, the capacity a planner moves -- any more than
+the oracle above can (§3.9).
 
 Measured: `scored`'s regret is all model gap -- its heuristic and execution gaps are exactly zero at
 the published defaults. Coupling is a statement about a regime: memory coupling is 0.0% at the
@@ -1015,8 +1032,10 @@ argmin over means is blind to spread: a node whose belief just went stale keeps 
 last had and keeps winning on it. The feared failure is **"the router herds onto whichever node
 has stopped reporting"**, because silence reads as calm. Measured, it does not occur on the
 integrated path, where load is read from the traffic the router carries; it does for a router that
-reads load from the stream, which herds or starves by luck of the node's load when it went quiet --
-and `P(resident)` changes none of that. It is §2.3's third reason for integrating, measured.
+reads load from the stream, which herds or starves by luck of the node's load when it went quiet,
+and for schedulers sharing a region, which read their peers' load from it and herd on reports a
+second old (§1) -- and `P(resident)` changes none of that. It is §2.3's third reason for
+integrating, measured.
 
 **A risk penalty is the wrong shape.** `cost = E[cost] + lambda * sigma[cost]`, with sigma widened
 by belief age, gap count and divergence, fails twice. First, the distribution is not one a mean and
@@ -1087,8 +1106,9 @@ Measured (Phase 4):
   predicted, 0.70 realised at half the partition), because the unknown evictions land on the
   stalest blocks an LRU takes first, not uniformly. The chosen node is not worse than the field, so
   the argmin is not exploiting the miscalibration.
-- **The declared SLO buys nothing a user would see.** `expected`, `quantile 0.9` and `slo` land
-  within 1% of each other on service p99, on three seeds.
+- **As a scoring quantile, the declared SLO buys nothing a user would see.** `expected`,
+  `quantile 0.9` and `slo` land within 1% of each other on service p99, on three seeds. What the
+  declared class buys is at admission, the router's queue and the cancel (§1, Phase 9).
 
 Pricing the belief as a probability also makes an accident into a principle: residency-greedy
 improves when a stale view stops it concentrating (§1), and a probability does the same on
@@ -1187,11 +1207,13 @@ meters prefill work and sequences in flight per tenant; across regions a tenant'
 into regional shares, leased from the global tier (Phase 11, §8). Host DDR's `Snapshot` and
 `ServiceHeap` have no tenant axis, and no measurement says it binds.
 
-One reframing falls out. The soft-floors-beat-hard-partitions result **is** this argument in
-miniature: a soft floor lets a class borrow idle capacity where a hard partition strands it, which
-is Kubernetes' requests-versus-limits trade one axis over. Read that way it is less a claim about
-memory arbitration than about **quota policy**, and it is the form in which it survives §1's
-correction.
+One reframing falls out, with a limit. The soft-floors-beat-hard-partitions result is this argument
+in miniature: a soft floor lets a class borrow idle capacity where a hard partition strands it,
+which is Kubernetes' requests-versus-limits trade one axis over. It holds for bytes that would sit
+idle -- weights grown into host DDR and promoted back rather than rebuilt -- and not for compute,
+where the router's quota is the soft form and a replica set at the same allowance is ahead or level
+(above): borrowed engine time lengthens the steps of whoever shares the replica. On a placed fleet
+the memory form has no weights to carry it (§5).
 
 ### 3.9 What the score already does
 
@@ -1257,9 +1279,9 @@ and §2.2's rule decides where they go rather than taste.
 **One span per request**, recording the winning node and which of the five terms decided it: yes,
 and built (`span.rs`, Phase 2). A request costs hundreds of microseconds at minimum, so a span is
 lost in it, and this is the `observed` category doing its job. **One span per candidate inside the
-argmin**: no. That is the per-decision rate, where a bare syscall (97 ns) already exceeds an entire
-ring round trip. Instrumentation costing more than the decision it describes has stopped being
-instrumentation.
+argmin**: no. That is the per-decision rate, where a bare syscall (97 ns) already costs as much as
+an entire ring round trip (70-180 ns). Instrumentation costing more than the decision it describes
+has stopped being instrumentation.
 
 Not a compromise -- the same rule that rejected `ext_proc`. An orchestrator that gets this wrong for
 telemetry has reintroduced as observability precisely the overhead §2 removed as architecture.
@@ -1297,8 +1319,9 @@ swept into existence. The declaration-free alternative, ordering by attained ser
 classes backwards on this workload: the throughput class first and interactive agent sessions last
 (Phase 9).
 
-Each of the ten patterns becomes a named preset over those fields, the way `sched_lm` takes
-`--mix tool=0.5,rag=0.3,oneshot=0.2`. Three consequences:
+Nine of the ten patterns are named presets over those fields (`programs::Preset`), the way
+`sched_lm` takes `--mix tool=0.5,rag=0.3,oneshot=0.2`; multimodal real-time inference, stateful over
+a stream and bound by latency, has none yet. Three consequences:
 
 **Control flow maps onto machinery that exists.** Single-call is a plain request; fixed multi-step
 is the declared flow; parallel/delegated is the fan-out; dynamic multi-step -- the defining agentic
@@ -1381,12 +1404,13 @@ fan-out service by -2.8% to +3.3% at the one partition where claims bind.
 
 ### Per-pattern coupling is the falsifier
 
-Coupled % per taxonomy cell, on both axes, says for each pattern whether a unified orchestrator can
-help at all (Phase 7). Locality coupling on the programs is 0% for one-shot, extraction,
-conversational, retrieval and batch programs, 13-15% for tool pipelines, 4% for agentic, 7% for
-multi-agent and 2% for long-running ones. Memory coupling is 0% for every pattern, because no
-program contends with a second class in host DDR; on the published trace at 2 GiB it is 4-41% by
-pattern, driven by the services and function cells.
+Coupled % per taxonomy cell, on both axes, says for each pattern with a preset how often a unified
+view changes a decision (Phase 7): the falsifier for an advantage taken one decision at a time, not
+for one carried by the state decisions leave (§3.4). Locality coupling on the programs is 0% for
+one-shot, extraction, conversational, retrieval and batch programs, 13-15% for tool pipelines, 4%
+for agentic, 7% for multi-agent and 2% for long-running ones. Memory coupling is 0% for every
+pattern, because no program contends with a second class in host DDR; on the published trace at
+2 GiB it is 4-41% by pattern, driven by the services and function cells.
 
 So the thesis is narrower than the taxonomy suggests. Coupling lives on flows: patterns with nothing
 to co-decide show none, multi-agent and long-running agents -- shared context, cross-node dataflow,
@@ -1410,10 +1434,14 @@ engine-owned. The decision measured is a **budget**, and the budget stays the or
 whoever fills it.
 
 1. **A cross-class DDR shadow price.** One `marginal_price` balances microVM warm pools against
-   offload tiers and local services. Its budget form holds and grows: soft floors beat hard
-   partitions by 32% on the ledger and 36% with the engine allocating, and fixed per-class budgets
-   cost ~4% service and 2.7pp goodput. Its per-eviction form mostly does not: with the engine
-   allocating, 0-26% of DDR evictions are cross-class, against 54-85% on the ledger.
+   offload tiers and local services. Its budget form holds where weights are cached on demand: soft
+   floors beat hard partitions by 32% on the ledger and 36% with the engine allocating, because
+   weights evicted from HBM grow into idle DDR and promote back rather than being rebuilt. A placed
+   fleet (§8) places weights rather than caching them, so on the weight model this document adopts
+   that margin has no mechanism, and the budget form rests on what fixed per-class budgets cost --
+   ~4% service and 2.7pp goodput, in host classes' refusals -- and on the placement option below.
+   Its per-eviction form mostly does not hold: with the engine allocating, 0-26% of DDR evictions
+   are cross-class, against 54-85% on the ledger.
 2. **Placement options static partitioning forecloses.** With soft floors the score ships 90% of
    tool calls to idle host DDR for a 53% warm rate; with hard pools that slice is capped however
    much memory sits free beside it and the warm rate falls to 19%. This concerns `Snapshot` cells,
@@ -1430,14 +1458,17 @@ whoever fills it.
    places its own work and a function call never leaves it -- 0.1 ms of work against a round trip of
    60 ms.
 4. **Cross-workload atomic admission.** All-or-nothing placement of a fan-out across nodes is not
-   expressible per request. Where it binds: 22% more fan-outs completed and 10% less inference
-   stall; it holds on the router's partition check, though its size is sensitive to the control
-   crossing (§1). It is also where a lost node shows first (Phase 10): refused fan-outs rise from 0
-   to 23-28 at the published load and from 28-44 to 103-142 at 0.75x of the partition.
+   expressible per request. Where it binds it wins or ties and wastes nothing, on the router's
+   partition check as on the ledger, and its size is a cliff at one model of slack: with no control
+   crossing charged, as on the integrated path, it completes 2% more fan-outs on the ledger and 9%
+   more with the engine allocating (16% with decode KV held), and with a measured crossing 22% more
+   for 10% less inference stall (§1). It is also where a lost node shows first (Phase 10): refused
+   fan-outs rise from 0 to 23-28 at the published load and from 28-44 to 103-142 at 0.75x of the
+   partition.
 5. **One currency for host hints.** A prewarm, a retention directive and an eviction priced in the
    same host DDR units can be traded against each other. A siloed hint is advisory and unpriced. On
    the ledger the trade comes out lopsided (Phase 5): a host hint's retention half is worth 0.0-0.7%
-   of task latency and its prewarm half 4.1-6.0%.
+   of task latency and its prewarm half 4.1-6.0%, an open-loop figure (§3.2).
 
 **Across regions, two mechanisms that are not emergent** (Phase 11). A region alone collapses past
 about twice its share of demand -- a burst of 2.25 times it costs a scheduler per region +72-82% at
@@ -1514,18 +1545,21 @@ has.
 12. **Two-dimensional coupling as a published quantity.** Not an advantage but the measure of one
     (§3.4), and per pattern the falsifier (§4).
 
-Plainly: the largest defensible effects are **topological dataflow co-placement** within a region,
-**macro-orchestration of weights, partitions and gangs**, and **targeted host DDR multiplexing** --
-not cross-hardware arbitration of HBM bytes, and not a per-request argmin across regions.
-Macro-orchestration of weights has a size and a condition (Phase 6): one model per node at the
-partition its weights leave is within 0.3% of the pooled engine and 71% ahead of weights cached per
-request with a batch per model, and it holds only while the placement follows the mix -- a placement
-that is late by 30 s costs 110-120% more than one that is on time. Once the orchestrator stops
-pretending it allocates KV blocks, what remains is a system solving three problems existing stacks
-fail at: joint dataflow placement across the network boundaries inside a region, macro capacity
-and gang coordination, and authority-aware speculative execution. The first two survive the
-correction (Phase 3); the third is small where tools are short, a few percent of turn latency at
-published accuracies and at most 17% with a perfect predictor (Phase 7).
+Plainly: the largest defensible effect is **macro-orchestration of weights, partitions and gangs**,
+and it has a size and a condition (Phase 6): one model per node at the partition its weights leave
+is within 0.3% of the pooled engine and 71% ahead of weights cached per request with a batch per
+model, and it holds only while the placement follows the mix -- a placement that is late by 30 s
+costs 110-120% more than one that is on time. **Dataflow co-placement** within a region and
+**targeted host DDR multiplexing** are real and small: locality coupling is 0.8-1.7% of decisions
+on the published trace and 2-15% on the programs with flows, a flow's prefill-ahead keeps 0-5% once
+its downstream waits for its upstream (§3.2), and in host DDR the placement option holds with the
+engine allocating (property 2) while the soft-floor margin needs weights cached on demand
+(property 1). Not cross-hardware arbitration of HBM bytes, and not a per-request argmin across
+regions. Once the orchestrator stops pretending it allocates KV blocks, what remains is a system
+solving three problems existing stacks fail at: macro capacity and gang coordination, joint dataflow
+placement across the network boundaries inside a region, and authority-aware speculative execution.
+The first carries the size; the second and third are worth a few percent where measured, the third
+at most 17% of turn latency with a perfect predictor (Phase 7).
 
 ---
 
@@ -1662,9 +1696,10 @@ Worst first.
    does to someone else's warm prefix. Displacement's uncertainty has no estimator yet.
 4. **Two sources of truth, permanently.** What the engine holds and what the router believes drift.
    Not a defect to engineer away; it is the architecture, and the drift is a metric (§3.6).
-5. **The cross-class arbitration thesis narrowed.** The budget form survives and grows; the
-   per-eviction form mostly does not (§1). What remains is quota policy over host DDR and the
-   placement options it opens, not per-eviction arbitration of engine state. (Called the
+5. **The cross-class arbitration thesis narrowed.** The budget form survives the engine allocating
+   KV and grows, while weights are cached on demand; on a placed fleet its margin has no mechanism
+   (§5). The per-eviction form mostly does not survive (§1). What remains is quota policy over host
+   DDR and the placement options it opens, not per-eviction arbitration of engine state. (Called the
    *cross-class arbitration* thesis, not "the unified memory thesis": in this project "unified
    memory" means the **hardware** -- Apple silicon's single pool against the datacenter's split.)
 6. **Owning the path means owning stream semantics -- not HTTP.** The framing, parsing and TLS are
@@ -1794,7 +1829,9 @@ its own, and +1.5-3.4% with a spill or the table to regions it can still reach. 
 are not built. A tenant's regional share can be soft for the same reason: a lease refreshed every
 0.1 or 0.5 s of the run removes the 1.4-2.6 points of refusals a day adds to a static split, and the
 noise a faster refresh chases and the lag of a slower one are artefacts of compressing the day 1,440
-times and its arrivals not at all.
+times and its arrivals not at all. What a lease admits, a region that cannot spill must serve: at
+325 req/s and 10% of headroom, mean service is +106.3-121.6% with a lease against +13.4-15.2% for a
+static split that sheds it.
 
 **The global argmin is a comparison, never a design.** Run with no decision latency and an exact
 view of every region -- the most favourable form a global scheduler could take -- it buys nothing
@@ -1902,7 +1939,7 @@ each phase settled.
 | [8](phase-8.md) | the data path as an arm (`polyphonic data-path`) | done | the sidecar path binds below ~1 ms; an `ext_proc` hook caps one scheduler at ~20 nodes |
 | [9](phase-9.md) | enforcement: a queue at the router, cancellation on the path, and two-tier admission (`--engine-wait`, `--queue`, `--admit`, `--cancel`, `--victim`, `--disconnect`, `--leak`, `--batch`, `--stream-buffer`) | done | a cancel by declared class takes the interactive first-token p99 to 63-67 ms, a restart is 26-183% later than a continuation, and the stalled-stream buffer is under 2 MB a node |
 | [10](phase-10.md) | durability: what each tier writes, and what a crash costs (`--count-writes`, `--track-flights`, `--observe`, `--node-check`, `--snapshot-estimators`, `--copy-durable`, `polyphonic durability`) | done | a restart costs its outage (126-139 request-seconds at 1 s, 32,000-39,000 at a 15 s lease) and the streams that die with it; the soft state it loses costs nothing a run can see; the record's largest writer is liveness; a router that waits 40 s for a lease pays about 65,000 request-seconds |
-| [11](phase-11.md) | regions: a scheduler per region under global budgets (`polyphonic regions`) | done | with clients in regions the global argmin is 4-12% slower than a scheduler per region; a region alone collapses past about twice its share and every cross-region rule recovers it to within 7%; node budgets that follow a day recover it, and lateness is their price; the global record writes under once a second at 10,000 nodes |
+| [11](phase-11.md) | regions: a scheduler per region under global budgets (`polyphonic regions`) | done | with clients in regions the global argmin is 4-12% slower than a scheduler per region; a region alone collapses past about twice its share and every cross-region rule recovers it to within 7%, the table near the knee aside; node budgets that follow a day recover it, and lateness is their price; the global record writes under once a second at 10,000 nodes |
 
 Every bit is off by default, and every result behind one is an A/B against the run without it.
 Phase numbers are stable once cited, so a phase added later takes a new number and its dependencies
@@ -1927,7 +1964,8 @@ record (§8) is infrastructure rather than a phase, since the simulator models n
   fleet is not reached; a second engine per node; a replica set per tenant; and the per-tenant axis
   on `Quota` for host DDR.
 - **Programs** (Phase 7): `distributed --programs`, fan-out agents as victims and gangs queued
-  whole, durable memory beyond the sandbox, and real traces in place of the presets.
+  whole, durable memory beyond the sandbox, a preset for multimodal real-time inference, and real
+  traces in place of the presets.
 - **Durability** (Phase 10): the FoundationDB commit rung, a replaying subscriber, re-placing a lost
   node's replicas under `--fleet`, and fan-outs parked on a lease.
 - **Regions** (Phase 11): `--regions` on `distributed` and `code-review`, whose region-distance
