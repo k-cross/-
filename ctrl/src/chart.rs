@@ -1,7 +1,7 @@
 use eframe::egui::{self, Color32, RichText, Vec2b, vec2};
 use egui_plot::{Corner, Legend, Line, Plot, PlotPoint, PlotPoints};
 
-use crate::buffer::StepRecord;
+pub use crate::buffer::StepRecord;
 
 pub const COLOR_R: Color32 = Color32::from_rgb(235, 75, 75);
 pub const COLOR_E: Color32 = Color32::from_rgb(60, 140, 240);
@@ -24,6 +24,7 @@ pub enum SimTab {
     OpenLoop,
     ClosedLoop,
     Hitrate,
+    Chapter3,
 }
 
 struct LoopSeries {
@@ -54,6 +55,44 @@ impl LoopSeries {
             u,
             y,
             total_steps: records.len(),
+        }
+    }
+
+    fn render<'a>(
+        &'a self,
+        plot_ui: &mut egui_plot::PlotUi<'a>,
+        show_r: bool,
+        show_e: bool,
+        show_u: bool,
+        show_y: bool,
+    ) {
+        if show_r {
+            plot_ui.line(
+                Line::new("Setpoint (r)", PlotPoints::Borrowed(&self.r))
+                    .color(COLOR_R)
+                    .width(1.8),
+            );
+        }
+        if show_e {
+            plot_ui.line(
+                Line::new("Error (e)", PlotPoints::Borrowed(&self.e))
+                    .color(COLOR_E)
+                    .width(1.8),
+            );
+        }
+        if show_u {
+            plot_ui.line(
+                Line::new("Control (u)", PlotPoints::Borrowed(&self.u))
+                    .color(COLOR_U)
+                    .width(1.8),
+            );
+        }
+        if show_y {
+            plot_ui.line(
+                Line::new("Output (y)", PlotPoints::Borrowed(&self.y))
+                    .color(COLOR_Y)
+                    .width(1.8),
+            );
         }
     }
 }
@@ -98,6 +137,7 @@ pub struct SimPlotApp {
     open_series: LoopSeries,
     closed_series: LoopSeries,
     hitrate_series: HitrateSeries,
+    ch3_series: LoopSeries,
     active_tab: SimTab,
 
     show_open_r: bool,
@@ -116,6 +156,11 @@ pub struct SimPlotApp {
     show_hr_u: bool,
     show_hr_y: bool,
 
+    show_ch3_r: bool,
+    show_ch3_e: bool,
+    show_ch3_u: bool,
+    show_ch3_y: bool,
+
     reset_view: bool,
 }
 
@@ -124,12 +169,14 @@ impl SimPlotApp {
         open_data: Vec<StepRecord>,
         closed_data: Vec<StepRecord>,
         hitrate_data: Vec<HitrateRecord>,
+        ch3_data: Vec<StepRecord>,
     ) -> Self {
         Self {
             open_series: LoopSeries::from_records(&open_data),
             closed_series: LoopSeries::from_records(&closed_data),
             hitrate_series: HitrateSeries::from_records(&hitrate_data),
-            active_tab: SimTab::OpenLoop,
+            ch3_series: LoopSeries::from_records(&ch3_data),
+            active_tab: SimTab::Chapter3,
 
             show_open_r: true,
             show_open_e: true,
@@ -147,9 +194,30 @@ impl SimPlotApp {
             show_hr_u: true,
             show_hr_y: true,
 
+            show_ch3_r: true,
+            show_ch3_e: true,
+            show_ch3_u: true,
+            show_ch3_y: true,
+
             reset_view: true,
         }
     }
+}
+
+fn render_loop_checkboxes(
+    ui: &mut egui::Ui,
+    show_r: &mut bool,
+    show_e: &mut bool,
+    show_u: &mut bool,
+    show_y: &mut bool,
+    total_steps: usize,
+) {
+    ui.checkbox(show_r, RichText::new("Setpoint (r)").color(COLOR_R));
+    ui.checkbox(show_e, RichText::new("Error (e)").color(COLOR_E));
+    ui.checkbox(show_u, RichText::new("Control (u)").color(COLOR_U));
+    ui.checkbox(show_y, RichText::new("Output (y)").color(COLOR_Y));
+    ui.separator();
+    ui.label(format!("Steps: {total_steps}"));
 }
 
 impl eframe::App for SimPlotApp {
@@ -181,6 +249,13 @@ impl eframe::App for SimPlotApp {
                     self.active_tab = SimTab::Hitrate;
                     self.reset_view = true;
                 }
+                if ui
+                    .selectable_label(self.active_tab == SimTab::Chapter3, "Chapter 3")
+                    .clicked()
+                {
+                    self.active_tab = SimTab::Chapter3;
+                    self.reset_view = true;
+                }
 
                 ui.separator();
                 if ui.button("Fit / Reset View").clicked() {
@@ -196,44 +271,24 @@ impl eframe::App for SimPlotApp {
 
                 match self.active_tab {
                     SimTab::OpenLoop => {
-                        ui.checkbox(
+                        render_loop_checkboxes(
+                            ui,
                             &mut self.show_open_r,
-                            RichText::new("Setpoint (r)").color(COLOR_R),
-                        );
-                        ui.checkbox(
                             &mut self.show_open_e,
-                            RichText::new("Error (e)").color(COLOR_E),
-                        );
-                        ui.checkbox(
                             &mut self.show_open_u,
-                            RichText::new("Control (u)").color(COLOR_U),
-                        );
-                        ui.checkbox(
                             &mut self.show_open_y,
-                            RichText::new("Output (y)").color(COLOR_Y),
+                            self.open_series.total_steps,
                         );
-                        ui.separator();
-                        ui.label(format!("Steps: {}", self.open_series.total_steps));
                     }
                     SimTab::ClosedLoop => {
-                        ui.checkbox(
+                        render_loop_checkboxes(
+                            ui,
                             &mut self.show_closed_r,
-                            RichText::new("Setpoint (r)").color(COLOR_R),
-                        );
-                        ui.checkbox(
                             &mut self.show_closed_e,
-                            RichText::new("Error (e)").color(COLOR_E),
-                        );
-                        ui.checkbox(
                             &mut self.show_closed_u,
-                            RichText::new("Control (u)").color(COLOR_U),
-                        );
-                        ui.checkbox(
                             &mut self.show_closed_y,
-                            RichText::new("Output (y)").color(COLOR_Y),
+                            self.closed_series.total_steps,
                         );
-                        ui.separator();
-                        ui.label(format!("Steps: {}", self.closed_series.total_steps));
                     }
                     SimTab::Hitrate => {
                         ui.checkbox(
@@ -259,6 +314,16 @@ impl eframe::App for SimPlotApp {
                         ui.separator();
                         ui.label(format!("Steps: {}", self.hitrate_series.total_steps));
                     }
+                    SimTab::Chapter3 => {
+                        render_loop_checkboxes(
+                            ui,
+                            &mut self.show_ch3_r,
+                            &mut self.show_ch3_e,
+                            &mut self.show_ch3_u,
+                            &mut self.show_ch3_y,
+                            self.ch3_series.total_steps,
+                        );
+                    }
                 }
             });
 
@@ -269,6 +334,7 @@ impl eframe::App for SimPlotApp {
                 SimTab::OpenLoop => ("open_loop_plot", "Step (t)", "Value"),
                 SimTab::ClosedLoop => ("closed_loop_plot", "Step (t)", "Value"),
                 SimTab::Hitrate => ("hitrate_plot", "Step (t)", "Value"),
+                SimTab::Chapter3 => ("ch3_plot", "Step (t)", "Value"),
             };
 
             let mut plot = Plot::new(plot_id)
@@ -283,64 +349,22 @@ impl eframe::App for SimPlotApp {
 
             plot.show(ui, |plot_ui| match self.active_tab {
                 SimTab::OpenLoop => {
-                    if self.show_open_r {
-                        plot_ui.line(
-                            Line::new("Setpoint (r)", PlotPoints::Borrowed(&self.open_series.r))
-                                .color(COLOR_R)
-                                .width(1.8),
-                        );
-                    }
-                    if self.show_open_e {
-                        plot_ui.line(
-                            Line::new("Error (e)", PlotPoints::Borrowed(&self.open_series.e))
-                                .color(COLOR_E)
-                                .width(1.8),
-                        );
-                    }
-                    if self.show_open_u {
-                        plot_ui.line(
-                            Line::new("Control (u)", PlotPoints::Borrowed(&self.open_series.u))
-                                .color(COLOR_U)
-                                .width(1.8),
-                        );
-                    }
-                    if self.show_open_y {
-                        plot_ui.line(
-                            Line::new("Output (y)", PlotPoints::Borrowed(&self.open_series.y))
-                                .color(COLOR_Y)
-                                .width(1.8),
-                        );
-                    }
+                    self.open_series.render(
+                        plot_ui,
+                        self.show_open_r,
+                        self.show_open_e,
+                        self.show_open_u,
+                        self.show_open_y,
+                    );
                 }
                 SimTab::ClosedLoop => {
-                    if self.show_closed_r {
-                        plot_ui.line(
-                            Line::new("Setpoint (r)", PlotPoints::Borrowed(&self.closed_series.r))
-                                .color(COLOR_R)
-                                .width(1.8),
-                        );
-                    }
-                    if self.show_closed_e {
-                        plot_ui.line(
-                            Line::new("Error (e)", PlotPoints::Borrowed(&self.closed_series.e))
-                                .color(COLOR_E)
-                                .width(1.8),
-                        );
-                    }
-                    if self.show_closed_u {
-                        plot_ui.line(
-                            Line::new("Control (u)", PlotPoints::Borrowed(&self.closed_series.u))
-                                .color(COLOR_U)
-                                .width(1.8),
-                        );
-                    }
-                    if self.show_closed_y {
-                        plot_ui.line(
-                            Line::new("Output (y)", PlotPoints::Borrowed(&self.closed_series.y))
-                                .color(COLOR_Y)
-                                .width(1.8),
-                        );
-                    }
+                    self.closed_series.render(
+                        plot_ui,
+                        self.show_closed_r,
+                        self.show_closed_e,
+                        self.show_closed_u,
+                        self.show_closed_y,
+                    );
                 }
                 SimTab::Hitrate => {
                     if self.show_hr_r {
@@ -372,18 +396,33 @@ impl eframe::App for SimPlotApp {
                     }
                     if self.show_hr_u {
                         plot_ui.line(
-                            Line::new("Control (u)", PlotPoints::Borrowed(&self.hitrate_series.u))
-                                .color(COLOR_U)
-                                .width(1.8),
+                            Line::new(
+                                "Control (u)",
+                                PlotPoints::Borrowed(&self.hitrate_series.u),
+                            )
+                            .color(COLOR_U)
+                            .width(1.8),
                         );
                     }
                     if self.show_hr_y {
                         plot_ui.line(
-                            Line::new("Output (y)", PlotPoints::Borrowed(&self.hitrate_series.y))
-                                .color(COLOR_Y)
-                                .width(1.8),
+                            Line::new(
+                                "Output (y)",
+                                PlotPoints::Borrowed(&self.hitrate_series.y),
+                            )
+                            .color(COLOR_Y)
+                            .width(1.8),
                         );
                     }
+                }
+                SimTab::Chapter3 => {
+                    self.ch3_series.render(
+                        plot_ui,
+                        self.show_ch3_r,
+                        self.show_ch3_e,
+                        self.show_ch3_u,
+                        self.show_ch3_y,
+                    );
                 }
             });
         });
@@ -394,6 +433,7 @@ pub fn run(
     open_data: Vec<StepRecord>,
     closed_data: Vec<StepRecord>,
     hitrate_data: Vec<HitrateRecord>,
+    ch3_data: Vec<StepRecord>,
 ) -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -410,6 +450,7 @@ pub fn run(
                 open_data,
                 closed_data,
                 hitrate_data,
+                ch3_data,
             )))
         }),
     )

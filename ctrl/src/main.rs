@@ -1,4 +1,4 @@
-use ctrl::buffer::{Buffer, Controller, closed_loop, open_loop};
+use ctrl::buffer::{Buffer, Controller, StepRecord, closed_loop, open_loop};
 use ctrl::chart::{self, HitrateRecord};
 
 fn main() -> eframe::Result<()> {
@@ -13,7 +13,7 @@ fn main() -> eframe::Result<()> {
     let hitrate_data = hitrate_sim();
     let ch3_data = chapter_3_sim(1.0, 0.8);
 
-    chart::run(open_data, closed_data, hitrate_data)
+    chart::run(open_data, closed_data, hitrate_data, ch3_data)
 }
 
 // calculating cache from chapter 2
@@ -55,15 +55,21 @@ fn hitrate_sim() -> Vec<HitrateRecord> {
     records
 }
 
-fn chapter_3_sim(r: f64, k: f64) -> Vec<(f64, f64, f64, f64, f64)> {
+fn chapter_3_sim(r: f64, k: f64) -> Vec<StepRecord> {
     let mut records = Vec::with_capacity(200);
     let mut u = 0.0;
 
-    for _ in 0..200 {
+    for t in 0..200 {
         let y = u;
         let e = r - y;
         u = k * e;
-        records.push((r, e, 0.0, u, y));
+        records.push(StepRecord {
+            t: t as f64,
+            r,
+            e,
+            u,
+            y,
+        });
     }
     records
 }
