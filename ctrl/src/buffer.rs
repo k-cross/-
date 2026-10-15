@@ -58,12 +58,13 @@ impl Buffer {
     }
 }
 
+const DT: f64 = 1.0;
+
 pub struct PIDController {
     kp: f64,
     ki: f64,
     kd: f64,
     i: f64,
-    d: f64,
     prev: f64,
 }
 
@@ -74,16 +75,15 @@ impl PIDController {
             ki,
             kd,
             i: 0.0,
-            d: 0.0,
             prev: 0.0,
         }
     }
 
     pub fn work(&mut self, e: f64) -> f64 {
         self.i += DT * e;
-        self.d = (e - self.prev) / DT;
+        let d = (e - self.prev) / DT;
         self.prev = e;
-        (self.kp * e + self.ki * self.i + self.kd * self.d)
+        self.kp * e + self.ki * self.i + self.kd * d
     }
 }
 
