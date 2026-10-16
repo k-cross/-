@@ -12,10 +12,22 @@ pub use fonts::FontAssets;
 
 use bevy::prelude::*;
 
-/// Global Slide enumeration
-#[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SlideState {
-    #[default]
+macro_rules! slide_states {
+    ($first:ident $(, $rest:ident)* $(,)?) => {
+        #[derive(States, Default, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum SlideState {
+            #[default]
+            $first,
+            $($rest,)*
+        }
+
+        impl SlideState {
+            pub const ORDER: &'static [SlideState] = &[SlideState::$first, $(SlideState::$rest,)*];
+        }
+    };
+}
+
+slide_states![
     Intro,
     MutexBottleneck,
     SizeFocus,
@@ -31,43 +43,17 @@ pub enum SlideState {
     CacheContention,
     DisassembledCode,
     BitWalk,
-    BranchlessIndex,
     PipelineFlush,
+    BranchlessIndex,
     TailLatency,
     UnboundedLatency,
     Backoffs,
     CoreTopology,
     Scaling,
     Simplification,
-}
+];
 
 impl SlideState {
-    pub const ORDER: &'static [SlideState] = &[
-        SlideState::Intro,
-        SlideState::MutexBottleneck,
-        SlideState::SizeFocus,
-        SlideState::StateAmbiguity,
-        SlideState::BoolRep,
-        SlideState::ThreadLanes,
-        SlideState::AbaScenario,
-        SlideState::MemInit,
-        SlideState::AbaProblem,
-        SlideState::ThreadSafety,
-        SlideState::Recovery,
-        SlideState::AutomateRecovery,
-        SlideState::CacheContention,
-        SlideState::DisassembledCode,
-        SlideState::BitWalk,
-        SlideState::BranchlessIndex,
-        SlideState::PipelineFlush,
-        SlideState::TailLatency,
-        SlideState::UnboundedLatency,
-        SlideState::Backoffs,
-        SlideState::CoreTopology,
-        SlideState::Scaling,
-        SlideState::Simplification,
-    ];
-
     pub const TOTAL_COUNT: usize = Self::ORDER.len();
 
     pub fn from_index(index: usize) -> Self {
@@ -148,6 +134,21 @@ fn handle_slide_input(
     {
         controller.current_index =
             (controller.current_index + controller.total_slides - 1) % controller.total_slides;
+        changed = true;
+    }
+
+    if (keys.just_pressed(KeyCode::Home) || keys.just_pressed(KeyCode::Escape))
+        && controller.current_index != 0
+    {
+        controller.current_index = 0;
+        changed = true;
+    }
+
+    if keys.just_pressed(KeyCode::End)
+        && controller.total_slides > 0
+        && controller.current_index + 1 != controller.total_slides
+    {
+        controller.current_index = controller.total_slides - 1;
         changed = true;
     }
 

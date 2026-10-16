@@ -18,11 +18,12 @@ Use `cargo fmt`, not bare `rustfmt <file>` (it defaults to edition 2015 and ther
 
 ## Adding or reordering slides
 
-A slide is wired up in three places, and nothing fails to compile if one is missed:
+A slide is wired up in two places:
 
-- a `SlideState` variant in `src/slideshow/mod.rs`
-- its position in `SlideState::ORDER` (this defines slide order and `TOTAL_COUNT`)
-- an `OnEnter` registration in `SlidesPlugin::build` in `src/slides/mod.rs`
+- its position in the `slide_states!` list in `src/slideshow/mod.rs`, which generates both the `SlideState` enum and `SlideState::ORDER` (slide order and `TOTAL_COUNT`); the first entry is the default state
+- an arm in `spawn_systems` in `src/slides/mod.rs` naming its spawn function; the match is exhaustive, so a new variant without one fails to compile
+
+Reordering only touches the `slide_states!` list. The intro menu (`MENU_CARDS` in `intro.rs`) looks up its targets in `ORDER`, except the card targeting `SlideState::Intro`, which opens whatever slide is at index 1.
 
 Every entity a slide spawns needs `DespawnOnExit(SlideState::X)`, otherwise it persists onto the next slide. `spawn_slide_frame` in `src/slides/auto_slides.rs` does this for you and draws the header; `spawn_slide_scaffold` adds the code block and right column on top, and `src/slides/figure_slides.rs` uses the frame for full-width diagram slides built from `src/slideshow/figures.rs`. `intro.rs` inserts it per entity.
 

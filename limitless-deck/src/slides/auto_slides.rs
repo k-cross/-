@@ -256,9 +256,6 @@ pub fn spawn_slide_scaffold(
     });
 }
 
-// =========================================================================
-// SLIDE 2: SYNCHRONOUS WITH ATOMICS
-// =========================================================================
 pub fn spawn_sync_atomics_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
@@ -416,9 +413,6 @@ pub fn spawn_sync_atomics_slide(mut commands: Commands, font_assets: Res<FontAss
     );
 }
 
-// =========================================================================
-// SLIDE 3: THE SIZE VARIABLE RACE
-// =========================================================================
 pub fn spawn_size_focus_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![
@@ -459,7 +453,7 @@ pub fn spawn_size_focus_slide(mut commands: Commands, font_assets: Res<FontAsset
             ("        self.size.", TokenKind::Plain),
             ("fetch_sub", TokenKind::Function),
             ("(1, Ordering::AcqRel); ", TokenKind::Plain),
-            ("// ⚠️ Race condition!", TokenKind::Alert),
+            ("// [!] Race: size underflows!", TokenKind::Alert),
         ],
         vec![
             ("        rr = unsafe { r.", TokenKind::Plain),
@@ -528,9 +522,6 @@ pub fn spawn_size_focus_slide(mut commands: Commands, font_assets: Res<FontAsset
     );
 }
 
-// =========================================================================
-// SLIDE 4: STATE AMBIGUITY
-// =========================================================================
 pub fn spawn_state_ambiguity_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
@@ -639,11 +630,16 @@ pub fn spawn_state_ambiguity_slide(mut commands: Commands, font_assets: Res<Font
     );
 }
 
-// =========================================================================
-// SLIDE 5: ATOMICBOOL IS NOT ENOUGH
-// =========================================================================
 pub fn spawn_bool_rep_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
+        vec![(
+            "// Without size, write_idx advances BEFORE data is written,",
+            TokenKind::Comment,
+        )],
+        vec![(
+            "// so fast readers can read uninitialized memory!",
+            TokenKind::Comment,
+        )],
         vec![
             ("struct ", TokenKind::Keyword),
             ("Slot", TokenKind::Type),
@@ -660,14 +656,10 @@ pub fn spawn_bool_rep_slide(mut commands: Commands, font_assets: Res<FontAssets>
             ("    initialized: ", TokenKind::Plain),
             ("AtomicBool", TokenKind::Type),
             (", ", TokenKind::Plain),
-            ("// Boolean readiness flag", TokenKind::Comment),
+            ("// Guard each slot's readiness", TokenKind::Comment),
         ],
         vec![("}", TokenKind::Plain)],
         vec![("", TokenKind::Plain)],
-        vec![(
-            "// Writer marks true; Reader marks false:",
-            TokenKind::Comment,
-        )],
         vec![
             ("if !self.buffer[idx].initialized.", TokenKind::Plain),
             ("load", TokenKind::Function),
@@ -693,8 +685,12 @@ pub fn spawn_bool_rep_slide(mut commands: Commands, font_assets: Res<FontAssets>
         ],
         vec![("", TokenKind::Plain)],
         vec![(
-            "// Fails when fast producers lap slow consumers!",
-            TokenKind::Comment,
+            "// LLDB (Process 17878): read_idx == write_idx == 1977",
+            TokenKind::Alert,
+        )],
+        vec![(
+            "// Slot { initialized: true, data: 1 } -> Write threads livelock!",
+            TokenKind::Alert,
         )],
     ];
 
@@ -711,7 +707,19 @@ pub fn spawn_bool_rep_slide(mut commands: Commands, font_assets: Res<FontAssets>
             spawn_math_formula(
                 side,
                 fonts,
-                "/// 2-STATE LAPPING INVERSION ///",
+                "/// 16-BYTE SLOT MEMORY LAYOUT (LLDB) ///",
+                &[
+                    ("data (8B) ", P5_WHITE),
+                    ("+ ", P5_MUTED),
+                    ("bool (1B) ", P5_CYAN),
+                    ("+ ", P5_MUTED),
+                    ("pad (7B)", P5_MUTED),
+                ],
+            );
+            spawn_math_formula(
+                side,
+                fonts,
+                "/// 2-STATE BOOLEAN CYCLE ///",
                 &[
                     ("false ", P5_MUTED),
                     ("──▶ ", P5_RED),
@@ -719,7 +727,7 @@ pub fn spawn_bool_rep_slide(mut commands: Commands, font_assets: Res<FontAssets>
                     ("──▶ ", P5_RED),
                     ("false ", P5_MUTED),
                     ("──▶ ", P5_RED),
-                    ("true (LAPPED!)", P5_BRIGHT_RED),
+                    ("true (ABA!)", P5_BRIGHT_RED),
                 ],
             );
             spawn_callout_card(
@@ -727,8 +735,8 @@ pub fn spawn_bool_rep_slide(mut commands: Commands, font_assets: Res<FontAssets>
                 fonts,
                 CalloutCard {
                     icon: "!",
-                    title: "THE LAPPING DISASTER",
-                    text: "Fast producers lap slow consumers around the ring, flipping initialized back to true. The reader wakes up and reads corrupted data from the next generation.",
+                    title: "UNINITIALIZED READS & LIVELOCK",
+                    text: "Advancing write_idx before writing data exposes uninitialized memory. Adding AtomicBool per slot causes writers to livelock at index 1977 when check ordering races.",
                     is_alert: true,
                 },
             );
@@ -738,7 +746,7 @@ pub fn spawn_bool_rep_slide(mut commands: Commands, font_assets: Res<FontAssets>
                 CalloutCard {
                     icon: "◆",
                     title: "NON-MONOTONIC HAZARD",
-                    text: "Boolean state variables cannot distinguish Generation N from Generation N+1. Monotonic turn sequences are strictly required.",
+                    text: "Even after reordering full/empty checks, a 2-state boolean cannot distinguish Lap N from Lap N+1 when a reader is descheduled.",
                     is_alert: false,
                 },
             );
@@ -746,9 +754,6 @@ pub fn spawn_bool_rep_slide(mut commands: Commands, font_assets: Res<FontAssets>
     );
 }
 
-// =========================================================================
-// SLIDE 6: MANUAL MEMORY TRACKING
-// =========================================================================
 pub fn spawn_mem_init_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
@@ -838,65 +843,67 @@ pub fn spawn_mem_init_slide(mut commands: Commands, font_assets: Res<FontAssets>
     );
 }
 
-// =========================================================================
-// SLIDE 7: THE ABA PROBLEM RESOLUTION
-// =========================================================================
 pub fn spawn_aba_problem_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
-            "// Dmitry Vyukov MPMC turn-stamp algorithm:",
+            "// Monotonic sequence stamps (Crossbeam / Vyukov turn scheme):",
             TokenKind::Comment,
         )],
         vec![
             ("pub fn ", TokenKind::Keyword),
-            ("write", TokenKind::Function),
-            ("(&self, v: T) -> ", TokenKind::Plain),
+            ("read", TokenKind::Function),
+            ("(&self) -> ", TokenKind::Plain),
             ("Result", TokenKind::Type),
-            ("<(), ()> {", TokenKind::Plain),
-        ],
-        vec![
-            ("    let mut head = self.write_idx.", TokenKind::Plain),
-            ("load", TokenKind::Function),
-            ("(Ordering::Relaxed);", TokenKind::Plain),
+            ("<T, ()> {", TokenKind::Plain),
         ],
         vec![("    loop {", TokenKind::Plain)],
-        vec![(
-            "        let node = &self.buffer[head & (self.capacity - 1)];",
-            TokenKind::Plain,
-        )],
         vec![
-            ("        let stamp = node.stamp.", TokenKind::Plain),
+            ("        let idx = self.read_idx.", TokenKind::Plain),
             ("load", TokenKind::Function),
             ("(Ordering::Acquire);", TokenKind::Plain),
         ],
+        vec![
+            ("        let widx = self.write_idx.", TokenKind::Plain),
+            ("load", TokenKind::Function),
+            ("(Ordering::Acquire);", TokenKind::Plain),
+        ],
+        vec![("        let i = idx % self.capacity;", TokenKind::Plain)],
         vec![(
-            "        let diff = stamp as isize - head as isize;",
+            "        if self.empty(idx, widx) { return Err(()); }",
             TokenKind::Plain,
         )],
         vec![
-            ("        if diff == 0 { ", TokenKind::Plain),
-            ("// Slot ready for this write turn!", TokenKind::Comment),
+            ("        if self.buffer[i].stamp.", TokenKind::Plain),
+            ("load", TokenKind::Function),
+            ("(Ordering::Acquire) != idx {", TokenKind::Plain),
         ],
-        vec![(
-            "            if self.write_idx.compare_exchange_weak(",
-            TokenKind::Plain,
-        )],
-        vec![(
-            "                head, head + 1, Relaxed, Relaxed",
-            TokenKind::Plain,
-        )],
-        vec![("            ).is_ok() {", TokenKind::Plain)],
-        vec![(
-            "                unsafe { node.data.get().write(MaybeUninit::new(v)) };",
-            TokenKind::Plain,
-        )],
-        vec![(
-            "                node.stamp.store(head + 1, Ordering::Release);",
-            TokenKind::Plain,
-        )],
-        vec![("                return Ok(());", TokenKind::Plain)],
-        vec![("            }", TokenKind::Plain)],
+        vec![("            spin_loop(); continue;", TokenKind::Plain)],
         vec![("        }", TokenKind::Plain)],
+        vec![(
+            "        if self.read_idx.compare_exchange_weak(",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "            idx, idx.wrapping_add(1), AcqRel, Relaxed",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "        ).is_err() { spin_loop(); continue; }",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "        let rr = unsafe { self.buffer[i].data.get().read().assume_init() };",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "        // Offset uninit stamp for next lap (Crossbeam scheme):",
+            TokenKind::Comment,
+        )],
+        vec![(
+            "        self.buffer[i].stamp.store(idx.wrapping_add(self.capacity + 1), Release);",
+            TokenKind::Plain,
+        )],
+        vec![("        return Ok(rr);", TokenKind::Plain)],
         vec![("    }", TokenKind::Plain)],
         vec![("}", TokenKind::Plain)],
     ];
@@ -907,19 +914,19 @@ pub fn spawn_aba_problem_slide(mut commands: Commands, font_assets: Res<FontAsse
         SlideState::AbaProblem,
         "/// EXHIBIT F // RETHINKING STATES ///",
         "THE ABA PROBLEM RESOLUTION",
-        "vyukov_mpmc.rs",
+        "stamp_ring_buffer.rs",
         "RUST // TURN-STAMP",
         code_lines,
         |side, fonts| {
             spawn_ring_buffer_diagram(
                 side,
                 fonts.monospace.clone(),
-                "VYUKOV MPMC RING BUFFER (N=4)",
+                "MONOTONIC STAMP RING BUFFER (N=4)",
                 vec![
                     SlotState {
                         label: "Slot 0",
                         value: "0xAA",
-                        state: "stamp: 4",
+                        state: "stamp: 0",
                         is_highlighted: true,
                         is_error: false,
                     },
@@ -940,7 +947,7 @@ pub fn spawn_aba_problem_slide(mut commands: Commands, font_assets: Res<FontAsse
                     SlotState {
                         label: "Slot 3",
                         value: "0x00",
-                        state: "stamp: 3",
+                        state: "stamp: 4",
                         is_highlighted: false,
                         is_error: false,
                     },
@@ -951,12 +958,12 @@ pub fn spawn_aba_problem_slide(mut commands: Commands, font_assets: Res<FontAsse
             spawn_math_formula(
                 side,
                 fonts,
-                "/// TURN-STAMP INVARIANT ///",
+                "/// STAMP TRANSITION INVARIANT ///",
                 &[
-                    ("diff ", P5_WHITE),
-                    ("= ", P5_MUTED),
-                    ("stamp − head", P5_CYAN),
-                    (" (0=write, 1=read)", P5_MUTED),
+                    ("Read: ", P5_MUTED),
+                    ("stamp = idx", P5_WHITE),
+                    (" | Uninit: ", P5_MUTED),
+                    ("idx + cap + 1", P5_CYAN),
                 ],
             );
             spawn_callout_card(
@@ -965,7 +972,7 @@ pub fn spawn_aba_problem_slide(mut commands: Commands, font_assets: Res<FontAsse
                 CalloutCard {
                     icon: "★",
                     title: "ABA IMMUNITY",
-                    text: "Vyukov's stamp increments monotonically (head + 1). A thread cannot write unless stamp == head, rendering ABA mathematically impossible.",
+                    text: "Monotonically advancing read_idx and write_idx with per-slot stamps (idx on write, idx + cap + 1 on read) distinguishes every lap around the ring.",
                     is_alert: false,
                 },
             );
@@ -973,9 +980,6 @@ pub fn spawn_aba_problem_slide(mut commands: Commands, font_assets: Res<FontAsse
     );
 }
 
-// =========================================================================
-// SLIDE 8: TESTING WITH LOOM
-// =========================================================================
 pub fn spawn_thread_safety_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
@@ -991,29 +995,25 @@ pub fn spawn_thread_safety_slide(mut commands: Commands, font_assets: Res<FontAs
             TokenKind::Plain,
         )],
         vec![(
-            "TRACE loom::rt::atomic: Atomic::store state=Ref(5) ordering=Release",
-            TokenKind::Plain,
-        )],
-        vec![(
-            "INFO iter{68005}:thread{id=1}: loom::rt::execution: ~~~ THREAD 1 ~~~",
-            TokenKind::Comment,
-        )],
-        vec![(
             "TRACE loom::rt: yield_now thread=Id(2) switch=true",
             TokenKind::Plain,
         )],
         vec![(
-            "TRACE loom::rt::atomic: Atomic::load state=Ref(6) ordering=Acquire",
-            TokenKind::Plain,
-        )],
-        vec![(
-            "// Panicked: Model exceeded maximum number of branches (spin locks!)",
+            "// 3-Thread Test: Model exceeded maximum number of branches (19! * 3)",
             TokenKind::Alert,
         )],
         vec![(
-            "// Later in test_two_threads: Causality violation on UnsafeCell!",
+            "// 2-Thread Test: Causality violation: Concurrent accesses to UnsafeCell!",
             TokenKind::Alert,
         )],
+        vec![("", TokenKind::Plain)],
+        vec![(
+            "// Part 2 Fix: 3 targeted 2-thread Loom tests (cuts state explosion):",
+            TokenKind::Comment,
+        )],
+        vec![("// 1. Read / Write pair starting EMPTY", TokenKind::Plain)],
+        vec![("// 2. Write / Write pair starting EMPTY", TokenKind::Plain)],
+        vec![("// 3. Read / Read pair starting FULL", TokenKind::Plain)],
     ];
 
     spawn_slide_scaffold(
@@ -1049,8 +1049,8 @@ pub fn spawn_thread_safety_slide(mut commands: Commands, font_assets: Res<FontAs
                 fonts,
                 CalloutCard {
                     icon: "!",
-                    title: "MODEL CHECKING REALITY",
-                    text: "Loom exposed spin lock branch explosion in 3-thread tests and caught a concurrent UnsafeCell data race on empty/full boundaries that random cargo test loops missed.",
+                    title: "TARGETED 2-THREAD BOUNDARY TESTS",
+                    text: "Loom caught a concurrent UnsafeCell boundary race that random loops missed. Splitting 3-thread tests into R/W (empty), W/W (empty), and R/R (full) pairs tames state explosion.",
                     is_alert: true,
                 },
             );
@@ -1058,52 +1058,52 @@ pub fn spawn_thread_safety_slide(mut commands: Commands, font_assets: Res<FontAs
     );
 }
 
-// =========================================================================
-// SLIDE 9: CRASH IN CRITICAL SECTION
-// =========================================================================
 pub fn spawn_recovery_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
-            "// Lockless slot advancement is a 3-step sequence:",
-            TokenKind::Comment,
-        )],
-        vec![(
-            "// 1. Claim slot cursor via atomic CAS:",
+            "// Critical section between index CAS and stamp commit:",
             TokenKind::Comment,
         )],
         vec![
-            ("let idx = self.write_idx.", TokenKind::Plain),
+            ("if self.write_idx.", TokenKind::Plain),
             ("compare_exchange_weak", TokenKind::Function),
-            ("(...)?;", TokenKind::Plain),
+            (
+                "(idx, idx.wrapping_add(1), ...).is_err() {",
+                TokenKind::Plain,
+            ),
         ],
+        vec![("    continue;", TokenKind::Plain)],
+        vec![("}", TokenKind::Plain)],
         vec![("", TokenKind::Plain)],
         vec![(
-            "// 2. Write payload into buffer memory:",
+            "// Step 2: Raw bit copy from stack (panic-free in Rust):",
             TokenKind::Comment,
         )],
         vec![
-            ("unsafe { self.buffer[idx].data.get().", TokenKind::Plain),
+            ("unsafe { core::ptr::", TokenKind::Plain),
             ("write", TokenKind::Function),
-            ("(MaybeUninit::new(v)) };", TokenKind::Plain),
+            (
+                "(self.buffer[i].data.get(), MaybeUninit::new(v)) };",
+                TokenKind::Plain,
+            ),
         ],
-        vec![("", TokenKind::Plain)],
         vec![(
-            "// 3. Commit slot stamp to wake next reader:",
+            "// Step 3: Atomic stamp store (panic-free in Rust):",
             TokenKind::Comment,
         )],
         vec![
-            ("self.buffer[idx].stamp.", TokenKind::Plain),
+            ("self.buffer[i].stamp.", TokenKind::Plain),
             ("store", TokenKind::Function),
-            ("(idx + 1, Ordering::Release);", TokenKind::Plain),
+            ("(idx, Ordering::Release);", TokenKind::Plain),
         ],
         vec![("", TokenKind::Plain)],
         vec![(
-            "// IF THREAD CRASHES (SIGKILL/OOM/PANIC) AT STEP 2:",
-            TokenKind::Comment,
+            "// If OS forcefully kills thread (SIGKILL) before Step 3:",
+            TokenKind::Alert,
         )],
         vec![(
-            "// Slot stamp is NEVER committed! All subsequent threads freeze!",
-            TokenKind::Comment,
+            "// Slot 2 { stamp: 0, val: 0x0 } -> Readers spin on uninit, Writers see full!",
+            TokenKind::Alert,
         )],
     ];
 
@@ -1122,7 +1122,7 @@ pub fn spawn_recovery_slide(mut commands: Commands, font_assets: Res<FontAssets>
                 fonts.sans.clone(),
                 "CRITICAL SECTION PROGRESSION",
                 P5_RED,
-                &["1. CAS Index", "2. Write Value", "3. Store Stamp"],
+                &["1. CAS Index", "2. ptr::write", "3. Store Stamp"],
                 Some(1),
             );
             spawn_callout_card(
@@ -1131,7 +1131,7 @@ pub fn spawn_recovery_slide(mut commands: Commands, font_assets: Res<FontAssets>
                 CalloutCard {
                     icon: "!",
                     title: "LOCKLESS != LOCK-FREE",
-                    text: "Lock-free guarantees system-wide forward progress. Vyukov's algorithm is lockless but blocking per-slot; if a thread dies at step 2, the slot deadlocks forever.",
+                    text: "Vyukov's 2010 MPMC design is lockless (per-slot blocking), trading pointer-CAS and epoch reclamation overhead for cache locality.",
                     is_alert: true,
                 },
             );
@@ -1140,8 +1140,8 @@ pub fn spawn_recovery_slide(mut commands: Commands, font_assets: Res<FontAssets>
                 fonts,
                 CalloutCard {
                     icon: "◆",
-                    title: "UNRECOVERABLE HALT",
-                    text: "If a thread is killed (SIGKILL/OOM) while holding an uncommitted index, that slot is permanently orphaned without manual intervention.",
+                    title: "PANIC-FREE CRITICAL SECTION",
+                    text: "Because raw bit copies and atomic stores cannot panic, only an external OS SIGKILL during those two instructions can orphan a slot.",
                     is_alert: false,
                 },
             );
@@ -1149,13 +1149,10 @@ pub fn spawn_recovery_slide(mut commands: Commands, font_assets: Res<FontAssets>
     );
 }
 
-// =========================================================================
-// SLIDE 10: AUTOMATING RECOVERY REINTRODUCES ABA
-// =========================================================================
 pub fn spawn_automate_recovery_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
-            "// Attempting peer-thread recovery with retry threshold:",
+            "// Attempting peer-thread recovery with local retry counter:",
             TokenKind::Comment,
         )],
         vec![("let mut retry = (0, idx);", TokenKind::Plain)],
@@ -1165,18 +1162,15 @@ pub fn spawn_automate_recovery_slide(mut commands: Commands, font_assets: Res<Fo
             ("load", TokenKind::Function),
             ("(Ordering::Acquire) != ridx {", TokenKind::Plain),
         ],
+        vec![("        spin_loop();", TokenKind::Plain)],
         vec![("        match retry {", TokenKind::Plain)],
-        vec![(
-            "            // If stalled for 10 retries, force-advance stamp:",
-            TokenKind::Comment,
-        )],
         vec![
             (
                 "            (cnt, id) if cnt >= 10 && id == idx => self.",
                 TokenKind::Plain,
             ),
             ("fix", TokenKind::Function),
-            ("(id), // DANGER!", TokenKind::Alert),
+            ("(i), // ABA returns!", TokenKind::Alert),
         ],
         vec![(
             "            (cnt, id) if id == idx => retry.0 += 1,",
@@ -1185,6 +1179,26 @@ pub fn spawn_automate_recovery_slide(mut commands: Commands, font_assets: Res<Fo
         vec![("            _ => retry = (0, idx),", TokenKind::Plain)],
         vec![("        }", TokenKind::Plain)],
         vec![("        continue;", TokenKind::Plain)],
+        vec![("    }", TokenKind::Plain)],
+        vec![("}", TokenKind::Plain)],
+        vec![("", TokenKind::Plain)],
+        vec![
+            ("fn ", TokenKind::Keyword),
+            ("fix", TokenKind::Function),
+            ("(&self, i: usize) {", TokenKind::Plain),
+        ],
+        vec![(
+            "    let read = self.read_idx.load(Ordering::Acquire);",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "    if self.buffer[(read + 1) % self.capacity].stamp.load(Acquire) == read + 1 {",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "        self.buffer[i].stamp.store(...); // Skip orphaned slot",
+            TokenKind::Plain,
+        )],
         vec![("    }", TokenKind::Plain)],
         vec![("}", TokenKind::Plain)],
     ];
@@ -1202,17 +1216,16 @@ pub fn spawn_automate_recovery_slide(mut commands: Commands, font_assets: Res<Fo
             spawn_math_formula(
                 side,
                 fonts,
-                "/// LAP DISTANCE CALCULATION ///",
+                "/// EXACT FORMER-STATE CRASH CHECKS ///",
                 &[
-                    ("|⌊read ÷ cap⌋ − ⌊stamp ÷ cap⌋| ", P5_WHITE),
-                    ("≥ ", P5_RED),
-                    ("2 (Lapped)", P5_WHITE),
+                    ("Write Crash: ", P5_MUTED),
+                    ("stamp = idx − cap + 1", P5_RED),
                 ],
             );
             spawn_math_formula(
                 side,
                 fonts,
-                "/// ADJACENT STAMP HEURISTIC ///",
+                "/// ADJACENT SLOT HEURISTIC ///",
                 &[
                     ("post_init ", P5_WHITE),
                     ("= ", P5_MUTED),
@@ -1225,7 +1238,7 @@ pub fn spawn_automate_recovery_slide(mut commands: Commands, font_assets: Res<Fo
                 CalloutCard {
                     icon: "!",
                     title: "PREEMPTION VS CRASH",
-                    text: "A peer thread cannot distinguish a killed thread from an OS-preempted thread. Force-advancing a slot stamp causes the delayed thread to overwrite future data when it wakes up.",
+                    text: "Even exact former-state checks (stamp == idx - cap + 1) cannot distinguish a killed thread from an OS-paused thread. Auto-fixing reintroduces ABA; expose manual fix() to clients instead.",
                     is_alert: true,
                 },
             );
@@ -1233,9 +1246,6 @@ pub fn spawn_automate_recovery_slide(mut commands: Commands, font_assets: Res<Fo
     );
 }
 
-// =========================================================================
-// SLIDE 11: MEASURING CACHE CONTENTION
-// =========================================================================
 pub fn spawn_cache_contention_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
@@ -1333,46 +1343,18 @@ pub fn spawn_cache_contention_slide(mut commands: Commands, font_assets: Res<Fon
     );
 }
 
-// =========================================================================
-// SLIDE 12: DISASSEMBLY & CACHE LINES
-// =========================================================================
 pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
-            "// Disassembly revealed read_idx & write_idx stored consecutively:",
-            TokenKind::Comment,
-        )],
-        vec![
-            ("pub struct ", TokenKind::Keyword),
-            ("RingBuffer", TokenKind::Type),
-            ("<T> {", TokenKind::Plain),
-        ],
-        vec![
-            ("    read_idx: ", TokenKind::Plain),
-            ("AtomicUsize", TokenKind::Type),
-            (",  ", TokenKind::Plain),
-            (
-                "// Offset 0x00..0x08 (Shared 128B Apple Silicon line)",
-                TokenKind::Comment,
-            ),
-        ],
-        vec![
-            ("    write_idx: ", TokenKind::Plain),
-            ("AtomicUsize", TokenKind::Type),
-            (", ", TokenKind::Plain),
-            (
-                "// Offset 0x08..0x10 (Shared 128B Apple Silicon line)",
-                TokenKind::Comment,
-            ),
-        ],
-        vec![("}", TokenKind::Plain)],
-        vec![("", TokenKind::Plain)],
-        vec![(
-            "// MESI protocol forces invalidation on every producer write!",
+            "// Disassembly revealed two major bottlenecks:",
             TokenKind::Comment,
         )],
         vec![(
-            "// Fix: Hardware cache-line padding (128 bytes on Apple Silicon)",
+            "// 1. read_idx (+0x00) & write_idx (+0x08) share a 128B L1 cache line",
+            TokenKind::Comment,
+        )],
+        vec![(
+            "// 2. idx % capacity compiles to udiv + msub (2 to 34 CPU cycles!)",
             TokenKind::Comment,
         )],
         vec![("#[repr(align(128))]", TokenKind::Keyword)],
@@ -1382,8 +1364,33 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
             ("<T>(pub T);", TokenKind::Plain),
         ],
         vec![("", TokenKind::Plain)],
-        vec![("read_idx: CachePadded<AtomicUsize>,", TokenKind::Plain)],
-        vec![("write_idx: CachePadded<AtomicUsize>,", TokenKind::Plain)],
+        vec![
+            ("pub struct ", TokenKind::Keyword),
+            ("RingBuffer", TokenKind::Type),
+            ("<T> {", TokenKind::Plain),
+        ],
+        vec![(
+            "    read_idx: CachePadded<AtomicUsize>,  // Isolated 128B line",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "    write_idx: CachePadded<AtomicUsize>, // +128B offset (#128 in ASM)",
+            TokenKind::Plain,
+        )],
+        vec![("}", TokenKind::Plain)],
+        vec![("", TokenKind::Plain)],
+        vec![(
+            "// Criterion + Instruments after 128B CachePadded:",
+            TokenKind::Comment,
+        )],
+        vec![(
+            "// Time: 18.30 ms -> 12.86 ms (-30.6% wall-clock reduction!)",
+            TokenKind::Keyword,
+        )],
+        vec![(
+            "// L1 Misses: 50.74% -> 31.22% | IPC: 0.0306 -> 0.0450",
+            TokenKind::Keyword,
+        )],
     ];
 
     spawn_slide_scaffold(
@@ -1399,22 +1406,22 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
             spawn_math_formula(
                 side,
                 fonts,
-                "/// CACHE LINE CONTENTION (128 BYTES) ///",
+                "/// 128B CACHE PADDED SPEEDUP ///",
                 &[
-                    ("read_idx [0x00] ", P5_WHITE),
-                    ("| ", P5_MUTED),
-                    ("write_idx [0x08] ", P5_WHITE),
-                    ("(SAME 128B LINE!)", P5_RED),
+                    ("18.30 ms ", P5_RED),
+                    ("──▶ ", P5_MUTED),
+                    ("12.86 ms (−30.6%)", P5_GOLD),
                 ],
             );
             spawn_math_formula(
                 side,
                 fonts,
-                "/// PADDED HARDWARE ISOLATION ///",
+                "/// L1 MISS & IPC IMPROVEMENT ///",
                 &[
-                    ("#[repr(align(128))] ", P5_CYAN),
-                    ("⟹ ", P5_MUTED),
-                    ("128B Offset in ASM (#128)", P5_WHITE),
+                    ("L1 Miss: ", P5_MUTED),
+                    ("31.22%", P5_CYAN),
+                    (" | IPC: ", P5_MUTED),
+                    ("0.0450", P5_WHITE),
                 ],
             );
             spawn_callout_card(
@@ -1422,8 +1429,8 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
                 fonts,
                 CalloutCard {
                     icon: "!",
-                    title: "FALSE SHARING",
-                    text: "On Apple Silicon, L1 cache lines are 128 bytes. Because read_idx and write_idx sit 8 bytes apart, producer writes continuously invalidate the consumer's L1 cache line.",
+                    title: "FALSE SHARING & UDIV DISCOVERY",
+                    text: "Padding indices to 128-byte Apple Silicon L1 lines cut runtime by 30.6% and L1 misses to 31.2%. Disassembly also exposed udiv + msub modulo instructions as the next bottleneck.",
                     is_alert: true,
                 },
             );
@@ -1431,9 +1438,6 @@ pub fn spawn_disassembled_code_slide(mut commands: Commands, font_assets: Res<Fo
     );
 }
 
-// =========================================================================
-// SLIDE 13: BRANCHLESS COMPUTATION
-// =========================================================================
 pub fn spawn_branchless_index_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
@@ -1539,13 +1543,38 @@ pub fn spawn_branchless_index_slide(mut commands: Commands, font_assets: Res<Fon
     );
 }
 
-// =========================================================================
-// SLIDE 14: MEASURING TAIL LATENCY
-// =========================================================================
 pub fn spawn_tail_latency_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
-            "// User-Level Statically Defined Tracing (USDT) probe hooks:",
+            "// 1. Define Rust USDT probes (compiles to NOPs when inactive):",
+            TokenKind::Comment,
+        )],
+        vec![("#[usdt::provider]", TokenKind::Keyword)],
+        vec![
+            ("mod ", TokenKind::Keyword),
+            ("limitless_probes {", TokenKind::Plain),
+        ],
+        vec![(
+            "    fn read__start(_: &usdt::UniqueId) {}",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "    fn read__done(_: &usdt::UniqueId, idx: u64, ok: u8) {}",
+            TokenKind::Plain,
+        )],
+        vec![("}", TokenKind::Plain)],
+        vec![("let probe_id = usdt::UniqueId::new();", TokenKind::Plain)],
+        vec![(
+            "limitless_probes::read__start!(|| &probe_id);",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "limitless_probes::read__done!(|| (&probe_id, i as u64, 1u8));",
+            TokenKind::Plain,
+        )],
+        vec![("", TokenKind::Plain)],
+        vec![(
+            "// 2. DTrace script (tail_latency.d) bucketing by power of two:",
             TokenKind::Comment,
         )],
         vec![(
@@ -1561,21 +1590,6 @@ pub fn spawn_tail_latency_slide(mut commands: Commands, font_assets: Res<FontAss
             TokenKind::Plain,
         )],
         vec![("    self->read_ts = 0;", TokenKind::Plain)],
-        vec![("}", TokenKind::Plain)],
-        vec![("", TokenKind::Plain)],
-        vec![(
-            "limitless_probes*:::write-start { self->write_ts = timestamp; }",
-            TokenKind::Plain,
-        )],
-        vec![(
-            "limitless_probes*:::write-done /self->write_ts/ {",
-            TokenKind::Plain,
-        )],
-        vec![(
-            "    @write_lat = quantize(timestamp - self->write_ts);",
-            TokenKind::Plain,
-        )],
-        vec![("    self->write_ts = 0;", TokenKind::Plain)],
         vec![("}", TokenKind::Plain)],
     ];
 
@@ -1631,9 +1645,6 @@ pub fn spawn_tail_latency_slide(mut commands: Commands, font_assets: Res<FontAss
     );
 }
 
-// =========================================================================
-// SLIDE 15: UNBOUNDED TAIL LATENCY
-// =========================================================================
 pub fn spawn_unbounded_latency_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
@@ -1645,19 +1656,23 @@ pub fn spawn_unbounded_latency_slide(mut commands: Commands, font_assets: Res<Fo
             TokenKind::Plain,
         )],
         vec![(
-            " 256 |@@@@@@@@@@@@@@@@@@ 17932   512 |@@@@@@@@@@@@@@@@ 8316",
+            "  128 |                      25    256 |@@@@@@             2950",
             TokenKind::Plain,
         )],
         vec![(
-            " 512 |@@@@@               4943  1024 |@@@@@            2510",
+            "  256 |@@@@@@@@@@@@@@@@@@ 17932    512 |@@@@@@@@@@@@@@@@   8316",
             TokenKind::Plain,
         )],
         vec![(
-            "1024 |@@                  1818  8192 |                    2",
+            "  512 |@@@@@               4943   1024 |@@@@@              2510",
             TokenKind::Plain,
         )],
         vec![(
-            "16384 |                      3 131072 |                    1",
+            " 1024 |@@                  1818  32768 |                      2",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "16384 |                       3 131072 |                      1",
             TokenKind::Plain,
         )],
         vec![("", TokenKind::Plain)],
@@ -1684,7 +1699,7 @@ pub fn spawn_unbounded_latency_slide(mut commands: Commands, font_assets: Res<Fo
             spawn_histogram(
                 side,
                 fonts.monospace.clone(),
-                "DTRACE LATENCY QUANTIZE HISTOGRAM",
+                "DTRACE READ LATENCY HISTOGRAM",
                 vec![
                     HistogramBucket {
                         label: "256 ns",
@@ -1716,30 +1731,28 @@ pub fn spawn_unbounded_latency_slide(mut commands: Commands, font_assets: Res<Fo
             spawn_math_formula(
                 side,
                 fonts,
-                "/// READ TAIL LATENCY SPIKE ///",
+                "/// READ & WRITE TAIL SPIKES ///",
                 &[
-                    ("16,384 ns ÷ 256 ns ", P5_WHITE),
-                    ("= ", P5_MUTED),
-                    ("64× degradation!", P5_BRIGHT_RED),
+                    ("Read: ", P5_MUTED),
+                    ("64× (16.4 µs)", P5_RED),
+                    (" | Write: ", P5_MUTED),
+                    ("256× (131 µs)", P5_BRIGHT_RED),
                 ],
             );
-            spawn_math_formula(
+            spawn_callout_card(
                 side,
                 fonts,
-                "/// WRITE TAIL LATENCY SPIKE ///",
-                &[
-                    ("131,072 ns ÷ 512 ns ", P5_WHITE),
-                    ("= ", P5_MUTED),
-                    ("256× degradation!", P5_BRIGHT_RED),
-                ],
+                CalloutCard {
+                    icon: "!",
+                    title: "WHY TAIL LATENCY IS UNBOUNDED",
+                    text: "Measured across 4 read and 4 write threads. Because the algorithm is lockless rather than lock-free, an OS-preempted thread holding a slot forces peers to spin-wait indefinitely.",
+                    is_alert: true,
+                },
             );
         },
     );
 }
 
-// =========================================================================
-// SLIDE 16: BACKOFF MITIGATION
-// =========================================================================
 pub fn spawn_backoffs_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![
@@ -1831,13 +1844,10 @@ pub fn spawn_backoffs_slide(mut commands: Commands, font_assets: Res<FontAssets>
     );
 }
 
-// =========================================================================
-// SLIDE 17: CORE SCALING LIMITATIONS
-// =========================================================================
 pub fn spawn_scaling_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(
-            "[Core 0] [Core 1] [Core 2] [Core 3] ---> Contending on read_idx",
+            "[Core 1] [Core 2] [Core 3] [Core 4] ---> Contending on read_idx",
             TokenKind::Plain,
         )],
         vec![("  |         |        |        |", TokenKind::Comment)],
@@ -1847,16 +1857,32 @@ pub fn spawn_scaling_slide(mut commands: Commands, font_assets: Res<FontAssets>)
         )],
         vec![("  |         |        |        |", TokenKind::Comment)],
         vec![(
-            "[Core 4] [Core 5] [Core 6] [Core 7] ---> Contending on write_idx",
+            "[Core 5] [Core 6] [Core 7] [Core 8] ---> Contending on write_idx",
             TokenKind::Plain,
         )],
         vec![("", TokenKind::Plain)],
         vec![(
-            "// Result: As logical core counts increase beyond 8 cores,",
+            "// Optimization Journey (Criterion & Instruments on Apple Silicon):",
             TokenKind::Comment,
         )],
         vec![(
-            "// interconnect contention causes total throughput to DECLINE!",
+            "// 1. Unpadded + Modulo:   18.30 ms | 50.74% L1 miss | 0.0306 IPC",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "// 2. 128B CachePadded:    12.86 ms | 31.22% L1 miss | 0.0450 IPC",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "// 3. Padded Slot<T>:      12.60 ms | 25.62% L1 miss | 3456K RAM",
+            TokenKind::Plain,
+        )],
+        vec![(
+            "// 4. MCB Bit-Walk:         2.74 ms | 17.19% L1 miss | 0.0838 IPC",
+            TokenKind::Keyword,
+        )],
+        vec![(
+            "// 5. Crossbeam / Backoff:  5.26 ms | Prevents multi-core bus storms",
             TokenKind::Comment,
         )],
     ];
@@ -1874,38 +1900,38 @@ pub fn spawn_scaling_slide(mut commands: Commands, font_assets: Res<FontAssets>)
             spawn_bar_chart(
                 side,
                 fonts.sans_heavy.clone(),
-                "THROUGHPUT VS CORE COUNT",
+                "CRITERION RUNTIME (LOWER IS FASTER)",
                 200.0,
                 vec![
                     BarEntry {
-                        label: "2 Cores",
-                        value_text: "1.00x base",
-                        fraction: 0.35,
-                        color: P5_WHITE,
-                    },
-                    BarEntry {
-                        label: "4 Cores",
-                        value_text: "2.30x",
-                        fraction: 0.85,
-                        color: P5_CYAN,
-                    },
-                    BarEntry {
-                        label: "8 Cores",
-                        value_text: "2.70x PEAK",
+                        label: "1. Unpadded + udiv",
+                        value_text: "18.30 ms (50.7% miss)",
                         fraction: 1.00,
-                        color: P5_GOLD,
+                        color: P5_BRIGHT_RED,
                     },
                     BarEntry {
-                        label: "12 Cores",
-                        value_text: "1.40x DROP",
-                        fraction: 0.50,
+                        label: "2. 128B CachePadded",
+                        value_text: "12.86 ms (31.2% miss)",
+                        fraction: 0.70,
                         color: P5_RED,
                     },
                     BarEntry {
-                        label: "16 Cores",
-                        value_text: "0.70x FAIL",
-                        fraction: 0.25,
-                        color: P5_BRIGHT_RED,
+                        label: "3. Padded Slot<T>",
+                        value_text: "12.60 ms (25.6% miss)",
+                        fraction: 0.69,
+                        color: P5_MUTED,
+                    },
+                    BarEntry {
+                        label: "4. MCB Bit-Walk",
+                        value_text: "2.74 ms (17.2% miss)",
+                        fraction: 0.15,
+                        color: P5_GOLD,
+                    },
+                    BarEntry {
+                        label: "5. Crossbeam Queue",
+                        value_text: "5.26 ms (With Backoff)",
+                        fraction: 0.29,
+                        color: P5_CYAN,
                     },
                 ],
             );
@@ -1914,8 +1940,8 @@ pub fn spawn_scaling_slide(mut commands: Commands, font_assets: Res<FontAssets>)
                 fonts,
                 CalloutCard {
                     icon: "!",
-                    title: "MESI BUS SATURATION",
-                    text: "Each atomic write requires broadcasting invalidations across core interconnects. Beyond 8-12 cores, bus arbitration dominates execution.",
+                    title: "SHARED INDEX CONTENTION WALL",
+                    text: "Even after a 6.7x speedup (18.3 ms -> 2.74 ms), MPMC scales only so far: every reader and writer still hammers shared atomic indices across the core interconnect.",
                     is_alert: true,
                 },
             );
@@ -1923,9 +1949,6 @@ pub fn spawn_scaling_slide(mut commands: Commands, font_assets: Res<FontAssets>)
     );
 }
 
-// =========================================================================
-// SLIDE 18: SPSC & ARCHITECTURAL PATHS
-// =========================================================================
 pub fn spawn_simplification_slide(mut commands: Commands, font_assets: Res<FontAssets>) {
     let code_lines = vec![
         vec![(

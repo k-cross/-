@@ -77,9 +77,11 @@ Beyond standard text callouts, technical slides embed custom Persona 5-styled UI
 | :--- | :--- |
 | `Space` / `→` / `Enter` / `PageDown` | Advance to Next Slide (with blade slash & character lunge) |
 | `←` / `Backspace` / `PageUp` | Retreat to Previous Slide |
+| `Escape` / `Home` | Jump back to Slide 01 (Calling Card & Route Selector) |
+| `End` | Jump to Final Slide (Slide 23) |
 | `Mouse Wheel` (Scroll) | Scroll code blocks & debugger logs smoothly |
-| `J` / `↓` (Arrow Down) | Scroll code block down |
-| `K` / `↑` (Arrow Up) | Scroll code block up |
+| `J` / `↓` (Arrow Down) | Scroll code block down (or select route on Slide 01) |
+| `K` / `↑` (Arrow Up) | Scroll code block up (or select route on Slide 01) |
 | `F` / `F11` | Toggle Borderless Fullscreen |
 
 ---
@@ -88,28 +90,28 @@ Beyond standard text callouts, technical slides embed custom Persona 5-styled UI
 
 | # | Slide Title | Technical Topic & Source Content | Visual / Math Component |
 | :---: | :--- | :--- | :--- |
-| **01** | **On the Road to Lock Freedom** | Palace Infiltration calling card manifesto & descending zine agenda. | Extruded 3D title banners, stars, & calling card seal |
+| **01** | **On the Road to Lock Freedom** | Palace Infiltration calling card manifesto & interactive 5-act zine agenda. | Extruded 3D title banners, stars, & calling card seal |
 | **02** | **Synchronous with Atomics** | Naive ring buffer commit (`b0f8f05d`), atomic cursors, livelock deadlock. | Thread flow diagram (Write vs Read thread pipeline) |
 | **03** | **The Size Variable Race** | Atomic counter underflow in `read()` and LLDB breakpoint analysis. | Math formula: $\text{size} = 0 \to 18{,}446{,}744{,}073{,}709{,}551{,}615$ |
 | **04** | **State Ambiguity** | Removing `size` and resolving the `head == tail` boundary condition. | Math formulas: Empty ($\text{head} == \text{tail}$), Full ($(\text{tail}+1)\%\text{cap} == \text{head}$) |
-| **05** | **AtomicBool Is Not Enough** | Memory initialization and data corruption when producers lap consumers. | Math formula: 2-state lapping sequence ($\text{false} \to \text{true} \to \text{false} \to \text{true}$) |
+| **05** | **AtomicBool Is Not Enough** | Guarding uninitialized memory per slot and LLDB livelock at index `1977`. | Math formula: 16B `Slot<T>` layout & 2-state boolean ABA cycle |
 | **06** | **Who Checks What, and When** | Graphic execution lanes showing race windows between check and commit. | Full-width multi-thread step timeline with highlighted race gaps |
-| **07** | **The Sleeping Reader** | Visualizing ABA when a reader deschedules and wakeups up after a full lap. | 4-slot ring buffer state scenes before and after buffer wrap |
+| **07** | **The Sleeping Reader** | Visualizing ABA when a reader deschedules and wakes up after a full lap. | 4-slot ring buffer state scenes before and after buffer wrap |
 | **08** | **Manual Memory Tracking** | Generational sequence stamps in `Slot<T>` and fixing test stack overflows. | Locality formula: $\text{bitmap\_words} = \frac{\text{capacity}}{64}$ vs embedded $\text{Slot}\langle T \rangle$ |
-| **09** | **The ABA Problem Resolution** | Dmitry Vyukov's MPMC turn-stamp algorithm and monotonic progression. | 4-slot ring buffer memory diagram + Vyukov invariant formula |
-| **10** | **Testing with Loom** | Model checking reveals spin lock branch explosion and concurrent `UnsafeCell` race. | Metrics panel: Iteration $68{,}005$ branch limit panic + race alert |
-| **11** | **Crash in Critical Section** | Lockless slot progression vulnerabilities: thread death in critical section. | Critical section flow diagram: `CAS` $\to$ `Write` $\to$ `Commit Stamp` |
-| **12** | **Automating Recovery** | Why peer-thread healing heuristics cannot distinguish preemption from death. | Lap distance invariant formula: $|\lfloor\text{rd}/\text{cap}\rfloor - \lfloor\text{st}/\text{cap}\rfloor| \ge 2$ |
-| **13** | **Measuring Cache Contention** | Hardware counter metrics on Apple Silicon using macOS Instruments. | Bar chart: L1 Miss Rate ($50.74\%$), CAS Contention ($67.17\%$), IPC ($0.03$) |
-| **14** | **Disassembly & Cache Lines** | Decompilation analysis: false sharing across 128-byte cache lines on Apple Silicon. | 128-byte L1 cache line diagram + `#[repr(align(128))]` fix |
-| **15** | **The Lap Bit** | Bit-walk generation tracking: shifting and flipping the furthest-reaching bit. | Dual binary bit-row comparison table with XOR flip demonstrations |
-| **16** | **Branchless Computation** | Pure arithmetic wrapping via `wrapping_sub(1)` bitmasking without branches. | Math formulas: `at_capacity.wrapping_sub(1)` mask + XOR flip |
-| **17** | **When the CPU Guesses Wrong** | CPU pipeline stall visualization: fetch/decode stalls and bubble flushes. | 5-stage CPU pipeline grid across misprediction, flush, and refill |
-| **18** | **Measuring Tail Latency** | Production tracing using User-Level Statically Defined Tracing (USDT). | DTrace USDT probe overhead formula ($0\text{ ns}$ when disabled) |
+| **09** | **The ABA Problem Resolution** | Monotonic sequence stamps and Crossbeam/Vyukov `idx + cap + 1` turn scheme. | 4-slot ring buffer memory diagram + stamp transition formula |
+| **10** | **Testing with Loom** | Model checking: spin lock branch explosion, `UnsafeCell` race, & 2-thread pairs. | Metrics panel: Iteration $68{,}005$ branch limit + boundary race alert |
+| **11** | **Crash in Critical Section** | Lockless vs. lock-free: panic-free critical section vs. external OS `SIGKILL`. | Critical section flow diagram: `CAS` $\to$ `ptr::write` $\to$ `Store Stamp` |
+| **12** | **Automating Recovery** | Why peer-thread healing (`stamp == idx - cap + 1`) reintroduces ABA on preemption. | Former-state crash formula & adjacent slot stamp heuristic |
+| **13** | **Measuring Cache Contention** | Hardware counter metrics on Apple Silicon using macOS Instruments. | Bar chart: L1 Miss Rate ($50.74\%$), CAS Contention ($67.17\%$), IPC ($0.0306$) |
+| **14** | **Disassembly & Cache Lines** | 128-byte Apple Silicon L1 lines (`18.30ms -> 12.86ms`) & `udiv`/`msub` discovery. | 128B `CachePadded` speedup ($-30.6\%$) & L1 miss drop ($31.22\%$) |
+| **15** | **The Lap Bit** | Bit-walk generation tracking (`MCB = (cap + 1).next_power_of_two()`, `2.74ms`). | Dual binary bit-row comparison table with XOR flip demonstrations |
+| **16** | **When the CPU Guesses Wrong** | CPU pipeline stall visualization: fetch/decode stalls and bubble flushes. | 5-stage CPU pipeline grid across misprediction, flush, and refill |
+| **17** | **Branchless Computation** | Pure arithmetic wrapping via `wrapping_sub(1)` bitmasking without branches. | Math formulas: `at_capacity.wrapping_sub(1)` mask + XOR flip |
+| **18** | **Measuring Tail Latency** | Production tracing using `#[usdt::provider]` and DTrace `quantize` scripts. | DTrace USDT probe overhead formula ($0\text{ ns}$ NOP when disabled) |
 | **19** | **Unbounded Tail Latency** | DTrace quantize histograms revealing extreme latency outlier multipliers. | Power-of-2 histogram: $64\times$ read spike ($16.4\ \mu\text{s}$), $256\times$ write spike ($131\ \mu\text{s}$) |
 | **20** | **Backoff Mitigation** | Exponential backoff (`crossbeam_utils::Backoff`) relieving interconnect storms. | Backoff progression flow: `CAS` $\to$ `spin_loop` $\to$ `yield_now` $\to$ `Snooze` |
 | **21** | **Four Cores, One Index** | Multi-core contention topology: 4 readers and 4 writers hammering single lines. | Dual multi-core cluster topology mapping cores to index lines |
-| **22** | **Core Scaling Limitations** | Multi-threaded scaling ceiling caused by MESI invalidation bus saturation. | Bar chart: Throughput vs Core Count (scaling collapse past 8 cores) |
+| **22** | **Core Scaling Limitations** | Complete Criterion & Instruments progression (`18.30ms -> 2.74ms`) & MESI ceiling. | Bar chart: Criterion runtime & L1 miss rate across all 5 stages |
 | **23** | **SPSC & Architectural Paths** | Single-Producer Single-Consumer queues with core pinning & zero CAS ops. | Synchronization architecture panel: 0 CAS ops, Acquire/Release ordering |
 
 ---

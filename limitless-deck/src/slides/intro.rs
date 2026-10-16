@@ -127,7 +127,7 @@ pub const MENU_CARDS: [MenuCardData; 5] = [
         indent: 104.0,
         num: "05",
         title: "BRANCHLESS & TAIL LATENCY",
-        sub: "[CLIMAX ROUTE ★]",
+        sub: "[CLIMAX // DTRACE & SPSC]",
         unselected_bg: P5_GOLD,
         unselected_border: BorderColor {
             left: P5_BLACK,
@@ -139,7 +139,7 @@ pub const MENU_CARDS: [MenuCardData; 5] = [
         corner: CardCorner::BottomLeft,
         splat_color: P5_BLACK,
         is_climax: true,
-        target_state: SlideState::BranchlessIndex,
+        target_state: SlideState::PipelineFlush,
     },
 ];
 
@@ -1016,18 +1016,17 @@ pub fn handle_intro_menu_input(
     }
     if keys.just_pressed(KeyCode::Enter) {
         let target_state = MENU_CARDS[selection.current].target_state;
-        let (final_state, final_idx) = if target_state == SlideState::Intro {
-            (SlideState::MutexBottleneck, 1)
+        let target_index = if target_state == SlideState::Intro {
+            1
         } else {
-            let idx = SlideState::ORDER
+            SlideState::ORDER
                 .iter()
                 .position(|&s| s == target_state)
-                .unwrap_or(0);
-            (target_state, idx)
+                .unwrap_or(0)
         };
 
-        controller.current_index = final_idx;
-        next_state.set(final_state);
+        controller.current_index = target_index;
+        next_state.set(SlideState::from_index(target_index));
         crate::slideshow::animation::spawn_screen_slash(&mut commands);
         crate::slideshow::character::trigger_character_slash(character_roots);
     }

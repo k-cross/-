@@ -65,16 +65,15 @@ pub fn spawn_styled_code_block(
     lines: Vec<Vec<(&str, TokenKind)>>,
     mono_font: Option<Handle<Font>>,
 ) {
-    let font_gutter = if let Some(ref f) = mono_font {
-        TextFont::from_font_size(FONT_CODE).with_font(f.clone())
-    } else {
-        TextFont::from_font_size(FONT_CODE)
+    let mono_at = |size: f32| {
+        let font = TextFont::from_font_size(size);
+        match &mono_font {
+            Some(handle) => font.with_font(handle.clone()),
+            None => font,
+        }
     };
-    let font_token = if let Some(ref f) = mono_font {
-        TextFont::from_font_size(FONT_CODE).with_font(f.clone())
-    } else {
-        TextFont::from_font_size(FONT_CODE)
-    };
+    let font_code = mono_at(FONT_CODE);
+    let font_tag = mono_at(FONT_LABEL_SM);
 
     // Outer Container with Persona 5 layered framing
     parent
@@ -114,14 +113,10 @@ pub fn spawn_styled_code_block(
                         ..default()
                     },))
                     .with_children(|left| {
-                        left.spawn((
-                            Text::new("///"),
-                            TextFont::from_font_size(FONT_CODE),
-                            TextColor(P5_RED),
-                        ));
+                        left.spawn((Text::new("///"), font_code.clone(), TextColor(P5_RED)));
                         left.spawn((
                             Text::new(file_title),
-                            TextFont::from_font_size(FONT_CODE),
+                            font_code.clone(),
                             TextColor(P5_WHITE),
                         ));
                     });
@@ -139,11 +134,7 @@ pub fn spawn_styled_code_block(
                         rot_subtle(),
                     ))
                     .with_children(|tag| {
-                        tag.spawn((
-                            Text::new(language_tag),
-                            TextFont::from_font_size(FONT_LABEL_SM),
-                            TextColor(P5_WHITE),
-                        ));
+                        tag.spawn((Text::new(language_tag), font_tag, TextColor(P5_WHITE)));
                     });
             });
 
@@ -185,7 +176,7 @@ pub fn spawn_styled_code_block(
                             .with_children(|gutter| {
                                 gutter.spawn((
                                     Text::new(format!("{:02}", line_idx + 1)),
-                                    font_gutter.clone(),
+                                    font_code.clone(),
                                     TextColor(P5_MUTED),
                                 ));
                             });
@@ -210,7 +201,7 @@ pub fn spawn_styled_code_block(
                                 for (text, kind) in tokens {
                                     token_row.spawn((
                                         Text::new(text),
-                                        font_token.clone(),
+                                        font_code.clone(),
                                         TextColor(kind.color()),
                                     ));
                                 }
